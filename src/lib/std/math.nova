@@ -1,5 +1,22 @@
+//! Numeric maths for `int`, `long`, and `double`.
+//!
+//! This module fills the gap left by Nova having no built-in maths library:
+//! integer helpers (abs, sqrt, pow, gcd, lcm, min/max/clamp), checked and
+//! saturating integer arithmetic that guards against silent 32-bit and
+//! 64-bit overflow, and a self-contained set of floating-point routines
+//! (trig, log, exp, hyperbolic) implemented from series expansions and bit
+//! reduction rather than calling into libm, so the only external hook is
+//! `nova_f64_sqrt`.
+//!
+//! The floating-point functions trade a little precision for portability:
+//! `sin`/`cos` use a 12-term Taylor series after range reduction into
+//! `[-pi, pi]`, `fln`/`fexp` use series expansions after range reduction by
+//! powers of two, and `atan` uses argument reduction plus a series. Expect
+//! roughly 1e-4 to 1e-5 accuracy, not full IEEE-754 double precision.
+
 import assert;
 
+/// Absolute value of an integer.
 pub fn abs(val: int): int {
     if (val < 0) {
         return -val;
@@ -7,6 +24,9 @@ pub fn abs(val: int): int {
     return val;
 }
 
+/// Integer square root, rounded down to the nearest integer via binary search.
+///
+/// Returns 0 for negative input instead of erroring.
 pub fn sqrt(val: int): int {
     if (val < 0) {
         return 0;
@@ -36,6 +56,10 @@ pub fn sqrt(val: int): int {
     return ans;
 }
 
+/// Raises `base` to the power `exp` using repeated multiplication.
+///
+/// `exp` is assumed non-negative; a negative exponent leaves the loop
+/// unexecuted and returns 1. No overflow checking is performed.
 pub fn pow(base: int, exp: int): int {
     let result = 1;
     let i = 0;
@@ -46,6 +70,7 @@ pub fn pow(base: int, exp: int): int {
     return result;
 }
 
+/// Smaller of two integers.
 pub fn min(a: int, b: int): int {
     if (a < b) {
         return a;
@@ -53,6 +78,7 @@ pub fn min(a: int, b: int): int {
     return b;
 }
 
+/// Larger of two integers.
 pub fn max(a: int, b: int): int {
     if (a > b) {
         return a;
@@ -60,6 +86,7 @@ pub fn max(a: int, b: int): int {
     return b;
 }
 
+/// Restricts `val` to the inclusive range `[min_val, max_val]`.
 pub fn clamp(val: int, min_val: int, max_val: int): int {
     if (val < min_val) {
         return min_val;
@@ -70,34 +97,43 @@ pub fn clamp(val: int, min_val: int, max_val: int): int {
     return val;
 }
 
+/// Hash of an integer for use as a map/set key. The identity function: an
+/// `int` hashes to itself.
 pub fn int_hash(val: int): int {
     return val;
 }
 
+/// The constant pi.
 pub fn pi(): double { return 3.14159265358979323846; }
+/// Euler's number, the base of the natural logarithm.
 pub fn e(): double { return 2.71828182845904523536; }
 
+/// Absolute value of a double.
 pub fn fabs(x: double): double {
     if (x < 0.0) { return 0.0 - x; }
     return x;
 }
 
+/// Smaller of two doubles.
 pub fn fmin(a: double, b: double): double {
     if (a < b) { return a; }
     return b;
 }
 
+/// Larger of two doubles.
 pub fn fmax(a: double, b: double): double {
     if (a > b) { return a; }
     return b;
 }
 
+/// Restricts `x` to the inclusive range `[lo, hi]`.
 pub fn fclamp(x: double, lo: double, hi: double): double {
     if (x < lo) { return lo; }
     if (x > hi) { return hi; }
     return x;
 }
 
+/// Rounds `x` down to the nearest whole number (towards negative infinity).
 pub fn ffloor(x: double): double {
     let t = x as int;
     let tf = t as double;
@@ -105,6 +141,7 @@ pub fn ffloor(x: double): double {
     return tf;
 }
 
+/// Rounds `x` up to the nearest whole number (towards positive infinity).
 pub fn fceil(x: double): double {
     let t = x as int;
     let tf = t as double;
@@ -112,16 +149,23 @@ pub fn fceil(x: double): double {
     return tf;
 }
 
+/// Rounds `x` to the nearest whole number, halves rounding away from zero.
 pub fn fround(x: double): double {
     if (x < 0.0) { return fceil(x - 0.5); }
     return ffloor(x + 0.5);
 }
 
+/// Square root of a double, delegating to the native `nova_f64_sqrt`.
+///
+/// Returns 0.0 for non-positive input instead of NaN.
 pub fn fsqrt(x: double): double {
     if (x <= 0.0) { return 0.0; }
     return nova_f64_sqrt(x);
 }
 
+/// Raises a double `base` to an integer power `exp` by repeated multiplication.
+///
+/// `exp` is assumed non-negative.
 pub fn fpow(base: double, exp: int): double {
     let result = 1.0;
     let i = 0;
@@ -132,8 +176,13 @@ pub fn fpow(base: double, exp: int): double {
     return result;
 }
 
+/// Natural logarithm of 2.
 pub fn ln2(): double { return 0.69314718055994530942; }
 
+/// Natural logarithm of `x`, computed by reducing to `[1, 2)` via powers of
+/// two and summing a 20-term series over the reduced value.
+///
+/// Returns 0.0 for non-positive input instead of NaN or negative infinity.
 pub fn fln(x: double): double {
     if (x <= 0.0) { return 0.0; }
     let m = x;
@@ -153,6 +202,9 @@ pub fn fln(x: double): double {
     return (2.0 * sum) + ((k as double) * ln2());
 }
 
+/// Natural exponential of `x`, computed by splitting `x` into a whole
+/// multiple of `ln2()` (applied as a power-of-two scale) plus a small
+/// remainder evaluated with an 18-term series.
 pub fn fexp(x: double): double {
     let k = fround(x / ln2());
     let r = x - (k * ln2());
@@ -171,18 +223,27 @@ pub fn fexp(x: double): double {
     return sum * scale;
 }
 
+/// Raises `base` to a fractional power `exp`, via `exp(exp * ln(base))`.
+///
+/// Returns 0.0 for non-positive `base` instead of NaN.
 pub fn fpowf(base: double, exp: double): double {
     if (base <= 0.0) { return 0.0; }
     return fexp(exp * fln(base));
 }
 
+/// The constant tau, i.e. 2 * pi, a full turn in radians.
 pub fn tau(): double { return 6.28318530717958647692; }
+/// log base 10 of e, the multiplier used to convert a natural log to a base-10 log.
 pub fn log10e(): double { return 0.43429448190325182765; }
+/// log base 2 of e, the multiplier used to convert a natural log to a base-2 log.
 pub fn log2e(): double { return 1.44269504088896340736; }
 
+/// Base-10 logarithm of `x`, derived from `fln` via the change-of-base formula.
 pub fn log10(x: double): double { return fln(x) * log10e(); }
+/// Base-2 logarithm of `x`, derived from `fln` via the change-of-base formula.
 pub fn log2(x: double): double { return fln(x) * log2e(); }
 
+// Reduces an angle in radians to the range [-pi, pi] for the trig series below.
 fn wrapAngle(x: double): double {
     let t = x;
     while (t > pi()) { t = t - tau(); }
@@ -190,6 +251,7 @@ fn wrapAngle(x: double): double {
     return t;
 }
 
+/// Sine of `x` (radians), via range reduction plus a 12-term Taylor series.
 pub fn sin(x: double): double {
     let r = wrapAngle(x);
     let term = r;
@@ -205,6 +267,7 @@ pub fn sin(x: double): double {
     return sum;
 }
 
+/// Cosine of `x` (radians), via range reduction plus a 12-term Taylor series.
 pub fn cos(x: double): double {
     let r = wrapAngle(x);
     let term = 1.0;
@@ -220,12 +283,18 @@ pub fn cos(x: double): double {
     return sum;
 }
 
+/// Tangent of `x` (radians), as `sin(x) / cos(x)`.
+///
+/// Returns 0.0 when `cos(x)` is nearly zero (near the asymptotes) instead of
+/// a huge or infinite value.
 pub fn tan(x: double): double {
     let c = cos(x);
     if (fabs(c) < 0.000000000001) { return 0.0; }
     return sin(x) / c;
 }
 
+/// Arctangent of `x`, in radians, via argument reduction (halving the
+/// argument repeatedly using the tangent half-angle identity) plus a series.
 pub fn atan(x: double): double {
     let neg = x < 0.0;
     let a = fabs(x);
@@ -249,6 +318,8 @@ pub fn atan(x: double): double {
     return result;
 }
 
+/// Angle in radians of the point `(x, y)` from the positive x-axis, in the
+/// full range `(-pi, pi]`, handling all four quadrants and `x == 0`.
 pub fn atan2(y: double, x: double): double {
     if (x > 0.0) { return atan(y / x); }
     if (x < 0.0) {
@@ -260,6 +331,8 @@ pub fn atan2(y: double, x: double): double {
     return 0.0;
 }
 
+/// Arcsine of `x`, in radians, computed via `atan` after clamping `x` to
+/// `[-1, 1]` (values outside that range are treated as the nearest endpoint).
 pub fn asin(x: double): double {
     let c = fclamp(x, 0.0 - 1.0, 1.0);
     if (c >= 1.0) { return pi() / 2.0; }
@@ -267,23 +340,30 @@ pub fn asin(x: double): double {
     return atan(c / fsqrt(1.0 - (c * c)));
 }
 
+/// Arccosine of `x`, in radians, as `pi/2 - asin(x)`.
 pub fn acos(x: double): double {
     return (pi() / 2.0) - asin(x);
 }
 
+/// Hyperbolic sine of `x`.
 pub fn sinh(x: double): double {
     let ex = fexp(x);
     return (ex - (1.0 / ex)) / 2.0;
 }
+/// Hyperbolic cosine of `x`.
 pub fn cosh(x: double): double {
     let ex = fexp(x);
     return (ex + (1.0 / ex)) / 2.0;
 }
+/// Hyperbolic tangent of `x`.
 pub fn tanh(x: double): double {
     let e2 = fexp(2.0 * x);
     return (e2 - 1.0) / (e2 + 1.0);
 }
 
+/// Greatest common divisor of `a` and `b`, via the Euclidean algorithm.
+///
+/// Both arguments are taken by absolute value; `gcd(0, 0)` is 0.
 pub fn gcd(a: int, b: int): int {
     let x = abs(a);
     let y = abs(b);
@@ -295,6 +375,9 @@ pub fn gcd(a: int, b: int): int {
     return x;
 }
 
+/// Least common multiple of `a` and `b`.
+///
+/// Returns 0 if either argument is 0.
 pub fn lcm(a: int, b: int): int {
     if (a == 0 || b == 0) { return 0; }
     return abs(a / gcd(a, b) * b);
@@ -349,30 +432,41 @@ fn test_float_math(): void {
 }
 
 
+/// The maximum representable value of a 32-bit `int`.
 pub fn intMax(): int { return 2147483647; }
+/// The minimum representable value of a 32-bit `int`.
 pub fn intMin(): int { return -2147483647 - 1; }
 
+/// The maximum representable value of a 64-bit `long`.
 fn longMax(): long { return 9223372036854775807; }
+/// The minimum representable value of a 64-bit `long`.
 fn longMin(): long { return -9223372036854775807 - 1; }
 
+/// Adds two `int`s, returning `undefined` instead of wrapping if the
+/// mathematically exact result overflows `int` range.
 pub fn checkedAddInt(a: int, b: int): int | undefined {
     let r: long = (a as long) + (b as long);
     if (r > (intMax() as long) || r < (intMin() as long)) { return undefined; }
     return r as int;
 }
 
+/// Subtracts two `int`s, returning `undefined` instead of wrapping if the
+/// mathematically exact result overflows `int` range.
 pub fn checkedSubInt(a: int, b: int): int | undefined {
     let r: long = (a as long) - (b as long);
     if (r > (intMax() as long) || r < (intMin() as long)) { return undefined; }
     return r as int;
 }
 
+/// Multiplies two `int`s, returning `undefined` instead of wrapping if the
+/// mathematically exact result overflows `int` range.
 pub fn checkedMulInt(a: int, b: int): int | undefined {
     let r: long = (a as long) * (b as long);
     if (r > (intMax() as long) || r < (intMin() as long)) { return undefined; }
     return r as int;
 }
 
+/// Adds two `int`s, clamping to `intMin()`/`intMax()` instead of wrapping on overflow.
 pub fn satAddInt(a: int, b: int): int {
     let r: long = (a as long) + (b as long);
     if (r > (intMax() as long)) { return intMax(); }
@@ -380,6 +474,7 @@ pub fn satAddInt(a: int, b: int): int {
     return r as int;
 }
 
+/// Subtracts two `int`s, clamping to `intMin()`/`intMax()` instead of wrapping on overflow.
 pub fn satSubInt(a: int, b: int): int {
     let r: long = (a as long) - (b as long);
     if (r > (intMax() as long)) { return intMax(); }
@@ -387,6 +482,7 @@ pub fn satSubInt(a: int, b: int): int {
     return r as int;
 }
 
+/// Multiplies two `int`s, clamping to `intMin()`/`intMax()` instead of wrapping on overflow.
 pub fn satMulInt(a: int, b: int): int {
     let r: long = (a as long) * (b as long);
     if (r > (intMax() as long)) { return intMax(); }
@@ -394,18 +490,27 @@ pub fn satMulInt(a: int, b: int): int {
     return r as int;
 }
 
+/// Adds two `long`s, returning `undefined` instead of wrapping on overflow.
+///
+/// Uses pre-addition bounds checks (rather than a wider intermediate type,
+/// since `long` is already the widest integer type) to detect overflow.
 pub fn checkedAddLong(a: long, b: long): long | undefined {
     if (b > 0 && a > longMax() - b) { return undefined; }
     if (b < 0 && a < longMin() - b) { return undefined; }
     return a + b;
 }
 
+/// Subtracts two `long`s, returning `undefined` instead of wrapping on overflow.
 pub fn checkedSubLong(a: long, b: long): long | undefined {
     if (b < 0 && a > longMax() + b) { return undefined; }
     if (b > 0 && a < longMin() + b) { return undefined; }
     return a - b;
 }
 
+/// Multiplies two `long`s, returning `undefined` instead of wrapping on
+/// overflow. Detects overflow by dividing the product back by `b` and
+/// checking it recovers `a`, with explicit handling of the `-1 * longMin()`
+/// edge case (which overflows but would not be caught by the division check).
 pub fn checkedMulLong(a: long, b: long): long | undefined {
     if (a == 0 || b == 0) { return 0; }
     let r: long = a * b;

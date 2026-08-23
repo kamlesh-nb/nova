@@ -1,11 +1,21 @@
+//! TCP server listener: binds a port and hands off accepted connections.
+//!
+//! `TcpListener` wraps a listening socket file descriptor and provides the
+//! bind/accept/close lifecycle a server needs. Accepted connections are
+//! returned as `net.tcp.stream.TcpStream`, the same borrowed-connection type
+//! used elsewhere in the networking stack, so callers read and write with the
+//! usual stream API once a client is accepted.
 
 import bytes;
 import mem.allocator;
 import net.tcp.stream;
 
+/// A listening TCP socket bound to a local port, ready to accept connections.
 pub class TcpListener {
+    /// The underlying OS file descriptor of the listening socket, or `-1` once closed.
     pub fd: int,
 
+    /// Binds a listening socket to the given port on all local interfaces and returns a heap-allocated `TcpListener`.
     pub fn bind(port: int): TcpListener {
         let fd = stream.listenAny(port);
         let listener = bytes.new_with_allocator<TcpListener>(allocator.globalAllocator());
@@ -13,11 +23,13 @@ pub class TcpListener {
         return listener;
     }
 
+    /// Blocks until a client connects, then returns a `TcpStream` wrapping the accepted connection's file descriptor.
     pub fn accept(self: TcpListener): stream.TcpStream {
         let client_fd = stream.acceptOne(self.fd);
         return stream.TcpStream(client_fd);
     }
 
+    /// Closes the listening socket. Safe to call more than once: a no-op once `fd` is already `-1`.
     pub fn close(self: TcpListener): void {
         if (self.fd != -1) {
             stream.closeFd(self.fd);
@@ -25,6 +37,7 @@ pub class TcpListener {
         }
     }
 
+    /// Destructor: closes the listening socket if still open.
     pub fn delete(self: TcpListener): void {
         self.close();
     }

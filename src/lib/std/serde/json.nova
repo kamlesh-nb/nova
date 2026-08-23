@@ -1,3 +1,18 @@
+//! A JSON reader, writer, and in-memory value model.
+//!
+//! `JsonValue` is a single tagged struct that represents every JSON shape
+//! (null, bool, number, string, array, object) by discriminating on `kind`,
+//! rather than a family of distinct types. Numbers keep both a fast integer
+//! path (`inum`, when the literal fits and has no fraction or exponent) and a
+//! decimal-string fallback (`num`), so large or fractional values round trip
+//! without losing precision through a floating-point conversion.
+//!
+//! `parse`/`tryParse` turn JSON text into a `JsonValue` tree via a small
+//! hand-written recursive-descent parser (`JsonParser`); `stringify` walks
+//! the tree back into compact JSON text (no pretty-printing, no key
+//! ordering guarantee beyond insertion order). This module is the base
+//! encoding used across the standard library wherever JSON is exchanged:
+//! HTTP bodies, config files, and driver wire formats that embed JSON.
 
 import string;
 import list;
@@ -5,14 +20,30 @@ import map;
 import bytes;
 import collections.string_builder;
 
+/// A single JSON value of any shape, discriminated by `kind`.
+///
+/// `kind`: 0 = null, 1 = bool, 2 = number, 3 = string, 4 = array, 5 = object.
+/// Only the fields relevant to the current `kind` are meaningful; the rest
+/// hold their zero values. Prefer the `null`/`bool`/`number`/`str`/`array`/
+/// `object` constructors and the `as*` accessors over touching fields
+/// directly, since the constructors keep `kind` and payload in sync.
 pub struct JsonValue {
+    /// Discriminator: 0 null, 1 bool, 2 number, 3 string, 4 array, 5 object.
     pub kind: int,
+    /// The boolean payload, valid only when `kind == 1`.
     pub bval: bool,
+    /// Decimal-string form of a number, used when the literal is not a
+    /// plain small integer (has a fraction, exponent, or too many digits).
     pub num: string,
+    /// Integer payload of a number, valid when `kind == 2 && numIsInt`.
     pub inum: long,
+    /// True when a `kind == 2` value is stored in `inum` rather than `num`.
     pub numIsInt: bool,
+    /// The string payload, valid only when `kind == 3`.
     pub sval: string,
+    /// The array payload, present only when `kind == 4`.
     pub arr: List<JsonValue> | undefined,
+    /// The object payload, present only when `kind == 5`.
     pub obj: Map<string, JsonValue> | undefined,
 
     init(kind: int) {
@@ -29,58 +60,83 @@ pub struct JsonValue {
     }
 }
 
+// Returns the array payload of an array-kind value, or an empty list as a safe default for other kinds.
 fn arrOf(val: JsonValue): List<JsonValue> {
     let a = val.arr;
     if (a != undefined) { return a; }
     return List<JsonValue>();
 }
+// Returns the object payload of an object-kind value, or a fresh empty map as a safe default for other kinds.
 fn objOf(val: JsonValue): Map<string, JsonValue> {
     let o = val.obj;
     if (o != undefined) { return o; }
     return Map<string, JsonValue>(8, string.hash);
 }
 
+/// Builds a JSON `null` value.
 pub fn null(): JsonValue { return JsonValue(0); }
+/// Builds a JSON boolean value.
 pub fn bool(val: bool): JsonValue { let v = JsonValue(1); v.bval = val; return v; }
+/// Builds a JSON number value from an integer, stored on the fast integer path.
 pub fn number(val: long): JsonValue { let v = JsonValue(2); v.inum = val; v.numIsInt = true; return v; }
 
+/// Builds a JSON number value from a `decimal`, stored via its exact decimal-string form (no float rounding).
 pub fn decimalValue(val: decimal): JsonValue { let v = JsonValue(2); v.num = `${val}`; return v; }
+/// Builds a JSON string value.
 pub fn str(val: string): JsonValue { let v = JsonValue(3); v.sval = val; return v; }
+/// Builds a JSON array value that wraps the given list.
 pub fn array(val: List<JsonValue>): JsonValue { let v = JsonValue(4); v.arr = val; return v; }
+/// Builds a JSON object value that wraps the given map.
 pub fn object(val: Map<string, JsonValue>): JsonValue { let v = JsonValue(5); v.obj = val; return v; }
 
+/// True when the value's kind is null.
 pub fn isNull(val: JsonValue): bool { return val.kind == 0; }
 
+/// Returns the boolean payload, or `undefined` if the value is not a bool.
 pub fn asBool(val: JsonValue): bool | undefined {
     if (val.kind == 1) { return val.bval; }
     return undefined;
 }
+/// Returns the value as an integer, or `undefined` if it is not a number.
+///
+/// When the number was parsed onto the decimal-string fallback path (too
+/// many digits, a fraction, or an exponent), this parses that string as an
+/// integer, which can fail and return `undefined` even though `kind == 2`.
 pub fn asNumber(val: JsonValue): long | undefined {
     if (val.kind == 2) { if (val.numIsInt) { return val.inum; } return string.parseI64(val.num); }
     return undefined;
 }
+/// Returns the value as a floating-point number, or `undefined` if it is not a number.
 pub fn asFloat(val: JsonValue): double | undefined {
     if (val.kind == 2) { if (val.numIsInt) { return val.inum as double; } return string.parseFloat(val.num); }
     return undefined;
 }
 
+/// Returns the value as an exact `decimal`, or `undefined` if it is not a number.
 pub fn asDecimal(val: JsonValue): decimal | undefined {
     if (val.kind == 2) { if (val.numIsInt) { return decimal.fromString(i64ToString(val.inum)); } return decimal.fromString(val.num); }
     return undefined;
 }
+/// Returns the string payload, or `undefined` if the value is not a string.
 pub fn asString(val: JsonValue): string | undefined {
     if (val.kind == 3) { return val.sval; }
     return undefined;
 }
+/// Returns the array payload, or `undefined` if the value is not an array.
 pub fn asArray(val: JsonValue): List<JsonValue> | undefined {
     if (val.kind == 4) { return val.arr; }
     return undefined;
 }
+/// Returns the object payload, or `undefined` if the value is not an object.
 pub fn asObject(val: JsonValue): Map<string, JsonValue> | undefined {
     if (val.kind == 5) { return val.obj; }
     return undefined;
 }
 
+/// Looks up `key` in an object-kind value.
+///
+/// Returns a JSON `null` value both when the key is absent and when `val`
+/// is not an object; use `has` first to tell those cases apart.
 pub fn get(val: JsonValue, key: string): JsonValue {
     if (val.kind == 5) {
         let r = objOf(val).get(key);
@@ -90,6 +146,7 @@ pub fn get(val: JsonValue, key: string): JsonValue {
     return JsonValue(0);
 }
 
+/// True when `val` is an object and contains `key`.
 pub fn has(val: JsonValue, key: string): bool {
     if (val.kind == 5) {
         let r = objOf(val).get(key);
@@ -99,6 +156,9 @@ pub fn has(val: JsonValue, key: string): bool {
     return false;
 }
 
+/// Returns the element at `index` in an array-kind value.
+///
+/// Returns a JSON `null` value if `val` is not an array or `index` is out of bounds.
 pub fn at(val: JsonValue, index: int): JsonValue {
     if (val.kind == 4) {
         if (index < 0 || index >= arrOf(val).size()) { return JsonValue(0); }
@@ -107,12 +167,18 @@ pub fn at(val: JsonValue, index: int): JsonValue {
     return JsonValue(0);
 }
 
+/// Returns the number of elements (array) or keys (object); 0 for any other kind.
 pub fn size(val: JsonValue): int {
     if (val.kind == 4) { return arrOf(val).size(); }
     if (val.kind == 5) { return objOf(val).size(); }
     return 0;
 }
 
+// Recursive-descent JSON parser: walks `src` byte by byte, testing ASCII
+// codepoints directly (e.g. 34 = '"', 123 = '{') rather than character
+// literals. On any malformed input it sets `failed` and returns a best-effort
+// partial value instead of raising, so callers must check `failed`
+// (`tryParse` does this) rather than trust the returned tree alone.
 struct JsonParser {
     src: string,
     pos: int,
@@ -133,6 +199,7 @@ struct JsonParser {
         }
     }
 
+    /// Parses one JSON value starting at the current position, dispatching on the first non-whitespace byte.
     pub fn parseValue(self: JsonParser): JsonValue {
         self.skipWs();
         if (self.pos >= self.src.length) { self.failed = true; return JsonValue(0); }
@@ -147,6 +214,7 @@ struct JsonParser {
         return JsonValue(0);
     }
 
+    // Skips over the literal "null" (4 bytes); assumes the caller already matched the leading 'n'.
     fn parseNull(self: JsonParser): JsonValue {
         self.pos = self.pos + 4;
         return JsonValue(0);
@@ -171,6 +239,7 @@ struct JsonParser {
         return v;
     }
 
+    // Converts one hex-digit ASCII byte (0-9, a-f, A-F) to its numeric value; returns 0 for anything else.
     fn hexVal(self: JsonParser, c: int): int {
         if (c >= 48 && c <= 57) { return c - 48; }
         if (c >= 97 && c <= 102) { return c - 87; }
@@ -178,6 +247,7 @@ struct JsonParser {
         return 0;
     }
 
+    // Reads a `\uXXXX` escape's 4 hex digits (after the leading backslash) into a codepoint; advances past the 'u' and the digits.
     fn readHex4(self: JsonParser): int {
         self.pos = self.pos + 1;
         let cp = 0;
@@ -190,6 +260,7 @@ struct JsonParser {
         return cp;
     }
 
+    // Encodes a Unicode codepoint as 1-4 UTF-8 bytes appended to sb.
     fn encodeUtf8(self: JsonParser, sb: StringBuilder, cp: int): void {
         if (cp < 128) {
             sb.appendChar(cp);
@@ -208,6 +279,7 @@ struct JsonParser {
         }
     }
 
+    // Handles a `\uXXXX` escape, including combining a UTF-16 surrogate pair (high 0xD800-0xDBFF followed by a low 0xDC00-0xDFFF `\u` escape) into one codepoint before encoding.
     fn appendUnicode(self: JsonParser, sb: StringBuilder): void {
         let cp = self.readHex4();
         if (cp >= 55296 && cp <= 56319) {
@@ -225,6 +297,7 @@ struct JsonParser {
         self.encodeUtf8(sb, cp);
     }
 
+    // Parses a quoted JSON string body starting at the opening '"', decoding escapes, and returns the unquoted UTF-8 content.
     fn parseRawString(self: JsonParser): string {
         let len = self.src.length;
         self.pos = self.pos + 1;
@@ -255,6 +328,7 @@ struct JsonParser {
         return sb.toString();
     }
 
+    // Parses a JSON number literal: values with a fraction/exponent or more than 18 digits fall back to storing the raw literal text in `num` instead of `inum`, to avoid silent overflow or precision loss.
     fn parseNumber(self: JsonParser): JsonValue {
         let len = self.src.length;
         let start = self.pos;
@@ -345,11 +419,17 @@ struct JsonParser {
     }
 }
 
+/// Parses `src` as JSON and returns the resulting value tree.
+///
+/// Does not itself report failure: malformed input yields a best-effort
+/// partial `JsonValue` (see `JsonParser`). Use `tryParse` when the input is
+/// untrusted and a parse failure needs to be detected.
 pub fn parse(src: string): JsonValue {
     let p = JsonParser(src);
     return p.parseValue();
 }
 
+/// Parses `src` as JSON, returning `undefined` if it is malformed or has trailing content after the value.
 pub fn tryParse(src: string): JsonValue | undefined {
     let p = JsonParser(src);
     let v = p.parseValue();
@@ -358,6 +438,10 @@ pub fn tryParse(src: string): JsonValue | undefined {
     return v;
 }
 
+/// Serialises a `JsonValue` tree to compact JSON text.
+///
+/// Object keys are emitted in the map's iteration (insertion) order; there
+/// is no pretty-printing, no key sorting, and no trailing newline.
 pub fn stringify(val: JsonValue): string {
     if (val.kind == 0) { return "null"; }
     if (val.kind == 1) { return if (val.bval) "true" else "false"; }
@@ -386,10 +470,15 @@ pub fn stringify(val: JsonValue): string {
     return "null";
 }
 
+/// Wraps `s` in double quotes and escapes it as a JSON string literal.
 pub fn quote(s: string): string {
     return quoteString(s);
 }
 
+// Escapes '"', '\\', newline, carriage return, and tab into their JSON short
+// escapes; all other bytes (including other control characters) pass
+// through unescaped. Builds the result directly over a raw byte buffer for
+// speed rather than through a StringBuilder.
 fn quoteString(s: string): string {
     let len = s.length;
     let result = bytes.alloc(len * 2 + 2);
@@ -431,6 +520,7 @@ fn quoteString(s: string): string {
     return result as string;
 }
 
+// Formats a signed 64-bit integer as a decimal string without going through the general number-formatting path.
 fn i64ToString(val: long): string {
     if (val == 0) { return "0"; }
     let neg = false;

@@ -1,3 +1,12 @@
+//! File-backed logging for the web framework.
+//!
+//! `Logger` appends levelled log lines to a file on disk and, at the same
+//! time, mirrors each message to the console via `console.err`/`debug`/
+//! `info`/`log` depending on level. `LoggerMiddleware` wraps a `Logger` in
+//! the `Middleware` contract so a request's method and path, and its final
+//! response status, are logged automatically as part of the request
+//! pipeline. Both structs also implement `Service` so they can be resolved
+//! through `web.di`.
 
 import io.file;
 import web.request;
@@ -5,13 +14,18 @@ import web.response;
 import web.middleware;
 import web.di;
 
+/// Appends timestamped, levelled log lines to a file and echoes them to the console.
 pub struct Logger impl Service {
+    /// Path of the file that log lines are appended to.
     pub filepath: string,
 
     init(filepath: string) {
         self.filepath = filepath;
     }
 
+    /// Writes `[level] message` as a line to `filepath`, then echoes `message`
+    /// to the console using the console function that matches `level`
+    /// (`ERROR`, `DEBUG`, `INFO`, or `console.log` for anything else).
     pub fn log(self: Logger, level: string, message: string): void {
         let log_line = "[" + level + "] " + message + "\n";
         file.File.appendText(self.filepath, log_line);
@@ -26,31 +40,40 @@ pub struct Logger impl Service {
         }
     }
 
+    /// Logs `message` at INFO level.
     pub fn info(self: Logger, message: string): void {
         self.log("INFO", message);
     }
 
+    /// Logs `message` at DEBUG level.
     pub fn debug(self: Logger, message: string): void {
         self.log("DEBUG", message);
     }
 
+    /// Logs `message` at ERROR level.
     pub fn err(self: Logger, message: string): void {
         self.log("ERROR", message);
     }
 }
 
+/// Middleware that logs every request on the way in and every response on the way out.
 pub struct LoggerMiddleware impl Middleware, Service {
+    /// The `Logger` used to record request and response lines.
     pub logger: Logger,
 
     init(logger: Logger) {
         self.logger = logger;
     }
 
+    /// Logs the incoming method and path at INFO level, then always continues
+    /// the middleware chain (never short-circuits the request).
     pub fn execute(self: LoggerMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
         self.logger.info("Incoming request: " + req.method + " " + req.path);
         return MiddlewareAction.Next;
     }
 
+    /// Logs the final response status alongside the originating method and path,
+    /// once the route has finished handling the request.
     pub fn after(self: LoggerMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
         self.logger.info(`Response sent: status=${res.status as int} for ${req.method} ${req.path}`);
     }

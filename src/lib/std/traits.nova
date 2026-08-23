@@ -1,9 +1,20 @@
+//! Minimal example and self-test of Nova's trait-based dynamic dispatch.
+//!
+//! This file is not a general-purpose stdlib module: it defines a single small
+//! trait, `Executable`, and a free function that calls it through a fat
+//! pointer (`{struct_ptr, vtable}`), then exercises the whole path with a
+//! `@test`. It exists to keep the trait dispatch mechanism covered by a
+//! standalone, dependency-light case rather than only via larger stdlib
+//! traits (`Driver`, `Connection`, and so on).
+
 import assert;
 
+/// A trait for types that can be run with no arguments and no return value.
 pub trait Executable {
     fn run(self: Executable): void;
 }
 
+/// Invokes `run` on any `Executable` through dynamic dispatch.
 pub fn execute(exe: Executable): void {
     exe.run();
 }

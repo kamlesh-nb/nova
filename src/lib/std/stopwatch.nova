@@ -1,31 +1,50 @@
+//! A small elapsed-time measuring utility built on `datetime.nowNs()`.
+//!
+//! `StopWatch` is a lightweight value type for timing a block of work: benchmarks,
+//! request-latency logging, or ad hoc profiling inside application code. It captures
+//! a start timestamp on construction and an end timestamp when `stop()` is called,
+//! then exposes the elapsed span at nanosecond, microsecond, or millisecond
+//! resolution. It does not itself format or log anything; callers read the elapsed
+//! value and do what they need with it.
+
 import datetime;
 import assert;
 
+/// Measures elapsed wall-clock time between construction (or `reset()`) and `stop()`.
 pub struct StopWatch {
 
+    /// Nanosecond timestamp captured when the `StopWatch` was created or last reset.
     pub start_time: long,
+    /// Nanosecond timestamp captured by the most recent call to `stop()`. Zero until `stop()` is first called.
     pub end_time: long,
 
     init() {
         self.start_time = datetime.nowNs();
     }
 
+    /// Records the current time as the end of the measured span.
+    /// Does not stop or block anything: `elapsed*` calls remain valid to call again after a later `stop()`.
     pub fn stop(self: StopWatch): void {
         self.end_time = datetime.nowNs();
     }
 
+    /// Restarts the measured span from the current time, discarding any prior `start_time`/`end_time`.
     pub fn reset(self: StopWatch): void {
         self.start_time = datetime.nowNs();
     }
 
+    /// Elapsed time between `start_time` and `end_time`, in nanoseconds.
+    /// Meaningless until `stop()` has been called at least once, since `end_time` defaults to 0.
     pub fn elapsedNs(self: StopWatch): long {
         return self.end_time - self.start_time;
     }
 
+    /// Elapsed time between `start_time` and `end_time`, in microseconds (integer division, truncated).
     pub fn elapsedUs(self: StopWatch): long {
         return (self.end_time - self.start_time) / 1000;
     }
 
+    /// Elapsed time between `start_time` and `end_time`, in milliseconds (integer division, truncated).
     pub fn elapsedMs(self: StopWatch): long {
         return (self.end_time - self.start_time) / 1000000;
     }

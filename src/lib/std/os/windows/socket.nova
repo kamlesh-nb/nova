@@ -1,10 +1,30 @@
+//! Windows sockets, built as a thin Nova layer over `os.windows.winsock`
+//! (which itself binds Winsock2 via FFI), the way `os/windows/socket` sits
+//! over `os/windows/winsock` on this platform generally. This module is the
+//! Windows counterpart selected by the target-conditional file rule for
+//! whatever POSIX socket module the rest of the standard library imports, so
+//! callers stay unchanged across platforms.
+//!
+//! It covers socket creation, bind/listen/accept/connect, blocking send/recv,
+//! non-blocking mode and socket options, hostname resolution via
+//! `getaddrinfo`, and a couple of small sockaddr helpers. AF_UNIX (domain
+//! sockets and fd handoff over SCM_RIGHTS) has no Winsock equivalent, so
+//! those entry points exist only to satisfy the shared interface and always
+//! report failure; see the gotcha in `lang/CLAUDE.md` about `WSAStartup`,
+//! which `newTcp`/`newUdp`/`getAddrInfo` call before first use since POSIX
+//! callers have no equivalent init step to forget.
 
 import os.windows.winsock;
 import bytes;
 
+/// Winsock address family constant for IPv4, used when building a
+/// `sockaddr_in` by hand in `makeSockaddrIn`.
 pub const AF_INET: int = 2;
+/// Winsock socket type constant for a byte-stream (TCP) socket.
 pub const SOCK_STREAM: int = 1;
 
+/// Creates a new IPv4 TCP socket, initialising Winsock first if needed.
+/// Returns the socket handle as an `int`, or a negative value on failure.
 pub fn newTcp(): int {
     winsock.startup();
     return winsock.socket(winsock.AF_INET, winsock.SOCK_STREAM, winsock.IPPROTO_TCP) as int;
@@ -14,15 +34,25 @@ pub fn newUdp(): int {
     return winsock.socket(winsock.AF_INET, 2, 17) as int;
 }
 fn closeSock(fd: int): int { return winsock.closesocket(fd as long); }
+/// Closes a socket handle. Wraps `closeSock` for callers outside this module.
 pub fn close(fd: int): int { return closeSock(fd); }
+/// Binds a socket to the address in `addr` (a `sockaddr` of `addrlen` bytes).
 pub fn bindSock(fd: int, addr: ptr, addrlen: int): int { return winsock.bind(fd as long, addr, addrlen); }
+/// Marks a bound socket as passive, ready to accept up to `backlog` pending connections.
 pub fn listenSock(fd: int, backlog: int): int { return winsock.listen(fd as long, backlog); }
+/// Accepts one pending connection. Pass `0` for `addr`/`addrlen` if the peer address is not needed.
 pub fn acceptSock(fd: int, addr: ptr, addrlen: ptr): int { return winsock.accept(fd as long, addr, addrlen) as int; }
+/// Connects a socket to the address in `addr`. Blocking unless the socket was set non-blocking.
 pub fn connectSock(fd: int, addr: ptr, addrlen: int): int { return winsock.connect(fd as long, addr, addrlen); }
 
+/// Receives up to `len` bytes into `buf` (a raw address, hence `long` so the
+/// pointer survives above 4 GB). Returns bytes read, `0` on orderly close,
+/// or a negative value on error.
 pub fn recvSock(fd: int, buf: long, len: int): long { return winsock.recv(fd as long, buf as ptr, len, 0) as long; }
+/// Sends up to `len` bytes from `buf`. May write fewer than `len` bytes; see `sendAll` to loop until done.
 pub fn sendSock(fd: int, buf: long, len: int): long { return winsock.send(fd as long, buf as ptr, len, 0) as long; }
 
+/// Puts the socket into non-blocking mode via `FIONBIO`.
 pub fn setNonBlock(fd: int): int {
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
@@ -31,6 +61,7 @@ pub fn setNonBlock(fd: int): int {
     return r;
 }
 
+/// Sets `SO_REUSEADDR`, letting a listener rebind a port still in `TIME_WAIT`.
 pub fn setReuseAddr(fd: int): int {
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
@@ -38,8 +69,10 @@ pub fn setReuseAddr(fd: int): int {
     bytes.free(one);
     return r;
 }
+/// Winsock has no `SO_REUSEPORT`, so this just aliases `setReuseAddr` to keep the shared interface.
 pub fn setReusePort(fd: int): int { return setReuseAddr(fd); }
 
+/// Sets `TCP_NODELAY`, disabling Nagle's algorithm so small writes are sent immediately.
 pub fn setTcpNoDelay(fd: int): int {
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
@@ -48,6 +81,8 @@ pub fn setTcpNoDelay(fd: int): int {
     return r;
 }
 
+/// Reads and clears the socket's pending error via `SO_ERROR`.
+/// Returns the error code, or `-1` if the `getsockopt` call itself failed.
 pub fn sockError(fd: int): int {
     let val = bytes.alloc(4);
     let len = bytes.alloc(4);
@@ -60,10 +95,15 @@ pub fn sockError(fd: int): int {
     return e;
 }
 
+/// True if the last Winsock call failed with `WSAEWOULDBLOCK` (the non-blocking analogue of `EAGAIN`).
 pub fn wouldBlock(): bool { return winsock.WSAGetLastError() == winsock.WSAEWOULDBLOCK; }
 
+/// True if a non-blocking `connect` is still pending. Same underlying error code as `wouldBlock`.
 pub fn connectInProgress(): bool { return winsock.WSAGetLastError() == winsock.WSAEWOULDBLOCK; }
 
+/// Builds a 16-byte `sockaddr_in` for `port` (host byte order) and `addrBE`
+/// (an IPv4 address already in network byte order). Caller owns and must
+/// free the returned buffer with `bytes.free`.
 pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
     let sa = bytes.alloc(16);
     let i = 0;
@@ -75,18 +115,24 @@ pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
     bytes.write_i32(sa, 4, addrBE);
     return sa;
 }
+/// Thin wrapper over `getaddrinfo`, initialising Winsock first. `node`,
+/// `service`, and `hints` are raw C strings/structs as `getaddrinfo` expects;
+/// `res` receives the address of the result linked list.
 pub fn getAddrInfo(node: ptr, service: ptr, hints: ptr, res: ptr): int {
     winsock.startup();
     return winsock.getaddrinfo(node, service, hints, res);
 }
+/// Releases the linked list returned by `getAddrInfo`.
 pub fn freeAddrInfo(res: ptr): void { winsock.freeaddrinfo(res); }
 
+/// True if `s` is a plain dotted-decimal IPv4 literal (digits and dots only).
 fn isNumericIPv4(s: string): bool {
     if (s.length == 0) { return false; }
     let i = 0;
     while (i < s.length) { let c = s[i]; if (!((c >= 48 && c <= 57) || c == 46)) { return false; } i = i + 1; }
     return true;
 }
+/// Parses a dotted-decimal IPv4 literal into a network-byte-order (big-endian) address.
 fn parseIPv4BE(s: string): long {
     let result = 0 as long; let cur = 0; let shift = 0; let i = 0;
     while (i < s.length) {
@@ -98,6 +144,10 @@ fn parseIPv4BE(s: string): long {
     result = result | ((cur as long) << shift);
     return result;
 }
+/// Resolves `host` to an IPv4 address in network byte order. Numeric
+/// dotted-decimal hosts are parsed directly; anything else goes through
+/// `getaddrinfo`, picking the first `AF_INET` result. Returns `-1` if
+/// resolution fails or no IPv4 address is found.
 pub fn resolveHost4(host: string): long {
     if (isNumericIPv4(host)) { return parseIPv4BE(host); }
     let n = host.length;
@@ -122,6 +172,9 @@ pub fn resolveHost4(host: string): long {
     bytes.free(res);
     return addr;
 }
+/// Resolves `host`, opens a TCP socket, and connects, blocking until the
+/// connect completes or fails. Returns the connected socket handle, or `-1`
+/// on any failure (resolution, socket creation, or connect).
 pub fn connectBlocking(host: string, port: int): int {
     let addr = resolveHost4(host);
     if (addr == (-1 as long)) { return -1; }
@@ -133,6 +186,8 @@ pub fn connectBlocking(host: string, port: int): int {
     if (r != 0) { closeSock(fd); return -1; }
     return fd;
 }
+/// Sets both send and receive timeouts (`SO_SNDTIMEO`/`SO_RCVTIMEO`) to `ms`
+/// milliseconds. A non-positive `ms` is clamped to `0` (no timeout).
 pub fn setTimeout(fd: int, ms: int): int {
     let d = bytes.alloc(4);
     bytes.write_i32(d, 0, (if (ms > 0) ms else 0) as long);
@@ -141,6 +196,9 @@ pub fn setTimeout(fd: int, ms: int): int {
     bytes.free(d);
     return if (r1 == 0 && r2 == 0) 0 else -1;
 }
+/// Sends exactly `len` bytes from `buf`, looping over `sendSock` until done.
+/// Returns `len` on success; on a failed or zero-length send it returns the
+/// number of bytes already sent (or `-1` if none were sent yet).
 pub fn sendAll(fd: int, buf: long, len: int): int {
     let total = 0;
     while (total < len) {
@@ -150,10 +208,15 @@ pub fn sendAll(fd: int, buf: long, len: int): int {
     }
     return total;
 }
+/// Receives at most `max` bytes in a single call. Returns bytes read, `0` on
+/// orderly close, or `-1` on error (any negative `recv` result collapses to `-1`).
 pub fn recvOnce(fd: int, buf: long, max: int): int {
     let n = recvSock(fd, buf, max);
     return if (n < 0) -1 else (n as int);
 }
+/// Creates, binds (with `SO_REUSEADDR`), and listens on a TCP socket for
+/// `port` on all interfaces, with a fixed backlog of 128. Returns the
+/// listening socket handle, or `-1` on any failure.
 pub fn listenAny(port: int): int {
     let fd = newTcp();
     if (fd < 0) { return -1; }
@@ -164,22 +227,40 @@ pub fn listenAny(port: int): int {
     if (br != 0 || listenSock(fd, 128) != 0) { closeSock(fd); return -1; }
     return fd;
 }
+/// Accepts one connection without recording the peer address.
 pub fn acceptOne(fd: int): int { return acceptSock(fd, 0, 0); }
 
+/// Placeholder address family constant for AF_UNIX, kept only to match the
+/// POSIX module's shared interface; Winsock has no usable AF_UNIX support here.
 pub const AF_UNIX: int = 1;
+/// Unsupported on Windows: always returns `-1`. No AF_UNIX socket creation.
 pub fn newUnix(): int { return -1; }
+/// Unsupported on Windows: always returns `-1`. No `socketpair` equivalent used here.
 pub fn unixPair(sv: ptr): int { return -1; }
+/// Unsupported on Windows: always returns `0` (no AF_UNIX sockaddr length).
 pub fn sockaddrUnLen(): int { return 0; }
+/// Unsupported on Windows: always returns a null pointer.
 pub fn makeSockaddrUn(path: string): ptr { return 0; }
+/// Unsupported on Windows: fd passing over SCM_RIGHTS has no Winsock equivalent, always returns `-1`.
 pub fn sendFd(sock: int, fd: int, payload: string): long { return -1 as long; }
+/// Unsupported on Windows: fd passing over SCM_RIGHTS has no Winsock equivalent, always returns `-1`.
 pub fn recvFdRaw(fd: int, buf: long, cap: int, outFd: long): long { return -1 as long; }
+/// Result of an fd-handoff receive: the received handle, any accompanying
+/// payload bytes, and a byte count. On this platform `recvFd` always
+/// produces the failure shape (`fd: -1, n: -1`) since fd passing is unsupported.
 pub struct HandoffResult {
+    /// Received file descriptor/handle, or `-1` on failure.
     pub fd: int,
+    /// Payload bytes received alongside the handle.
     pub payload: string,
+    /// Number of payload bytes received, or `-1` on failure.
     pub n: int,
 }
+/// Unsupported on Windows: always returns the failure shape (see `HandoffResult`).
 pub fn recvFd(sock: int, cap: int): HandoffResult { return HandoffResult { fd: -1, payload: "", n: -1 }; }
 
+/// Reads back the local port a socket is bound to, via `getsockname`.
+/// Returns `-1` if `getsockname` fails.
 pub fn boundPort(fd: int): int {
     let sa = bytes.alloc(16);
     let len = bytes.alloc(4);

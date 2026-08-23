@@ -1,3 +1,75 @@
+//! Server side of the TLS 1.3 handshake state machine (RFC 8446).
+//!
+//! This module drives a single TLS 1.3 connection from the server's point of
+//! view. It consumes the raw handshake and record bytes that arrive on the
+//! wire, decides the cryptographic parameters, produces the server's own
+//! handshake flight, derives every traffic secret, and finally hands over to
+//! application-data encryption. All of the crypto (ECDHE, the HKDF schedule,
+//! AEAD record protection, signatures) is pure Nova, pulled in from the sibling
+//! `crypto.*` modules; nothing here calls into wolfSSL or any C TLS stack. The
+//! only external symbol is `nova_cpu_has_aes`, used purely to pick a cipher
+//! suite that the hardware can run fast.
+//!
+//! ## Why it is shaped this way
+//!
+//! Everything is expressed as flat byte-buffer arithmetic over `ptr` and raw
+//! offsets rather than typed message structs. TLS records are tightly packed,
+//! big-endian, length-prefixed wire formats, and the server has to parse a
+//! ClientHello it did not construct and emit bytes another implementation will
+//! parse. Working directly on the buffer keeps the byte layout obvious and
+//! avoids minting owned intermediate objects on the handshake hot path. The
+//! cost is that offsets and lengths are the programmer's responsibility: there
+//! is almost no bounds checking, and the field arithmetic assumes a
+//! well-formed peer. See the `bytes` module for the raw read and write
+//! helpers, and [`w3`] / [`putHex`] for the two write idioms used throughout.
+//!
+//! ## The handshake flow, in call order
+//!
+//! A server connection walks through the exported functions roughly like this:
+//!
+//!   1. [`newServer`] builds a [`TlsServer`] holding the certificate, the
+//!      signing key, and the pre-generated ephemeral ECDHE private keys for
+//!      each supported group.
+//!   2. [`processClientHello`] parses the ClientHello: it selects the cipher
+//!      suite, reads the client's key shares, negotiates ALPN, records the PSK
+//!      identity and early-data offer, and appends the message to the running
+//!      transcript.
+//!   3. For a resumption attempt, [`verifyPskBinder`] checks the offered binder
+//!      and [`deriveEarlyKeysServer`] sets up the early-data keys so
+//!      [`decryptEarly`] can read 0-RTT records.
+//!   4. [`buildServerHello`] emits the ServerHello, performs the ECDHE, runs the
+//!      key schedule, and derives the client and server handshake traffic keys.
+//!   5. [`buildFlight`] emits the encrypted EncryptedExtensions, optional
+//!      CertificateRequest, Certificate, CertificateVerify, and Finished, then
+//!      derives the application traffic keys.
+//!   6. If a client certificate was requested, [`processClientCertFlight`]
+//!      parses and verifies it.
+//!   7. [`processClientFinished`] verifies the client's Finished and derives the
+//!      resumption master secret, completing the handshake.
+//!   8. After that, [`encryptApp`] / [`decryptApp`] carry application data and
+//!      [`newSessionTicketRecord`] issues resumption tickets.
+//!
+//! ## Invariants a caller must respect
+//!
+//! The transcript hash is cumulative and order-sensitive: every handshake
+//! message must be fed to [`trAdd`] exactly once, in the order it appears on
+//! the wire, or the Finished verification and the derived secrets will not
+//! match the peer. The record sequence numbers ([`TlsServer.sSeq`],
+//! [`TlsServer.cSeq`], [`TlsServer.eSeq`]) must advance in lockstep with the
+//! peer's, which is why every protect and unprotect call increments its
+//! counter and why [`processClientFinished`] resets both to zero when it
+//! switches to the application keys. The functions must be called in the order
+//! above; each one assumes the state that the previous one left behind.
+//!
+//! ## A note on `kind` and `suite`
+//!
+//! Two small integer discriminants thread through the whole module and it is
+//! worth fixing their meaning up front. [`TlsServer.kind`] selects the hash and
+//! HKDF family: 0 means SHA-256 (32-byte secrets), 1 means SHA-384 (48-byte
+//! secrets). [`TlsServer.suite`] selects the AEAD: 0 is AES-128-GCM, 1 is
+//! AES-256-GCM, 2 is ChaCha20-Poly1305. They are set together from the
+//! negotiated cipher suite in [`processClientHello`].
+
 import bytes;
 import crypto.tls.13.tls;
 import crypto.tls.13.handshake;
@@ -8,21 +80,59 @@ import crypto.hash.sha256;
 import crypto.hash.sha512;
 import crypto.mac.hmac;
 
+/// Runtime probe for hardware AES support (returns 1 if the CPU has AES-NI or
+/// the equivalent). Used only to prefer an AES-GCM suite when the hardware can
+/// run it fast, falling back to ChaCha20-Poly1305 otherwise. See the suite
+/// selection in [`processClientHello`].
 extern("c") fn nova_cpu_has_aes(): int;
 
+/// Returns a `ptr` pointing `off` bytes into `b`.
+///
+/// The addition is done at 64-bit width (`b as long + off`) before the cast
+/// back to `ptr`, which is deliberate: a 32-bit add on a heap address above
+/// 4 GB would truncate to garbage. This is the standard way this module forms
+/// a sub-pointer into a message buffer, for example to feed a single handshake
+/// message to [`trAdd`].
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
+/// Writes `v` as a 3-byte big-endian integer at `buf[off .. off+3]`.
+///
+/// TLS uses 24-bit length prefixes for handshake message bodies and for the
+/// certificate list lengths, so this is the workhorse for back-patching a body
+/// length once its true size is known. Only the low 24 bits of `v` are stored.
 fn w3(buf: ptr, off: int, v: int): void {
     bytes.write_byte(buf, off, (v >> 16) & 0xff);
     bytes.write_byte(buf, off + 1, (v >> 8) & 0xff);
     bytes.write_byte(buf, off + 2, v & 0xff);
 }
+/// Converts a single lowercase-hex ASCII character code to its 0..15 value.
+///
+/// `c` is a byte value: `48..57` are the digits `0..9` (subtract 48) and
+/// anything else is assumed to be `a..f`, whose codes `97..102` map to `10..15`
+/// (subtract 87). Only lowercase input is handled; there is no validation.
+/// Used by [`putHex`] to decode a compile-time hex literal.
 fn sNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } return c - 87; }
+/// Writes the bytes encoded by the hex string `hex` into `out` starting at `p`,
+/// and returns the new write offset.
+///
+/// This is how the module emits fixed, known-ahead byte sequences (extension
+/// headers, the supported-versions extension, the key-share group and length
+/// prefixes) compactly and readably: the hex literal in the source reads as
+/// the exact wire bytes. `hex` must have an even length and contain only
+/// lowercase hex digits, since each pair of characters becomes one output
+/// byte via [`sNib`].
 fn putHex(out: ptr, p: int, hex: string): int {
     let n = hex.length / 2;
     let i = 0;
     while (i < n) { bytes.write_byte(out, p + i, sNib(hex[i * 2]) * 16 + sNib(hex[i * 2 + 1])); i = i + 1; }
     return p + n;
 }
+/// Allocates and returns a 32-byte buffer holding the X25519 base point:
+/// the scalar 9 in the first byte, zeros in the rest.
+///
+/// This is the standard X25519 generator (u-coordinate 9). It is multiplied by
+/// the server's ephemeral private key in [`buildServerHello`] to produce the
+/// server's public key share for the x25519 group. The buffer is freshly
+/// allocated on each call and its ownership passes to the caller.
 fn base9(): ptr {
     let b = bytes.alloc(32);
     bytes.write_byte(b, 0, 9);
@@ -31,45 +141,215 @@ fn base9(): ptr {
     return b;
 }
 
+/// All mutable state for one server-side TLS 1.3 connection.
+///
+/// A single instance is created by [`newServer`] and then threaded through the
+/// handshake functions as `self`. It owns the transcript buffer and all the
+/// derived-secret and traffic-key buffers, plus scratch space for the client's
+/// key shares and the resumption bookkeeping. Almost every field is a raw `ptr`
+/// into a fixed-size heap allocation made once in [`newServer`]; the sizes are
+/// chosen for the hash in use (32 bytes for SHA-256, 48 for SHA-384), so the
+/// SHA-384 secrets fill the whole 48-byte buffer and the SHA-256 ones use the
+/// first 32.
+///
+/// The instance is not thread-safe and models exactly one connection: sequence
+/// numbers, the transcript, and the key state are all per-connection.
 struct TlsServer {
-    pub kind: int, pub suite: int,
+    /// Hash family selector: 0 = SHA-256 (32-byte secrets), 1 = SHA-384
+    /// (48-byte secrets). Chosen alongside [`TlsServer.suite`] from the
+    /// negotiated cipher suite and read by [`trHash`] / [`trHashLen`] and the
+    /// key-schedule calls.
+    pub kind: int,
+    /// AEAD selector: 0 = AES-128-GCM, 1 = AES-256-GCM, 2 = ChaCha20-Poly1305.
+    /// Passed to [`tls.recordProtect`] and [`tls.recordUnprotect`] to pick the
+    /// record-protection cipher.
+    pub suite: int,
+    /// Server's ephemeral X25519 private key (32 bytes), supplied by the
+    /// caller. Used for the ECDHE when the x25519 group is chosen.
     pub ephPriv: ptr,
+    /// Server's ephemeral P-256 private key, used for the ECDHE when the
+    /// secp256r1 (0x0017) group is chosen.
     pub ephPrivP256: ptr,
+    /// Server's ephemeral P-384 private key, used for the ECDHE when the
+    /// secp384r1 (0x0018) group is chosen.
     pub ephPrivP384: ptr,
-    pub certDer: ptr, pub certLen: int,
+    /// DER-encoded server certificate to send in the Certificate message.
+    pub certDer: ptr,
+    /// Length in bytes of [`TlsServer.certDer`].
+    pub certLen: int,
+    /// Server's long-term signing private key (P-256 ECDSA), used in
+    /// [`buildFlight`] to sign the CertificateVerify.
     pub signKey: ptr,
+    /// 32-byte buffer receiving the client's X25519 public key share.
     pub clientPub: ptr,
+    /// 65-byte buffer receiving the client's P-256 public key share
+    /// (uncompressed point).
     pub clientPubP: ptr,
+    /// 97-byte buffer receiving the client's P-384 public key share
+    /// (uncompressed point).
     pub clientPubP384: ptr,
+    /// Negotiated key-exchange group: 0x001d (x25519), 0x0017 (secp256r1), or
+    /// 0x0018 (secp384r1). Defaults to x25519 and is finalised in
+    /// [`processClientHello`] to the strongest group the client offered.
     pub group: int,
-    pub haveX25519: bool, pub haveP256: bool, pub haveP384: bool,
-    pub alpnOffer: string, pub alpnSel: string,
-    pub recvLimit: int, pub sendLimit: int,
-    pub sid: ptr, pub sidLen: int,
-    pub trBuf: ptr, pub trLen: int, pub trCap: int,
-    pub hs: ptr, pub chs: ptr, pub shs: ptr,
-    pub cKey: ptr, pub cIv: ptr, pub sKey: ptr, pub sIv: ptr,
-    pub master: ptr, pub cap: ptr, pub sap: ptr,
-    pub capKey: ptr, pub capIv: ptr, pub sapKey: ptr, pub sapIv: ptr,
-    pub sSeq: long, pub cSeq: long,
+    /// True if the client offered an X25519 key share.
+    pub haveX25519: bool,
+    /// True if the client offered a P-256 key share.
+    pub haveP256: bool,
+    /// True if the client offered a P-384 key share.
+    pub haveP384: bool,
+    /// Comma-separated list of ALPN protocol names the server is willing to
+    /// speak, in preference order (for example "h2,http/1.1"). Set by the
+    /// caller before the handshake; consumed by [`negotiateAlpn`].
+    pub alpnOffer: string,
+    /// The single ALPN protocol actually selected, or the empty string if none
+    /// matched. Emitted back to the client in [`buildFlight`].
+    pub alpnSel: string,
+    /// record_size_limit the server advertises to the client (bytes it is
+    /// willing to receive). Sent in EncryptedExtensions.
+    pub recvLimit: int,
+    /// record_size_limit the client advertised, read from its
+    /// record_size_limit extension; caps the plaintext the server should put in
+    /// one record.
+    pub sendLimit: int,
+    /// Buffer holding the client's legacy session id (echoed back in the
+    /// ServerHello for middlebox compatibility).
+    pub sid: ptr,
+    /// Length of the session id in [`TlsServer.sid`].
+    pub sidLen: int,
+    /// Growable buffer accumulating the raw handshake transcript, the exact
+    /// message bytes in wire order. Hashed to bind every derived secret; grown
+    /// by [`trAdd`].
+    pub trBuf: ptr,
+    /// Number of valid bytes currently in [`TlsServer.trBuf`].
+    pub trLen: int,
+    /// Allocated capacity of [`TlsServer.trBuf`]; [`trAdd`] reallocates when the
+    /// transcript would exceed it.
+    pub trCap: int,
+    /// Handshake secret from the HKDF-Extract of the (EC)DHE, the root of the
+    /// handshake-phase key schedule.
+    pub hs: ptr,
+    /// Client handshake traffic secret ("c hs traffic"), from which the client
+    /// handshake key and IV are derived.
+    pub chs: ptr,
+    /// Server handshake traffic secret ("s hs traffic"), from which the server
+    /// handshake key and IV are derived.
+    pub shs: ptr,
+    /// Client handshake write key (used to decrypt the client's handshake
+    /// records).
+    pub cKey: ptr,
+    /// Client handshake write IV, xored with the record sequence number to form
+    /// each nonce.
+    pub cIv: ptr,
+    /// Server handshake write key (used to encrypt the server's handshake
+    /// flight).
+    pub sKey: ptr,
+    /// Server handshake write IV.
+    pub sIv: ptr,
+    /// Master secret, the root of the application-phase key schedule, derived
+    /// in [`buildFlight`].
+    pub master: ptr,
+    /// Client application traffic secret ("c ap traffic").
+    pub cap: ptr,
+    /// Server application traffic secret ("s ap traffic").
+    pub sap: ptr,
+    /// Client application write key (used by [`decryptApp`]).
+    pub capKey: ptr,
+    /// Client application write IV.
+    pub capIv: ptr,
+    /// Server application write key (used by [`encryptApp`] and
+    /// [`newSessionTicketRecord`]).
+    pub sapKey: ptr,
+    /// Server application write IV.
+    pub sapIv: ptr,
+    /// Server record sequence number; incremented after each record the server
+    /// protects. Reset to 0 when switching key epochs in
+    /// [`processClientFinished`].
+    pub sSeq: long,
+    /// Client record sequence number; incremented after each record the server
+    /// unprotects.
+    pub cSeq: long,
+    /// True once the client's Finished has verified in [`processClientFinished`],
+    /// meaning the handshake is complete.
     pub finishedOk: bool,
+    /// Resumption master secret, derived after the client Finished; the base for
+    /// PSKs handed out via [`newSessionTicketRecord`].
     pub resMaster: ptr,
-    pub psk: ptr, pub pskLen: int,
+    /// The pre-shared key bytes for a resumption attempt, supplied by the
+    /// caller after looking up the ticket named by [`TlsServer.pskId`].
+    pub psk: ptr,
+    /// Length of [`TlsServer.psk`]; 0 means no PSK is in play.
+    pub pskLen: int,
+    /// True once [`verifyPskBinder`] has confirmed the client's PSK binder, so
+    /// the ServerHello should signal PSK acceptance and the certificate flight
+    /// can be skipped.
     pub pskAccepted: bool,
-    pub pskIdOff: int, pub pskIdLen: int,
-    pub binderOff: int, pub chLen0: int,
-    pub earlyOffered: bool, pub earlyAccepted: bool,
-    pub eKey: ptr, pub eIv: ptr, pub eSeq: long,
-    pub chTruncHash: ptr, pub offeredBinder: ptr,
+    /// Offset of the PSK identity within the ClientHello (bookkeeping field).
+    pub pskIdOff: int,
+    /// Length of the PSK identity captured into [`TlsServer.pskId`].
+    pub pskIdLen: int,
+    /// Offset of the PSK binder within the ClientHello (bookkeeping field).
+    pub binderOff: int,
+    /// Original ClientHello length bookkeeping used when computing the truncated
+    /// transcript for binder verification.
+    pub chLen0: int,
+    /// True if the client offered early data (0-RTT) via the early_data
+    /// extension.
+    pub earlyOffered: bool,
+    /// True once the server has accepted early data and derived the early keys
+    /// in [`deriveEarlyKeysServer`].
+    pub earlyAccepted: bool,
+    /// Client early-data write key (used by [`decryptEarly`]).
+    pub eKey: ptr,
+    /// Client early-data write IV.
+    pub eIv: ptr,
+    /// Early-data record sequence number.
+    pub eSeq: long,
+    /// Hash of the truncated ClientHello (everything up to but excluding the
+    /// binders), the input to the PSK binder HMAC. Computed in
+    /// [`processClientHello`] and checked in [`verifyPskBinder`].
+    pub chTruncHash: ptr,
+    /// The PSK binder the client offered, captured from the tail of the
+    /// ClientHello for comparison in [`verifyPskBinder`].
+    pub offeredBinder: ptr,
+    /// Buffer holding the PSK identity (ticket) the client presented, up to 1024
+    /// bytes; the caller reads it to look up the matching [`TlsServer.psk`].
     pub pskId: ptr,
+    /// Caller-set flag: if true and the session is not a resumption, the server
+    /// sends a CertificateRequest to ask the client to authenticate.
     pub requestClientCert: bool,
+    /// True once [`processClientCertFlight`] has run, whether or not a cert was
+    /// actually presented.
     pub clientCertProcessed: bool,
+    /// True if the client actually sent a non-empty certificate in its
+    /// Certificate message.
     pub clientCertPresent: bool,
+    /// True if the client's CertificateVerify signature validated against the
+    /// certificate it presented.
     pub clientCertOk: bool,
-    pub stapleOcsp: ptr, pub stapleOcspLen: int,
+    /// DER-encoded OCSP response to staple in the Certificate message, set by
+    /// [`setStapleOcsp`]. Length 0 means no staple.
+    pub stapleOcsp: ptr,
+    /// Length of [`TlsServer.stapleOcsp`].
+    pub stapleOcspLen: int,
+    /// If non-zero, forces a specific cipher suite (0x1301/0x1302/0x1303) and
+    /// refuses to negotiate anything else; set via [`setRestrictSuite`]. Zero
+    /// means normal preference-based selection.
     pub restrictSuite: int,
 }
 
+/// Constructs a fresh [`TlsServer`] for one connection, allocating all its
+/// working buffers up front.
+///
+/// The caller supplies the certificate ([`certDer`], [`certLen`]), the
+/// long-term signing key ([`signKey`]), and the three pre-generated ephemeral
+/// ECDHE private keys, one per supported group. Everything else, the transcript
+/// buffer, the client-share scratch, and every secret and key buffer, is
+/// allocated here at the largest size any hash needs (48 bytes for the
+/// SHA-384 secrets, 32/12 for keys and IVs), so no allocation happens on the
+/// handshake hot path afterwards. The returned server starts with x25519 as the
+/// default group and no cipher suite chosen; [`processClientHello`] fills those
+/// in. The buffers are owned by the returned struct.
 pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPrivP256: ptr, ephPrivP384: ptr): TlsServer {
     return TlsServer {
         kind: 0, suite: 0, ephPriv: ephPriv, ephPrivP256: ephPrivP256, ephPrivP384: ephPrivP384,
@@ -94,15 +374,48 @@ pub fn newServer(certDer: ptr, certLen: int, signKey: ptr, ephPriv: ptr, ephPriv
     };
 }
 
+/// Pins the connection to a single cipher suite (0x1301/0x1302/0x1303).
+///
+/// After this, [`processClientHello`] will only negotiate `suite`, and only if
+/// the client actually offered it; otherwise no suite is chosen. Pass 0 to
+/// restore normal preference-based selection. Mainly for testing and for
+/// policies that mandate one suite.
 pub fn setRestrictSuite(self: TlsServer, suite: int): void { self.restrictSuite = suite; }
 
+/// Registers a DER-encoded OCSP response to staple into the Certificate
+/// message.
+///
+/// When set (`len > 0`), [`buildFlight`] embeds it as a status_request
+/// certificate-entry extension so the client can check revocation without a
+/// separate OCSP round trip.
 pub fn setStapleOcsp(self: TlsServer, der: ptr, len: int): void { self.stapleOcsp = der; self.stapleOcspLen = len; }
 
+/// Turns mutual TLS on or off: when `on` is true and the session is not a PSK
+/// resumption, [`buildFlight`] sends a CertificateRequest asking the client to
+/// authenticate.
 pub fn setRequestClientCert(self: TlsServer, on: bool): void { self.requestClientCert = on; }
 
+/// Reports whether the client actually presented a certificate during its
+/// authentication flight (regardless of whether it verified).
 pub fn clientPresentedCert(self: TlsServer): bool { return self.clientCertPresent; }
+/// Reports whether client authentication fully succeeded: a certificate was
+/// presented AND its CertificateVerify signature validated. This is the
+/// predicate to gate access on for mutual TLS.
 pub fn clientAuthOk(self: TlsServer): bool { return self.clientCertPresent && self.clientCertOk; }
 
+/// Parses and verifies the client's authentication flight (Certificate +
+/// CertificateVerify) from an encrypted `record`.
+///
+/// The record is first unprotected with the client handshake key (advancing
+/// [`TlsServer.cSeq`]); a negative unprotect result means decryption failed and
+/// the function returns false. It then walks the handshake messages inside:
+/// for a Certificate message (type 0x0b) it locates the leaf certificate and
+/// sets [`TlsServer.clientCertPresent`]; for a CertificateVerify (type 0x0f) it
+/// hashes the transcript up to that point, parses the leaf, and verifies the
+/// signature into [`TlsServer.clientCertOk`]. Every message is appended to the
+/// transcript via [`trAdd`] so that the later Finished check stays consistent.
+/// Returns true once the flight has been processed (which is not the same as
+/// the client having authenticated: inspect [`clientAuthOk`] for that).
 pub fn processClientCertFlight(self: TlsServer, record: ptr, recLen: int): bool {
     let inner = bytes.alloc(recLen);
     let innerLen = tls.recordUnprotect(self.suite, self.cKey, self.cIv, self.cSeq, record, recLen, inner);
@@ -149,6 +462,16 @@ pub fn processClientCertFlight(self: TlsServer, record: ptr, recLen: int): bool 
     return true;
 }
 
+/// Appends `n` bytes of a handshake message to the running transcript
+/// [`TlsServer.trBuf`], growing the buffer if needed.
+///
+/// The transcript is the exact concatenation of handshake message bytes in
+/// wire order, and it is the input to every key-schedule hash, so this must be
+/// called once per message, in order, and never for a record that is not a
+/// handshake message. When the buffer would overflow [`TlsServer.trCap`] it is
+/// reallocated to twice the required size and the old contents are copied
+/// across. Bytes are copied one at a time because `msg` may alias into a
+/// buffer that is about to be freed.
 fn trAdd(self: TlsServer, msg: ptr, n: int): void {
     if (self.trLen + n > self.trCap) {
         let nc = (self.trLen + n) * 2;
@@ -163,12 +486,32 @@ fn trAdd(self: TlsServer, msg: ptr, n: int): void {
     while (i < n) { bytes.write_byte(self.trBuf, self.trLen + i, bytes.read_byte(msg, i)); i = i + 1; }
     self.trLen = self.trLen + n;
 }
+/// Writes the hash of the whole transcript so far into `out`.
+///
+/// Uses SHA-384 when [`TlsServer.kind`] is 1, otherwise SHA-256. `out` must
+/// have room for the digest ([`trHashLen`] bytes). This is called at each point
+/// where the key schedule needs "hash of everything up to here", for example
+/// before deriving handshake traffic secrets or signing the CertificateVerify.
 fn trHash(self: TlsServer, out: ptr): void {
     if (self.kind == 1) { sha512.hash384Into(self.trBuf, self.trLen, out); }
     else { sha256.hashInto(self.trBuf, self.trLen, out); }
 }
+/// Returns the transcript hash length in bytes: 48 for SHA-384
+/// ([`TlsServer.kind`] == 1), otherwise 32 for SHA-256. This doubles as the
+/// length of every derived secret in the schedule.
 fn trHashLen(self: TlsServer): int { if (self.kind == 1) { return 48; } return 32; }
 
+/// Selects one ALPN protocol from the server's `offer` list against the
+/// client's ALPN extension in the ClientHello, returning the chosen protocol
+/// name or the empty string if none match.
+///
+/// `offer` is the server preference list, comma-separated, and server
+/// preference wins: the outer loop walks the server's names in order and
+/// returns the first one the client also advertised. `ch` is the ClientHello
+/// buffer, `body` points at the extension body (the 2-byte protocol-name-list
+/// length prefix), and `extLen` is the extension length. The matched name is
+/// copied into a freshly allocated `string` owned by the caller. An empty
+/// `offer` short-circuits to no selection.
 fn negotiateAlpn(offer: string, ch: ptr, body: int, extLen: int): string {
     if (offer.length == 0) { return ""; }
     let i = 0;
@@ -197,6 +540,35 @@ fn negotiateAlpn(offer: string, ch: ptr, body: int, extLen: int): string {
     return "";
 }
 
+/// Parses a ClientHello and records everything the server needs to respond.
+///
+/// This is the first big step of the handshake and it does several things in
+/// one pass over the `ch` buffer (`chLen` bytes, the handshake message
+/// including its 4-byte header):
+///
+///   * Reads and stores the legacy session id into [`TlsServer.sid`].
+///   * Scans the offered cipher suites and picks one. Selection order:
+///     a forced [`TlsServer.restrictSuite`] wins if the client offered it;
+///     otherwise, for a PSK the first suite offered is taken; otherwise AES is
+///     preferred when [`nova_cpu_has_aes`] reports hardware support, else
+///     ChaCha20-Poly1305. The choice sets [`TlsServer.suite`] and
+///     [`TlsServer.kind`] together.
+///   * Walks the extensions: key_share (0x0033) captures the client's public
+///     key for each group it recognises and sets the `have*` flags; ALPN
+///     (0x0010) runs [`negotiateAlpn`]; record_size_limit (0x001c) sets
+///     [`TlsServer.sendLimit`]; pre_shared_key (0x0029) captures the PSK
+///     identity into [`TlsServer.pskId`]; early_data (0x002a) sets
+///     [`TlsServer.earlyOffered`].
+///   * When a PSK identity was present, computes the truncated-ClientHello hash
+///     into [`TlsServer.chTruncHash`] and copies the offered binder into
+///     [`TlsServer.offeredBinder`], ready for [`verifyPskBinder`]. The
+///     truncation length subtracts the binder (`hl`) plus its 3 length-prefix
+///     bytes.
+///   * Chooses the final ECDHE [`TlsServer.group`], preferring x25519, then
+///     P-256, then P-384, among the groups the client supplied a share for.
+///
+/// Finally the whole ClientHello is appended to the transcript with [`trAdd`].
+/// The parsing does almost no bounds checking and assumes a well-formed peer.
 pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
     let p = 4 + 2 + 32;
     let sl = bytes.read_byte(ch, p);
@@ -316,6 +688,18 @@ pub fn processClientHello(self: TlsServer, ch: ptr, chLen: int): void {
     trAdd(self, ch, chLen);
 }
 
+/// Verifies the PSK binder the client offered, deciding whether resumption is
+/// accepted.
+///
+/// Recomputes the expected binder from the pre-shared key: it runs the early
+/// secret and the resumption binder key through the schedule, derives the
+/// Finished key, and HMACs the truncated-ClientHello hash
+/// ([`TlsServer.chTruncHash`]) that [`processClientHello`] captured. The result
+/// is compared against [`TlsServer.offeredBinder`] in constant time (the loop
+/// ORs the per-byte differences rather than early-exiting), which matters
+/// because a timing side channel here would leak whether the binder was
+/// correct. Sets and returns [`TlsServer.pskAccepted`]. The caller must have
+/// populated [`TlsServer.psk`] / [`TlsServer.pskLen`] before calling.
 pub fn verifyPskBinder(self: TlsServer): bool {
     let hl = trHashLen(self);
     let es = bytes.alloc(hl); tls.earlySecretPsk(self.kind, self.psk, self.pskLen, es);
@@ -332,6 +716,16 @@ pub fn verifyPskBinder(self: TlsServer): bool {
     return self.pskAccepted;
 }
 
+/// Derives the client early-data (0-RTT) traffic key and IV so the server can
+/// read early application data.
+///
+/// Runs the early secret from the PSK through [`tls.deriveEarlyTraffic`] using
+/// the current transcript hash (which at this point covers the ClientHello),
+/// then expands it into [`TlsServer.eKey`] / [`TlsServer.eIv`], resets
+/// [`TlsServer.eSeq`] to 0, and marks [`TlsServer.earlyAccepted`]. Call this
+/// only after [`verifyPskBinder`] has accepted the PSK and the server has
+/// decided to accept early data. Afterwards [`decryptEarly`] can decrypt 0-RTT
+/// records.
 pub fn deriveEarlyKeysServer(self: TlsServer): void {
     let hl = trHashLen(self);
     let es = bytes.alloc(hl); tls.earlySecretPsk(self.kind, self.psk, self.pskLen, es);
@@ -343,6 +737,26 @@ pub fn deriveEarlyKeysServer(self: TlsServer): void {
     bytes.free(es); bytes.free(chHash); bytes.free(cet);
 }
 
+/// Builds the ServerHello message into `out` and runs the handshake key
+/// schedule; returns the total message length in bytes.
+///
+/// Emits the ServerHello body: legacy version 0x0303, the 32-byte
+/// `serverRandom` the caller supplies, the echoed session id, the selected
+/// cipher suite, a null compression byte, and the extensions
+/// (supported_versions, the key_share carrying the server's freshly derived
+/// public key for [`TlsServer.group`], and pre_shared_key if
+/// [`TlsServer.pskAccepted`]). The 24-bit body length is back-patched with
+/// [`w3`] once known.
+///
+/// Along the way it performs the ECDHE for the negotiated group (X25519, P-256,
+/// or P-384) to get the shared secret `ecdhe`, then runs the key schedule:
+/// early secret (PSK-based if a PSK was accepted, else the zero-PSK early
+/// secret), the Derived label, HKDF-Extract with `ecdhe` to get
+/// [`TlsServer.hs`], and finally the client and server handshake traffic
+/// secrets and their keys/IVs ([`TlsServer.cKey`]/`cIv`,
+/// [`TlsServer.sKey`]/`sIv`). The ServerHello is appended to the transcript
+/// before the traffic secrets are derived, because they hash the transcript up
+/// to and including this message. All scratch buffers are freed before return.
 pub fn buildServerHello(self: TlsServer, serverRandom: ptr, out: ptr): int {
     let p = 4;
     bytes.write_byte(out, p, 0x03); bytes.write_byte(out, p + 1, 0x03); p = p + 2;
@@ -410,6 +824,15 @@ pub fn buildServerHello(self: TlsServer, serverRandom: ptr, out: ptr): int {
     return p;
 }
 
+/// Encodes a 32-byte big-endian integer `src` as a DER INTEGER at `out[off..]`,
+/// returning the number of bytes written.
+///
+/// This is the per-component encoder for an ECDSA signature. It strips leading
+/// zero bytes (a DER INTEGER is minimal) but keeps the integer non-negative:
+/// if the top bit of the first significant byte is set, a single 0x00 pad byte
+/// is prepended so the value is not read as negative. The output is the tag
+/// 0x02, a one-byte length, the optional pad, then the significant bytes. Used
+/// by [`encodeEcdsaSig`].
 fn derInt(src: ptr, out: ptr, off: int): int {
     let s = 0;
     while (s < 31 && bytes.read_byte(src, s) == 0) { s = s + 1; }
@@ -424,6 +847,14 @@ fn derInt(src: ptr, out: ptr, off: int): int {
     while (i < 32) { bytes.write_byte(out, p, bytes.read_byte(src, i)); p = p + 1; i = i + 1; }
     return p - off;
 }
+/// Encodes an ECDSA signature `(r, s)` as a DER SEQUENCE of two INTEGERs into
+/// `out`, returning the total encoded length.
+///
+/// Wraps the two [`derInt`] components in a `0x30 <len> <INTEGER r> <INTEGER s>`
+/// SEQUENCE, which is the format the TLS signature field expects for the
+/// ecdsa_secp256r1_sha256 scheme. The length byte is single-byte, which is
+/// sufficient because a P-256 signature is well under 128 bytes. Used in
+/// [`buildFlight`] to encode the CertificateVerify signature.
 fn encodeEcdsaSig(r: ptr, s: ptr, out: ptr): int {
     let rlen = derInt(r, out, 2);
     let slen = derInt(s, out, 2 + rlen);
@@ -433,6 +864,35 @@ fn encodeEcdsaSig(r: ptr, s: ptr, out: ptr): int {
     return 2 + total;
 }
 
+/// Builds the server's encrypted handshake flight into `out` and derives the
+/// application traffic keys; returns the length of the protected record.
+///
+/// This assembles the whole second flight as one plaintext `inner` buffer, then
+/// AEAD-protects it into `out` with the server handshake key. The plaintext, in
+/// order, is:
+///
+///   * EncryptedExtensions (0x08): ALPN if one was selected, early_data
+///     acceptance if [`TlsServer.earlyAccepted`], and the record_size_limit the
+///     server advertises ([`TlsServer.recvLimit`]).
+///   * CertificateRequest (0x0d), only if [`TlsServer.requestClientCert`] and
+///     the session is not a PSK resumption.
+///   * Certificate (0x0b) and CertificateVerify (0x0f), skipped entirely on a
+///     PSK resumption (the whole block is gated on `!pskAccepted`). The
+///     Certificate carries the leaf DER plus an optional stapled OCSP response;
+///     the CertificateVerify hashes the transcript, builds the RFC 8446 signed
+///     content (64 spaces, the context string, a 0 separator, then the hash),
+///     signs it with P-256 ECDSA, and DER-encodes the signature via
+///     [`encodeEcdsaSig`].
+///   * Finished (0x14): the HMAC over the transcript with the Finished key
+///     derived from [`TlsServer.shs`].
+///
+/// Each message is appended to the transcript with [`trAdd`] as it is written,
+/// so the CertificateVerify and Finished cover exactly the right prefix. After
+/// protecting the record ([`TlsServer.sSeq`] advances), it derives the master
+/// secret and the client/server application traffic secrets and keys
+/// ([`TlsServer.cap`]/`sap`, [`TlsServer.capKey`]/`capIv`,
+/// [`TlsServer.sapKey`]/`sapIv`) from the transcript hash taken after the
+/// Finished. All scratch allocations are freed before return.
 pub fn buildFlight(self: TlsServer, out: ptr): int {
     let inner = bytes.alloc(4096 + self.certLen + self.stapleOcspLen);
     let ip = 0;
@@ -555,6 +1015,20 @@ pub fn buildFlight(self: TlsServer, out: ptr): int {
     return recLen;
 }
 
+/// Verifies the client's Finished message and completes the handshake;
+/// returns whether it verified.
+///
+/// Unprotects the `record` with the client handshake key (advancing
+/// [`TlsServer.cSeq`]; a negative result means decrypt failed and the function
+/// returns false), then checks the Finished HMAC over the current transcript
+/// using the client handshake secret [`TlsServer.chs`]. On success it sets
+/// [`TlsServer.finishedOk`], appends the Finished to the transcript, derives
+/// the resumption master secret [`TlsServer.resMaster`] from the post-Finished
+/// transcript hash, and resets BOTH sequence numbers to 0 because the
+/// connection now switches to the application traffic keys, which start their
+/// own record-counter epoch. On a mutual-TLS handshake,
+/// [`processClientCertFlight`] must have run before this so the client's
+/// certificate messages are already in the transcript.
 pub fn processClientFinished(self: TlsServer, record: ptr, recLen: int): bool {
     let inner = bytes.alloc(recLen);
     let innerLen = tls.recordUnprotect(self.suite, self.cKey, self.cIv, self.cSeq, record, recLen, inner);
@@ -574,6 +1048,18 @@ pub fn processClientFinished(self: TlsServer, record: ptr, recLen: int): bool {
     return self.finishedOk;
 }
 
+/// Builds an encrypted NewSessionTicket record into `out` and returns its
+/// length.
+///
+/// Emits a NewSessionTicket (0x04) carrying a fixed 7-day lifetime, the
+/// `ageAdd` obfuscation value (written big-endian), the per-ticket `nonce`, and
+/// the opaque `ticket` bytes the caller minted from the resumption master
+/// secret. If `allowEarly` is true it adds an early_data extension advertising a
+/// max_early_data_size of 0x4000, permitting 0-RTT on a future resumption. The
+/// message is protected with the SERVER APPLICATION key
+/// ([`TlsServer.sapKey`]/`sapIv`), not the handshake key, because tickets are
+/// sent post-handshake; [`TlsServer.sSeq`] advances accordingly. Call after the
+/// handshake has completed ([`processClientFinished`] succeeded).
 pub fn newSessionTicketRecord(self: TlsServer, ticket: ptr, ticketLen: int, nonce: ptr, nonceLen: int,
                               ageAdd: long, allowEarly: bool, out: ptr): int {
     let msg = bytes.alloc(ticketLen + nonceLen + 64);
@@ -605,23 +1091,48 @@ pub fn newSessionTicketRecord(self: TlsServer, ticket: ptr, ticketLen: int, nonc
     return n;
 }
 
+/// Encrypts `dataLen` bytes of application data into a protected record in
+/// `out`, returning the record length.
+///
+/// Protects with the server application key ([`TlsServer.sapKey`]/`sapIv`) and
+/// the application_data content type 0x17, then advances [`TlsServer.sSeq`].
+/// Valid only after the handshake completes.
 pub fn encryptApp(self: TlsServer, data: ptr, dataLen: int, out: ptr): int {
     let n = tls.recordProtect(self.suite, self.sapKey, self.sapIv, self.sSeq, data, dataLen, 0x17, out);
     self.sSeq = self.sSeq + 1;
     return n;
 }
+/// Decrypts a protected application-data `record` into `out`, returning the
+/// plaintext length (negative on AEAD failure).
+///
+/// Uses the client application key ([`TlsServer.capKey`]/`capIv`) and advances
+/// [`TlsServer.cSeq`]. The counterpart to [`encryptApp`].
 pub fn decryptApp(self: TlsServer, record: ptr, recLen: int, out: ptr): int {
     let n = tls.recordUnprotect(self.suite, self.capKey, self.capIv, self.cSeq, record, recLen, out);
     self.cSeq = self.cSeq + 1;
     return n;
 }
 
+/// Decrypts a client early-data (0-RTT) `record` into `out`, returning the
+/// plaintext length (negative on AEAD failure).
+///
+/// Uses the early key ([`TlsServer.eKey`]/`eIv`) set up by
+/// [`deriveEarlyKeysServer`] and advances [`TlsServer.eSeq`]. Only meaningful
+/// when [`TlsServer.earlyAccepted`] is true.
 pub fn decryptEarly(self: TlsServer, record: ptr, recLen: int, out: ptr): int {
     let n = tls.recordUnprotect(self.suite, self.eKey, self.eIv, self.eSeq, record, recLen, out);
     self.eSeq = self.eSeq + 1;
     return n;
 }
 
+/// Appends a synthetic EndOfEarlyData (0x05) message to the transcript.
+///
+/// When early data is accepted, the EndOfEarlyData handshake message sits in
+/// the transcript between the client's early records and its Finished, so the
+/// server must fold it in for the transcript to line up with the client's.
+/// This builds the fixed 4-byte message (type 0x05, zero length), feeds it to
+/// [`trAdd`], and frees the scratch buffer. Call before
+/// [`processClientFinished`] on a 0-RTT-accepted handshake.
 pub fn addEndOfEarlyData(self: TlsServer): void {
     let m = bytes.alloc(4);
     bytes.write_byte(m, 0, 0x05); bytes.write_byte(m, 1, 0); bytes.write_byte(m, 2, 0); bytes.write_byte(m, 3, 0);

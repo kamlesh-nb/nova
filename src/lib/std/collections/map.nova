@@ -1,3 +1,47 @@
+//! Generic open-addressing hash map (`Map<K, V>`).
+//!
+//! This is the standard library's general-purpose associative container: it
+//! maps keys of type `K` to values of type `V` in amortised O(1) time. It backs
+//! everything from HTTP header bags to JSON object decoding, so the hot paths
+//! (set / get / has) are kept flat and allocation-light.
+//!
+//! Design, in one breath: it is a power-of-two open-addressing table with
+//! LINEAR PROBING and TOMBSTONE deletion. The three arrays that make up the
+//! table are kept in parallel and indexed by the same slot number:
+//!
+//!   1. `keys`  - a [`rawbuffer.RawBuffer`] of `K`, one slot per bucket.
+//!   2. `vals`  - a [`rawbuffer.RawBuffer`] of `V`, one slot per bucket.
+//!   3. `slots` - a raw byte array of slot STATES, one byte per bucket, each
+//!      holding [`SLOT_EMPTY`], [`SLOT_TOMBSTONE`], or [`SLOT_OCCUPIED`].
+//!
+//! Why raw buffers and a byte array rather than a `List` of key/value structs:
+//! the map must work for any `K` and `V` without boxing each entry, and probing
+//! must scan the state byte array without touching (and without ARC-retaining)
+//! the key and value slots until it actually finds a live match. The state byte
+//! is read first precisely so an empty or tombstoned slot never dereferences the
+//! parallel key slot.
+//!
+//! Key invariants the code relies on and the caller must not break:
+//!
+//!   - `cap` is ALWAYS a power of two, so `hash & (cap - 1)` replaces the
+//!     modulo and the probe wrap `(idx + 1) & (cap - 1)` stays in range. The
+//!     constructor rounds any requested capacity up with [`nextPowerOfTwo`].
+//!   - The table is grown BEFORE it fills, at the 0.75 load factor encoded by
+//!     the `(len + 1) * 4 > cap * 3` test in [`Map.set`], so a linear probe
+//!     always terminates on an empty slot in practice and clustering stays low.
+//!   - A deleted entry becomes a TOMBSTONE, not an empty slot, so that probe
+//!     chains running through it are not broken. Tombstones are only reclaimed
+//!     on the next [`Map.resize`], which rehashes just the occupied slots.
+//!
+//! Equality and hashing come in through the `hashFn` supplied at construction.
+//! There is one special case, [`Map.keysEqual`]: when the caller passes
+//! [`string.hash`] the map compares keys with [`string.eql`] (byte comparison)
+//! instead of `==`, because two equal string values may live at different heap
+//! addresses and pointer identity would wrongly report them unequal.
+//!
+//! This container is a `class`, so it has reference semantics and is shared by
+//! handle, and its raw `slots` allocation is released in [`Map.delete`]. It sits
+//! alongside [`list.List`] and the set type in `std/collections`.
 
 import bytes;
 import list;
@@ -5,13 +49,47 @@ import mem.rawbuffer;
 import string;
 import assert;
 
+/// Width in bytes of a single slot-state entry in the `slots` array.
+///
+/// Each bucket's state is a single byte holding one of the `SLOT_*` constants,
+/// so the state array is exactly `cap` bytes long. This is documentation of
+/// that layout choice; it is not multiplied into any sizing expression here.
 const TOMBSTONE_SIZE: int = 1;
+/// Maximum load factor before the table is grown.
+///
+/// The table doubles once it would exceed 0.75 occupancy. The live growth test
+/// in [`Map.set`] does not read this constant; it uses the integer-only form
+/// `(len + 1) * 4 > cap * 3`, which is the same 3/4 threshold without floating
+/// point. This constant records the intended factor for readers.
 const LOAD_FACTOR_MAX: float = 0.75;
 
+/// Slot state: the bucket has never held a live entry.
+///
+/// An empty slot terminates a probe chain: a lookup that reaches one concludes
+/// the key is absent, and an insert may claim it. Fresh `slots` memory is
+/// zeroed, so every bucket starts in this state.
 const SLOT_EMPTY: int = 0;
+/// Slot state: the bucket held an entry that has since been deleted.
+///
+/// A tombstone does NOT terminate a lookup probe: the chain must continue past
+/// it, because the sought key may have been inserted further along before this
+/// entry was removed. An insert MAY reuse a tombstoned slot (the first one seen
+/// on the chain), which is how deleted space is recycled without a full resize.
 const SLOT_TOMBSTONE: int = 1;
+/// Slot state: the bucket currently holds a live key/value pair.
+///
+/// Only when a slot is occupied are its parallel `keys` and `vals` entries
+/// valid to read. Probing checks this state before ever touching those slots.
 const SLOT_OCCUPIED: int = 2;
 
+/// Allocates `size` bytes of persistent memory and zero-fills it.
+///
+/// Used for the `slots` state array, where every bucket must start as
+/// [`SLOT_EMPTY`] (value 0). The allocation is `alloc_persistent`, so it is not
+/// tied to any request arena and lives for as long as the map does; it is
+/// released explicitly in [`Map.delete`] and on the old table during
+/// [`Map.resize`]. The bytes are written one at a time rather than via a bulk
+/// memset because that is the primitive available at this layer.
 fn allocZero(size: int): ptr {
     let ptr = bytes.alloc_persistent(size);
     let i = 0;
@@ -22,6 +100,14 @@ fn allocZero(size: int): ptr {
     return ptr;
 }
 
+/// Rounds `n` up to the next power of two (or `n` itself if already one).
+///
+/// This is the classic bit-smearing trick: subtract one, OR the value onto
+/// itself shifted by 1, 2, 4, 8 and 16 so every bit below the highest set bit
+/// becomes set, then add one to carry up to the next power of two. It exists so
+/// [`Map`] can honour the "capacity is always a power of two" invariant that
+/// makes `hash & (cap - 1)` a valid replacement for the modulo. It covers 32-bit
+/// inputs (five shifts up to 16); callers pass small, positive capacities.
 fn nextPowerOfTwo(n: int): int {
     let v = n - 1;
     v = v | (v >> 1);
@@ -32,15 +118,48 @@ fn nextPowerOfTwo(n: int): int {
     return v + 1;
 }
 
+/// A hash map from keys of type `K` to values of type `V`.
+///
+/// Reference-typed (a `class`), open-addressing, linear-probing, tombstone
+/// deleting, and grown at a 0.75 load factor. Construct it with an initial
+/// capacity and a hash function; for string keys pass [`string.hash`], which
+/// also switches equality to [`string.eql`] (see [`Map.keysEqual`]).
+///
+/// The three parallel arrays (`keys`, `vals`, `slots`) are always the same
+/// length, `cap`, and are indexed by the same bucket number. See the file
+/// header for the full layout and invariants. The raw `slots` allocation is
+/// owned by the map and freed by [`Map.delete`].
 pub class Map<K, V> {
+    /// Number of buckets in the table. Always a power of two, so `hash &
+    /// (cap - 1)` maps a hash into a bucket and `(idx + 1) & (cap - 1)` wraps
+    /// the probe. Doubles on [`Map.resize`].
     pub cap: int,
+    /// Number of live (occupied) entries. Tombstoned buckets do NOT count, so
+    /// `len` is the answer returned by [`Map.size`] and drives the load-factor
+    /// growth test in [`Map.set`].
     pub len: int,
 
+    /// Parallel array of keys, one slot per bucket. Only slots whose `slots`
+    /// state is [`SLOT_OCCUPIED`] hold a valid key.
     pub keys: rawbuffer.RawBuffer<K>,
+    /// Parallel array of values, one slot per bucket, indexed identically to
+    /// [`Map.keys`]. Valid only where the bucket is [`SLOT_OCCUPIED`].
     pub vals: rawbuffer.RawBuffer<V>,
+    /// Raw byte array of per-bucket states, one byte each holding a `SLOT_*`
+    /// constant. Read FIRST during probing so an empty or tombstoned bucket is
+    /// never mistaken for a live key. Owned by the map; freed in [`Map.delete`].
     pub slots: ptr,
+    /// The hash function used to place and find keys. Passing [`string.hash`]
+    /// additionally selects byte-wise string equality in [`Map.keysEqual`].
     pub hashFn: (K) -> int,
 
+    /// Creates an empty map sized for `initialCap` entries, using `hashFn`.
+    ///
+    /// The capacity is clamped to a minimum of 8 and rounded up to a power of
+    /// two by [`nextPowerOfTwo`], preserving the core invariant. The three
+    /// parallel arrays are allocated and the `keys`/`vals` raw buffers are
+    /// `fill`ed to `cap` slots so they can be indexed directly; `slots` starts
+    /// all-zero, meaning every bucket is [`SLOT_EMPTY`].
     init(initialCap: int, hashFn: (K) -> int) {
         let cap = if (initialCap <= 0) 8 else nextPowerOfTwo(initialCap);
         let ps = bytes.ptr_size();
@@ -54,6 +173,14 @@ pub class Map<K, V> {
         self.hashFn = hashFn;
     }
 
+    /// Compares two keys for equality, honouring string identity.
+    ///
+    /// When the map was built with [`string.hash`], keys are compared with
+    /// [`string.eql`] (byte-for-byte), not `==`. This matters because two string
+    /// values with the same contents can sit at different heap addresses, so a
+    /// pointer/`==` comparison would treat equal strings as distinct and the map
+    /// would store duplicates or fail to find an existing key. For every other
+    /// key type the ordinary `==` is used.
     fn keysEqual(self: Map<K, V>, a: K, b: K): bool {
         if (self.hashFn == string.hash) {
             return string.eql(a, b);
@@ -61,6 +188,23 @@ pub class Map<K, V> {
         return a == b;
     }
 
+    /// Inserts `key` with `value`, or overwrites the value if `key` is present.
+    ///
+    /// Grows the table first if this insert would push occupancy past the 0.75
+    /// load factor, using the integer test `(len + 1) * 4 > cap * 3`. It then
+    /// linear-probes from `hash & (cap - 1)`:
+    ///
+    ///   - On the FIRST [`SLOT_EMPTY`] it inserts, preferring an earlier
+    ///     [`SLOT_TOMBSTONE`] seen on the way (`firstTombstone`) so deleted space
+    ///     is recycled and probe chains stay short.
+    ///   - On a matching [`SLOT_OCCUPIED`] key it overwrites the value in place
+    ///     and does NOT change `len`.
+    ///
+    /// The `if (idx == startIdx)` branch handles a full wrap of the probe (a
+    /// table with no empty slot left, which the load-factor guard normally
+    /// prevents): it inserts into a remembered tombstone if there is one,
+    /// otherwise it resizes and retries the whole insert recursively. `len` is
+    /// incremented only on a genuine new insert, never on an overwrite.
     pub fn set(self: Map<K, V>, key: K, value: V): void {
         if ((self.len + 1) * 4 > self.cap * 3) {
             self.resize();
@@ -109,6 +253,15 @@ pub class Map<K, V> {
         }
     }
 
+    /// Looks up `key`, returning its value or `undefined` if absent.
+    ///
+    /// Short-circuits to `undefined` on an empty map. Otherwise it linear-probes
+    /// from `hash & (cap - 1)`: a [`SLOT_EMPTY`] ends the search with `undefined`
+    /// (the key cannot be further along, since inserts fill the first empty
+    /// slot), a matching [`SLOT_OCCUPIED`] returns the value, and a
+    /// [`SLOT_TOMBSTONE`] is skipped so chains through deleted entries stay
+    /// intact. The `idx == startIdx` guard stops a full-table scan from looping
+    /// forever when every slot is occupied or tombstoned.
     pub fn get(self: Map<K, V>, key: K): V | undefined {
         if (self.len == 0) {
             return undefined;
@@ -136,6 +289,13 @@ pub class Map<K, V> {
         }
     }
 
+    /// Returns the value for `key`, panicking if the key is absent.
+    ///
+    /// This is the non-optional accessor: use it when the key is known to be
+    /// present, and [`Map.get`] or [`Map.getOrDefault`] when it might not be.
+    /// The probe logic mirrors [`Map.get`]; on a miss it calls `nova_panic`. The
+    /// trailing `return self.vals.at(0)` is unreachable in practice (the panic
+    /// does not return) and exists only to satisfy the return type.
     pub fn at(self: Map<K, V>, key: K): V {
         if (self.len != 0) {
             let hash = (self.hashFn)(key);
@@ -162,6 +322,14 @@ pub class Map<K, V> {
         return self.vals.at(0);
     }
 
+    /// Removes `key`, returning `true` if it was present and `false` otherwise.
+    ///
+    /// On a match the bucket is turned into a [`SLOT_TOMBSTONE`] rather than
+    /// [`SLOT_EMPTY`], so any probe chain that passes through it is preserved;
+    /// the key and value slots are cleared (set to 0) and `len` is decremented.
+    /// The freed space is reclaimed lazily, either reused by a later
+    /// [`Map.set`] or swept on the next [`Map.resize`]. Named `delete_key`
+    /// because [`Map.delete`] is the internal teardown that frees `slots`.
     pub fn delete_key(self: Map<K, V>, key: K): bool {
         if (self.len == 0) {
             return false;
@@ -193,15 +361,28 @@ pub class Map<K, V> {
         }
     }
 
+    /// Reports whether `key` is present.
+    ///
+    /// A thin wrapper over [`Map.get`] that checks the result against
+    /// `undefined`. Note that if a value of `undefined` were ever stored this
+    /// could not distinguish presence from absence, but the map is used with
+    /// concrete value types.
     pub fn has(self: Map<K, V>, key: K): bool {
         let val = self.get(key);
         return val != undefined;
     }
 
+    /// Number of live entries, excluding tombstones. Same as [`Map.len`].
     pub fn size(self: Map<K, V>): int {
         return self.len;
     }
 
+    /// Calls `fn(key, value)` for every live entry, in bucket order.
+    ///
+    /// Iteration order is the internal slot order, which is unspecified and can
+    /// change after a resize; do not depend on it. Only [`SLOT_OCCUPIED`]
+    /// buckets are visited, so tombstones and empties are skipped. Underpins
+    /// [`Map.keys`], [`Map.values`] and, indirectly, [`Map.entries`].
     pub fn forEach(self: Map<K, V>, fn: (K, V) => void): void {
         let ps = bytes.ptr_size();
         let i = 0;
@@ -216,18 +397,37 @@ pub class Map<K, V> {
         }
     }
 
+    /// Collects all live keys into a fresh [`list.List`], in bucket order.
+    ///
+    /// The order is unspecified (see [`Map.forEach`]). The returned list is a
+    /// new owned collection; the keys inside it follow the usual value/ARC rules
+    /// for `K`.
     pub fn keys(self: Map<K, V>): list.List<K> {
         let result = list.List<K>();
         self.forEach((k, v) => result.push(k));
         return result;
     }
 
+    /// Collects all live values into a fresh [`list.List`], in bucket order.
+    ///
+    /// Order is unspecified and parallel to [`Map.keys`] over the same
+    /// iteration, but the two are separate lists.
     pub fn values(self: Map<K, V>): list.List<V> {
         let result = list.List<V>();
         self.forEach((k, v) => result.push(v));
         return result;
     }
 
+    /// Doubles the table capacity and rehashes every live entry into it.
+    ///
+    /// Called from [`Map.set`] when the load factor is exceeded (and from its
+    /// full-wrap fallback). It allocates a new set of parallel arrays at
+    /// `oldCap * 2`, then walks the old table and re-inserts only the
+    /// [`SLOT_OCCUPIED`] entries with a simple linear probe. This is where
+    /// TOMBSTONES are reclaimed: deleted slots are not copied, so a resize
+    /// compacts the table. The old `slots` allocation is freed; the old key/val
+    /// raw buffers are left for their own lifetime management. `len` is
+    /// unchanged because the set of live entries does not change.
     fn resize(self: Map<K, V>): void {
         let ps = bytes.ptr_size();
         let oldCap = self.cap;
@@ -273,6 +473,13 @@ pub class Map<K, V> {
         self.slots = newSlots;
     }
 
+    /// Destructor hook: frees the raw `slots` state allocation.
+    ///
+    /// Releases the persistent byte array backing the slot states and nulls the
+    /// pointer, guarding against a double free (the `slots != 0` check). The
+    /// `keys` and `vals` raw buffers manage their own memory. This is the
+    /// teardown counterpart to [`Map.delete_key`], which only removes a single
+    /// entry.
     fn delete(self: Map<K, V>): void {
         if (self.slots != 0) {
             bytes.free(self.slots);
@@ -280,12 +487,23 @@ pub class Map<K, V> {
         }
     }
 
+    /// Returns the value for `key`, or `fallback` if the key is absent.
+    ///
+    /// The safe, non-panicking counterpart to [`Map.at`]: it calls [`Map.get`]
+    /// and substitutes `fallback` when the result is `undefined`. Use it when a
+    /// sensible default exists for a missing key.
     pub fn getOrDefault(self: Map<K, V>, key: K, fallback: V): V {
         let v = self.get(key);
         if (v == undefined) { return fallback; }
         return v;
     }
 
+    /// Copies every entry from `other` into this map, overwriting on conflict.
+    ///
+    /// Iterates `other`'s keys and `set`s each key/value into `self`, so where a
+    /// key exists in both maps the value from `other` wins (last write wins, per
+    /// [`Map.set`]). `other` is not modified. Snapshots the keys first via
+    /// [`Map.keys`], so it is safe against `self` resizing during the loop.
     pub fn merge(self: Map<K, V>, other: Map<K, V>): void {
         let ks = other.keys();
         let i = 0;
@@ -296,6 +514,12 @@ pub class Map<K, V> {
         }
     }
 
+    /// Collects all live entries as `(key, value)` tuples into a [`list.List`].
+    ///
+    /// Builds the key list via [`Map.keys`] and pairs each key with its value
+    /// looked up through [`Map.at`], which is safe because every key came from
+    /// the map itself and is therefore present. Order is the unspecified bucket
+    /// order. Useful for iterating keys and values together.
     pub fn entries(self: Map<K, V>): list.List<(K, V)> {
         let result = list.List<(K, V)>();
         let ks = self.keys();
@@ -308,6 +532,14 @@ pub class Map<K, V> {
         return result;
     }
 
+    /// Removes every entry, leaving the map empty but keeping its capacity.
+    ///
+    /// Snapshots the current keys with [`Map.keys`] and deletes each one via
+    /// [`Map.delete_key`], so afterwards `len` is 0. The buckets become
+    /// tombstones rather than being reallocated, so the table keeps its `cap`;
+    /// this trades a smaller footprint for avoiding a fresh allocation and lets
+    /// subsequent inserts reuse the space (tombstones are swept on the next
+    /// resize).
     pub fn clear(self: Map<K, V>): void {
         let ks = self.keys();
         let i = 0;
@@ -315,6 +547,12 @@ pub class Map<K, V> {
     }
 }
 
+/// Smoke test for the core map operations.
+///
+/// Exercises construction with [`string.hash`], [`Map.size`], insert and
+/// overwrite via [`Map.set`], lookup via [`Map.get`], presence via [`Map.has`],
+/// and removal via [`Map.delete_key`], asserting the observable results at each
+/// step.
 @test
 fn test_map(): void {
     let map = Map<string, int>(16, string.hash);

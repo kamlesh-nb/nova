@@ -1,3 +1,43 @@
+//! TLS 1.3 handshake authentication and message parsing (RFC 8446).
+//!
+//! This file sits one layer above the raw key schedule in `crypto.tls.13.tls`.
+//! Where that module derives the secrets, this module uses them to do the two
+//! jobs that turn a key exchange into an authenticated handshake: proving the
+//! peer holds the private key that matches its certificate (CertificateVerify),
+//! and proving both sides saw the identical handshake transcript so nobody
+//! tampered with it in flight (Finished). It also carries the small parsers that
+//! read the fields Nova cares about out of the ServerHello and EncryptedExtensions
+//! messages.
+//!
+//! The transcript hash is the spine of all of this. TLS 1.3 binds every derived
+//! secret and every signature to a running hash of all handshake messages seen so
+//! far, so both the Finished MAC and the CertificateVerify signature are computed
+//! over that hash rather than over the messages directly. [`Transcript`] is the
+//! growable byte buffer that accumulates those messages; [`transcriptHash`]
+//! collapses it to a digest at the point a binding is needed.
+//!
+//! Everything here works on raw `ptr` buffers and byte offsets rather than on
+//! owned Nova values. That is deliberate: handshake bytes arrive off the wire in
+//! a record buffer, and the crypto primitives (`hkdf`, `hmac`, `sha256`, `rsa`,
+//! `p256`) also speak `ptr`/length. Passing offsets keeps the whole path
+//! zero-copy and avoids minting owned strings for data that lives and dies inside
+//! one handshake. The cost is that the caller owns every lifetime and bound: none
+//! of the parsers here range-check against the record length, so a malformed
+//! record is the caller's responsibility to have length-validated before these
+//! run.
+//!
+//! One invariant runs through the MAC and comparison code: anything that decides
+//! "did this handshake authenticate" must be constant-time with respect to secret
+//! data. [`verifyFinished`] therefore ORs together every byte difference and
+//! checks the accumulator once at the end, rather than returning early on the
+//! first mismatch, so a network attacker cannot learn the correct verify_data one
+//! byte at a time from timing.
+//!
+//! The `kind` integer threaded through most functions selects the hash: `1` means
+//! SHA-384 (used with the AES-256 cipher suite) and any other value means
+//! SHA-256. It is the same convention `hkdf.hashLen` uses, so `kind` is passed
+//! straight through to keep the two in step.
+
 import bytes;
 import crypto.tls.13.tls;
 import crypto.kdf.hkdf;
@@ -7,23 +47,60 @@ import crypto.x509;
 import crypto.rsa;
 import crypto.ecc.p256;
 
+/// Copies a Nova `string` into a freshly allocated byte buffer and returns it.
+///
+/// The crypto primitives take `ptr`/length pairs, not owned `string`s, so a
+/// string literal such as a label needs materialising into raw bytes first. The
+/// returned buffer is heap-allocated and NOT NUL-terminated (only `s.length`
+/// bytes are written), so the caller must track the length separately and is
+/// responsible for freeing it with `bytes.free`.
 fn strBuf(s: string): ptr {
     let b = bytes.alloc(s.length);
     let i = 0;
     while (i < s.length) { bytes.write_byte(b, i, s[i]); i = i + 1; }
     return b;
 }
+/// Returns a pointer `off` bytes into `buf`, computing the offset at 64-bit width.
+///
+/// The addition is done in `long` before the cast back to `ptr` on purpose: doing
+/// `buf + off` where `buf` narrowed to `int` would truncate a heap address above
+/// 4 GB and produce a garbage pointer. Used to point at sub-fields inside an
+/// x509 certificate buffer, where the field offsets are stored as plain `int`.
 fn ptrAt(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
 
 
+/// A growable byte buffer accumulating the handshake transcript.
+///
+/// TLS 1.3 binds every secret and signature to a running hash of all handshake
+/// messages exchanged so far, so the client must keep every handshake message it
+/// sends and receives, in order, until it needs to hash them. This is a plain
+/// manually-grown buffer (`{buf, len, cap}`): messages are appended with
+/// [`transcriptAdd`], the digest is taken with [`transcriptHash`], and the buffer
+/// is released with [`transcriptFree`]. It owns its `buf` allocation, so it must
+/// be freed exactly once.
 struct Transcript {
+    /// Heap buffer holding the concatenated handshake messages. Owned by the
+    /// [`Transcript`]; reallocated by [`transcriptAdd`] when it grows.
     pub buf: ptr,
+    /// Number of bytes currently used in `buf`, i.e. the transcript length so far.
     pub len: int,
+    /// Total capacity of `buf` in bytes; `len` may not exceed this without a grow.
     pub cap: int,
 }
 
+/// Allocates an empty transcript with a 4 KB starting capacity.
+///
+/// The initial 4 KB is a starting size, not a limit: [`transcriptAdd`] grows the
+/// buffer as needed. The result owns its buffer and must be released with
+/// [`transcriptFree`].
 pub fn transcriptNew(): Transcript { return Transcript { buf: bytes.alloc(4096), len: 0, cap: 4096 }; }
 
+/// Appends `n` bytes of a handshake message to the transcript, growing if needed.
+///
+/// When the existing capacity cannot hold the new bytes, the buffer is reallocated
+/// to twice the required size, the old contents are copied across, and the old
+/// allocation is freed. The bytes copied are the message exactly as it appears on
+/// the wire, since the transcript hash is defined over the raw handshake messages.
 pub fn transcriptAdd(t: Transcript, msg: ptr, n: int): void {
     if (t.len + n > t.cap) {
         let nc = (t.len + n) * 2;
@@ -39,12 +116,27 @@ pub fn transcriptAdd(t: Transcript, msg: ptr, n: int): void {
     t.len = t.len + n;
 }
 
+/// Writes the hash of everything accumulated in the transcript into `out`.
+///
+/// This is the "Transcript-Hash" of RFC 8446: a plain digest over the
+/// concatenated handshake messages. `out` must have room for the digest length
+/// (32 bytes for SHA-256). The `kind` argument is accepted for symmetry with the
+/// rest of the module but this implementation always uses SHA-256, so `out` needs
+/// 32 bytes regardless.
 pub fn transcriptHash(kind: int, t: Transcript, out: ptr): void {
     sha256.hashInto(t.buf, t.len, out);
 }
+/// Frees the transcript's backing buffer. Call exactly once, after the last hash.
 pub fn transcriptFree(t: Transcript): void { bytes.free(t.buf); }
 
 
+/// Derives the Finished MAC key from a traffic secret via HKDF-Expand-Label.
+///
+/// Per RFC 8446 section 4.4.4, the finished_key is
+/// `HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)`: an expansion with
+/// an empty context whose output length equals the hash length. `out` must hold
+/// `hkdf.hashLen(kind)` bytes. The temporary label and empty-context buffers are
+/// freed before returning. Used by [`finishedVerifyData`].
 pub fn finishedKey(kind: int, trafficSecret: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let empty = bytes.alloc(1);
@@ -53,6 +145,14 @@ pub fn finishedKey(kind: int, trafficSecret: ptr, out: ptr): void {
     bytes.free(empty); bytes.free(lab);
 }
 
+/// Computes the Finished message's verify_data into `out`.
+///
+/// verify_data is `HMAC(finished_key, Transcript-Hash)`: the transcript hash up
+/// to but not including the Finished message, keyed by the finished_key from
+/// [`finishedKey`]. The HMAC hash is chosen by `kind` to match the finished_key
+/// length, SHA-384 when `kind == 1` and SHA-256 otherwise, so `out` must hold
+/// `hkdf.hashLen(kind)` bytes. The intermediate finished_key buffer is freed
+/// before returning. [`verifyFinished`] wraps this with a constant-time compare.
 pub fn finishedVerifyData(kind: int, trafficSecret: ptr, transcriptHash: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let fk = bytes.alloc(hl);
@@ -62,6 +162,15 @@ pub fn finishedVerifyData(kind: int, trafficSecret: ptr, transcriptHash: ptr, ou
     bytes.free(fk);
 }
 
+/// Recomputes verify_data and compares it against the peer's Finished, in constant time.
+///
+/// Returns `true` only if the locally computed verify_data (see
+/// [`finishedVerifyData`]) equals the `expected` bytes the peer sent. The compare
+/// ORs together the XOR of every byte pair and tests the accumulator once at the
+/// end, deliberately NOT returning early on the first mismatch, so the timing does
+/// not leak how many leading bytes were correct. `expected` must point at
+/// `hkdf.hashLen(kind)` bytes. A false result means the handshake failed to
+/// authenticate and the connection must be torn down.
 pub fn verifyFinished(kind: int, trafficSecret: ptr, transcriptHash: ptr, expected: ptr): bool {
     let hl = hkdf.hashLen(kind);
     let vd = bytes.alloc(hl);
@@ -74,6 +183,15 @@ pub fn verifyFinished(kind: int, trafficSecret: ptr, transcriptHash: ptr, expect
 }
 
 
+/// Builds the CertificateVerify signing content into `out` and returns its length.
+///
+/// RFC 8446 section 4.4.3 fixes the exact bytes that get signed: 64 octets of
+/// 0x20 (ASCII space), then the context string (for example "TLS 1.3, server
+/// CertificateVerify"), then a single 0x00 separator, then the transcript hash.
+/// The 64 spaces exist so a signature can never be confused with one produced by
+/// an earlier TLS version or a different context. This writes that layout and
+/// returns the total number of bytes written, which the caller then hashes.
+/// `out` must be sized `64 + ctxLen + 1 + hl`.
 fn certVerifyContent(context: ptr, ctxLen: int, transcriptHash: ptr, hl: int, out: ptr): int {
     let i = 0;
     while (i < 64) { bytes.write_byte(out, i, 0x20); i = i + 1; }
@@ -87,6 +205,14 @@ fn certVerifyContent(context: ptr, ctxLen: int, transcriptHash: ptr, hl: int, ou
     return p + hl;
 }
 
+/// Hashes the CertificateVerify signing content and writes the digest to `digestOut`.
+///
+/// Selects the context string by role (server or client, both 33 bytes long),
+/// builds the signing content with [`certVerifyContent`], and hashes it. The
+/// resulting digest is what gets fed to the signature verify in [`verifyCvSig`],
+/// NOT the raw content. `digestOut` must hold the hash length (32 bytes for the
+/// SHA-256 used here). The temporary content and context buffers are freed before
+/// returning. `hl` is the transcript hash length being signed over.
 pub fn certVerifyDigest(isServer: bool, transcriptHash: ptr, hl: int, digestOut: ptr): void {
     let ctx = if (isServer) strBuf("TLS 1.3, server CertificateVerify") else strBuf("TLS 1.3, client CertificateVerify");
     let content = bytes.alloc(64 + 33 + 1 + hl);
@@ -96,10 +222,21 @@ pub fn certVerifyDigest(isServer: bool, transcriptHash: ptr, hl: int, digestOut:
     bytes.free(ctx);
 }
 
+/// SignatureScheme code point for rsa_pkcs1_sha256 (RFC 8446), value 0x0401.
 const SS_RSA_PKCS1_SHA256: int = 0x0401;
+/// SignatureScheme code point for ecdsa_secp256r1_sha256 (RFC 8446), value 0x0403.
 const SS_ECDSA_P256_SHA256: int = 0x0403;
+/// SignatureScheme code point for rsa_pss_rsae_sha256 (RFC 8446), value 0x0804.
 const SS_RSA_PSS_SHA256: int = 0x0804;
 
+/// Verifies the SERVER's CertificateVerify signature against its certificate.
+///
+/// Rebuilds the signed digest for the server role via [`certVerifyDigest`] and
+/// checks `sig` against the certificate's public key with [`verifyCvSig`],
+/// dispatching on `sigScheme`. Returns `true` only if the signature is valid,
+/// which proves the server holds the private key for the certificate it
+/// presented. An unrecognised or unsupported `sigScheme` yields `false`. The
+/// scratch digest buffer is freed before returning.
 pub fn verifyCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, transcriptHash: ptr, transcriptHashLen: int): bool {
     let digest = bytes.alloc(32);
     certVerifyDigest(true, transcriptHash, transcriptHashLen, digest);
@@ -108,6 +245,12 @@ pub fn verifyCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen
     return ok;
 }
 
+/// Verifies the CLIENT's CertificateVerify signature, for mutual-TLS handshakes.
+///
+/// Identical to [`verifyCertificateVerify`] except it rebuilds the digest with the
+/// client context string ("TLS 1.3, client CertificateVerify"), used when the
+/// server has requested a client certificate and must authenticate the client.
+/// Returns `true` only on a valid signature.
 pub fn verifyClientCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, transcriptHash: ptr, transcriptHashLen: int): bool {
     let digest = bytes.alloc(32);
     certVerifyDigest(false, transcriptHash, transcriptHashLen, digest);
@@ -116,6 +259,16 @@ pub fn verifyClientCertificateVerify(cert: x509.Cert, sigScheme: int, sig: ptr, 
     return ok;
 }
 
+/// Dispatches a CertificateVerify signature check on `sigScheme` against a cert's key.
+///
+/// The signed message is the precomputed `digest` from [`certVerifyDigest`], not
+/// the transcript hash. Three schemes are handled: RSA-PSS and RSA-PKCS1 verify
+/// directly against the certificate's modulus and exponent slices, while ECDSA
+/// P-256 first splits the DER-encoded signature into its `r` and `s` scalars with
+/// [`decodeEcdsaSigDer`] before calling `p256.ecdsaVerify`. Any other scheme
+/// leaves `ok` false. Certificate key material is read via [`ptrAt`] into the
+/// x509 buffer using the offsets the parser recorded. The ECDSA path frees its two
+/// scratch scalar buffers.
 fn verifyCvSig(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, digest: ptr): bool {
     let ok = false;
     if (sigScheme == SS_RSA_PSS_SHA256) {
@@ -133,8 +286,25 @@ fn verifyCvSig(cert: x509.Cert, sigScheme: int, sig: ptr, sigLen: int, digest: p
     return ok;
 }
 
+/// Reads the length byte of a DER TLV at `pos` (the byte after the tag).
+///
+/// Assumes the short-form length encoding, a single byte, which is all an ECDSA
+/// P-256 signature ever needs since its INTEGER and SEQUENCE values fit well under
+/// 128 bytes. It does not handle the multi-byte long form.
 fn derLen(buf: ptr, pos: int): int { return bytes.read_byte(buf, pos + 1); }
+/// Returns the offset of a DER TLV's content, skipping its 1-byte tag and 1-byte length.
+///
+/// Paired with [`derLen`] and only valid for the short-form encoding, where the
+/// header is exactly two bytes.
 fn derContentStart(buf: ptr, pos: int): int { return pos + 2; }
+/// Copies a DER INTEGER's value into a fixed 32-byte, big-endian, left-padded field.
+///
+/// ECDSA P-256 scalars are 32 bytes, but DER INTEGER encoding strips leading zero
+/// bytes and may add one back to keep the value positive. This normalises either
+/// way: it skips any leading zero bytes of the source, zero-fills the whole 32-byte
+/// output, then right-aligns the remaining `l` value bytes so the scalar sits in
+/// the low end with high-order zero padding. That fixed-width form is what
+/// `p256.ecdsaVerify` expects.
 fn derIntTo(buf: ptr, start: int, len: int, out: ptr): void {
     let s = start; let l = len;
     while (l > 0 && bytes.read_byte(buf, s) == 0) { s = s + 1; l = l - 1; }
@@ -145,6 +315,15 @@ fn derIntTo(buf: ptr, start: int, len: int, out: ptr): void {
     while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
 }
 
+/// Encodes a 32-byte big-endian scalar as a DER INTEGER at `out+off`, returning its total length.
+///
+/// The inverse of [`derIntTo`]. It strips leading zero bytes from the source
+/// scalar (keeping at least one byte), then, if the top bit of the first
+/// significant byte is set, prepends a single 0x00 so DER reads the value as
+/// positive rather than negative. It writes the 0x02 INTEGER tag, the short-form
+/// length, the optional pad byte, then the significant bytes, and returns the
+/// number of bytes written including the tag and length. Used by
+/// [`encodeEcdsaSigDer`].
 fn derEncInt(src: ptr, out: ptr, off: int): int {
     let s = 0;
     while (s < 31 && bytes.read_byte(src, s) == 0) { s = s + 1; }
@@ -159,6 +338,13 @@ fn derEncInt(src: ptr, out: ptr, off: int): int {
     while (i < 32) { bytes.write_byte(out, p, bytes.read_byte(src, i)); p = p + 1; i = i + 1; }
     return p - off;
 }
+/// Encodes an ECDSA (r, s) pair as a DER `SEQUENCE { INTEGER r, INTEGER s }` into `out`.
+///
+/// Encodes each 32-byte scalar with [`derEncInt`] back to back at `out+2`,
+/// reserving `out[0..2]` for the SEQUENCE header, then backfills the 0x30 SEQUENCE
+/// tag and its short-form length once the inner total is known. Returns the total
+/// encoded length including the 2-byte header. This is the wire form of a P-256
+/// signature; [`decodeEcdsaSigDer`] reverses it.
 pub fn encodeEcdsaSigDer(r: ptr, s: ptr, out: ptr): int {
     let rlen = derEncInt(r, out, 2);
     let slen = derEncInt(s, out, 2 + rlen);
@@ -167,6 +353,14 @@ pub fn encodeEcdsaSigDer(r: ptr, s: ptr, out: ptr): int {
     bytes.write_byte(out, 1, total);
     return 2 + total;
 }
+/// Decodes a DER `SEQUENCE { INTEGER r, INTEGER s }` signature into two 32-byte scalars.
+///
+/// Walks the short-form TLV structure: it enters the outer SEQUENCE, reads the
+/// first INTEGER (r) and its length, steps past it to the second INTEGER (s), and
+/// normalises each into a fixed 32-byte big-endian field via [`derIntTo`]. `rOut`
+/// and `sOut` must each hold 32 bytes. It assumes well-formed short-form DER as
+/// produced by [`encodeEcdsaSigDer`] or a conforming peer, and does no bounds
+/// validation.
 pub fn decodeEcdsaSigDer(sig: ptr, rOut: ptr, sOut: ptr): void {
     let seqStart = derContentStart(sig, 0);
     let rTag = derContentStart(sig, seqStart);
@@ -177,6 +371,15 @@ pub fn decodeEcdsaSigDer(sig: ptr, rOut: ptr, sOut: ptr): void {
     derIntTo(sig, sTag, sLen, sOut);
 }
 
+/// Reports whether a ServerHello accepted the offered pre-shared key.
+///
+/// Walks the ServerHello extension list looking for pre_shared_key (extension type
+/// 0x0029). Its presence in the ServerHello means the server selected one of the
+/// client's PSK identities, so a session resumption or 0-RTT attempt succeeded.
+/// The parser skips the fixed prefix (4-byte handshake header, 2-byte version,
+/// 32-byte random), then the variable session-id, cipher suite, and compression
+/// byte, to reach the extensions block. It does no bounds checking, so `sh` must
+/// already be a validated ServerHello record.
 pub fn serverAcceptedPsk(sh: ptr, shLen: int): bool {
     let p = 4 + 2 + 32;
     let sidLen = bytes.read_byte(sh, p);
@@ -195,6 +398,13 @@ pub fn serverAcceptedPsk(sh: ptr, shLen: int): bool {
 }
 
 
+/// Reports whether EncryptedExtensions signalled acceptance of 0-RTT early data.
+///
+/// Scans the EncryptedExtensions message (starting at `off`, past its 4-byte
+/// handshake header) for the early_data extension (type 0x002a). In an
+/// EncryptedExtensions message that extension, even empty, means the server agreed
+/// to process the early data the client sent. Returns `false` if absent. Assumes a
+/// validated message; does no bounds checking.
 pub fn serverAcceptedEarlyData(ee: ptr, off: int): bool {
     let p = off + 4;
     let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
@@ -209,6 +419,13 @@ pub fn serverAcceptedEarlyData(ee: ptr, off: int): bool {
     return false;
 }
 
+/// Reads the peer's record_size_limit from EncryptedExtensions, or 0 if unset.
+///
+/// Scans for the record_size_limit extension (type 0x001c, RFC 8449) and returns
+/// its 2-byte big-endian value, the largest record plaintext the peer is willing
+/// to receive. A return of 0 means the peer did not send the extension, in which
+/// case the default record size limit applies. Assumes a validated
+/// EncryptedExtensions message and does no bounds checking.
 pub fn parseRecordSizeLimit(ee: ptr, off: int): int {
     let p = off + 4;
     let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
@@ -223,6 +440,16 @@ pub fn parseRecordSizeLimit(ee: ptr, off: int): int {
     return 0;
 }
 
+/// Reads the ALPN protocol the server selected from EncryptedExtensions, as a string.
+///
+/// Scans for the application_layer_protocol_negotiation extension (type 0x0010).
+/// The extension body is a protocol-name list containing exactly one entry in a
+/// ServerHello context, so this skips the 2-byte list length, reads the 1-byte
+/// name length, and copies that many bytes into a freshly allocated `string`
+/// (for example "h2" or "http/1.1"). Unlike the other parsers here it returns an
+/// OWNED string, since the caller needs the protocol name to outlive the record
+/// buffer. Returns the empty string when the extension is absent, meaning no ALPN
+/// was negotiated.
 pub fn parseAlpnSelection(ee: ptr, off: int): string {
     let p = off + 4;
     let extLen = (bytes.read_byte(ee, p) << 8) | bytes.read_byte(ee, p + 1);
@@ -245,6 +472,15 @@ pub fn parseAlpnSelection(ee: ptr, off: int): string {
 }
 
 
+/// Derives the TLS 1.3 Master Secret from the Handshake Secret into `out`.
+///
+/// Follows the key schedule of RFC 8446 section 7.1: first Derive-Secret the
+/// handshake secret with the "derived" label (via `tls.deriveDerived`), then
+/// HKDF-Extract that with an all-zero IKM to produce the master secret. The zero
+/// buffer is `hkdf.hashLen(kind)` bytes, matching the empty-input convention of
+/// the schedule. `out` must hold the hash length. Both scratch buffers are freed
+/// before returning. The master secret is the root from which the application
+/// traffic secrets are later derived.
 pub fn masterSecret(kind: int, handshakeSecret: ptr, out: ptr): void {
     let hl = hkdf.hashLen(kind);
     let derived = bytes.alloc(hl);
@@ -257,6 +493,17 @@ pub fn masterSecret(kind: int, handshakeSecret: ptr, out: ptr): void {
 }
 
 
+/// Parses a ServerHello, returning the chosen cipher suite and extracting the key share.
+///
+/// This is the main ServerHello reader. It returns the negotiated cipher suite
+/// code point, and writes two things out by pointer: `groupOut` receives the
+/// 2-byte named group of the server's key_share extension (type 0x0033), and
+/// `pubOut` receives the server's raw public key bytes for the ECDHE exchange.
+/// `groupOut` is pre-zeroed, so a `{0, 0}` group after the call means no key_share
+/// was present. The parser skips the fixed prefix and the variable session-id and
+/// compression fields to reach the extensions, then walks them. It does no bounds
+/// checking, so `sh` must be a validated ServerHello and `pubOut` must be large
+/// enough for the key it copies. Related extension probes: [`serverAcceptedPsk`].
 pub fn parseServerHello(sh: ptr, shLen: int, pubOut: ptr, groupOut: ptr): int {
     bytes.write_byte(groupOut, 0, 0); bytes.write_byte(groupOut, 1, 0);
     let p = 4 + 2 + 32;

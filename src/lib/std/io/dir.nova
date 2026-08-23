@@ -1,14 +1,34 @@
 
+//! Directory access: opening a directory for iteration, listing entries,
+//! creating/removing/renaming directories, and querying or changing the
+//! current working directory.
+//!
+//! This wraps the platform `opendir`/`readdir`/`mkdir` family exposed by
+//! `os.sys` behind a small, allocator-aware `Dir` handle, matching the shape
+//! of file access provided elsewhere in `std.io`. Names returned by `read`
+//! and `entries` are freshly allocated Nova strings copied out of the raw
+//! `dirent` buffer, so callers own them and do not need to manage the
+//! underlying OS handle directly.
+
 import bytes;
 import mem.allocator;
 import collections.list;
 import os.sys;
 
+/// An open handle onto a directory, used to iterate its entries one at a time.
 pub struct Dir {
+    /// Raw OS directory stream handle (as returned by `opendir`), or `0` once closed.
     pub handle: ptr,
+    /// The path this handle was opened with.
     pub path: string,
+    /// Allocator used for the `Dir` value itself and for strings it returns.
     pub allocator: allocator.Allocator,
 
+    /// Opens `path` for iteration and returns a new `Dir` handle.
+    ///
+    /// Does not check whether the open succeeded: if `opendir` fails, `handle`
+    /// is left however `os.sys.opendir` reports failure, and subsequent
+    /// `read` calls will see it as closed.
     pub fn open(path: string): Dir {
         let d = bytes.new_with_allocator<Dir>(allocator.globalAllocator());
         d.allocator = allocator.globalAllocator();
@@ -19,6 +39,12 @@ pub struct Dir {
         return d;
     }
 
+    /// Reads the next entry's name from the directory stream.
+    ///
+    /// Returns `undefined` once the handle is closed (`handle == 0`) or once
+    /// `readdir` reports no more entries. Includes `.` and `..` like the
+    /// underlying OS call; callers that want a filtered listing should skip
+    /// them explicitly.
     pub fn read(self: Dir): string | undefined {
         if (self.handle == 0) {
             return undefined;
@@ -43,6 +69,7 @@ pub struct Dir {
         return buf as string;
     }
 
+    /// Reads all remaining entries into a `List<string>`, exhausting the stream.
     pub fn entries(self: Dir): List<string> {
         let result = List<string>();
         while (true) {
@@ -55,6 +82,8 @@ pub struct Dir {
         return result;
     }
 
+    /// Closes the directory stream. Safe to call more than once; a second
+    /// call is a no-op since `handle` is reset to `0` after closing.
     pub fn close(self: Dir): void {
         if (self.handle != 0) {
             sys.closedir(self.handle);
@@ -62,6 +91,8 @@ pub struct Dir {
         self.handle = 0;
     }
 
+    /// Creates a directory at `path` with the given `mode` (permission bits).
+    /// Returns the underlying `mkdir` result: `0` on success, non-zero on failure.
     pub fn create(path: string, mode: int): int {
         let cp = sys.cstr(path);
         let r = sys.mkdir(cp, mode);
@@ -69,6 +100,8 @@ pub struct Dir {
         return r;
     }
 
+    /// Removes the (empty) directory at `path`. Returns the underlying
+    /// `rmdir` result: `0` on success, non-zero on failure.
     pub fn remove(path: string): int {
         let cp = sys.cstr(path);
         let r = sys.rmdir(cp);
@@ -76,6 +109,8 @@ pub struct Dir {
         return r;
     }
 
+    /// Renames or moves `oldPath` to `newPath`. Returns the underlying
+    /// `rename` result: `0` on success, non-zero on failure.
     pub fn rename(oldPath: string, newPath: string): int {
         let a = sys.cstr(oldPath);
         let b = sys.cstr(newPath);
@@ -85,14 +120,19 @@ pub struct Dir {
         return r;
     }
 
+    /// Reports whether `path` exists and is a directory.
     pub fn exists(path: string): bool {
         return sys.pathIsDir(path);
     }
 
+    /// Reports whether `path` is a directory. Identical to `exists`; kept as
+    /// a separate name for callers that want the intent to read clearly.
     pub fn isDir(path: string): bool {
         return sys.pathIsDir(path);
     }
 
+    /// Returns the current working directory as an absolute path.
+    /// Returns an empty string if `getcwd` fails.
     pub fn getCwd(): string {
         let buf = bytes.alloc(4096);
         let r = sys.getcwd(buf, 4096);
@@ -116,6 +156,8 @@ pub struct Dir {
         return out as string;
     }
 
+    /// Changes the process's current working directory to `path`. Returns
+    /// the underlying `chdir` result: `0` on success, non-zero on failure.
     pub fn chdir(path: string): int {
         let cp = sys.cstr(path);
         let r = sys.chdir(cp);
@@ -123,6 +165,10 @@ pub struct Dir {
         return r;
     }
 
+    /// Returns a directory suitable for temporary files: the first non-empty
+    /// of `TMPDIR`, `TEMP`, `TMP`, falling back to `/tmp` if none are set.
+    /// Note this fallback is POSIX-specific; on Windows one of the env vars
+    /// is expected to be set.
     pub fn tempDir(): string {
         let t = envDir("TMPDIR");
         if (t.length > 0) { return t; }
@@ -134,6 +180,8 @@ pub struct Dir {
     }
 }
 
+/// Reads env var `name` and strips any trailing path separator (`/` or `\`);
+/// returns "" if unset.
 fn envDir(name: string): string {
     let cp = sys.cstr(name);
     let v = sys.getenv(cp);

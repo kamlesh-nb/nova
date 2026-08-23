@@ -1,12 +1,33 @@
 
+//! Redaction of sensitive HTTP header values for logging and diagnostics.
+//!
+//! This file provides a small allowlist-style check for header names that
+//! commonly carry secrets (auth tokens, session cookies, API keys), plus a
+//! helper that masks the value before it is written to a log line, trace, or
+//! error message. It is intended to be called from the web framework's
+//! request/response logging path so that credentials never end up in plain
+//! text output.
+
 import string;
 import assert;
 
+/// Reports whether a header name is considered sensitive and should have its
+/// value masked before logging. The comparison is case-insensitive.
+///
+/// Currently matches `authorization`, `cookie`, `set-cookie`, and
+/// `x-api-key`.
 pub fn isSensitiveHeader(name: string): bool {
     let lower = string.toLowerCase(name);
     return lower == "authorization" || lower == "cookie" || lower == "set-cookie" || lower == "x-api-key";
 }
 
+/// Returns a safe-to-log form of a header value: unchanged if `name` is not
+/// sensitive, otherwise masked.
+///
+/// For `Authorization` values that use the `Bearer ` scheme, the prefix is
+/// kept and the token is replaced with `Bearer ***`, so the auth scheme
+/// remains visible in logs without leaking the token. Every other sensitive
+/// header is replaced wholesale with `***`.
 pub fn redactHeaderValue(name: string, value: string): string {
     if (isSensitiveHeader(name)) {
         let lower = string.toLowerCase(name);

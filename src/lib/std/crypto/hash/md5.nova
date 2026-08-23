@@ -1,5 +1,56 @@
+//! MD5 message digest (RFC 1321), implemented from scratch in Nova.
+//!
+//! This file computes the 128-bit MD5 hash of an arbitrary byte run. It exists
+//! so the standard library has a self-contained MD5 with no dependency on a
+//! foreign crypto library: the whole algorithm is pure Nova over the low-level
+//! `bytes` module (raw allocation and byte-level reads and writes), so it works
+//! identically on every target including WASM.
+//!
+//! WHAT MD5 IS FOR HERE. MD5 is cryptographically BROKEN: it is not collision
+//! resistant and must never be used for signatures, password hashing, or any
+//! security decision. It survives only as a fast, widely interoperable checksum
+//! and content-addressing digest, for example ETags, cache keys, legacy wire
+//! protocols (SASL, some database handshakes), and file fingerprinting where an
+//! attacker is not in the picture. For anything that must resist an adversary,
+//! reach for the SHA-2 family instead.
+//!
+//! HOW IT WORKS. The core is the classic Merkle-Damgard construction. The input
+//! is padded to a multiple of 64 bytes (a single `0x80` byte, then zero bytes,
+//! then the original bit length as a 64-bit little-endian trailer), then each
+//! 512-bit block runs 64 rounds that mix four 32-bit state words A, B, C, D
+//! through the per-round nonlinear function, a rotate, and an addition. The
+//! final state, emitted little-endian, is the digest.
+//!
+//! DESIGN NOTES AND INVARIANTS.
+//!   - Nova's `int` is 32-bit and its arithmetic can be signed, so every 32-bit
+//!     modular operation is done in `ulong` (64-bit) and masked back down to 32
+//!     bits with `m32` / the `0xffffffff` mask. This keeps the wrap-around
+//!     semantics MD5 requires without relying on `int` overflow behaviour.
+//!   - MD5 is little-endian throughout: message words are read little-endian
+//!     from the padded buffer and the digest words are written little-endian by
+//!     [`writeLe`]. This is the opposite of SHA-2's big-endian convention, and
+//!     is the single easiest thing to get wrong when porting.
+//!   - The round constants K[0..63] and the per-round rotate amounts are fixed
+//!     by the specification. They live as the packed hex table [`KHEX`] and the
+//!     switch ladder [`shiftAt`] respectively, rather than as a literal array,
+//!     because the language has no concise array-literal of 64 constants here.
+//!   - Buffers come from `bytes.alloc` and MUST be released with `bytes.free`.
+//!     [`hashInto`] frees its scratch pad; [`md5`] frees its raw-digest scratch
+//!     and hands the caller an owned hex `string`.
+//!
+//! ENTRY POINTS. [`md5`] is the convenience form: `string` in, lowercase hex
+//! `string` out. [`hashInto`] is the raw form for callers that already have a
+//! `ptr`/`len` and want the 16 raw digest bytes written into a buffer they own.
+
 import bytes;
 
+/// Per-round left-rotate amount for MD5 round `i` (0-based, 0..63).
+///
+/// MD5's four 16-round groups each cycle through a fixed four-value rotate
+/// schedule keyed by `i & 3`: {7,12,17,22} for rounds 0..15, {5,9,14,20} for
+/// 16..31, {4,11,16,23} for 32..47, and {6,10,15,21} for 48..63. These are the
+/// `s` values fixed by RFC 1321; getting one wrong silently produces a wrong
+/// but plausible-looking digest. Used by [`hashInto`] to drive [`rotl32`].
 fn shiftAt(i: int): int {
     if (i < 16) {
         let t = i & 3;
@@ -17,12 +68,33 @@ fn shiftAt(i: int): int {
     if (t == 0) { return 6; } if (t == 1) { return 10; } if (t == 2) { return 15; } return 21;
 }
 
+/// The 64 MD5 round constants K[0..63], packed as one hex string.
+///
+/// Each K[i] is the 32-bit value `floor(2^32 * abs(sin(i + 1)))` from RFC 1321,
+/// stored here as its 8 lowercase hex digits, big-endian and concatenated, so
+/// K[i] occupies bytes `[i*8, i*8+8)` of this string. It is decoded on demand by
+/// [`kAt`] rather than pre-expanded into an array, which keeps the table compact
+/// and avoids needing a 64-element array literal. This is data, not a hash of
+/// anything: the ORDER matters and must not be reformatted.
 const KHEX: string = "d76aa478e8c7b756242070dbc1bdceeef57c0faf4787c62aa8304613fd469501698098d88b44f7afffff5bb1895cd7be6b901122fd987193a679438e49b40821f61e2562c040b340265e5a51e9b6c7aad62f105d02441453d8a1e681e7d3fbc821e1cde6c33707d6f4d50d87455a14eda9e3e905fcefa3f8676f02d98d2a4c8afffa39428771f6816d9d6122fde5380ca4beea444bdecfa9f6bb4b60bebfbc70289b7ec6eaa127fad4ef308504881d05d9d4d039e6db99e51fa27cf8c4ac5665f4292244432aff97ab9423a7fc93a039655b59c38f0ccc92ffeff47d85845dd16fa87e4ffe2ce6e0a30143144e0811a1f7537e82bd3af2352ad7d2bbeb86d391";
 
+/// Decodes one lowercase-hex ASCII character into its 0..15 nibble value.
+///
+/// `'0'..'9'` (ASCII 48..57) map to 0..9 by subtracting 48; `'a'..'f'` map to
+/// 10..15 by subtracting 87 (since `'a'` is 97 and 97 - 87 == 10). No validation
+/// is done: the caller (only [`kAt`], reading [`KHEX`]) guarantees the input is
+/// a lowercase hex digit, so uppercase or out-of-range bytes yield nonsense.
 fn hexNib(c: int): int {
     if (c >= 48 && c <= 57) { return c - 48; }
     return c - 87;
 }
+/// Returns the i-th MD5 round constant K[i] as a 32-bit value in a `ulong`.
+///
+/// Reads the 8 hex digits at offset `i*8` in [`KHEX`] and folds them
+/// most-significant-nibble-first into a value, so the stored big-endian hex
+/// becomes the numeric constant. Called once per round by [`hashInto`]; kept as
+/// a lookup so the constants stay in one authoritative place. See [`KHEX`] for
+/// the storage layout and [`hexNib`] for the per-digit decode.
 fn kAt(i: int): ulong {
     let o = i * 8;
     let v: ulong = 0;
@@ -31,13 +103,46 @@ fn kAt(i: int): ulong {
     return v;
 }
 
+/// Rotates the low 32 bits of `x` left by `s` places, discarding the high bits.
+///
+/// `x` is first masked to 32 bits, then the standard left-rotate is done as a
+/// left shift OR-ed with a right shift by `32 - s`, and the result is masked
+/// back to 32 bits. This is done in `ulong` so the shifts do not lose bits;
+/// doing it in `int` would be wrong because Nova's `int` is 32-bit and signed.
+/// Valid for `1 <= s <= 31` (the only values [`shiftAt`] returns); `s == 0`
+/// would shift by 32 and is not exercised.
 fn rotl32(x: ulong, s: int): ulong {
     let m: ulong = 0xffffffff;
     let xm = x & m;
     return ((xm << (s as ulong)) | (xm >> ((32 - s) as ulong))) & m;
 }
+/// Truncates a `ulong` to its low 32 bits, i.e. modular reduction to 2^32.
+///
+/// The whole algorithm keeps 32-bit MD5 state in 64-bit `ulong`s and masks after
+/// every add and every nonlinear step, so this is the workhorse that enforces
+/// the wrap-around MD5 defines. Named `m32` for "mask to 32".
 fn m32(x: ulong): ulong { return x & 0xffffffff; }
 
+/// Computes the raw 16-byte MD5 digest of `len` bytes at `data`, into `out`.
+///
+/// This is the low-level entry point. `data` must point at `len` readable bytes
+/// and `out` must point at a buffer of AT LEAST 16 writable bytes; the digest is
+/// written there little-endian as A, B, C, D. Neither pointer is owned by this
+/// function and neither is freed here. `len == 0` is valid and yields the MD5 of
+/// the empty message.
+///
+/// Internally it allocates one scratch pad sized to the padded message
+/// (`((len + 8) / 64 + 1) * 64` bytes: room for the input, the mandatory `0x80`
+/// terminator, and the 8-byte length trailer, rounded up to a whole number of
+/// 512-bit blocks), fills it with the RFC 1321 padding, then runs the 64-round
+/// compression over every 64-byte block. The scratch pad is released with
+/// `bytes.free` before returning, so this leaks nothing. The message words `w`
+/// are read little-endian from the pad, and the bit length is `len * 8` computed
+/// in `ulong` to avoid 32-bit overflow on inputs at or above 512 MB.
+///
+/// See [`md5`] for the hex-string convenience wrapper, [`shiftAt`] and [`kAt`]
+/// for the per-round schedule and constants, and [`writeLe`] for the output
+/// encoding.
 pub fn hashInto(data: ptr, len: int, out: ptr): void {
     let m: ulong = 0xffffffff;
     let a0: ulong = 0x67452301;
@@ -96,6 +201,11 @@ pub fn hashInto(data: ptr, len: int, out: ptr): void {
     writeLe(out, 0, a0); writeLe(out, 4, b0); writeLe(out, 8, c0); writeLe(out, 12, d0);
 }
 
+/// Writes the low 32 bits of `v` into `out` at offset `o`, little-endian.
+///
+/// Emits four bytes least-significant-first, which is the byte order MD5 uses
+/// for each state word in the final digest. Used by [`hashInto`] to serialise
+/// the four state words A, B, C, D at offsets 0, 4, 8, 12.
 fn writeLe(out: ptr, o: int, v: ulong): void {
     bytes.write_byte(out, o, (v & 0xff) as int);
     bytes.write_byte(out, o + 1, ((v >> 8) & 0xff) as int);
@@ -103,8 +213,24 @@ fn writeLe(out: ptr, o: int, v: ulong): void {
     bytes.write_byte(out, o + 3, ((v >> 24) & 0xff) as int);
 }
 
+/// Lowercase hex alphabet, indexed by a 0..15 nibble to render digest bytes.
+///
+/// Used by [`md5`] to turn each raw digest byte into two hex characters. Keeping
+/// it as a string means the render is a plain byte lookup with no arithmetic.
 const HEXD: string = "0123456789abcdef";
 
+/// Computes the MD5 of `input` and returns it as a 32-character lowercase hex
+/// `string`.
+///
+/// This is the convenience wrapper most callers want: `string` in, hex `string`
+/// out. It hashes the raw bytes of `input` (via [`hashInto`]) into a 16-byte
+/// scratch buffer, then expands each byte into two lowercase hex digits using
+/// [`HEXD`], yielding 32 characters. Both intermediate buffers come from
+/// `bytes.alloc`; the raw-digest buffer is freed here, and the hex buffer is
+/// handed back as an owned Nova `string` (so the caller need not free it).
+///
+/// Remember MD5 is not secure: use this for checksums and content addressing,
+/// not for anything an attacker could exploit.
 pub fn md5(input: string): string {
     let raw = bytes.alloc(16);
     hashInto(input as ptr, input.length, raw);

@@ -1,3 +1,16 @@
+//! Async TLS 1.3 record layer, layered over the reactor and the pure-Nova
+//! `crypto.tls.13` handshake state machines (`tlsClient`, `tlsServer`).
+//!
+//! This module owns the wire-level plumbing that the handshake state machines
+//! do not: buffered, non-blocking record reads off an `eventedio.ReactorStream`
+//! (`TlsIO`), assembling and sending the TLS record framing for the ClientHello,
+//! ServerHello, ChangeCipherSpec and Finished flights, and the steady-state
+//! application-data `read`/`write` path that encrypts/decrypts through the
+//! negotiated session. `crypto.tls.13.tlsClient`/`tlsServer` handle the
+//! cryptographic handshake logic; this file drives them over a real socket
+//! inside Nova's `async`/`await` coroutine model, so a full handshake or
+//! read/write suspends the coroutine instead of blocking the reactor thread.
+
 import bytes;
 import net.eventedio;
 import crypto.tls.13.tlsClient;
@@ -5,17 +18,27 @@ import crypto.tls.13.tlsServer;
 import crypto.ecc.p256;
 import crypto.random;
 
+// Adds a byte offset to a raw pointer via a 64-bit intermediate, so the
+// address cannot truncate on buffers above 4 GB.
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
 
+// Buffered, non-blocking TLS record I/O state for one connection: a fixed
+// read buffer (`rbuf`) with a [rlo, rhi) window of unconsumed bytes, refilled
+// from the reactor as needed.
 struct TlsIO {
     pub fd: int, pub kq: int,
     pub rbuf: ptr, pub rcap: int, pub rlo: int, pub rhi: int,
 }
 
+/// Creates a `TlsIO` for file descriptor `fd` registered with reactor `kq`,
+/// allocating a 33792-byte (33 KB) read buffer sized to hold one full TLS record.
 pub fn newIO(fd: int, kq: int): TlsIO {
     return TlsIO { fd: fd, kq: kq, rbuf: bytes.alloc(33792), rcap: 33792, rlo: 0, rhi: 0 };
 }
 
+// Reads more bytes from the socket into `rbuf`, compacting the unconsumed
+// window to the front first if the buffer has run out of trailing space.
+// Returns the number of bytes read, or -1 on a closed/errored connection.
 async fn fill(self: TlsIO): int {
     if (self.rlo > 0 && self.rhi == self.rcap) {
         let m = self.rhi - self.rlo;
@@ -31,6 +54,8 @@ async fn fill(self: TlsIO): int {
     return n;
 }
 
+// Fills the read buffer via repeated `fill` calls until at least `need` bytes
+// are available in the unconsumed window. Returns -1 if the connection closes first.
 async fn ensure(self: TlsIO, need: int): int {
     while (self.rhi - self.rlo < need) {
         if (await self.fill() < 0) { return -1; }
@@ -38,6 +63,9 @@ async fn ensure(self: TlsIO, need: int): int {
     return 0;
 }
 
+// Reads one full TLS record (5-byte header plus payload) into `out`, waiting
+// on the reactor as needed. Returns the total record length (header included),
+// or -1 on a connection error.
 async fn readRecord(self: TlsIO, out: ptr): int {
     if (await self.ensure(5) < 0) { return -1; }
     let len = (bytes.read_byte(self.rbuf, self.rlo + 3) << 8) | bytes.read_byte(self.rbuf, self.rlo + 4);
@@ -48,17 +76,28 @@ async fn readRecord(self: TlsIO, out: ptr): int {
     return 5 + len;
 }
 
+// Sends all `n` bytes of `buf` on the connection's stream, suspending until
+// the reactor confirms delivery. Returns the byte count sent, or a negative value on failure.
 async fn sendAll(self: TlsIO, buf: ptr, n: int): int {
     let rs = eventedio.ReactorStream(self.fd, self.kq);
     return await rs.sendBuf(buf as long, n);
 }
 
+// Fills `buf` with `n` cryptographically random bytes, masked to a byte range.
 fn fillRandom(buf: ptr, n: int): void {
     let s = random.randomBytes(n);
     let i = 0;
     while (i < n) { bytes.write_byte(buf, i, s[i] & 0xff); i = i + 1; }
 }
 
+/// Runs the client side of a full TLS 1.3 handshake over `io`: builds and
+/// sends the ClientHello (with fresh random and session-id bytes and the
+/// ephemeral P-256 key share), sends a compatibility ChangeCipherSpec, reads
+/// and processes the ServerHello, feeds subsequent handshake records to `cl`
+/// until it signals completion, then sends the client Finished record.
+///
+/// Rejects a HelloRetryRequest or a downgrade sentinel outright. Returns 0 on
+/// a completed handshake, -1 on any I/O error or protocol rejection.
 pub async fn handshake(io: TlsIO, cl: tlsClient.TlsClient, ephPub: ptr, host: string): int {
     let rnd = bytes.alloc(32); fillRandom(rnd, 32);
     let sid = bytes.alloc(32); fillRandom(sid, 32);
@@ -103,6 +142,15 @@ pub async fn handshake(io: TlsIO, cl: tlsClient.TlsClient, ephPub: ptr, host: st
     return 0;
 }
 
+/// Runs the server side of a full TLS 1.3 handshake over `io`: reads the
+/// ClientHello, builds and sends the ServerHello using `serverRandom`, sends
+/// a compatibility ChangeCipherSpec followed by the rest of the server flight
+/// (certificate, verify, Finished, etc. via `srv.buildFlight`), then reads
+/// and skips any client ChangeCipherSpec records before verifying the client
+/// Finished.
+///
+/// Returns 0 on a completed handshake, -1 on any I/O error or a Finished
+/// verification failure.
 pub async fn serveHandshake(io: TlsIO, srv: tlsServer.TlsServer, serverRandom: ptr): int {
     let buf = bytes.alloc(33792);
     let n = await io.readRecord(buf);
@@ -133,6 +181,9 @@ pub async fn serveHandshake(io: TlsIO, srv: tlsServer.TlsServer, serverRandom: p
     return 0;
 }
 
+/// Encrypts `n` bytes of `data` as TLS 1.3 application data through `srv`'s
+/// session keys and sends the resulting record on `io`. Returns the number of
+/// bytes sent, or a negative value on failure.
 pub async fn serverWrite(io: TlsIO, srv: tlsServer.TlsServer, data: ptr, n: int): int {
     let out = bytes.alloc(n + 64);
     let m = srv.encryptApp(data, n, out);
@@ -141,6 +192,12 @@ pub async fn serverWrite(io: TlsIO, srv: tlsServer.TlsServer, data: ptr, n: int)
     return r;
 }
 
+/// Reads and decrypts the next application-data record from `io` into `out`
+/// using `srv`'s session keys, transparently looping past any non-application
+/// (e.g. post-handshake) records until real data arrives.
+///
+/// Returns the decrypted payload length (excluding the trailing TLS inner
+/// content-type byte), or -1 on a connection error.
 pub async fn serverRead(io: TlsIO, srv: tlsServer.TlsServer, out: ptr): int {
     let rec = bytes.alloc(33792);
     while (true) {
@@ -153,6 +210,9 @@ pub async fn serverRead(io: TlsIO, srv: tlsServer.TlsServer, out: ptr): int {
     return -1;
 }
 
+/// Encrypts `n` bytes of `data` as TLS 1.3 application data through `cl`'s
+/// session keys and sends the resulting record on `io`. Returns the number of
+/// bytes sent, or a negative value on failure.
 pub async fn write(io: TlsIO, cl: tlsClient.TlsClient, data: ptr, n: int): int {
     let out = bytes.alloc(n + 64);
     let m = cl.encryptApp(data, n, out);
@@ -161,6 +221,12 @@ pub async fn write(io: TlsIO, cl: tlsClient.TlsClient, data: ptr, n: int): int {
     return r;
 }
 
+/// Reads and decrypts the next application-data record from `io` into `out`
+/// using `cl`'s session keys, transparently looping past any non-application
+/// (e.g. post-handshake) records until real data arrives.
+///
+/// Returns the decrypted payload length (excluding the trailing TLS inner
+/// content-type byte), or -1 on a connection error.
 pub async fn read(io: TlsIO, cl: tlsClient.TlsClient, out: ptr): int {
     let rec = bytes.alloc(33792);
     while (true) {

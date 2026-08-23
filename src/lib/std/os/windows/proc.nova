@@ -1,36 +1,83 @@
+//! Windows process creation and control, over raw Win32 FFI.
+//!
+//! This module gives `std/process_windows` the low-level building blocks it
+//! needs to spawn and manage child processes on Windows: the `CreateProcessW`
+//! family, pipe creation for redirected stdio, and wait/exit-code/terminate
+//! calls. It mirrors the role `os/sys` plays for POSIX `fork`/`exec`, but the
+//! Win32 model is structurally different (no fork, a single `CreateProcessW`
+//! call that takes a `STARTUPINFO` and returns a `PROCESS_INFORMATION`), so
+//! this file is a genuine reimplementation, not a thin alias.
+//!
+//! The constants below describe fixed byte layouts and field offsets for the
+//! `SECURITY_ATTRIBUTES`, `STARTUPINFO`, and `PROCESS_INFORMATION` structs, so
+//! that callers can build and read these structs directly in raw byte buffers
+//! (via `bytes`) without a native struct binding.
 
 import bytes;
 
+/// Flag value for `SetHandleInformation`: marks a handle as inheritable by a child process.
 pub const HANDLE_FLAG_INHERIT: int = 1;
+/// `STARTUPINFO.dwFlags` bit that tells `CreateProcessW` to honour the
+/// `hStdInput`/`hStdOutput`/`hStdError` fields for redirected stdio.
 pub const STARTF_USESTDHANDLES: int = 256;
+/// Wait indefinitely: pass as `timeoutMs` to `WaitForSingleObject`.
 pub const INFINITE: int = -1;
+/// `WaitForSingleObject` return value meaning the handle became signalled (the process exited).
 pub const WAIT_OBJECT_0: int = 0;
+/// `WaitForSingleObject` return value meaning the wait timed out before the handle signalled.
 pub const WAIT_TIMEOUT: int = 258;
+/// `GetExitCodeProcess` value meaning the process has not exited yet.
 pub const STILL_ACTIVE: int = 259;
+/// `CreateProcessW` flag that suppresses the console window for the child process.
 pub const CREATE_NO_WINDOW: int = 134217728;
 
+/// Byte size of a `SECURITY_ATTRIBUTES` struct on 64-bit Windows.
 pub const SECURITY_ATTRIBUTES_SIZE: int = 24;
+/// Byte offset of the `nLength` field within `SECURITY_ATTRIBUTES`.
 pub const SA_LENGTH_OFF: int = 0;
+/// Byte offset of the `bInheritHandle` field within `SECURITY_ATTRIBUTES`.
 pub const SA_INHERIT_OFF: int = 16;
 
+/// Byte size of a `STARTUPINFOW` struct on 64-bit Windows.
 pub const STARTUPINFO_SIZE: int = 104;
+/// Byte offset of the `cb` (struct size) field within `STARTUPINFOW`.
 pub const SI_CB_OFF: int = 0;
+/// Byte offset of the `dwFlags` field within `STARTUPINFOW`.
 pub const SI_FLAGS_OFF: int = 60;
+/// Byte offset of the `hStdInput` field within `STARTUPINFOW`.
 pub const SI_STDIN_OFF: int = 80;
+/// Byte offset of the `hStdOutput` field within `STARTUPINFOW`.
 pub const SI_STDOUT_OFF: int = 88;
+/// Byte offset of the `hStdError` field within `STARTUPINFOW`.
 pub const SI_STDERR_OFF: int = 96;
 
+/// Byte size of a `PROCESS_INFORMATION` struct on 64-bit Windows.
 pub const PROCESS_INFORMATION_SIZE: int = 24;
+/// Byte offset of the `hProcess` handle field within `PROCESS_INFORMATION`.
 pub const PI_PROCESS_OFF: int = 0;
+/// Byte offset of the `hThread` handle field within `PROCESS_INFORMATION`.
 pub const PI_THREAD_OFF: int = 8;
+/// Byte offset of the `dwProcessId` field within `PROCESS_INFORMATION`.
 pub const PI_PID_OFF: int = 16;
 
+/// Creates an anonymous pipe; writes the read and write handles into `hRead`/`hWrite`.
+/// `sa` points at a `SECURITY_ATTRIBUTES` buffer controlling handle inheritance. Returns nonzero on success.
 pub extern("c") fn CreatePipe(hRead: ptr, hWrite: ptr, sa: ptr, size: int): int;
+/// Sets inheritance/other flags on an existing handle, masked by `mask`. Returns nonzero on success.
 pub extern("c") fn SetHandleInformation(h: long, mask: int, flags: int): int;
 
+/// Creates a new process and its primary thread from `appName`/`cmdLine`, filling `procInfo`
+/// (a `PROCESS_INFORMATION` buffer) with the resulting process and thread handles and PID.
+/// `startupInfo` (a `STARTUPINFOW` buffer) controls stdio redirection and window visibility.
+/// Returns nonzero on success; the caller must close the returned handles when done.
 pub extern("c") fn CreateProcessW(appName: ptr, cmdLine: ptr, procAttrs: ptr, threadAttrs: ptr,
                                   inheritHandles: int, flags: int, env: ptr, cwd: ptr,
                                   startupInfo: ptr, procInfo: ptr): int;
+/// Blocks until `h` (a process or thread handle) signals or `timeoutMs` elapses.
+/// Returns `WAIT_OBJECT_0`, `WAIT_TIMEOUT`, or an error code.
 pub extern("c") fn WaitForSingleObject(h: long, timeoutMs: int): int;
+/// Writes the exit code of process handle `h` into the `int` pointed to by `exitCode`,
+/// or `STILL_ACTIVE` if the process has not exited. Returns nonzero on success.
 pub extern("c") fn GetExitCodeProcess(h: long, exitCode: ptr): int;
+/// Forcibly terminates process handle `h`, setting its exit code to `exitCode`. Returns nonzero on success.
 pub extern("c") fn TerminateProcess(h: long, exitCode: int): int;

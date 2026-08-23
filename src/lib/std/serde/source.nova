@@ -1,3 +1,13 @@
+//! A uniform, format-agnostic way to read typed values out of request-shaped data.
+//!
+//! `ValueSource` gives callers (route handlers, ORM binders, config loaders) one interface
+//! for pulling strings, numbers, booleans, decimals, and nested/array values out of a
+//! document, regardless of whether that document arrived as JSON, YAML, or route/query
+//! parameters. `JsonSource` and `YamlSource` wrap the respective `serde.json`/`serde.yaml`
+//! trees; `ParamSource` wraps a flat `Map<string, string>` (route params, query strings);
+//! `CompositeSource` layers a `ParamSource` in front of a body `ValueSource` so route
+//! parameters take precedence over the request body for the same key. `ValueSink` is the
+//! mirror-image write side for building an output document field by field.
 
 import serde.json;
 import serde.yaml;
@@ -6,31 +16,59 @@ import str;
 import list;
 import map;
 
+/// Read-only, format-agnostic access to a document's fields by key, including nested
+/// objects and arrays.
+///
+/// Every getter is total: a missing key or a value of the wrong shape returns a zero
+/// value for the type (empty string, `0`, `false`, `0.0`, `0m`) rather than failing, so
+/// callers do not need to check `has` before every read. Use `has` only when presence
+/// itself is meaningful.
 pub trait ValueSource {
+    /// Field value as a `string`, or `""` if the key is absent or not string-like.
     fn getString(self: ValueSource, key: string): string;
+    /// Field value as a borrowed `Str` view; see `getString` for the fallback rule.
     fn getStr(self: ValueSource, key: string): str.Str;
+    /// Field value as a `long`, or `0` if the key is absent or not numeric.
     fn getInt(self: ValueSource, key: string): long;
+    /// Field value as a `bool`, or `false` if the key is absent or not boolean.
     fn getBool(self: ValueSource, key: string): bool;
+    /// Field value as a `double`, or `0.0` if the key is absent or not numeric.
     fn getFloat(self: ValueSource, key: string): double;
+    /// Field value as a `decimal`, or `0m` if the key is absent or not numeric.
     fn getDecimal(self: ValueSource, key: string): decimal;
+    /// Nested object at `key` as another `ValueSource` of the same underlying format.
     fn getChild(self: ValueSource, key: string): ValueSource;
+    /// Whether `key` is present in the document (format-specific "present" rule).
     fn has(self: ValueSource, key: string): bool;
+    /// Number of elements in the array at `key`, or `0` if absent or not an array.
     fn arrayLen(self: ValueSource, key: string): int;
+    /// String value at index `i` of the array at `key`.
     fn itemString(self: ValueSource, key: string, i: int): string;
+    /// Integer value at index `i` of the array at `key`.
     fn itemInt(self: ValueSource, key: string, i: int): long;
+    /// Decimal value at index `i` of the array at `key`.
     fn itemDecimal(self: ValueSource, key: string, i: int): decimal;
+    /// Nested object at index `i` of the array at `key`, as another `ValueSource`.
     fn itemChild(self: ValueSource, key: string, i: int): ValueSource;
 }
 
+/// Write-only, format-agnostic interface for building an output document field by field.
 pub trait ValueSink {
+    /// Sets a string field.
     fn putString(self: ValueSink, key: string, val: string): void;
+    /// Sets an integer field.
     fn putInt(self: ValueSink, key: string, val: long): void;
+    /// Sets a boolean field.
     fn putBool(self: ValueSink, key: string, val: bool): void;
+    /// Sets a floating-point field.
     fn putFloat(self: ValueSink, key: string, val: double): void;
+    /// Sets a decimal field.
     fn putDecimal(self: ValueSink, key: string, val: decimal): void;
 }
 
+/// `ValueSource` backed by a parsed `serde.json.JsonValue` tree.
 pub struct JsonSource impl ValueSource {
+    /// The wrapped JSON node this source reads from.
     pub node: json.JsonValue,
 
     init(node: json.JsonValue) { self.node = node; }
@@ -76,11 +114,14 @@ pub struct JsonSource impl ValueSource {
     }
 }
 
+/// Parses `body` as JSON and wraps the result in a `JsonSource`.
 pub fn fromJson(body: string): JsonSource {
     return JsonSource(json.parse(body));
 }
 
+/// `ValueSource` backed by a parsed `serde.yaml.YamlValue` tree.
 pub struct YamlSource impl ValueSource {
+    /// The wrapped YAML node this source reads from.
     pub node: yaml.YamlValue,
 
     init(node: yaml.YamlValue) { self.node = node; }
@@ -153,11 +194,19 @@ pub struct YamlSource impl ValueSource {
     }
 }
 
+/// Parses `body` as YAML and wraps the result in a `YamlSource`.
 pub fn fromYaml(body: string): YamlSource {
     return YamlSource(yaml.parse(body));
 }
 
+/// `ValueSource` backed by a flat string-to-string map, typically route or query
+/// parameters.
+///
+/// There is no nested structure here: `getChild`/`itemChild` return an empty
+/// `ParamSource`, and `arrayLen`/`itemString`/`itemInt`/`itemDecimal` all report "no
+/// array" (`0` / `""`), since a flat param map has no array shape to expose.
 pub struct ParamSource impl ValueSource {
+    /// The underlying key-to-value map this source reads from.
     pub params: Map<string, string>,
 
     init(params: Map<string, string>) { self.params = params; }
@@ -197,8 +246,16 @@ pub struct ParamSource impl ValueSource {
     }
 }
 
+/// `ValueSource` that layers route/query parameters over a request body source.
+///
+/// Every getter checks `route` first and falls through to `body` only when `route` does
+/// not have the key, so a route parameter always shadows a body field of the same name.
+/// `getChild`, `arrayLen`, and the `item*` accessors delegate straight to `body`, since
+/// `route` (a `ParamSource`) has no nested or array structure to contribute.
 pub struct CompositeSource impl ValueSource {
+    /// Route or query parameters, consulted first for every key.
     pub route: ParamSource,
+    /// Fallback source, typically the parsed request body.
     pub body: ValueSource,
 
     init(route: ParamSource, body: ValueSource) {

@@ -1,3 +1,12 @@
+//! Per-client request rate limiting for the web framework.
+//!
+//! Implements a token bucket algorithm keyed by client IP address, exposed as
+//! a `RateLimitMiddleware` that can be dropped into the standard `Middleware`
+//! chain (see `web.middleware`). Tokens are tracked in fixed-point thousandths
+//! (1000 units per request) so fractional refill rates below one request per
+//! second stay exact under integer arithmetic. A request over the limit gets
+//! a 429 response with a `Retry-After` header rather than being silently
+//! dropped.
 
 import web.request;
 import web.response;
@@ -7,18 +16,35 @@ import map;
 import string;
 import datetime;
 
+/// Per-client token bucket state: how many request-tokens are available now,
+/// and how fast the bucket refills over time.
+///
+/// Tokens are stored in thousandths of a request (`tokens: 1000` means one
+/// full request is available), so `refillRate` can represent sub-request
+/// per-second rates without losing precision to integer division.
 pub struct TokenBucket {
+    /// Maximum number of tokens the bucket can hold, in thousandths of a request.
     pub capacity: int,
+    /// Tokens currently available, in thousandths of a request.
     pub tokens: int,
+    /// Tokens added per unit of elapsed time (same thousandths scale as `tokens`).
     pub refillRate: int,
+    /// Timestamp (from `datetime.now()`) of the last refill, used to compute elapsed time.
     pub lastRefill: int,
 }
 
+/// Returns the smaller of two ints.
 fn minInt(a: int, b: int): int {
     if (a < b) return a;
     return b;
 }
 
+/// Refills `bucket` for the elapsed time since `lastRefill`, then attempts to
+/// consume one request's worth of tokens (1000 units).
+///
+/// Mutates `bucket` in place (refill and, on success, the deduction) and
+/// returns whether the request is allowed. `bucket.tokens` is clamped to
+/// `bucket.capacity` so idle time cannot accumulate unbounded credit.
 pub fn tryConsume(bucket: TokenBucket, now: int): bool {
     let elapsed = now - bucket.lastRefill;
     bucket.tokens = minInt(bucket.capacity, bucket.tokens + elapsed * bucket.refillRate);
@@ -31,9 +57,14 @@ pub fn tryConsume(bucket: TokenBucket, now: int): bool {
     return false;
 }
 
+/// Tracks a separate `TokenBucket` per client IP address, allowing up to
+/// `requestsPerMinute` requests per client with smooth refill between them.
 pub struct RateLimiter {
+    /// Bucket capacity in thousandths of a request, equal to `requestsPerMinute * 1000`.
     pub capacity: int,
+    /// Refill rate in thousandths of a request per second.
     pub refillRate: int,
+    /// Per-client-IP token buckets, created lazily on first request.
     pub buckets: Map<string, TokenBucket>,
 
     init(requestsPerMinute: int) {
@@ -43,6 +74,11 @@ pub struct RateLimiter {
         self.buckets = Map<string, TokenBucket>(16, string.hash);
     }
 
+    /// Checks whether a request from `ip` is allowed under the current limit.
+    ///
+    /// The first request seen from a given IP always succeeds and seeds a new
+    /// bucket already debited by one request. Subsequent requests refill and
+    /// consume via `tryConsume`.
     pub fn isAllowed(self: RateLimiter, ip: string): bool {
         let now = datetime.now();
         let bucket = self.buckets.get(ip);
@@ -64,13 +100,18 @@ pub struct RateLimiter {
     }
 }
 
+/// Middleware that enforces a `RateLimiter` against the requesting client's IP.
 pub struct RateLimitMiddleware impl Middleware {
+    /// The shared limiter state consulted (and mutated) on every request.
     pub limiter: RateLimiter,
 
     init(limiter: RateLimiter) {
         self.limiter = limiter;
     }
 
+    /// Resolves the client IP from `X-Forwarded-For` (first entry) or
+    /// `X-Real-IP`, falling back to `127.0.0.1`, and stops the chain with a
+    /// 429 JSON error and a `Retry-After: 60` header if the limiter rejects it.
     pub fn execute(self: RateLimitMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
         let ip = req.headers.get("X-Forwarded-For") ?? req.headers.get("X-Real-IP") ?? "127.0.0.1";
 
@@ -89,6 +130,7 @@ pub struct RateLimitMiddleware impl Middleware {
         return MiddlewareAction.Next;
     }
 
+    /// Post-route hook required by `Middleware`; rate limiting has nothing to do here.
     pub fn after(self: RateLimitMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
     }
 }

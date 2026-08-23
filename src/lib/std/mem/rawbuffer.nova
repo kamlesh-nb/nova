@@ -1,6 +1,28 @@
+//! Untyped growable buffer that backs the owning collections (`list`, `map`, `set` and so on).
+//!
+//! `RawBuffer<T>` is a low-level, contiguous store of raw bytes interpreted as
+//! `T` elements via `mem.witness`: the witness knows how to store, load, move
+//! and drop a `T` at a given address without the buffer itself needing to know
+//! anything about `T`'s layout or ownership rules. This keeps the growth,
+//! shifting and reallocation logic in one place instead of duplicating it per
+//! collection.
+//!
+//! `RawBuffer` owns its backing allocation and the elements stored in it: it
+//! grows by doubling capacity, and every removal or overwrite path routes
+//! through `witness.dropElem` so owned `T`s (structs with retained fields,
+//! ARC-managed pointers) are released correctly. Callers that build a
+//! collection on top of `RawBuffer` are expected to call `delete()` when the
+//! collection itself is torn down, since nothing calls it automatically.
+
 import bytes;
 import mem.witness;
 
+/// Untyped, growable, contiguous buffer of `T` elements addressed by raw pointer arithmetic.
+///
+/// Capacity always starts at 1 or more (never zero) and doubles whenever an
+/// insert would exceed it. `RawBuffer` performs no bounds checking on `at`,
+/// `set`, `insertAt` or `removeAt` beyond what each method documents; callers
+/// (the typed collections) are expected to have already validated indices.
 pub class RawBuffer<T> {
     data: long,
     cap: int,
@@ -13,16 +35,26 @@ pub class RawBuffer<T> {
         self.len = 0;
     }
 
+    /// Number of elements the backing allocation can hold before the next growth.
     pub fn capacity(self: RawBuffer<T>): int { return self.cap; }
+    /// Number of elements currently in use (the logical length).
     pub fn count(self: RawBuffer<T>): int { return self.len; }
+    /// Raw address of the first element in the backing allocation.
     pub fn base(self: RawBuffer<T>): long { return self.data; }
 
+    /// Sets the logical length directly, without storing or dropping any elements.
+    ///
+    /// Intended for callers that write elements into the backing memory
+    /// out of band (for example via `base()`) and then need to make the
+    /// written range visible; it does not allocate or validate `n` against `cap`.
     pub fn fill(self: RawBuffer<T>, n: int): void { self.len = n; }
 
+    /// Computes the address of element `i` from the base pointer and element size.
     fn slot(self: RawBuffer<T>, i: int): long {
         return self.data + (i as long) * (witness.sizeOf<T>() as long);
     }
 
+    /// Appends `value` at the end, doubling capacity first if the buffer is full.
     pub fn push(self: RawBuffer<T>, value: T): void {
         if (self.len >= self.cap) {
             let nc = if (self.cap < 1) 1 else self.cap * 2;
@@ -32,14 +64,17 @@ pub class RawBuffer<T> {
         self.len = self.len + 1;
     }
 
+    /// Reads (and returns a copy of) the element at index `i`. No bounds check.
     pub fn at(self: RawBuffer<T>, i: int): T {
         return witness.load<T>(self.slot(i));
     }
 
+    /// Overwrites the element at index `i` with `value`, dropping the previous occupant first.
     pub fn set(self: RawBuffer<T>, i: int, value: T): void {
         witness.storeOver<T>(self.slot(i), value);
     }
 
+    /// Exchanges the elements at indices `i` and `j` via a temporary byte-copy buffer.
     pub fn swap(self: RawBuffer<T>, i: int, j: int): void {
         if (i == j) { return; }
         let sz = witness.sizeOf<T>() as long;
@@ -52,12 +87,20 @@ pub class RawBuffer<T> {
         bytes.free(tmp);
     }
 
+    /// Removes and returns the last element, or `undefined` if the buffer is empty.
+    ///
+    /// Moves the element out (does not copy-and-drop), so ownership transfers
+    /// to the caller.
     pub fn pop(self: RawBuffer<T>): T | undefined {
         if (self.len == 0) { return undefined; }
         self.len = self.len - 1;
         return witness.moveOut<T>(self.slot(self.len));
     }
 
+    /// Inserts `value` at index `i`, shifting later elements up by one slot.
+    ///
+    /// Silently does nothing if `i` is out of the `[0, len]` range. Grows
+    /// the backing allocation first if it is full.
     pub fn insertAt(self: RawBuffer<T>, i: int, value: T): void {
         if (i < 0 || i > self.len) { return; }
         if (self.len >= self.cap) {
@@ -73,6 +116,9 @@ pub class RawBuffer<T> {
         self.len = self.len + 1;
     }
 
+    /// Drops and removes the element at index `i`, shifting later elements down by one slot.
+    ///
+    /// Silently does nothing if `i` is out of the `[0, len)` range.
     pub fn removeAt(self: RawBuffer<T>, i: int): void {
         if (i < 0 || i >= self.len) { return; }
         witness.dropElem<T>(self.slot(i));
@@ -84,6 +130,7 @@ pub class RawBuffer<T> {
         self.len = self.len - 1;
     }
 
+    /// Drops every element and resets the logical length to zero, keeping the allocation.
     pub fn clear(self: RawBuffer<T>): void {
         let i = 0;
         while (i < self.len) {
@@ -93,6 +140,7 @@ pub class RawBuffer<T> {
         self.len = 0;
     }
 
+    /// Grows the backing allocation to exactly `nc` elements, copying live elements over.
     fn reserveExact(self: RawBuffer<T>, nc: int): void {
         if (nc <= self.cap) { return; }
         let w = witness.sizeOf<T>() as long;
@@ -105,6 +153,12 @@ pub class RawBuffer<T> {
         self.cap = nc;
     }
 
+    /// Drops every element and frees the backing allocation.
+    ///
+    /// Must be called explicitly by the owning collection's destructor;
+    /// `RawBuffer` has no destructor of its own and nothing calls this for
+    /// you. Safe to call more than once: it guards on `data != 0` and clears
+    /// `data` and `len` after freeing.
     pub fn delete(self: RawBuffer<T>): void {
         let i = 0;
         while (i < self.len) {

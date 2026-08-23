@@ -1,6 +1,49 @@
+//! PBKDF2 password-based key derivation (RFC 2898 / RFC 8018).
+//!
+//! PBKDF2 turns a low-entropy secret (a password) plus a salt into a
+//! fixed-length key, and it does so DELIBERATELY slowly. The slowness is the
+//! whole point: an attacker who steals the derived key must repeat the same
+//! `iters` rounds of HMAC for every password guess, so a large iteration count
+//! raises the cost of an offline brute-force attack by that same factor. This
+//! file provides two concrete instantiations, one over HMAC-SHA-1 and one over
+//! HMAC-SHA-256, which are the two PRFs the rest of the stack actually needs:
+//! SCRAM authentication in the database drivers uses HMAC-SHA-1 and
+//! HMAC-SHA-256, and password storage in applications wants SHA-256.
+//!
+//! The construction is the standard one. The derived key is produced one
+//! `hLen`-sized block at a time, where `hLen` is the output width of the
+//! underlying HMAC (20 bytes for SHA-1, 32 for SHA-256). Block number `idx`
+//! (1-based, big-endian, four bytes) is appended to the salt and run through
+//! HMAC to get `U_1`; each further iteration feeds the previous `U` back
+//! through HMAC to get the next `U`; and the block `T_idx` is the XOR of all
+//! `iters` of those `U` values. Blocks are concatenated and the result is
+//! truncated to `dkLen` bytes. This matches RFC 8018 section 5.2 exactly.
+//!
+//! These functions work in raw memory, not Nova strings: every buffer is a
+//! `ptr` the caller owns, and lengths are explicit. That keeps the derivation
+//! allocation-light on the hot path (three small scratch buffers, freed before
+//! return) and lets callers derive straight into a slice of a larger secret.
+//! The password, salt, and output buffers are read and written in place and are
+//! never retained past the call. See [`crypto.mac.hmac`] for the PRF and the
+//! SCRAM code in the database drivers for the main caller.
+
 import bytes;
 import crypto.mac.hmac;
 
+/// Derives `dkLen` bytes into `out` using PBKDF2 with HMAC-SHA-1 as the PRF.
+///
+/// The password (`pw`, `pwLen` bytes) and salt (`salt`, `saltLen` bytes) are
+/// read in place; the caller keeps both alive for the call. `iters` is the
+/// iteration count applied to every block, so higher values are proportionally
+/// slower and more resistant to offline guessing. `out` must have room for
+/// `dkLen` bytes, which need not be a multiple of the 20-byte HMAC-SHA-1 output:
+/// the final block is truncated to fit.
+///
+/// Three scratch buffers are allocated (the salt-plus-counter block, the
+/// running `U`, and the accumulating `T`) and freed before return, so this
+/// function leaks nothing. HMAC-SHA-1 is provided here for protocol
+/// compatibility, chiefly SCRAM-SHA-1: prefer [`pbkdf2Sha256`] for new password
+/// storage.
 pub fn pbkdf2Sha1(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, out: ptr, dkLen: int): void {
     let hLen = 20;
     let block = bytes.alloc(saltLen + 4);
@@ -37,6 +80,17 @@ pub fn pbkdf2Sha1(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, out:
     bytes.free(t);
 }
 
+/// Derives `dkLen` bytes into `out` using PBKDF2 with HMAC-SHA-256 as the PRF.
+///
+/// Identical in structure to [`pbkdf2Sha1`] but with the wider 32-byte
+/// HMAC-SHA-256 output, so fewer blocks are needed for a given `dkLen` and the
+/// per-guess cost to an attacker is higher. The password (`pw`, `pwLen`) and
+/// salt (`salt`, `saltLen`) are read in place, `iters` sets the work factor,
+/// and `out` must hold `dkLen` bytes (the last block is truncated to fit rather
+/// than requiring a multiple of 32).
+///
+/// This is the recommended choice for password storage and for SCRAM-SHA-256.
+/// The three scratch buffers are freed before return.
 pub fn pbkdf2Sha256(pw: ptr, pwLen: int, salt: ptr, saltLen: int, iters: int, out: ptr, dkLen: int): void {
     let hLen = 32;
     let block = bytes.alloc(saltLen + 4);

@@ -1,16 +1,42 @@
 
+//! kqueue-backed event loop for the macOS/BSD reactor.
+//!
+//! This is the readiness-model backend selected by `net/ev` when
+//! `platform.os == "darwin"`: it wraps `os.darwin.kqueue` to arm read/write
+//! interest on file descriptors and drains completions with `EVFILT_READ`/
+//! `EVFILT_WRITE` events. Unlike the completion-model backends (IOCP,
+//! io_uring), an armed kqueue interest just means "tell me when this fd is
+//! ready", so the actual `recv`/`send`/`accept` syscall still happens here,
+//! in `Poller.poll`, once the event fires.
+//!
+//! Two related but distinct pieces live in this file: a free-function op
+//! protocol (`makeOp`/`submit`/`armRead`/`armWrite`/...) built directly over
+//! raw `long` buffers for the free-function reactor path, and the `Poller`
+//! class implementing the `EventLoop` trait for the higher-level reactor
+//! driver. Both submit ops the same way; `Poller` additionally owns the
+//! kqueue fd, the raw kqueue event buffer, and a completion-token buffer,
+//! and performs the actual I/O once an fd reports ready.
+
 import bytes;
 import os.socket;
 import os.darwin.kqueue;
 
+/// Operation kind: a non-blocking `recv`.
 pub const OP_RECV: int = 0;
+/// Operation kind: a non-blocking `send`.
 pub const OP_SEND: int = 1;
+/// Operation kind: a non-blocking `accept`.
 pub const OP_ACCEPT: int = 2;
+/// Operation kind: a non-blocking connect completion check.
 pub const OP_CONNECT: int = 3;
+/// Operation kind: receive a file descriptor over a Unix domain socket.
 pub const OP_RECVFD: int = 4;
 
+/// Size in bytes of one op record, as laid out by `makeOp` and read by the `op*` accessors.
 pub const OP_SIZE: int = 40;
 
+/// Initialises an op record at `op` with the given kind, fd, buffer, length, and completion token.
+/// Clears the done flag and result slot. The buffer at `op` must be at least `OP_SIZE` bytes.
 pub fn makeOp(op: long, kind: int, fd: int, buf: long, len: int, token: long): void {
     bytes.write_i32(op, 0, kind as long);
     bytes.write_i32(op, 4, fd as long);
@@ -20,15 +46,25 @@ pub fn makeOp(op: long, kind: int, fd: int, buf: long, len: int, token: long): v
     bytes.write_ptr(op, 24, token);
     bytes.write_ptr(op, 32, 0);
 }
+/// Reads the operation kind (one of the `OP_*` constants) from an op record.
 pub fn opKind(op: long): int { return bytes.read_i32(op, 0) as int; }
+/// Reads the file descriptor an op record is bound to.
 pub fn opFd(op: long): int { return bytes.read_i32(op, 4) as int; }
+/// Reads the data buffer address an op record will read into or write from.
 pub fn opBuf(op: long): long { return bytes.read_ptr(op, 8); }
+/// Reads the requested buffer length in bytes.
 pub fn opLen(op: long): int { return bytes.read_i32(op, 16) as int; }
+/// Returns non-zero once the op has completed (set by `setOpResult`).
 pub fn opDone(op: long): int { return bytes.read_i32(op, 20) as int; }
+/// Reads the caller-supplied completion token (typically a coroutine handle) for an op record.
 pub fn opToken(op: long): long { return bytes.read_ptr(op, 24); }
+/// Reads the syscall result stored by `setOpResult`: bytes transferred, an accepted fd, or a negative errno.
 pub fn opResult(op: long): int { return bytes.read_ptr(op, 32) as int; }
+/// Stores the syscall result on an op record and marks it done.
 pub fn setOpResult(op: long, r: int): void { bytes.write_ptr(op, 32, r as long); bytes.write_i32(op, 20, 1); }
 
+/// Arms kqueue interest for an op record: write/connect ops wait on `EVFILT_WRITE` (one-shot),
+/// everything else waits on `EVFILT_READ`. Returns the kqueue result of the registration call.
 pub fn submit(kq: int, op: long): int {
     let kind = opKind(op);
     let fd = opFd(op);
@@ -38,53 +74,90 @@ pub fn submit(kq: int, op: long): int {
     return kqueue.registerOne(kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, op);
 }
 
+/// Removes read interest for `fd` from the kqueue set.
 pub fn cancelRead(kq: int, fd: int): void {
     kqueue.registerOne(kq, fd, kqueue.EVFILT_READ, kqueue.EV_DELETE, 0);
 }
 
+/// kqueue is a readiness model, so a connect operation is never "submitted" as a distinct
+/// asynchronous op the way it is on a proactor; this always returns false.
 pub fn connectIsSubmitted(): bool { return false; }
 
+/// Size in bytes of one raw `struct kevent` entry, as returned by `kqueue.wait`.
 pub const EVENT_SIZE: int = 32;
 
+/// Arms level-triggered read interest for `fd`, tagging the event with `token`.
 pub fn armRead(kq: int, fd: int, token: long): int {
     return kqueue.registerOne(kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, token);
 }
+/// Arms one-shot write interest for `fd`, tagging the event with `token`.
 pub fn armWrite(kq: int, fd: int, token: long): int {
     return kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_ADD | kqueue.EV_ONESHOT, token);
 }
+/// Deregisters interest for an in-flight op that the caller is giving up on.
+///
+/// On kqueue, freeing the op record after this call is always safe because deregistering an
+/// interest leaves nothing in the kernel referring to it; this always returns false, meaning
+/// the caller retains (and should free) ownership of the record. Contrast with the proactor
+/// backends (IOCP, io_uring), where the kernel still owns the record until cancellation lands
+/// and `abandonOp` returns true. A zero `op` is a no-op.
 pub fn abandonOp(kq: int, op: long): bool {
     if (op == (0 as long)) { return false; }
     cancelRead(kq, opFd(op));
     return false;
 }
 
+/// Removes write interest for `fd` from the kqueue set.
 pub fn cancelWrite(kq: int, fd: int): void {
     kqueue.registerOne(kq, fd, kqueue.EVFILT_WRITE, kqueue.EV_DELETE, 0);
 }
+/// Blocks up to `timeoutMs` waiting for kqueue events, writing them into `eventBuf`.
+/// Returns the number of events delivered.
 pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
     return kqueue.wait(kq, eventBuf, maxEvents, timeoutMs);
 }
+/// Reads the file descriptor (`ident`) of event `i` in a raw kqueue event buffer.
 pub fn evFd(eventBuf: long, i: int): int { return kqueue.evIdent(eventBuf, i) as int; }
+/// Reads the `udata` token attached to event `i`.
 pub fn evToken(eventBuf: long, i: int): long { return kqueue.evUdata(eventBuf, i); }
+/// Reads the `data` field of event `i` (typically bytes available to read, per kqueue semantics).
 pub fn evBytes(eventBuf: long, i: int): long { return kqueue.evData(eventBuf, i); }
+/// True if event `i` carries `EV_EOF` (peer closed / half-closed the connection).
 pub fn evEof(eventBuf: long, i: int): bool { return (kqueue.evFlags(eventBuf, i) & kqueue.EV_EOF) != 0; }
+/// Reads the filter (`EVFILT_READ`/`EVFILT_WRITE`/other) of event `i`.
 pub fn evFilterAt(eventBuf: long, i: int): int { return kqueue.evFilter(eventBuf, i); }
 
+/// The common interface every reactor backend implements, so the runtime driver can be written
+/// once against `EventLoop` instead of per-platform.
 pub trait EventLoop {
+    /// Submits an op for readiness monitoring; returns the underlying registration result.
     fn submit(self, op: long): int;
+    /// Waits for and processes ready events, performing the actual I/O for completed ops.
+    /// Returns the number of ops that completed this call.
     fn poll(self, timeoutMs: int): int;
+    /// Returns the completion token of the `i`-th op that completed in the last `poll` call.
     fn completedToken(self, i: int): long;
+    /// True if the loop was constructed successfully and is usable.
     fn ok(self): bool;
+    /// Releases the loop's underlying resources (fd and buffers).
     fn destroy(self): void;
 }
 
+/// kqueue-backed `EventLoop`: owns the kqueue fd, the raw kevent buffer used by `poll`, and a
+/// side buffer of completion tokens ready to be drained via `completedToken`.
 pub class Poller impl EventLoop {
+    /// The underlying kqueue file descriptor, or negative if creation failed.
     pub kq: int,
+    /// Raw buffer of `maxEvents` kevent structs, reused across `poll` calls.
     pub eventBuf: long,
+    /// Buffer of completion tokens (one `long` per slot) populated by the last `poll` call.
     pub compBuf: long,
+    /// Capacity, in events, of `eventBuf` and `compBuf`.
     pub maxEvents: int,
+    /// Number of completions produced by the most recent `poll` call.
     pub nComp: int,
 
+    /// Creates a kqueue instance and allocates the event and completion buffers for up to `maxEvents` events.
     init(maxEvents: int) {
         self.kq = kqueue.kqueue();
         self.maxEvents = maxEvents;
@@ -95,6 +168,8 @@ pub class Poller impl EventLoop {
 
     fn ok(self: Poller): bool { return self.kq >= 0; }
 
+    /// Same logic as the free-function `submit`: writes wait on `EVFILT_WRITE` (one-shot), other
+    /// kinds wait on `EVFILT_READ`.
     fn submit(self: Poller, op: long): int {
         let kind = opKind(op);
         let fd = opFd(op);
@@ -104,6 +179,13 @@ pub class Poller impl EventLoop {
         return kqueue.registerOne(self.kq, fd, kqueue.EVFILT_READ, kqueue.EV_ADD, op);
     }
 
+    /// Waits for kqueue events and, for each one whose filter is read/write, performs the
+    /// operation's actual syscall (recv/send/accept/recvfd/connect-check). If the syscall would
+    /// block, the op stays pending (a send re-arms itself for another write-ready event); on
+    /// completion the result is stashed via `setOpResult` and the op's token copied into
+    /// `compBuf`. Events on filters other than read/write are treated as already-complete and
+    /// their `udata` token is copied straight through. Returns `nComp`, the number of tokens
+    /// now sitting in `compBuf`.
     fn poll(self: Poller, timeoutMs: int): int {
         let n = kqueue.wait(self.kq, self.eventBuf, self.maxEvents, timeoutMs);
         self.nComp = 0;

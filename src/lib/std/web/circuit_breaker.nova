@@ -1,3 +1,13 @@
+//! Circuit-breaker-wrapped HTTP client for the web layer.
+//!
+//! `ResilientClient` sits in front of `web.client.HttpClient` and consults a
+//! `resilience.breaker.CircuitBreaker` before every request. While the breaker
+//! is open, calls fail fast with a `503 Service Unavailable` response instead
+//! of hitting the upstream host, and every completed request feeds its outcome
+//! (a `5xx` status counts as a failure, anything else as a success) back into
+//! the breaker so it can trip or recover. This is the standard way to call an
+//! unreliable upstream from Nova web code without hand-rolling failure
+//! bookkeeping around every `get`/`post`/`send` call site.
 
 import resilience.breaker;
 import web.request;
@@ -7,13 +17,22 @@ import web.client;
 import string;
 import map;
 
+/// An `HttpClient`-style wrapper that gates outbound requests through a circuit breaker.
+///
+/// Construct one per upstream host (or per logical dependency) so failures
+/// against one service cannot trip the breaker for another.
 pub struct ResilientClient {
+    /// The underlying breaker tracking failure/success counts and open/closed state.
     pub breaker: breaker.CircuitBreaker,
 
+    /// Creates a client whose breaker opens after `failureThreshold` consecutive
+    /// failures, closes again after `successThreshold` consecutive successes
+    /// once half-open, and waits `timeoutMs` before probing an open circuit.
     init(failureThreshold: int, successThreshold: int, timeoutMs: long) {
         self.breaker = breaker.CircuitBreaker(failureThreshold, successThreshold, timeoutMs);
     }
 
+    // Feeds a completed response's outcome back into the breaker: a 5xx status counts as a failure.
     fn record(self: ResilientClient, res: response.Response): void {
         if (Status.toCode(res.status) >= 500) {
             self.breaker.recordFailure();
@@ -22,6 +41,10 @@ pub struct ResilientClient {
         }
     }
 
+    /// Issues a GET request if the breaker currently allows traffic.
+    ///
+    /// Returns a synthetic `503 Service Unavailable` response, without
+    /// touching the network, when the circuit is open.
     pub fn get(self: ResilientClient, host: string, port: int, path: string): response.Response {
         if (!self.breaker.shouldAllow()) {
             return response.Response(Status.ServiceUnavailable, "Circuit open: upstream unavailable");
@@ -31,6 +54,10 @@ pub struct ResilientClient {
         return res;
     }
 
+    /// Issues a POST request if the breaker currently allows traffic.
+    ///
+    /// Returns a synthetic `503 Service Unavailable` response, without
+    /// touching the network, when the circuit is open.
     pub fn post(self: ResilientClient, host: string, port: int, path: string, body: string): response.Response {
         if (!self.breaker.shouldAllow()) {
             return response.Response(Status.ServiceUnavailable, "Circuit open: upstream unavailable");
@@ -40,6 +67,10 @@ pub struct ResilientClient {
         return res;
     }
 
+    /// Sends an arbitrary, pre-built `Request` if the breaker currently allows traffic.
+    ///
+    /// Returns a synthetic `503 Service Unavailable` response, without
+    /// touching the network, when the circuit is open.
     pub fn send(self: ResilientClient, host: string, port: int, req: request.Request): response.Response {
         if (!self.breaker.shouldAllow()) {
             return response.Response(Status.ServiceUnavailable, "Circuit open: upstream unavailable");

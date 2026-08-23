@@ -1,3 +1,17 @@
+//! Cross-Site Request Forgery protection middleware for the web framework.
+//!
+//! `CsrfMiddleware` implements the "double submit" pattern: the session layer
+//! is expected to place a per-session token in the `X-Session-CSRF` request
+//! header (set up elsewhere, typically from a signed session cookie), and this
+//! middleware checks that the same token is echoed back by the client on any
+//! state-changing request, either as a custom header or as a form field. Safe
+//! methods (GET, HEAD, OPTIONS) are never blocked; they only get the token
+//! mirrored onto the response so a page can pick it up for later use.
+//!
+//! This file provides the middleware itself, plugged into the framework via
+//! the `Middleware` trait from `web.middleware`, alongside the small
+//! `application/x-www-form-urlencoded` field reader it needs to support the
+//! form-field fallback.
 
 import web.request;
 import web.response;
@@ -5,8 +19,18 @@ import web.middleware;
 import web.status;
 import string;
 
+/// Middleware that enforces the double-submit CSRF token pattern.
+///
+/// Requires a session layer upstream to have already put the expected token
+/// into the `X-Session-CSRF` request header; if that header is absent, this
+/// middleware treats the request as unprotected (no session to defend) and
+/// lets it through unchanged.
 pub struct CsrfMiddleware impl Middleware {
+    /// Name of the response/request header used to carry the CSRF token to
+    /// and from the client (defaults to `"X-CSRF-Token"`).
     pub headerName: string,
+    /// Name of the form field checked as a fallback when the header is not
+    /// present on a submitted request (defaults to `"_csrf"`).
     pub formField: string,
 
     init() {
@@ -14,6 +38,15 @@ pub struct CsrfMiddleware impl Middleware {
         self.formField = "_csrf";
     }
 
+    /// Validates or issues the CSRF token depending on the request method.
+    ///
+    /// For GET/HEAD/OPTIONS, mirrors the session's token onto the response
+    /// header so the client can read it and returns `Next` unconditionally.
+    /// For other methods, compares the session token against the client's
+    /// token (from the header, or the form field as fallback); a mismatch or
+    /// missing client token responds `403 Forbidden` with a JSON error body
+    /// and returns `Stop`, otherwise the token is echoed back and processing
+    /// continues with `Next`.
     pub fn execute(self: CsrfMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
         if (req.method == "GET" || req.method == "HEAD" || req.method == "OPTIONS") {
             let token = req.headers.get("X-Session-CSRF") ?? "";
@@ -39,10 +72,12 @@ pub struct CsrfMiddleware impl Middleware {
         return MiddlewareAction.Next;
     }
 
+    /// No-op post-route hook required by the `Middleware` trait.
     pub fn after(self: CsrfMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
     }
 }
 
+// Scans an `application/x-www-form-urlencoded` body for `name` and returns its value, or "" if absent or the body is empty.
 fn getFormField(body: string, name: string): string {
     if (body.length == 0) return "";
     let pairs = string.split(body, "&");

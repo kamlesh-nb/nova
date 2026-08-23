@@ -1,3 +1,14 @@
+//! Server-side session support for the web framework: in-memory session
+//! storage with expiry, and a `Middleware` that binds each request to a
+//! session via a cookie.
+//!
+//! `SessionStore` owns the session table and is the single source of truth
+//! for creating, fetching, and expiring sessions. `SessionMiddleware` wires
+//! that store into the request pipeline: it reads (or mints) a session
+//! cookie on every request, refreshes the session's expiry, and stamps a
+//! CSRF token onto the request headers for downstream handlers to check.
+//! Sessions live only in process memory, so they do not survive a restart
+//! and are not shared across multiple server instances.
 
 import map;
 import string;
@@ -6,15 +17,24 @@ import web.request;
 import web.response;
 import web.middleware;
 
+/// A single server-side session: an opaque id, an arbitrary string-keyed
+/// data bag, and an absolute expiry timestamp.
 pub struct Session {
+    /// Unique session identifier, also used as the session cookie value.
     pub id: string,
+    /// Arbitrary session-scoped key/value data (for example the CSRF token).
     pub data: Map<string, string>,
+    /// Unix timestamp (seconds) after which the session is considered expired.
     pub expiresAt: int,
 }
 
+/// In-memory table of active sessions, keyed by session id.
 pub struct SessionStore {
+    /// Live sessions, keyed by `Session.id`.
     pub sessions: Map<string, Session>,
+    /// Seconds a session stays valid after it was created or last touched.
     pub defaultTtl: int,
+    /// Monotonically increasing counter used to make generated session ids unique.
     pub counter: int,
 
     init() {
@@ -23,6 +43,10 @@ pub struct SessionStore {
         self.counter = 0;
     }
 
+    /// Creates a new session with a freshly generated id and inserts it into
+    /// the store. The id is built from the current timestamp plus an
+    /// incrementing counter, so ids stay unique even for sessions created in
+    /// the same second. Expiry is set to now plus `defaultTtl`.
     pub fn createSession(self: SessionStore): Session {
         self.counter = self.counter + 1;
         let ts = datetime.now();
@@ -37,6 +61,10 @@ pub struct SessionStore {
         return sess;
     }
 
+    /// Looks up a session by id and, if it is still valid, slides its
+    /// expiry forward by another `defaultTtl` (a "touch on access" policy).
+    /// Returns `undefined` if the id is not known, and also returns
+    /// `undefined` (after deleting the entry) if the session has expired.
     pub fn getSession(self: SessionStore, id: string): Session {
         let ts = datetime.now();
         let sess = self.sessions.get(id);
@@ -52,13 +80,20 @@ pub struct SessionStore {
         return undefined;
     }
 
+    /// Removes a session from the store immediately (for example on logout).
+    /// A no-op if the id does not exist.
     pub fn destroySession(self: SessionStore, id: string): void {
         self.sessions.delete_key(id);
     }
 }
 
+/// Middleware that attaches a `Session` to every request via a cookie,
+/// creating one on first visit, and stamps a per-session CSRF token onto the
+/// request headers for handlers or later middleware to validate.
 pub struct SessionMiddleware impl Middleware {
+    /// Backing session store this middleware reads and writes.
     pub store: SessionStore,
+    /// Name of the cookie used to carry the session id (defaults to `session_id`).
     pub cookieName: string,
 
     init(store: SessionStore) {
@@ -66,6 +101,13 @@ pub struct SessionMiddleware impl Middleware {
         self.cookieName = "session_id";
     }
 
+    /// Resolves the session for this request: reads the session cookie, and
+    /// if it is missing or invalid, creates a new session and sets the
+    /// cookie on the response. Also mints a CSRF token on first use and
+    /// exposes both the session id and the CSRF token as request headers
+    /// (`X-Session-ID`, `X-Session-CSRF`) so downstream code does not need
+    /// to know about the session store. Always continues the middleware
+    /// chain.
     pub fn execute(self: SessionMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
         let sid = req.getCookie(self.cookieName) ?? "";
 
@@ -87,6 +129,8 @@ pub struct SessionMiddleware impl Middleware {
         return MiddlewareAction.Next;
     }
 
+    /// Post-route hook required by `Middleware`; this middleware has no
+    /// after-route work to do.
     pub fn after(self: SessionMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
     }
 }

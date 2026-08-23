@@ -1,34 +1,81 @@
+//! TLS 1.2 client bio: drives a `client12.TlsClient12` handshake and record
+//! layer purely over an in-memory buffer (`tlsmembio.MemBuf`), with no direct
+//! socket ownership. The caller feeds inbound ciphertext bytes in with
+//! `feed`, calls `step` to advance the handshake state machine, pulls
+//! outbound bytes with `pull`, and once the handshake completes uses
+//! `writeApp`/`readApp` to exchange application data as TLS records.
+//!
+//! This mirrors the shape of a BIO pair from OpenSSL-style TLS stacks: it
+//! lets the reactor (or any transport) own the actual I/O while this struct
+//! owns only the TLS state machine and buffering. It complements
+//! `crypto.tls.12.client12` (handshake message building and record sealing),
+//! `net.tlsmembio` (the record-framed memory buffer), and
+//! `crypto.tls.truststore` (certificate chain verification against trusted
+//! roots).
+
 import bytes;
 import net.tlsmembio;
 import crypto.tls.12.client12;
 import crypto.tls.truststore;
 import crypto.random;
 
+/// Offsets a raw pointer by `off` bytes, going through `long` so the addition
+/// does not truncate a heap address above 4 GB.
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
+/// Fills `buf` with `n` cryptographically random bytes, used to generate the
+/// client random nonce for the handshake.
 fn fillRandom(buf: ptr, n: int): void {
     let s = random.randomBytes(n);
     let i = 0;
     while (i < n) { bytes.write_byte(buf, i, s[i] & 0xff); i = i + 1; }
 }
 
+/// TLS 1.2 client-side bio: owns the handshake state machine, the plaintext
+/// handshake transcript buffer, and pending application-data plaintext, and
+/// exchanges TLS records with the peer through an in-memory buffer rather
+/// than a socket directly.
 pub struct Client12Bio impl TlsBio {
+    /// In-memory record buffer used to receive inbound ciphertext and stage
+    /// outbound ciphertext for the transport to pull.
     pub buf: tlsmembio.MemBuf,
+    /// TLS 1.2 handshake and record-layer state (keys, transcript hash, cipher).
     pub cl: client12.TlsClient12,
+    /// Handshake progress: 1 = awaiting server flight, 2 = client flight sent
+    /// and awaiting server Finished, 3 = handshake complete, negative = failed.
     pub state: int,
+    /// Growable buffer accumulating reassembled handshake messages, plus its
+    /// current length, capacity, and how many bytes have been consumed so far.
     pub hs: ptr, pub hsLen: int, pub hsCap: int, pub consumed: int,
+    /// Expected server Finished verify data, computed locally and checked
+    /// against what the server actually sends.
     pub svd: ptr,
+    /// Scratch buffer for one decoded record, and the buffer holding the
+    /// most recently decrypted application-data plaintext.
     pub scratch: ptr, pub plain: ptr,
+    /// Offset and length of unread plaintext still pending in `plain` from a
+    /// prior `readApp` call that returned less than a full decrypted record.
     pub pendingOff: int, pub pendingLen: int,
+    /// Whether to verify the server certificate chain against `store`, the
+    /// expected host name for verification, and the trust store to verify against.
     pub verify: bool, pub host: string, pub store: truststore.TrustStore,
 
+    /// Appends inbound ciphertext bytes received from the transport into the
+    /// record buffer for `step`/`readApp` to consume.
     pub fn feed(self: Client12Bio, data: ptr, n: int): void { self.buf.feed(data, n); }
+    /// Marks the underlying buffer closed, causing subsequent reads to signal EOF/error.
     pub fn markClosed(self: Client12Bio): void { self.buf.closed = true; }
+    /// Registers a client certificate and private key to present if the
+    /// server requests one during the handshake.
     pub fn configureClientCert(self: Client12Bio, certDer: ptr, certLen: int, key: ptr): void {
         self.cl.setClientCert12(certDer, certLen, key);
     }
+    /// Number of outbound ciphertext bytes currently staged and ready to be pulled.
     pub fn pendingOut(self: Client12Bio): int { return self.buf.olen; }
+    /// Copies up to `max` staged outbound bytes into `b` for the transport to send.
     pub fn pull(self: Client12Bio, b: ptr, max: int): int { return self.buf.pull(b, max); }
 
+    /// Appends `n` bytes to the handshake transcript buffer `hs`, growing its
+    /// capacity (doubling) if needed.
     fn appendHs(self: Client12Bio, src: ptr, n: int): void {
         if (self.hsLen + n > self.hsCap) {
             let nc = (self.hsLen + n) * 2;
@@ -42,6 +89,10 @@ pub struct Client12Bio impl TlsBio {
         self.hsLen = self.hsLen + n;
     }
 
+    /// Builds and appends the client's second-flight records: optional
+    /// Certificate (if requested), ClientKeyExchange, optional CertificateVerify
+    /// (if a client cert was configured), ChangeCipherSpec, and the encrypted
+    /// Finished message with its verify data.
     fn sendClientFlight(self: Client12Bio): void {
         if (self.cl.certRequested) {
             let cc = bytes.alloc(self.cl.clientCertLen + 32);
@@ -78,6 +129,14 @@ pub struct Client12Bio impl TlsBio {
         bytes.free(cke); bytes.free(ccs); bytes.free(vd); bytes.free(finMsg); bytes.free(encFin);
     }
 
+    /// Advances the handshake state machine by processing whatever complete
+    /// records are currently available in the buffer.
+    ///
+    /// Returns 0 once the handshake completes successfully, 1 when it needs
+    /// more input to continue, and -1 on a fatal handshake or verification
+    /// failure (also latches `state` to a negative value so subsequent calls
+    /// keep returning -1). Verifies the server certificate chain against
+    /// `store` before sending the client flight if `verify` is set.
     pub fn step(self: Client12Bio): int {
         if (self.state == 3) { return 0; }
         if (self.state < 0) { return 0 - 1; }
@@ -136,6 +195,8 @@ pub struct Client12Bio impl TlsBio {
         return 1;
     }
 
+    /// Encrypts `n` bytes of application data and appends it as an outbound
+    /// TLS record ready for `pull`. Returns `n` on success.
     pub fn writeApp(self: Client12Bio, data: ptr, n: int): int {
         let enc = bytes.alloc(n + 64);
         let el = self.cl.sealRecord(0x17, data, n, enc);
@@ -144,6 +205,13 @@ pub struct Client12Bio impl TlsBio {
         return n;
     }
 
+    /// Decrypts and returns up to `max` bytes of application data into `out`.
+    ///
+    /// Drains any leftover plaintext from a prior partial read first. Skips
+    /// over interleaved handshake (post-handshake renegotiation) records
+    /// transparently. Returns 0 when no full application record is available
+    /// yet (would block), and -1 on a decryption failure, an alert record, or
+    /// when the buffer has been closed with no pending data.
     pub fn readApp(self: Client12Bio, out: ptr, max: int): int {
         if (self.pendingLen > self.pendingOff) {
             let avail = self.pendingLen - self.pendingOff;
@@ -176,6 +244,8 @@ pub struct Client12Bio impl TlsBio {
         return 0;
     }
 
+    /// Releases all buffers owned by this bio (record buffer, handshake
+    /// transcript, verify data, scratch, and plaintext buffers).
     pub fn closeBio(self: Client12Bio): void {
         self.buf.freeBuffers();
         bytes.free(self.hs);
@@ -183,9 +253,12 @@ pub struct Client12Bio impl TlsBio {
         bytes.free(self.scratch);
         bytes.free(self.plain);
     }
+    /// Always returns the empty string: TLS 1.2 here does not negotiate ALPN.
     pub fn selectedAlpn(self: Client12Bio): string { return ""; }
 }
 
+/// Creates a TLS 1.2 client bio for the given host, without certificate
+/// verification, and stages the initial ClientHello record ready to `pull`.
 pub fn newClient12Bio(host: string): Client12Bio {
     let cl = client12.newClient12();
     fillRandom(cl.clientRandom, 32);
@@ -201,6 +274,8 @@ pub fn newClient12Bio(host: string): Client12Bio {
                          verify: false, host: host, store: truststore.TrustStore { ders: List<long>(), lens: List<int>() } };
 }
 
+/// Creates a TLS 1.2 client bio that verifies the server certificate chain
+/// against `store` (and the hostname) as part of `step`.
 pub fn newClient12BioVerify(host: string, store: truststore.TrustStore): Client12Bio {
     let b = newClient12Bio(host);
     b.verify = true;
@@ -208,18 +283,24 @@ pub fn newClient12BioVerify(host: string, store: truststore.TrustStore): Client1
     return b;
 }
 
+/// Parses a PEM certificate and EC private key and installs them as the
+/// bio's client certificate.
 fn configureClientCertPem(b: Client12Bio, certPem: string, keyPem: string): void {
     let certDer = tlsmembio.pemBody(certPem, "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----");
     let scalar = tlsmembio.ecKeyScalar(keyPem);
     b.configureClientCert(certDer as ptr, certDer.length, scalar);
 }
 
+/// Creates a TLS 1.2 client bio configured with a client certificate (PEM
+/// certificate + PEM EC key) for mutual TLS, without server verification.
 pub fn newClient12BioClientCert(host: string, certPem: string, keyPem: string): Client12Bio {
     let b = newClient12Bio(host);
     configureClientCertPem(b, certPem, keyPem);
     return b;
 }
 
+/// Creates a TLS 1.2 client bio with both server certificate verification
+/// against `store` and a client certificate for mutual TLS.
 pub fn newClient12BioClientCertVerify(host: string, store: truststore.TrustStore, certPem: string, keyPem: string): Client12Bio {
     let b = newClient12BioVerify(host, store);
     configureClientCertPem(b, certPem, keyPem);

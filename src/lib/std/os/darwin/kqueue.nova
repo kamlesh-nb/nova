@@ -1,25 +1,61 @@
+//! Raw FFI binding to macOS/BSD `kqueue`, the readiness-based reactor backend
+//! selected for `platform.os == "darwin"` (see the reactor backend table in
+//! the project docs). This module owns the low-level `struct kevent` layout
+//! and the two C calls (`kqueue`, `kevent`); it does not implement scheduling
+//! or coroutine resume itself, that lives in the runtime and the higher-level
+//! `net/ev` reactor seam, which calls into this module.
+//!
+//! Events are read and written directly against a flat byte buffer using
+//! `bytes.write_*`/`bytes.read_*` at fixed offsets, matching the C ABI layout
+//! of `struct kevent` on Darwin (`ident, filter, flags, fflags, data, udata`,
+//! 32 bytes per entry). There is no struct marshalling: callers allocate a
+//! buffer sized as `n * KEVENT_SIZE` and address individual events by index.
 
 import bytes;
 
+/// Creates a new kernel event queue and returns its file descriptor, or a
+/// negative value on failure (per the underlying `kqueue(2)` syscall).
 pub extern("c") fn kqueue(): int;
+/// Registers, modifies, or waits on kernel events, per `kevent(2)`.
+/// `changelist`/`nchanges` describe events to apply; `eventlist`/`nevents`
+/// receive fired events; `timeout` is a `struct timespec*` (or null to block
+/// indefinitely). Returns the number of events placed in `eventlist`, `0` on
+/// timeout, or a negative value on error.
 pub extern("c") fn kevent(kq: int, changelist: ptr, nchanges: int, eventlist: ptr, nevents: int, timeout: ptr): int;
 
+/// Size in bytes of one `struct kevent` entry on Darwin: used to index into a
+/// flat event buffer as `i * KEVENT_SIZE`.
 pub const KEVENT_SIZE: int = 32;
+/// Size in bytes of a `struct timespec` (seconds + nanoseconds, each a
+/// machine word), used for the `wait` timeout buffer.
 pub const TIMESPEC_SIZE: int = 16;
 
+/// Filter identifier: notify when the given descriptor has data available to read.
 pub const EVFILT_READ: int = -1;
+/// Filter identifier: notify when the given descriptor can accept a write without blocking.
 pub const EVFILT_WRITE: int = -2;
+/// Filter identifier: a timer event, fired after the configured interval elapses.
 pub const EVFILT_TIMER: int = -7;
 
+/// Flag: add the event to the kqueue (registers a new filter/ident pair).
 pub const EV_ADD: int = 1;
+/// Flag: remove the event from the kqueue.
 pub const EV_DELETE: int = 2;
+/// Flag: enable a previously disabled event so it can fire again.
 pub const EV_ENABLE: int = 4;
+/// Flag: disable the event without removing it, it will not fire until re-enabled.
 pub const EV_DISABLE: int = 8;
+/// Flag: deliver the event only once, then automatically delete its registration.
 pub const EV_ONESHOT: int = 16;
+/// Flag: after the event fires, reset its state so only new activity re-triggers it (edge-triggered).
 pub const EV_CLEAR: int = 32;
+/// Returned flag: set on the fired event when the descriptor's peer has reached end-of-file/hang-up.
 pub const EV_EOF: int = 32768;
+/// Returned flag: set on the fired event when registering it failed; the error code is in `data`.
 pub const EV_ERROR: int = 16384;
 
+/// Writes one `struct kevent` entry into `buf` at slot `i` (byte offset `i * KEVENT_SIZE`),
+/// encoding `ident` as a machine word and `filter`/`flags` as 16-bit fields per the Darwin ABI.
 pub fn setEvent(buf: ptr, i: int, ident: long, filter: int, flags: int, fflags: int, data: long, udata: long): void {
     let base = (i * KEVENT_SIZE) as long;
     bytes.write_ptr(buf, base, ident);
@@ -30,13 +66,22 @@ pub fn setEvent(buf: ptr, i: int, ident: long, filter: int, flags: int, fflags: 
     bytes.write_ptr(buf, base + 24, udata);
 }
 
+/// Reads the `ident` field (typically the file descriptor) of event `i` in `buf`.
 pub fn evIdent(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * KEVENT_SIZE) as long); }
+/// Reads the `filter` field (e.g. `EVFILT_READ`) of event `i` in `buf`.
 pub fn evFilter(buf: ptr, i: int): int { return bytes.read_i16(buf, (i * KEVENT_SIZE + 8) as long) as int; }
+/// Reads the `flags` field (e.g. `EV_EOF`, `EV_ERROR`) of event `i` in `buf`.
 pub fn evFlags(buf: ptr, i: int): int { return bytes.read_u16(buf, (i * KEVENT_SIZE + 10) as long) as int; }
+/// Reads the filter-specific `fflags` field of event `i` in `buf`.
 pub fn evFflags(buf: ptr, i: int): int { return bytes.read_i32(buf, (i * KEVENT_SIZE + 12) as long) as int; }
+/// Reads the filter-specific `data` field of event `i` in `buf` (e.g. bytes available to read, or the error code when `EV_ERROR` is set).
 pub fn evData(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * KEVENT_SIZE + 16) as long); }
+/// Reads the opaque `udata` field of event `i` in `buf`, the caller-supplied tag passed back unchanged on fire.
 pub fn evUdata(buf: ptr, i: int): long { return bytes.read_ptr(buf, (i * KEVENT_SIZE + 24) as long); }
 
+/// Registers a single filter for `fd` on `kq` in one call: allocates a scratch
+/// one-entry change buffer, applies it via `kevent`, and frees the buffer.
+/// Returns the underlying `kevent` result (negative on error).
 pub fn registerOne(kq: int, fd: int, filter: int, flags: int, udata: long): int {
     let ch = bytes.alloc(KEVENT_SIZE);
     setEvent(ch, 0, fd as long, filter, flags, 0, 0, udata);
@@ -45,6 +90,11 @@ pub fn registerOne(kq: int, fd: int, filter: int, flags: int, udata: long): int 
     return r;
 }
 
+/// Blocks on `kq` until an event fires or `timeoutMs` elapses, writing fired
+/// events into `eventlist` (capacity `maxEvents`) and returning how many were
+/// written. A negative `timeoutMs` blocks indefinitely (no timeout buffer is
+/// built); otherwise a scratch `timespec` is allocated, converted from
+/// milliseconds, passed to `kevent`, and freed afterwards.
 pub fn wait(kq: int, eventlist: ptr, maxEvents: int, timeoutMs: int): int {
     if (timeoutMs < 0) {
         return kevent(kq, 0, 0, eventlist, maxEvents, 0);

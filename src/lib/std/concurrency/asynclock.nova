@@ -1,23 +1,112 @@
+//! A cooperative, non-blocking mutex for the async scheduler (`AsyncLock`).
+//!
+//! `AsyncLock` gives coroutines mutual exclusion over a critical section
+//! WITHOUT parking an OS thread. When a coroutine cannot take the lock it
+//! suspends itself and hands control back to the scheduler, so the reactor
+//! thread stays free to run other work. This is the async analogue of a
+//! spin-free thread mutex: it never blocks the underlying thread, it only
+//! blocks the logical coroutine.
+//!
+//! WHY it exists: the Nova runtime runs many coroutines on a small pool of
+//! reactor threads (often a single thread per reactor). A conventional
+//! blocking mutex would freeze the whole reactor while one coroutine waits,
+//! stalling every other connection sharing that thread. See the memory note
+//! "blocking mutex in async = 70x slow". `AsyncLock` instead queues the
+//! waiter and yields, so the thread keeps making progress.
+//!
+//! DESIGN and INVARIANTS:
+//!
+//!   * The lock is a single boolean `held` plus a FIFO queue of waiting
+//!     coroutine handles. Fairness is first-in-first-out: `release` always
+//!     wakes the oldest waiter.
+//!   * A coroutine handle is stored as a raw frame address (`long`), the same
+//!     representation the scheduler uses. It is NOT owned or refcounted here;
+//!     the scheduler owns the coroutine's lifetime, and the handle is only
+//!     valid until that coroutine is reaped. A handle must therefore be
+//!     dequeued and rescheduled while it is still live.
+//!   * There is a subtle ownership hand-off in `release`. Waking a waiter does
+//!     NOT clear `held`: the lock is transferred directly to the woken
+//!     coroutine, which resumes already holding it. `held` only drops back to
+//!     false when the queue is empty. This keeps the lock continuously held
+//!     across a hand-off and closes the wake-then-race window a naive
+//!     release-and-reacquire scheme would open.
+//!
+//! USAGE: the fast path is [`AsyncLock.tryAcquire`], which takes the lock
+//! synchronously when it is free. Only when that fails does a caller `await`
+//! [`AsyncLock.acquireSlow`] to queue and suspend. On the way out call
+//! [`AsyncLock.release`] exactly once per successful acquire. This split lets
+//! the common uncontended case avoid the coroutine suspend machinery
+//! altogether.
+//!
+//! This type is intentionally minimal and single-reactor oriented: it assumes
+//! the coroutines contending on it run on the same scheduler and are not moved
+//! across threads while queued. It is the building block other concurrency
+//! primitives (channels, actor mailboxes) layer on for critical sections.
 
 import list;
 
+/// A cooperative mutex that suspends a contending coroutine instead of
+/// blocking its thread.
+///
+/// Hold state is a single boolean; contended acquirers park in a FIFO queue of
+/// coroutine handles. See the file header for the hand-off invariant that
+/// [`AsyncLock.release`] relies on (a wake transfers the lock without clearing
+/// `held`).
 pub struct AsyncLock {
+    /// True while some coroutine holds the lock. Stays true across a hand-off:
+    /// [`AsyncLock.release`] leaves it set when it wakes a waiter and only
+    /// clears it when the wait queue drains.
     held: bool,
+    /// FIFO queue of suspended waiters, each a raw coroutine frame address.
+    ///
+    /// Handles are not owned here: the scheduler owns each coroutine's
+    /// lifetime, so an entry is only valid while that coroutine is alive and
+    /// still parked. `release` dequeues from the front to preserve fairness.
     waiters: list.List<long>,
 
+    /// Creates an unlocked mutex with an empty wait queue.
     init() { self.held = false; self.waiters = list.List<long>(); }
 
+    /// Attempts to take the lock without suspending, returning whether it
+    /// succeeded.
+    ///
+    /// This is the fast, uncontended path: if the lock is free it is taken and
+    /// `true` is returned; if it is already held nothing changes and `false`
+    /// is returned. On `false` the caller should fall back to
+    /// [`AsyncLock.acquireSlow`] to queue and wait. Safe to call from
+    /// non-async code because it never suspends.
     pub fn tryAcquire(self: AsyncLock): bool {
         if (self.held) { return false; }
         self.held = true;
         return true;
     }
 
+    /// Queues the current coroutine as a waiter and suspends it until the lock
+    /// is handed to it.
+    ///
+    /// Call this (with `await`) only after [`AsyncLock.tryAcquire`] returned
+    /// `false`. It records the running coroutine's handle at the back of the
+    /// FIFO queue and yields control to the scheduler via `coroSuspend`. The
+    /// coroutine resumes from here only when [`AsyncLock.release`] dequeues its
+    /// handle, and at that point it already OWNS the lock (the hand-off does
+    /// not reset `held`), so it must NOT call `tryAcquire` again. It is
+    /// responsible for calling [`AsyncLock.release`] once it finishes the
+    /// critical section.
     pub async fn acquireSlow(self: AsyncLock): void {
         self.waiters.push(currentCoro());
         coroSuspend();
     }
 
+    /// Releases the lock, waking the oldest waiter if any are queued.
+    ///
+    /// If the wait queue is non-empty, the front handle is dequeued and
+    /// rescheduled through `nova_sched_schedule`, and the lock is handed
+    /// straight to that coroutine: `held` deliberately stays `true` so no
+    /// third party can slip in between the wake and the woken coroutine
+    /// resuming. Only when there are no waiters does `held` drop back to
+    /// `false`, leaving the lock genuinely free. Must be called exactly once
+    /// per successful acquire (whether via [`AsyncLock.tryAcquire`] or
+    /// [`AsyncLock.acquireSlow`]).
     pub fn release(self: AsyncLock): void {
         if (self.waiters.size() > 0) {
             let h = self.waiters.get(0) ?? 0;
@@ -28,6 +117,17 @@ pub struct AsyncLock {
         }
     }
 
+    /// Reports whether the lock is currently held, without acquiring it.
+    ///
+    /// Advisory only: in a concurrent setting the answer can change the moment
+    /// it returns, so treat it as a hint (for diagnostics or assertions), not
+    /// as a basis for a lock decision. Use [`AsyncLock.tryAcquire`] to actually
+    /// contend for the lock.
     pub fn isHeld(self: AsyncLock): bool { return self.held; }
+    /// Returns the number of coroutines currently queued waiting for the lock.
+    ///
+    /// Useful for diagnostics and back-pressure decisions. Like
+    /// [`AsyncLock.isHeld`] this is a point-in-time snapshot and may change
+    /// immediately after it returns.
     pub fn waiting(self: AsyncLock): int { return self.waiters.size(); }
 }

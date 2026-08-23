@@ -1,13 +1,78 @@
+//! AES-GCM authenticated encryption (AEAD).
+//!
+//! This file implements AES in Galois/Counter Mode as specified by NIST
+//! SP 800-38D. GCM is an AEAD scheme: a single pass produces both confidentiality
+//! (the ciphertext) and integrity (a 16-byte authentication tag) over the plaintext
+//! plus any additional authenticated data (AAD) that travels in the clear. It is
+//! the workhorse cipher behind TLS 1.2/1.3 record protection, and it is the reason
+//! a server on this box prefers AES-GCM over ChaCha20-Poly1305 whenever the CPU
+//! carries the AES-NI instructions (see the crypto-bench note in project memory).
+//!
+//! GCM works by running AES in counter mode (CTR) to make the keystream, and then
+//! authenticating with GHASH, a keyed hash over GF(2^128). The universal-hash key
+//! `H` is `AES_K(0^128)`, the encryption of an all-zero block. The tag is
+//! `GHASH(H, AAD || C || lengths) XOR AES_K(J0)`, where `J0` is a per-message counter
+//! seed derived from the IV. All of that machinery lives in [`GcmContext.seal`]
+//! and [`GcmContext.open`], with [`ghash.Ghash`] supplying the field arithmetic and
+//! [`aes.Aes`] the block cipher.
+//!
+//! Two implementations coexist behind one API. When the runtime probe
+//! [`nova_cpu_has_aes`] reports AES-NI and the carry-less multiply (PCLMULQDQ) are
+//! present, [`GcmContext`] delegates the whole seal/open to the assembly kernels in
+//! [`aesgcmhw`], which fuse CTR and GHASH over several blocks at once. Otherwise it
+//! falls back to the portable software path in this file, built from [`gctr`],
+//! [`computeJ0`], [`computeS`] and friends. The two paths are byte-for-byte
+//! equivalent; only the speed differs.
+//!
+//! Two design points that the caller must respect:
+//!
+//!   1. The tag comparison in [`GcmContext.open`] is CONSTANT TIME. It accumulates
+//!      the XOR difference of all 16 bytes into `diff` and only tests `diff == 0`
+//!      at the end, so a forged tag cannot be probed byte by byte through timing.
+//!      The plaintext is written out ONLY after the tag verifies, so a caller never
+//!      sees unauthenticated data.
+//!
+//!   2. Every function works on raw `ptr` buffers the caller owns and sizes. There
+//!      is no bounds checking: the output buffers must be large enough (ciphertext
+//!      the same length as plaintext, tag [`GCM_TAG_LEN`] bytes), and a nonce must
+//!      NEVER be reused with the same key. GCM catastrophically loses both secrecy
+//!      of the authentication key and integrity if a (key, IV) pair repeats.
+//!
+//! The two module-level [`seal`] and [`open`] helpers are the one-shot convenience
+//! API: they build a [`GcmContext`], run the operation, and tear it down. For
+//! repeated operations under one key, build a [`GcmContext`] once (the H and the
+//! hardware key schedule are computed at construction) and reuse it.
+
 import bytes;
 import crypto.cipher.aes;
 import crypto.mac.ghash;
 import crypto.aead.aesgcmhw;
 import mem.allocator;
 
+/// Runtime probe for the CPU's AES and carry-less-multiply instruction support.
+///
+/// Implemented in the C runtime (via `cpuid` on x86, feature registers on ARM). It
+/// returns `1` when AES-NI plus PCLMULQDQ (or the ARM crypto extensions) are usable,
+/// and `0` otherwise. [`GcmContext.create`] reads this once and latches the answer in
+/// [`GcmContext.hwAes`] to pick the hardware kernels in [`aesgcmhw`] over the software
+/// fallback in this file.
 extern("c") fn nova_cpu_has_aes(): int;
 
+/// Length of a GCM authentication tag in bytes: 16, i.e. the full 128-bit tag.
+///
+/// GCM permits truncated tags, but this implementation always produces and expects
+/// the full-length tag. Callers should size the `tagOut` and `tag` buffers passed to
+/// [`GcmContext.seal`] and [`GcmContext.open`] to exactly this many bytes.
 pub const GCM_TAG_LEN: int = 16;
 
+/// Increments the rightmost 32 bits of a 16-byte counter block in place, big-endian.
+///
+/// This is GCM's `inc32` function. Only bytes 12..15 form the counter; bytes 0..11
+/// (the invocation/nonce field) are left untouched. The add ripples the carry from
+/// byte 15 down to byte 12 and then stops, so the counter wraps modulo 2^32 within
+/// its own 4-byte field rather than overflowing into the nonce. Used to step the CTR
+/// keystream block by block in [`gctr`], and to turn `J0` into the first data counter
+/// `J0 + 1` in [`GcmContext.seal`] and [`GcmContext.open`].
 fn inc32(ctr: ptr): void {
     let i = 15;
     let carry = 1;
@@ -19,6 +84,13 @@ fn inc32(ctr: ptr): void {
     }
 }
 
+/// Writes a 64-bit value as 8 big-endian bytes into `buf` starting at `off`.
+///
+/// GCM's length-encoding and GHASH block layout are big-endian (network order), so
+/// this stores the most significant byte first. It is used to lay down the bit-length
+/// fields that GHASH folds in last: the IV bit length in [`computeJ0`] and the AAD and
+/// ciphertext bit lengths in [`computeS`]. The value is a `long` because a bit count
+/// can exceed 32 bits.
 fn putLen64(buf: ptr, off: int, bits: long): void {
     let i = 0;
     while (i < 8) {
@@ -27,6 +99,20 @@ fn putLen64(buf: ptr, off: int, bits: long): void {
     }
 }
 
+/// AES in counter mode: the GCTR function of SP 800-38D.
+///
+/// Encrypts (or decrypts, the operation is symmetric) `len` bytes from `dataIn` into
+/// `out` by XORing them with the AES keystream. Starting from the initial counter
+/// block `icb`, it encrypts each counter to a 16-byte keystream block, XORs it over
+/// the next slice of input, then advances the counter with [`inc32`]. The final
+/// partial block uses only its first `n` keystream bytes, so the ciphertext is exactly
+/// as long as the plaintext (GCM is length-preserving, no padding).
+///
+/// `icb` is consumed as a starting value and left unmodified by the caller's copy: this
+/// function copies it into a private `ctr` buffer first, so the caller's `icb` is not
+/// mutated. `dataIn` and `out` may be distinct buffers of length `len`. Because encrypt
+/// and decrypt are the same XOR, [`GcmContext.seal`] and [`GcmContext.open`] both call
+/// this with the counter seeded at `J0 + 1`.
 fn gctr(ctx: aes.Aes, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
     let ctr = bytes.alloc(16);
     let i = 0;
@@ -48,6 +134,12 @@ fn gctr(ctx: aes.Aes, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
     bytes.free(ks);
 }
 
+/// Derives the GHASH subkey `H` by encrypting an all-zero block under the AES key.
+///
+/// GHASH is keyed by `H = AES_K(0^128)`, so this fills a scratch 16-byte block with
+/// zeros and encrypts it into `h`. It is called once at construction time from
+/// [`GcmContext.create`]; the resulting `H` is then handed to [`ghash.Ghash.create`]
+/// and reused for every message under that key.
 fn computeH(ctx: aes.Aes, h: ptr): void {
     let zero = bytes.alloc(16);
     let i = 0;
@@ -56,6 +148,20 @@ fn computeH(ctx: aes.Aes, h: ptr): void {
     bytes.free(zero);
 }
 
+/// Computes the pre-counter block `J0` from the IV, per SP 800-38D.
+///
+/// `J0` is the seed the counter mode starts from. GCM specifies two cases and this
+/// function implements both:
+///
+///   1. The common case of a 96-bit (12-byte) IV: `J0` is the IV followed by the
+///      32-bit big-endian integer 1, i.e. `IV || 0x00000001`. This is the fast path
+///      TLS uses.
+///   2. Any other IV length: `J0 = GHASH(H, IV || zero-pad || len64(IV))`. Here the
+///      IV is fed through GHASH, then a final block carrying the IV bit length in its
+///      low 8 bytes (high 8 bytes zero) is folded in, and the digest becomes `J0`.
+///
+/// The `g` GHASH state is only used in the second branch; it is reset first so any
+/// prior message state is discarded. The 16-byte result is written to `j0`.
 fn computeJ0(g: ghash.Ghash, iv: ptr, ivLen: int, j0: ptr): void {
     if (ivLen == 12) {
         let i = 0;
@@ -77,6 +183,15 @@ fn computeJ0(g: ghash.Ghash, iv: ptr, ivLen: int, j0: ptr): void {
     }
 }
 
+/// Computes the GHASH digest `S` over the AAD and ciphertext, the tag's pre-image.
+///
+/// This is the authentication core: `S = GHASH(H, AAD || C || len64(AAD) || len64(C))`.
+/// It resets `g`, streams the AAD and then the ciphertext through it (GHASH pads each
+/// to a block boundary internally), and finally folds one more block carrying the AAD
+/// bit length in bytes 0..7 and the ciphertext bit length in bytes 8..15. The 16-byte
+/// digest is written to `s`. The caller then XORs `S` with `AES_K(J0)` to get the tag
+/// on seal, or compares against the supplied tag on open. Note it hashes the
+/// CIPHERTEXT, not the plaintext, which is why open can verify before decrypting.
 fn computeS(g: ghash.Ghash, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr): void {
     g.reset();
     g.update(aad, aadLen);
@@ -89,18 +204,51 @@ fn computeS(g: ghash.Ghash, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr):
     bytes.free(lens);
 }
 
+/// A reusable AES-GCM cipher context bound to one key.
+///
+/// Construction is where the per-key precomputation happens: the AES key schedule,
+/// the GHASH subkey `H` (see [`computeH`]), and, on capable CPUs, the hardware key
+/// schedule and precomputed `H` powers. Once built, a single context can [`seal`]
+/// and [`open`] many messages, each with its own IV, without redoing that work.
+///
+/// A context holds two parallel sets of state and picks between them by [`hwAes`]:
+/// the software path uses [`ctx`], [`h`] and [`g`]; the hardware path in [`aesgcmhw`]
+/// uses the `hw*` fields. Only one set is exercised per operation. The context owns
+/// several heap buffers, so the caller MUST call [`delete`] to free them.
 pub struct GcmContext {
+    /// The AES block-cipher context (expanded key schedule) for the software path.
     pub ctx: aes.Aes,
+    /// The 16-byte GHASH subkey `H = AES_K(0^128)`, owned by this context.
     pub h: ptr,
+    /// The GHASH universal-hash state, keyed by [`h`], used by the software path.
     pub g: ghash.Ghash,
 
+    /// True when the CPU offers AES-NI and PCLMULQDQ, latched from [`nova_cpu_has_aes`]
+    /// at construction. When true, [`seal`] and [`open`] delegate wholesale to
+    /// [`aesgcmhw`] and the software fields go unused; when false, the reverse.
     pub hwAes: bool,
+    /// Number of AES rounds for the hardware kernels (10/12/14 for 128/192/256-bit
+    /// keys). Set by [`aesgcmhw.setup`]; 0 when [`hwAes`] is false.
     pub hwNr: int,
+    /// Hardware round-key schedule buffer (240 bytes, enough for AES-256), or 0.
     pub hwRk: ptr,
+    /// The GHASH subkey `H` in the byte order the hardware kernel expects, or 0.
     pub hwHStd: ptr,
+    /// Bit-reversal or byte-reversal scratch table used by the hardware GHASH, or 0.
     pub hwBrev: ptr,
+    /// Precomputed powers of `H` that let the hardware kernel fold several blocks per
+    /// carry-less multiply, or 0.
     pub hwHpows: ptr,
 
+    /// Builds a context for `key` (of `keyLen` bytes: 16, 24, or 32) and precomputes
+    /// everything reusable across messages.
+    ///
+    /// It always sets up the software path (AES schedule, `H` via [`computeH`], and the
+    /// GHASH state). It then probes [`nova_cpu_has_aes`]; if the CPU is capable, it also
+    /// allocates the hardware buffers and calls [`aesgcmhw.setup`] to fill them, latching
+    /// [`hwAes`] true. If not, the `hw*` pointer fields are set to 0 so [`delete`] knows
+    /// there is nothing to free there. The returned context owns heap memory and must be
+    /// released with [`delete`].
     pub fn create(key: ptr, keyLen: int): GcmContext {
         let c = bytes.new_with_allocator<GcmContext>(allocator.globalAllocator());
         c.ctx = aes.Aes.create(key, keyLen);
@@ -120,6 +268,19 @@ pub struct GcmContext {
         return c;
     }
 
+    /// Encrypts and authenticates: writes `ptLen` ciphertext bytes to `ctOut` and a
+    /// [`GCM_TAG_LEN`]-byte tag to `tagOut`.
+    ///
+    /// The tag authenticates both the AAD (`aad`, `aadLen`, which stays in the clear)
+    /// and the ciphertext. On a hardware-capable CPU this is one call into
+    /// [`aesgcmhw.sealWith`]. The software path (a) derives `J0` from the IV with
+    /// [`computeJ0`], (b) runs CTR from `J0 + 1` over the plaintext with [`gctr`],
+    /// (c) computes `S` over AAD and ciphertext with [`computeS`], and (d) forms the
+    /// tag as `S XOR AES_K(J0)`.
+    ///
+    /// `ctOut` must have room for `ptLen` bytes and may alias `pt` for in-place
+    /// encryption; `tagOut` must have room for [`GCM_TAG_LEN`] bytes. The IV must be
+    /// unique per message under this key: reusing an IV breaks GCM's security entirely.
     pub fn seal(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
         if (self.hwAes) {
@@ -146,6 +307,20 @@ pub struct GcmContext {
         bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
     }
 
+    /// Verifies the tag and, only if it is valid, decrypts: returns whether the message
+    /// was authentic.
+    ///
+    /// This is the inverse of [`seal`]. It recomputes the expected tag from the IV, AAD,
+    /// and supplied ciphertext, and compares it against `tag`. Two safety properties are
+    /// deliberate here. First, the comparison is CONSTANT TIME: it ORs the XOR of all 16
+    /// byte differences into `diff` and tests `diff == 0` once, so a forgery cannot be
+    /// tuned byte by byte through timing. Second, the plaintext is written to `ptOut`
+    /// (via [`gctr`] from `J0 + 1`) ONLY after the tag verifies, so a caller never
+    /// observes unauthenticated plaintext. On a mismatch it returns `false` and leaves
+    /// `ptOut` untouched.
+    ///
+    /// `ptOut` must have room for `ctLen` bytes and may alias `ct`. On a hardware-capable
+    /// CPU the whole operation is delegated to [`aesgcmhw.openWith`].
     pub fn open(self: GcmContext, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
                 ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
         if (self.hwAes) {
@@ -180,6 +355,13 @@ pub struct GcmContext {
         return ok;
     }
 
+    /// Frees every heap buffer the context owns and tears down its sub-contexts.
+    ///
+    /// It deletes the AES schedule [`ctx`] and GHASH state [`g`], frees the subkey [`h`],
+    /// and frees whichever `hw*` buffers were allocated by [`create`]. Each pointer is
+    /// guarded by a non-zero check and then zeroed, so calling [`delete`] more than once
+    /// is safe (the second call finds every pointer already 0 and does nothing). Must be
+    /// called exactly once when the context is no longer needed.
     pub fn delete(self: GcmContext): void {
         self.ctx.delete();
         self.g.delete();
@@ -191,6 +373,13 @@ pub struct GcmContext {
     }
 }
 
+/// One-shot AES-GCM encryption: build a context, seal, and tear it down.
+///
+/// A convenience wrapper over [`GcmContext.create`], [`GcmContext.seal`], and
+/// [`GcmContext.delete`] for callers who encrypt a single message. It redoes the
+/// per-key precomputation every call, so for many messages under one key build a
+/// [`GcmContext`] once and reuse it instead. Buffer sizing and the no-IV-reuse rule
+/// are exactly as documented on [`GcmContext.seal`].
 pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
     let c = GcmContext.create(key, keyLen);
@@ -198,6 +387,13 @@ pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
     c.delete();
 }
 
+/// One-shot AES-GCM decryption and verification: build a context, open, and tear it down.
+///
+/// A convenience wrapper over [`GcmContext.create`], [`GcmContext.open`], and
+/// [`GcmContext.delete`]. It returns `true` and fills `ptOut` when the tag is authentic,
+/// or `false` (leaving `ptOut` untouched) when verification fails, with the same
+/// constant-time and verify-before-decrypt guarantees as [`GcmContext.open`]. Prefer a
+/// reused [`GcmContext`] when opening many messages under one key.
 pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
             ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
     let c = GcmContext.create(key, keyLen);

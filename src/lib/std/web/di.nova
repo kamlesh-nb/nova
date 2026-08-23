@@ -1,18 +1,41 @@
+//! Dependency injection container for the web framework.
+//!
+//! This mirrors the ASP.NET-style DI pattern: a `ServiceCollection` is used at
+//! startup to register factories keyed by string (typically a type name), then
+//! `buildServiceProvider()` freezes those registrations into a `ServiceProvider`
+//! that request handlers resolve services from. `ServiceScope` layers per-request
+//! (or per-unit-of-work) scoped instances on top of the shared singletons, which
+//! is how the framework gives each request its own scoped services (for example
+//! a database connection) without leaking them across requests.
+//!
+//! Services are registered under one of three lifetimes: singleton (one instance
+//! for the whole provider), scoped (one instance per `ServiceScope`), or
+//! transient (a fresh instance on every resolve). Lookup keys are plain strings,
+//! either supplied directly or derived from `serde.typeName<T>()` via the
+//! `*Type` helper methods.
 
 import map;
 
+/// Marker trait every injectable service must implement. Carries no methods:
+/// it exists only so registered factories and resolved values share a common
+/// type for storage in the DI maps.
 pub trait Service {
 }
 
+/// Lifetime tag: one shared instance for the lifetime of the `ServiceProvider`.
 pub const LIFETIME_SINGLETON: int = 1;
+/// Lifetime tag: one instance per `ServiceScope`, shared across resolves within that scope.
 pub const LIFETIME_SCOPED: int = 2;
+/// Lifetime tag: a new instance is created on every resolve. This is the default when a key has no recorded lifetime.
 pub const LIFETIME_TRANSIENT: int = 3;
 
+/// Outcome of a service lookup: either the resolved instance, or the key that was not registered.
 pub enum Resolved {
     Ok(Service),
     NotRegistered(string),
 }
 
+/// Renders a `Resolved` value as a short human-readable string, mainly for logging or error messages.
 pub fn resolvedReason(r: Resolved): string {
     switch (r) {
         case Resolved.Ok(v): { return "ok"; }
@@ -21,12 +44,21 @@ pub fn resolvedReason(r: Resolved): string {
     return "unknown";
 }
 
+// Placeholder Service returned from require() paths that panic before returning; never actually reached.
 struct NullService impl Service {
 }
 
+/// Read-only, built container of service registrations, used by request handlers to resolve services and by `ServiceScope` as the shared root.
+///
+/// Built once via `ServiceCollection.buildServiceProvider()`. Singletons resolved
+/// through this provider are cached directly on `self.singletons` and shared by
+/// every scope created from it.
 pub class ServiceProvider {
+    /// Registered factory functions, keyed by service key.
     pub factories: Map<string, (ServiceProvider) -> Service>,
+    /// Cache of already-created singleton instances, keyed by service key.
     pub singletons: Map<string, Service>,
+    /// Declared lifetime (`LIFETIME_*`) for each registered key.
     pub lifetimes: Map<string, int>,
 
     init(factories: Map<string, (ServiceProvider) -> Service>, singletons: Map<string, Service>, lifetimes: Map<string, int>) {
@@ -35,6 +67,9 @@ pub class ServiceProvider {
         self.lifetimes = lifetimes;
     }
 
+    /// Resolves a service by key: returns a cached singleton if present, otherwise invokes its factory.
+    /// A singleton-lifetime result is cached on first resolve; scoped and transient keys are not cached here.
+    /// Returns `Resolved.NotRegistered` if the key has no factory.
     pub fn resolve(self: ServiceProvider, key: string): Resolved {
         let cached = self.singletons.get(key);
         if (cached != undefined) {
@@ -52,6 +87,8 @@ pub class ServiceProvider {
         return Resolved.Ok(instance);
     }
 
+    /// Resolves a service by key, panicking with "DI: required service not registered" if it is missing.
+    /// Use when the caller has no sensible fallback for an unregistered dependency.
     pub fn require(self: ServiceProvider, key: string): Service {
         let r: Resolved = self.resolve(key);
         switch (r) {
@@ -61,17 +98,26 @@ pub class ServiceProvider {
         return NullService{};
     }
 
+    /// Resolves a service by its type name (`serde.typeName<T>()`) instead of an explicit string key. Panics if unregistered, same as `require`.
     pub fn resolveType<T>(self: ServiceProvider): Service {
         return self.require(serde.typeName<T>());
     }
 
+    /// Creates a new `ServiceScope` rooted at this provider, for resolving scoped and per-request services.
     pub fn createScope(self: ServiceProvider): ServiceScope {
         return ServiceScope(self);
     }
 }
 
+/// A per-request (or per-unit-of-work) resolution scope layered over a `ServiceProvider`.
+///
+/// Scoped-lifetime services resolved through a `ServiceScope` are cached on
+/// `self.scoped` and live only as long as this scope does; singletons still
+/// resolve through and are cached on the shared root provider.
 pub struct ServiceScope {
+    /// The `ServiceProvider` this scope was created from; shared singletons and factories come from here.
     pub root: ServiceProvider,
+    /// Cache of scoped-lifetime instances created within this scope, keyed by service key.
     pub scoped: Map<string, Service>,
 
     init(root: ServiceProvider) {
@@ -79,6 +125,8 @@ pub struct ServiceScope {
         self.scoped = Map<string, Service>(16, string.hash);
     }
 
+    /// Resolves a service by key within this scope: checks the scoped cache, then the root's singleton cache, otherwise invokes the factory and caches the result according to its lifetime.
+    /// Returns `Resolved.NotRegistered` if the key has no factory.
     pub fn resolve(self: ServiceScope, key: string): Resolved {
         let s = self.scoped.get(key);
         if (s != undefined) {
@@ -102,6 +150,7 @@ pub struct ServiceScope {
         return Resolved.Ok(instance);
     }
 
+    /// Resolves a service by key within this scope, panicking with "DI: required service not registered" if it is missing.
     pub fn require(self: ServiceScope, key: string): Service {
         let r: Resolved = self.resolve(key);
         switch (r) {
@@ -111,14 +160,24 @@ pub struct ServiceScope {
         return NullService{};
     }
 
+    /// Resolves a service by its type name (`serde.typeName<T>()`) within this scope. Panics if unregistered, same as `require`.
     pub fn resolveType<T>(self: ServiceScope): Service {
         return self.require(serde.typeName<T>());
     }
 }
 
+/// Mutable registry of service factories used at application startup, before any services can be resolved.
+///
+/// Registrations are added with `addSingleton`/`addScoped`/`addTransient` (or
+/// their `*Type` counterparts keyed by `serde.typeName<T>()`), then
+/// `buildServiceProvider()` produces the immutable `ServiceProvider` handlers
+/// actually resolve from.
 pub class ServiceCollection {
+    /// Registered factory functions, keyed by service key.
     pub factories: Map<string, (ServiceProvider) -> Service>,
+    /// Singleton cache map handed to the built `ServiceProvider`; empty until services are resolved.
     pub singletons: Map<string, Service>,
+    /// Declared lifetime (`LIFETIME_*`) for each registered key.
     pub lifetimes: Map<string, int>,
 
     init() {
@@ -127,33 +186,40 @@ pub class ServiceCollection {
         self.lifetimes = Map<string, int>(32, string.hash);
     }
 
+    /// Registers a factory under the given key with singleton lifetime: one instance shared for the life of the built provider.
     pub fn addSingleton(self: ServiceCollection, key: string, factory: (ServiceProvider) -> Service): void {
         self.factories.set(key, factory);
         self.lifetimes.set(key, LIFETIME_SINGLETON);
     }
 
+    /// Registers a factory under the given key with scoped lifetime: one instance per `ServiceScope`.
     pub fn addScoped(self: ServiceCollection, key: string, factory: (ServiceProvider) -> Service): void {
         self.factories.set(key, factory);
         self.lifetimes.set(key, LIFETIME_SCOPED);
     }
 
+    /// Registers a factory under the given key with transient lifetime: a fresh instance on every resolve.
     pub fn addTransient(self: ServiceCollection, key: string, factory: (ServiceProvider) -> Service): void {
         self.factories.set(key, factory);
         self.lifetimes.set(key, LIFETIME_TRANSIENT);
     }
 
+    /// Registers a singleton factory keyed by `serde.typeName<T>()` instead of an explicit string key.
     pub fn addSingletonType<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
         self.addSingleton(serde.typeName<T>(), factory);
     }
 
+    /// Registers a scoped factory keyed by `serde.typeName<T>()` instead of an explicit string key.
     pub fn addScopedType<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
         self.addScoped(serde.typeName<T>(), factory);
     }
 
+    /// Registers a transient factory keyed by `serde.typeName<T>()` instead of an explicit string key.
     pub fn addTransientType<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
         self.addTransient(serde.typeName<T>(), factory);
     }
 
+    /// Freezes the current registrations into a `ServiceProvider`. The factories, singleton cache, and lifetime maps are shared by reference, not copied.
     pub fn buildServiceProvider(self: ServiceCollection): ServiceProvider {
         return ServiceProvider(self.factories, self.singletons, self.lifetimes);
     }

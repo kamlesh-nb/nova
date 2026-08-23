@@ -1,33 +1,129 @@
+//! The actor model: message-driven concurrency on top of the async reactor.
+//!
+//! An actor is a single unit of state that only ever touches its own data and
+//! communicates with the outside world by receiving messages one at a time. No
+//! two messages for the same actor run at once, so an actor never needs a lock
+//! to protect its state: mutual exclusion falls out of the "one message in
+//! flight" rule for free. This file is the small, hand-rolled toolkit that makes
+//! that pattern work on Nova's cooperative async runtime.
+//!
+//! The pieces fit together like this:
+//!
+//!   * A [`Behavior`] (or [`SupervisedBehavior`]) is the user's code: what to do
+//!     with one message of type `M`.
+//!   * A [`Mailbox`] is the inbox: an ordered queue of pending messages plus a
+//!     signal channel used to wake the actor when work arrives or when it should
+//!     stop.
+//!   * An [`ActorCell`] glues a mailbox to a behaviour and runs the receive loop
+//!     as an async task, draining one message per wake.
+//!   * A [`Supervisor`] wraps a fallible behaviour and applies a restart policy,
+//!     so a message that fails does not silently kill the actor.
+//!   * An [`ActorRegistry`] is an optional name-to-mailbox directory, so actors
+//!     can find each other by string name rather than by passing raw handles
+//!     around.
+//!
+//! The core design decision is that the mailbox does NOT ship messages through
+//! the channel. The channel (see [`asyncchan`]) only ever carries a one-byte
+//! signal: `1` means "a message was enqueued, come and look", `0` means "stop".
+//! The actual messages live in an ordinary in-process [`List`], and the actor
+//! pops them itself. This keeps the channel payload tiny and fixed-size, and it
+//! side-steps having to move arbitrary `M` values through the channel's integer
+//! transport. The invariant the loop relies on is that every [`Mailbox.send`]
+//! pushes exactly one message and raises exactly one signal, so the count of
+//! pending signals never runs ahead of the queue.
+//!
+//! Everything here runs on the single-reactor async runtime, so "concurrent"
+//! means cooperatively interleaved on one thread, not parallel across cores.
+//! That is deliberate: the whole point of the actor model here is to get
+//! isolation and back-pressure without shared-memory locking. See the wider
+//! runtime direction notes in the standard library's concurrency package.
 
 import list;
 import map;
 import string;
 import concurrency.asyncchan;
 
+/// The user-supplied message handler for an actor, generic over message type `M`.
+///
+/// Implementers provide a single async [`Behavior.receive`] that processes one
+/// message. Because it is async, a handler may `await` (do I/O, talk to other
+/// actors) without blocking the reactor, and the driving [`ActorCell`] will not
+/// pull the next message until the current `receive` completes. This is what
+/// gives an actor its "one message at a time" guarantee.
 pub trait Behavior<M> {
+    /// Handles exactly one message. May `await`; the [`ActorCell`] loop waits
+    /// for this to finish before delivering the next message, so state touched
+    /// here never races with a second message.
     async fn receive(self, msg: M): void;
 }
 
+/// A name-to-mailbox directory so actors can be addressed by string rather than
+/// by a raw mailbox handle.
+///
+/// The value stored per name is a `long`, an opaque mailbox/channel handle (the
+/// same kind of handle [`Mailbox.signal`] holds), not a Nova object reference.
+/// Callers register a handle under a well-known name and look it up later,
+/// which decouples the sender from however the actor was constructed.
 pub struct ActorRegistry {
+    /// The backing directory. Maps a registered name to its opaque mailbox
+    /// handle. Seeded with capacity 16 and the standard string hash.
     names: map.Map<string, long>,
+    /// Creates an empty registry with a small starting capacity.
     init() { self.names = map.Map<string, long>(16, string.hash); }
+    /// Records `mbox` under `name`, overwriting any existing entry for that name.
     pub fn register(self: ActorRegistry, name: string, mbox: long): void { self.names.set(name, mbox); }
+    /// Returns the handle registered under `name`, or `0` if there is none.
+    ///
+    /// `0` doubles as the "not found" sentinel, so a caller that might register a
+    /// genuine zero handle should use [`ActorRegistry.has`] to disambiguate.
     pub fn lookup(self: ActorRegistry, name: string): long { return self.names.get(name) ?? 0; }
+    /// Reports whether `name` is currently registered.
     pub fn has(self: ActorRegistry, name: string): bool { return self.names.has(name); }
+    /// Removes the entry for `name` if present; a no-op when it is absent.
+    ///
+    /// The delete result is intentionally discarded into `_r`: callers that care
+    /// whether the name existed should check [`ActorRegistry.has`] beforehand.
     pub fn unregister(self: ActorRegistry, name: string): void { let _r = self.names.delete_key(name); }
+    /// Returns how many names are currently registered.
     pub fn count(self: ActorRegistry): int { return self.names.size(); }
 }
 
+/// A fallible, restartable message handler used with a [`Supervisor`].
+///
+/// Unlike [`Behavior`], this receive is synchronous and returns a `bool`
+/// success flag rather than throwing: `true` means the message was handled,
+/// `false` signals a failure that the supervisor should treat as a fault. A
+/// [`SupervisedBehavior.reset`] lets the supervisor restore the handler to a
+/// clean starting state before retrying subsequent messages.
 pub trait SupervisedBehavior<M> {
+    /// Processes one message and returns `true` on success, `false` on failure.
+    /// A `false` return is what triggers the supervisor's restart policy.
     fn receive(self, msg: M): bool;
+    /// Restores the behaviour to a clean initial state after a failure, called
+    /// by the supervisor between a failed message and the next one.
     fn reset(self): void;
 }
 
+/// Wraps a [`SupervisedBehavior`] with a bounded restart policy.
+///
+/// The supervisor counts failures and resets the behaviour after each one, up to
+/// `maxRestarts` times. Once that budget is exhausted it latches `stopped` and
+/// refuses all further messages, so a persistently failing actor is taken out of
+/// service rather than looping on the same fault forever. This is the classic
+/// "let it crash, but bound the crashes" supervision idea in miniature.
 pub struct Supervisor<M> {
+    /// The wrapped handler whose failures this supervisor manages.
     behavior: SupervisedBehavior<M>,
+    /// How many times the behaviour has been reset and restarted so far.
     restarts: int,
+    /// The maximum number of restarts allowed before the actor is stopped for
+    /// good.
     maxRestarts: int,
+    /// Latched once the restart budget is spent; blocks all further delivery.
     stopped: bool,
+    /// Creates a supervisor around `behavior` that tolerates up to `maxRestarts`
+    /// failures before latching stopped. Starts with zero restarts and not
+    /// stopped.
     init(behavior: SupervisedBehavior<M>, maxRestarts: int) {
         self.behavior = behavior;
         self.restarts = 0;
@@ -35,6 +131,17 @@ pub struct Supervisor<M> {
         self.stopped = false;
     }
 
+    /// Delivers one message through the restart policy.
+    ///
+    /// Returns `false` immediately if the actor is already stopped. Otherwise it
+    /// calls the behaviour: on success it returns `true`; on failure it either
+    /// latches `stopped` and returns `false` (budget exhausted) or resets the
+    /// behaviour, bumps [`Supervisor.restartCount`], and returns `true` so the
+    /// caller keeps feeding messages. Note the subtlety: a successfully
+    /// RECOVERED failure still returns `true`, because from the mailbox loop's
+    /// point of view the actor is alive and ready for the next message. Only the
+    /// two terminal cases (already stopped, or budget just exhausted) return
+    /// `false`.
     pub fn deliver(self: Supervisor<M>, msg: M): bool {
         if (self.stopped) { return false; }
         let ok = self.behavior.receive(msg);
@@ -46,36 +153,82 @@ pub struct Supervisor<M> {
         return true;
     }
 
+    /// Returns how many times the behaviour has been restarted so far.
     pub fn restartCount(self: Supervisor<M>): int { return self.restarts; }
+    /// Reports whether the supervisor has latched stopped and is refusing
+    /// messages.
     pub fn isStopped(self: Supervisor<M>): bool { return self.stopped; }
 }
 
+/// An actor's inbox: an ordered message queue plus a wake signal.
+///
+/// Messages are held in an ordinary in-process [`List`], and a separate signal
+/// channel is used only to wake the consuming [`ActorCell`]. The channel never
+/// carries the message itself, just a one-byte code, so its payload stays small
+/// and fixed regardless of `M`. See the file header for why this split exists.
 pub struct Mailbox<M> {
+    /// Pending messages in arrival order. The producer pushes to the back via
+    /// [`Mailbox.send`]; the [`ActorCell`] loop pops from the front.
     pub queue: List<M>,
+    /// Opaque handle to the wake channel (see [`asyncchan`]). Carries `1` for
+    /// "message enqueued" and `0` for "stop", never a message payload.
     pub signal: long,
+    /// Creates an empty mailbox with a fresh wake channel.
     init() {
         self.queue = List<M>();
         self.signal = asyncchan.chanNew();
     }
 
+    /// Enqueues one message and wakes the actor.
+    ///
+    /// Pushes `msg` to the back of the queue, then sends a `1` signal so the
+    /// [`ActorCell`] loop, which may be parked awaiting the channel, wakes and
+    /// drains it. The order matters: the message is visible in the queue before
+    /// the signal is raised, so the woken loop always finds work waiting.
     pub fn send(self: Mailbox<M>, msg: M): void {
         self.queue.push(msg);
         asyncchan.chanSend(self.signal, 1);
     }
 
+    /// Signals the actor to stop by sending the `0` sentinel on the channel.
+    ///
+    /// This does not drain or clear the queue; it just tells the running
+    /// [`ActorCell.run`] loop to break out on its next wake. Any messages still
+    /// queued behind the stop signal are left unprocessed.
     pub fn stop(self: Mailbox<M>): void {
         asyncchan.chanSend(self.signal, 0);
     }
 }
 
+/// Binds a [`Mailbox`] to a [`Behavior`] and runs the actor's receive loop.
+///
+/// The cell is the running instance of an actor: it owns the pairing of "where
+/// messages arrive" (the mailbox) and "what to do with them" (the behaviour),
+/// and its [`ActorCell.run`] method is the async task that services them one at
+/// a time.
 pub struct ActorCell<M> {
+    /// The inbox this cell drains.
     pub mbox: Mailbox<M>,
+    /// The handler invoked for each message pulled from the mailbox.
     pub behavior: Behavior<M>,
+    /// Creates a cell that will service `mbox` using `behavior`.
     init(mbox: Mailbox<M>, behavior: Behavior<M>) {
         self.mbox = mbox;
         self.behavior = behavior;
     }
 
+    /// Runs the receive loop until stopped, returning the number of messages
+    /// processed.
+    ///
+    /// The loop parks on the mailbox's signal channel; each wake carries either a
+    /// stop code (`0`), which breaks the loop, or a message-ready code, on which
+    /// it pops the front message and awaits the behaviour. Because it awaits
+    /// `receive` before looping, at most one message is ever in flight, which is
+    /// the actor isolation guarantee. Note the loop pulls at most ONE message per
+    /// wake and guards with a non-empty check, so a spurious or already-drained
+    /// wake is harmless; it relies on [`Mailbox.send`] raising one signal per
+    /// enqueued message to keep signals and messages in step. Spawn this as an
+    /// async task; it does not return until a stop signal arrives.
     pub async fn run(self: ActorCell<M>): int {
         let processed = 0;
         while (true) {

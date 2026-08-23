@@ -1,24 +1,56 @@
+//! Circuit breaker for guarding calls to a failure-prone dependency (a remote
+//! service, a database, any operation that can fail repeatedly under load).
+//!
+//! `CircuitBreaker` implements the classic three-state machine: CLOSED (calls
+//! flow normally, failures are counted), OPEN (calls are rejected outright
+//! until a timeout elapses, giving the dependency time to recover), and
+//! HALF_OPEN (a trial period where a limited number of calls are allowed
+//! through to decide whether to close again or trip back open). Callers drive
+//! the state machine themselves: check `shouldAllow()` before attempting the
+//! guarded call, then report the outcome via `recordSuccess()` or
+//! `recordFailure()`. This module holds only the state machine; it does not
+//! wrap or intercept calls itself, so it composes with any part of the
+//! standard library that makes outbound calls (db drivers, http clients).
 
 import datetime;
 
+/// The breaker is closed: calls are allowed through and failures are counted
+/// towards `failureThreshold`.
 pub const STATE_CLOSED: int = 0;
+/// The breaker is open: calls are rejected until `timeoutMs` has elapsed
+/// since the last state change.
 pub const STATE_OPEN: int = 1;
+/// The breaker is in its trial period after an open timeout: calls are
+/// allowed through, and a run of `successThreshold` successes closes the
+/// breaker while a single failure trips it back open.
 pub const STATE_HALF_OPEN: int = 2;
 
+// Current wall-clock time in milliseconds, used to time state transitions.
 fn nowMs(): long {
     return datetime.nowNs() / 1000000;
 }
 
+/// A three-state circuit breaker that tracks consecutive failures and
+/// successes for one guarded operation and decides when calls should be
+/// allowed, rejected, or trialled.
 pub struct CircuitBreaker {
+    /// Current state: one of `STATE_CLOSED`, `STATE_OPEN`, `STATE_HALF_OPEN`.
     pub state: int,
+    /// Consecutive failures seen in the current state (reset on transitions).
     pub failureCount: int,
+    /// Consecutive successes seen while in `STATE_HALF_OPEN`.
     pub successCount: int,
+    /// Timestamp (ms) of the last state transition, used to measure the open timeout.
     pub lastStateChange: long,
 
+    /// Number of consecutive failures in `STATE_CLOSED` that trips the breaker to `STATE_OPEN`.
     pub failureThreshold: int,
+    /// Number of consecutive successes in `STATE_HALF_OPEN` needed to close the breaker again.
     pub successThreshold: int,
+    /// How long (ms) the breaker stays `STATE_OPEN` before moving to `STATE_HALF_OPEN` for a trial.
     pub timeoutMs: long,
 
+    /// Creates a new breaker starting in `STATE_CLOSED` with zeroed counters.
     init(failureThreshold: int, successThreshold: int, timeoutMs: long) {
         self.state = STATE_CLOSED;
         self.failureCount = 0;
@@ -29,6 +61,12 @@ pub struct CircuitBreaker {
         self.timeoutMs = timeoutMs;
     }
 
+    /// Whether the caller should attempt the guarded call right now.
+    ///
+    /// Always true in `STATE_CLOSED` and `STATE_HALF_OPEN`. In `STATE_OPEN`,
+    /// true only once `timeoutMs` has elapsed since the last state change, at
+    /// which point this call also flips the breaker to `STATE_HALF_OPEN` and
+    /// resets the counters as a side effect.
     pub fn shouldAllow(self: CircuitBreaker): bool {
         if (self.state == STATE_CLOSED) { return true; }
         if (self.state == STATE_HALF_OPEN) { return true; }
@@ -44,6 +82,12 @@ pub struct CircuitBreaker {
         return false;
     }
 
+    /// Reports that the guarded call succeeded.
+    ///
+    /// In `STATE_HALF_OPEN`, counts towards `successThreshold` and closes the
+    /// breaker (resetting both counters) once reached. In any other state,
+    /// simply clears `failureCount`, so an isolated success in `STATE_CLOSED`
+    /// does not let unrelated failures accumulate across it.
     pub fn recordSuccess(self: CircuitBreaker): void {
         if (self.state == STATE_HALF_OPEN) {
             self.successCount = self.successCount + 1;
@@ -59,6 +103,13 @@ pub struct CircuitBreaker {
         }
     }
 
+    /// Reports that the guarded call failed.
+    ///
+    /// In `STATE_CLOSED`, increments `failureCount` and trips to `STATE_OPEN`
+    /// once `failureThreshold` is reached. In `STATE_HALF_OPEN`, a single
+    /// failure immediately trips back to `STATE_OPEN` (the trial failed). In
+    /// `STATE_OPEN`, refreshes `lastStateChange`, which restarts the timeout
+    /// window on continued failures.
     pub fn recordFailure(self: CircuitBreaker): void {
         self.failureCount = self.failureCount + 1;
         if (self.state == STATE_CLOSED) {
@@ -77,10 +128,13 @@ pub struct CircuitBreaker {
         }
     }
 
+    /// Returns the current state, one of `STATE_CLOSED`, `STATE_OPEN`, `STATE_HALF_OPEN`.
     pub fn getState(self: CircuitBreaker): int {
         return self.state;
     }
 
+    /// Forces the breaker back to `STATE_CLOSED` with zeroed counters,
+    /// regardless of its current state. Useful for manual override or test setup.
     pub fn reset(self: CircuitBreaker): void {
         self.state = STATE_CLOSED;
         self.failureCount = 0;

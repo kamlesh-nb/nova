@@ -1,16 +1,44 @@
+//! A small, dependency-free URL parser for absolute HTTP(S) URLs.
+//!
+//! This module splits a raw URL string into its component parts: scheme,
+//! host, port, path (including any query string), and query. It is a
+//! pragmatic parser aimed at the shapes that show up in server-side code
+//! (client requests, configuration, redirects), not a full RFC 3986
+//! implementation: there is no percent-decoding, no userinfo, no fragment
+//! handling, and no validation of illegal characters. IPv6 host literals in
+//! bracket notation (`[::1]`) are supported.
 
 import string;
 import assert;
 
+/// The parsed components of a URL, as produced by `parse`.
 pub struct Url {
+    /// The scheme in lower case, for example `"http"` or `"https"`. Defaults
+    /// to `"http"` when the input has no `"://"` separator.
     pub scheme: string,
+    /// The hostname or IP literal, without brackets for IPv6 addresses and
+    /// without the port.
     pub host: string,
+    /// The port number. Defaults to 443 for `https`, 80 for anything else,
+    /// unless the input explicitly specifies one.
     pub port: int,
+    /// The path, including the leading `?` and query string if present.
+    /// Defaults to `"/"` when the input has no path segment.
     pub path: string,
+    /// The query string with the leading `?` stripped, or `""` if there is
+    /// no query.
     pub query: string,
+    /// True when the scheme is `"https"`.
     pub secure: bool,
 }
 
+/// Parses a raw URL string into its `Url` components.
+///
+/// Recognises an optional `scheme://` prefix, an optional `host:port` (or
+/// bracketed IPv6 `[host]:port`), and everything after the first `/` as the
+/// path. Malformed or partial input degrades gracefully rather than
+/// erroring: a bare host such as `"example.com"` parses to scheme `"http"`,
+/// port 80, and path `"/"`.
 pub fn parse(raw: string): Url {
     let s = raw;
     let scheme = "http";

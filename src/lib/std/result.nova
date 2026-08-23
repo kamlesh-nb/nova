@@ -1,37 +1,74 @@
+//! A generic `Result<T, E>` type for functions that can fail without throwing.
+//!
+//! Unlike Nova's `try`/`catch`/`exception` error model, `Result` carries a
+//! success value or a failure value inline, as an ordinary value struct with
+//! no ARC overhead of its own. It is the sibling of the exception-based error
+//! model for call sites that prefer to inspect and propagate failure
+//! explicitly rather than unwind the stack.
+//!
+//! Because Nova has no variant/union payload for this struct, both `value`
+//! and `error` fields are always present on every `Result`: constructing an
+//! `Ok` still needs a placeholder `E`, and constructing an `Err` still needs
+//! a placeholder `T`. The `ok`/`err` free functions exist to make supplying
+//! that placeholder explicit at the call site.
 
+/// A value that is either a success (`isOk == true`, meaningful data in
+/// `value`) or a failure (`isOk == false`, meaningful data in `error`).
+///
+/// Both `value` and `error` are always populated: whichever one does not
+/// apply holds the caller-supplied placeholder passed to `ok`/`err`, and
+/// reading it is meaningless. Check `isOk` (or use `ok()`/`isErr()`) before
+/// trusting either field.
 pub struct Result<T, E> {
+    /// True when this Result represents success; false when it represents failure.
     pub isOk: bool,
+    /// The success payload. Only meaningful when `isOk` is true.
     pub value: T,
+    /// The failure payload. Only meaningful when `isOk` is false.
     pub error: E,
 
+    /// Returns true if this Result is a success.
     pub fn ok(self: Result<T, E>): bool { return self.isOk; }
+    /// Returns true if this Result is a failure.
     pub fn isErr(self: Result<T, E>): bool { return !self.isOk; }
 
+    /// Returns the success value, or `d` if this Result is a failure.
     pub fn getOr(self: Result<T, E>, d: T): T {
         if (self.isOk) { return self.value; }
         return d;
     }
 
+    /// Returns the failure value, or `d` if this Result is a success.
     pub fn errorOr(self: Result<T, E>, d: E): E {
         if (self.isOk) { return d; }
         return self.error;
     }
 
+    /// Applies `f` to the success value, leaving a failure untouched.
+    /// The error field of a failure result is passed through unchanged.
     pub fn map(self: Result<T, E>, f: (T) -> T): Result<T, E> {
         if (self.isOk) { return Result<T, E> { isOk: true, value: f(self.value), error: self.error }; }
         return self;
     }
 
+    /// Chains a Result-returning function onto a success value, leaving a
+    /// failure untouched. Useful for sequencing fallible steps without
+    /// nesting `if (isOk)` checks.
     pub fn flatMap(self: Result<T, E>, f: (T) -> Result<T, E>): Result<T, E> {
         if (self.isOk) { return f(self.value); }
         return self;
     }
 }
 
+/// Builds a success Result. `errZero` is a placeholder for the unused error
+/// field: since `Result` has no variant payload, every instance needs a
+/// concrete `E` even when it will never be read.
 pub fn ok<T, E>(value: T, errZero: E): Result<T, E> {
     return Result<T, E> { isOk: true, value: value, error: errZero };
 }
 
+/// Builds a failure Result. `valZero` is a placeholder for the unused value
+/// field, supplied for the same reason `ok` needs `errZero`.
 pub fn err<T, E>(error: E, valZero: T): Result<T, E> {
     return Result<T, E> { isOk: false, value: valZero, error: error };
 }

@@ -1,3 +1,17 @@
+//! HTTP/2 connection handling: turns a stream of HTTP/2 frames into request/response
+//! objects and back again, on top of `web.http2.frame` (framing) and `web.http2.hpack`
+//! (header compression). It provides two entry points: `processMessage`, which decodes a
+//! single already-buffered client message and encodes the reply (used for offline or
+//! test-style processing), and `serveH2`, the async connection loop that reads frames off
+//! a live `net.aio.AsyncIO` socket, handles the connection preface, SETTINGS and PING
+//! housekeeping, and dispatches each completed request stream to a user-supplied handler.
+//!
+//! This file only implements the request/response shape actually needed by the web
+//! framework: single HEADERS (+ optional DATA) per stream ending in END_STREAM, no
+//! request-body streaming, no server push, no flow-control window updates beyond the
+//! defaults. `H2Request`/`H2Response` are the plain data types the handler closure
+//! exchanges with the rest of `web`.
+
 import bytes;
 import string;
 import list;
@@ -5,14 +19,22 @@ import net.aio;
 import web.http2.hpack;
 import web.http2.frame;
 
+/// Initial flow-control window size advertised per HTTP/2 stream (not currently enforced,
+/// window updates are not sent or tracked).
 const DEFAULT_WINDOW: int = 65535;
+/// Maximum size of a single outgoing DATA frame payload; larger response bodies are split
+/// into multiple frames by `writeResponse`.
 const MAX_FRAME: int = 16384;
 
+/// A decoded HTTP/2 request: pseudo-headers pulled out separately from the regular header
+/// fields, plus the request body.
 pub struct H2Request {
     pub method: string,
     pub path: string,
     pub scheme: string,
     pub authority: string,
+    /// Regular (non pseudo-) header fields, in wire order; `:method`, `:path`, `:scheme`
+    /// and `:authority` have already been stripped out into the fields above.
     pub headers: List<hpack.HeaderField>,
     pub body: string,
     init(method: string, path: string, scheme: string, authority: string, headers: List<hpack.HeaderField>, body: string) {
@@ -21,6 +43,8 @@ pub struct H2Request {
     }
 }
 
+/// An HTTP/2 response as produced by a handler: status code, regular header fields, and body.
+/// `writeResponse` adds the `:status` pseudo-header itself, so `headers` should not include it.
 pub struct H2Response {
     pub status: int,
     pub headers: List<hpack.HeaderField>,
@@ -30,6 +54,7 @@ pub struct H2Response {
     }
 }
 
+/// Linear scan for a header by name; returns "" when absent.
 fn getHeader(fields: List<hpack.HeaderField>, name: string): string {
     let i = 0;
     while (i < fields.size()) {
@@ -40,6 +65,8 @@ fn getHeader(fields: List<hpack.HeaderField>, name: string): string {
     return "";
 }
 
+/// Encodes `resp` as a HEADERS frame (with `:status`) followed by zero or more DATA frames
+/// (split at `MAX_FRAME`) into `out` starting at offset `o0`; returns the new write offset.
 fn writeResponse(enc: hpack.Hpack, out: ptr, o0: int, streamId: int, resp: H2Response): int {
     let o = o0;
     let fields = List<hpack.HeaderField>();
@@ -69,8 +96,11 @@ fn writeResponse(enc: hpack.Hpack, out: ptr, o0: int, streamId: int, resp: H2Res
     return o;
 }
 
+/// Formats a status code as its decimal string, for the `:status` pseudo-header.
 fn statusStr(code: int): string { return `${code}`; }
 
+/// Splits a decoded header field list into the four request pseudo-headers plus the
+/// remaining regular fields, and assembles an `H2Request`.
 fn buildRequest(fields: List<hpack.HeaderField>, body: string): H2Request {
     let method = getHeader(fields, ":method");
     let path = getHeader(fields, ":path");
@@ -86,6 +116,9 @@ fn buildRequest(fields: List<hpack.HeaderField>, body: string): H2Request {
     return H2Request(method, path, scheme, authority, regular, body);
 }
 
+/// Given a HEADERS frame payload, strips the optional PADDED length byte and PRIORITY
+/// fields (per their flag bits) and returns the (offset, length) span of the actual
+/// header block fragment that HPACK should decode.
 fn headerBlockSpan(buf: ptr, payloadOff: int, payloadLen: int, flags: int): (int, int) {
     let off = payloadOff;
     let len = payloadLen;
@@ -104,6 +137,14 @@ fn headerBlockSpan(buf: ptr, payloadOff: int, payloadLen: int, flags: int): (int
     return (off, len);
 }
 
+/// Decodes a complete HTTP/2 client message already sitting in memory (an optional 24-byte
+/// connection preface followed by frames) and encodes the reply into a freshly allocated
+/// buffer, running `handler` once per request stream that completes with END_STREAM.
+///
+/// Returns `(outBuf, outLen)`: `outBuf` is sized `inLen * 4 + 65536`, which is a heuristic
+/// upper bound, not a guarantee, for very large responses relative to the request. Any
+/// SETTINGS frame is ACKed and PING frames are ACKed; unrecognised or unhandled frame types
+/// are skipped. Does not read from a socket: use `serveH2` for live connections.
 pub fn processMessage(inBuf: ptr, inLen: int, handler: (H2Request) -> H2Response): (ptr, int) {
     let dec = hpack.newHpack();
     let enc = hpack.newHpack();
@@ -150,6 +191,8 @@ pub fn processMessage(inBuf: ptr, inLen: int, handler: (H2Request) -> H2Response
     return (out, o);
 }
 
+/// Reads exactly `n` bytes into `buf` starting at `off`, looping over short reads; returns
+/// false (without raising) on EOF or a socket error partway through.
 async fn readN(io: aio.AsyncIO, buf: ptr, off: int, n: int): bool {
     let got = 0;
     while (got < n) {
@@ -160,6 +203,15 @@ async fn readN(io: aio.AsyncIO, buf: ptr, off: int, n: int): bool {
     return true;
 }
 
+/// Runs the server side of an HTTP/2 connection over `io` until the peer sends GOAWAY or
+/// the connection is lost: verifies the 24-byte client connection preface, sends an empty
+/// SETTINGS frame, then loops reading frames and ACKing SETTINGS/PING, decoding each HEADERS
+/// block with a per-connection HPACK decoder, and invoking `handler` (synchronously, one
+/// request at a time; there is no concurrent multiplexing of in-flight streams) whenever a
+/// header block arrives with END_STREAM set.
+///
+/// Returns 0 if the preface check fails or the connection closes before it is verified,
+/// and 1 on a normal exit from the frame loop (GOAWAY, EOF, or a write failure).
 pub async fn serveH2(io: aio.AsyncIO, handler: (H2Request) -> H2Response): int {
     let dec = hpack.newHpack();
     let enc = hpack.newHpack();
@@ -217,6 +269,8 @@ pub async fn serveH2(io: aio.AsyncIO, handler: (H2Request) -> H2Response): int {
     return 1;
 }
 
+/// Wraps a raw byte buffer as a `string` in place, by writing the NUL terminator and the
+/// ARC/length header word just before `buf`; does not copy the bytes.
 fn bufToStr(buf: ptr, len: int): string {
     bytes.write_byte(buf, len, 0);
     bytes.write_i32(buf - 4, 0, len);

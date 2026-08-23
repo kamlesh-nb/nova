@@ -1,3 +1,19 @@
+//! Windows implementation of the `process` module: spawns a child process
+//! and talks to it over anonymous pipes using the Win32 `CreateProcessW`
+//! family. This file is selected by the target-conditional file rule when
+//! compiling for `windows`, standing in for `process_posix.nova` so callers
+//! of the public `process`/`Process` API do not need to know which platform
+//! backs it.
+//!
+//! Everything below the raw Win32 calls exists to bridge two mismatches with
+//! the POSIX model the rest of the stdlib assumes: Windows has no native
+//! `argv` array, so a command line is a single string the child re-parses,
+//! which `buildCommandLine`/`quoteArg` construct with the MSVC quoting rules;
+//! and pipe handles are inherited by the whole process unless explicitly
+//! marked non-inheritable, which `inheritableSa` and the `SetHandleInformation`
+//! calls in `spawn` account for. Process state (handles, pid, cached exit
+//! code) is stored in a small manually laid out byte buffer (`ctx`) rather
+//! than typed fields, matching the POSIX sibling's ABI shape.
 
 import list;
 import bytes;
@@ -14,6 +30,9 @@ const CTX_PID_OFF: int = 24;
 const CTX_EXIT_OFF: int = 28;
 const CTX_EXITED_OFF: int = 32;
 
+// Wraps a single command-line argument in double quotes and backslash-escapes
+// embedded quotes, following the Windows argv-reparsing convention, only when
+// the argument contains whitespace, a quote, or is empty.
 fn quoteArg(a: string): string {
     let needs = a.length == 0;
     let quotes = 0;
@@ -40,6 +59,8 @@ fn quoteArg(a: string): string {
     return buf as string;
 }
 
+// Joins the quoted command and its quoted arguments into the single string
+// CreateProcessW expects as its command line.
 fn buildCommandLine(cmd: string, args: list.List<string>): string {
     let line = quoteArg(cmd);
     let i = 0;
@@ -50,6 +71,8 @@ fn buildCommandLine(cmd: string, args: list.List<string>): string {
     return line;
 }
 
+// Builds a zeroed SECURITY_ATTRIBUTES struct with bInheritHandle set, so pipe
+// handles created with it are inherited by a child process.
 fn inheritableSa(): ptr {
     let sa = bytes.alloc(proc.SECURITY_ATTRIBUTES_SIZE);
     let i = 0;
@@ -59,9 +82,18 @@ fn inheritableSa(): ptr {
     return sa;
 }
 
+/// A handle to a spawned Windows child process, with its stdin/stdout wired
+/// through anonymous pipes.
 pub struct Process {
+    /// Opaque pointer to a `CTX_SIZE`-byte native buffer holding the process
+    /// handle, the stdin/stdout pipe handles, the pid, and the cached exit
+    /// state. `0 as ptr` means the process failed to spawn or has been closed.
     pub ctx: ptr,
 
+    /// Spawns `cmd` with `args` via `CreateProcessW`, wiring the child's
+    /// stdin and stdout/stderr to anonymous pipes owned by this `Process`.
+    /// Returns a `Process` with `ctx == 0` on any failure (pipe creation,
+    /// UTF-16 conversion, or `CreateProcessW` itself).
     pub fn spawn(cmd: string, args: list.List<string>): Process {
         let sa = inheritableSa();
 
@@ -140,11 +172,15 @@ pub struct Process {
         return Process{ ctx: ctx };
     }
 
+    /// Namespace/container isolation (Linux-only concept) is not available on
+    /// Windows: always returns an unspawned `Process` (`ctx == 0`).
     pub fn spawnIsolated(cmd: string, args: list.List<string>, nsFlags: int, rootfs: string,
                          hostname: string, dropCaps: int, noNewPrivs: int, seccomp: int): Process {
         return Process{ ctx: 0 as ptr };
     }
 
+    /// Writes `data` to the child's stdin pipe. Returns the number of bytes
+    /// written, or -1 if the process was never spawned or the write failed.
     pub fn write(self: Process, data: string): int {
         if (self.ctx == 0) { return -1; }
         let h = bytes.read_ptr(self.ctx, CTX_STDIN_OFF);
@@ -156,6 +192,9 @@ pub struct Process {
         return if (ok != 0) n else -1;
     }
 
+    /// Reads up to `max_len` bytes from the child's combined stdout/stderr
+    /// pipe. Returns an empty string on failure, EOF, or an unspawned process
+    /// (this does not distinguish those cases from a genuine zero-byte read).
     pub fn read(self: Process, max_len: int): string {
         if (self.ctx == 0) { return ""; }
         let h = bytes.read_ptr(self.ctx, CTX_STDOUT_OFF);
@@ -180,6 +219,9 @@ pub struct Process {
         return str_ptr as string;
     }
 
+    /// Closes stdin, then blocks until the child exits and returns its exit
+    /// code. Returns -1 if the process was never spawned. Safe to call more
+    /// than once: a cached exit code is returned without waiting again.
     pub fn wait(self: Process): int {
         if (self.ctx == 0) { return -1; }
         if (bytes.read_i32(self.ctx, CTX_EXITED_OFF) != 0) {
@@ -191,6 +233,8 @@ pub struct Process {
         return self.reap();
     }
 
+    /// Non-blocking poll for exit. Returns -1 if never spawned, -2 if still
+    /// running, or the cached/observed exit code otherwise.
     pub fn tryWait(self: Process): int {
         if (self.ctx == 0) { return -1; }
         if (bytes.read_i32(self.ctx, CTX_EXITED_OFF) != 0) {
@@ -201,6 +245,7 @@ pub struct Process {
         return self.reap();
     }
 
+    // Fetches the exit code via GetExitCodeProcess and caches it in ctx; returns -1 on API failure.
     fn reap(self: Process): int {
         let h = bytes.read_ptr(self.ctx, CTX_PROC_OFF);
         let code = bytes.alloc(4);
@@ -214,6 +259,7 @@ pub struct Process {
         return c;
     }
 
+    // Closes the child's stdin handle, if open, so the child sees EOF on its input.
     fn closeStdin(self: Process): void {
         let h = bytes.read_ptr(self.ctx, CTX_STDIN_OFF);
         if (h != (0 as long)) {
@@ -222,24 +268,33 @@ pub struct Process {
         }
     }
 
+    /// True if the child process has not yet exited (or its exit has not yet been observed).
     pub fn isRunning(self: Process): bool {
         return self.tryWait() == -2;
     }
 
+    /// Returns the child's process id, or 0 if the process was never spawned.
     pub fn pid(self: Process): long {
         if (self.ctx == 0) { return 0 as long; }
         return bytes.read_i32(self.ctx, CTX_PID_OFF) as long;
     }
 
+    /// Terminates the process via TerminateProcess, encoding `sig` into the
+    /// exit code as `128 + sig` to mimic a POSIX signal-terminated exit
+    /// status. Returns 0 on success, -1 if unspawned or the call failed.
     pub fn kill(self: Process, sig: int): int {
         if (self.ctx == 0) { return -1; }
         let h = bytes.read_ptr(self.ctx, CTX_PROC_OFF);
         return if (proc.TerminateProcess(h, 128 + sig) != 0) 0 else -1;
     }
 
+    /// Requests a graceful stop, mapped to `kill` with a SIGTERM-equivalent code.
     pub fn terminate(self: Process): int { return self.kill(15); }
+    /// Forcibly kills the process, mapped to `kill` with a SIGKILL-equivalent code.
     pub fn forceKill(self: Process): int { return self.kill(9); }
 
+    /// Closes stdin, the stdout pipe, and the process handle, then frees the
+    /// native context buffer. Safe to call when unspawned or already closed.
     pub fn close(self: Process): void {
         if (self.ctx != 0) {
             self.closeStdin();
@@ -252,6 +307,7 @@ pub struct Process {
         }
     }
 
+    /// Destructor hook: releases native resources by delegating to `close`.
     pub fn delete(self: Process): void {
         self.close();
     }

@@ -1,15 +1,41 @@
+//! IANA-style timezone offsets and daylight saving conversions for a small,
+//! hardcoded set of well-known zones.
+//!
+//! This module does not read a real tzdata database. It keeps a fixed table
+//! (`zoneRec`) of standard UTC offsets for a handful of common zone names
+//! (`UTC`, `America/New_York`, `Europe/London`, `Asia/Kolkata`, and so on),
+//! plus a daylight saving rule tag (`DST_NONE`, `DST_US`, `DST_EU`, `DST_AU`)
+//! for the zones that observe it. Given that, it computes the yearly DST
+//! transition instants and derives the correct offset for any UTC instant,
+//! so callers can convert an epoch second to local time and format it
+//! without needing a full timezone database on disk.
+//!
+//! Built on top of `datetime` for epoch/calendar arithmetic and formatting.
+//! Callers that only need to check whether a zone name is supported should
+//! use `known`; conversions go through `offsetAt`, `toLocal`, or
+//! `formatInZone`.
+
 import datetime;
 import string;
 
+/// Zone observes no daylight saving; the standard offset applies year round.
 const DST_NONE: int = 0;
+/// Zone follows the United States daylight saving rule (second Sunday in
+/// March at 02:00 local to first Sunday in November at 02:00 local).
 const DST_US: int = 1;
+/// Zone follows the European Union daylight saving rule (last Sunday in
+/// March to last Sunday in October, both at 01:00 UTC).
 const DST_EU: int = 2;
+/// Zone follows the Australian daylight saving rule (first Sunday in October
+/// to first Sunday in April; the DST window wraps across the year boundary).
 const DST_AU: int = 3;
 
 const HOUR: long = 3600;
 
+// Standard UTC offset (seconds) and DST rule tag for one known zone.
 struct ZoneRec { pub off: int, pub dst: int }
 
+// Looks up the hardcoded standard offset and DST rule for a zone name; returns undefined if the name is not in the table.
 fn zoneRec(name: string): ZoneRec | undefined {
     if (string.eql(name, "UTC")) { return ZoneRec{ off: 0, dst: DST_NONE }; }
     if (string.eql(name, "America/New_York")) { return ZoneRec{ off: -18000, dst: DST_US }; }
@@ -26,14 +52,17 @@ fn zoneRec(name: string): ZoneRec | undefined {
     return undefined;
 }
 
+/// Reports whether `name` is one of the zone names in the internal table.
 pub fn known(name: string): bool { return zoneRec(name) != undefined; }
 
+// Day of week (0 = Sunday) for a given epoch day, using 1970-01-01 (a Thursday, dow 4) as the reference point.
 fn dowOfEpochDay(epochDay: long): int {
     let r = ((epochDay % 7) + 4) % 7;
     if (r < 0) { r = r + 7; }
     return r as int;
 }
 
+// Computes the UTC epoch second of a DST transition: the nth (or, if negative, last-from-end) occurrence of `weekday` in `month`/`year`, at `localHour` local wall time, converted to UTC using `stdOffset`.
 fn transitionEpoch(year: int, month: int, weekday: int, nth: int, localHour: int, stdOffset: int): long {
     let first = datetime.parse(twoDate(year, month, 1)) ?? 0;
     let firstDow = dowOfEpochDay(first / 86400);
@@ -51,6 +80,13 @@ fn transitionEpoch(year: int, month: int, weekday: int, nth: int, localHour: int
     return localWall - (stdOffset as long);
 }
 
+/// Returns the UTC offset in seconds that applies to `zone` at `utcEpoch`,
+/// including any daylight saving adjustment; returns undefined if `zone` is
+/// not in the known-zones table.
+///
+/// The Australian rule's DST window straddles the year boundary (October
+/// through April), so it is tested with an `||` rather than the `&&` used
+/// for the US and EU rules, which fall entirely within one calendar year.
 pub fn offsetAt(zone: string, utcEpoch: long): int | undefined {
     let zr = zoneRec(zone);
     if (zr == undefined) { return undefined; }
@@ -76,12 +112,18 @@ pub fn offsetAt(zone: string, utcEpoch: long): int | undefined {
     return rec.off;
 }
 
+/// Converts a UTC epoch second to the equivalent local wall-clock epoch
+/// second (UTC + zone offset) for `zone`; returns undefined if `zone` is
+/// unknown.
 pub fn toLocal(zone: string, utcEpoch: long): long | undefined {
     let o = offsetAt(zone, utcEpoch);
     if (o == undefined) { return undefined; }
     return utcEpoch + ((o ?? 0) as long);
 }
 
+/// Formats a UTC epoch second as a local wall-clock string for `zone`, using
+/// the `datetime.format` pattern in `fmt`; returns undefined if `zone` is
+/// unknown.
 pub fn formatInZone(zone: string, utcEpoch: long, fmt: string): string | undefined {
     let local = toLocal(zone, utcEpoch);
     if (local == undefined) { return undefined; }

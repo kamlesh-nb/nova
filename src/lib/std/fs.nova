@@ -1,3 +1,10 @@
+//! Filesystem change notification (`Watcher`).
+//!
+//! This file wraps the host OS's native filesystem watch facility (for
+//! example, kqueue's `EVFILT_VNODE` or inotify) behind a small blocking
+//! handle, so Nova code can wait for a directory or file to change without
+//! polling it. It complements `io.dir` and `io.file`, which provide plain
+//! reads, writes, and directory listing but have no notion of change events.
 
 import bytes;
 import mem.allocator;
@@ -5,23 +12,36 @@ import io.dir;
 import io.file;
 import assert;
 
+/// A handle to a native OS filesystem watch on a single path.
+///
+/// Construction starts watching immediately; the watch stays live until
+/// `close` is called, which releases the underlying native resource and
+/// zeroes the handle.
 pub struct Watcher {
+    /// Opaque native handle for the underlying OS watch; `0` once closed.
     pub handle: ptr,
 
     init(path: string) {
         self.handle = nova_fs_watcher_create(path);
     }
 
+    /// Blocks until the next filesystem change event fires, then returns it
+    /// as a string (event contents are host-dependent, for example a
+    /// changed file's name).
     pub fn nextEvent(self: Watcher): string {
         return nova_fs_watcher_next_event(self.handle);
     }
 
+    /// Stops the native watch and clears the handle. Safe to call once the
+    /// watcher is no longer needed; further use of the watcher after this is
+    /// not meaningful, since `handle` is reset to `0`.
     pub fn close(self: Watcher): void {
         nova_fs_watcher_close(self.handle);
         self.handle = 0;
     }
 }
 
+// Writes text to a file, used by the watcher test to trigger a change event.
 fn writeFsFile(path: string, content: string): void {
     file.File.writeText(path, content);
 }

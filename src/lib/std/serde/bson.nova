@@ -1,61 +1,111 @@
+//! BSON (Binary JSON) encoding and decoding for the Nova standard library.
+//!
+//! This module provides a flat, entry-list representation of a BSON document
+//! (`BsonDocument`, a `List<BsonEntry>`), constructors for each supported BSON
+//! type (`entryString`, `entryInt`, `entryDoc`, and so on), `serialize` and
+//! `deserialize` to move between that representation and the raw wire bytes,
+//! typed accessors (`docGetString`, `docGetInt`, `docGetDecimal`, ...) and
+//! by-key lookups (`findString`, `findInt`, ...), plus `docToJson` for a
+//! human-readable rendering and `validate` for a bounds-checked structural
+//! scan of an untrusted buffer. It is the codec used wherever Nova talks BSON
+//! on the wire, most notably the MongoDB driver.
+//!
+//! Nested documents and arrays (type 3 and type 4) are stored as raw,
+//! already-serialized BSON bytes inside `str_val` rather than as recursively
+//! nested `BsonDocument` values: they are only expanded (via `deserialize`)
+//! on demand, for example by `entryToJson` or `docGetDoc`.
 
 import string;
 import list;
 import assert;
 
+/// One BSON element: a key paired with a value carried across several
+/// generic fields depending on `type_id`. Numeric BSON type codes are used
+/// directly (2 = string, 16 = int32, 18 = int64, 1 = double, 19 = decimal128,
+/// 8 = bool, 10 = null, 7 = ObjectId, 3 = embedded document, 4 = array,
+/// 5 = binary, 9/17 = UTC datetime / timestamp, and so on); constructing an
+/// entry directly is unusual, prefer the `entryXxx` helpers below.
 pub struct BsonEntry {
+    /// BSON element type code (see the BSON spec byte 0x01-0xFF type table).
     pub type_id: int,
+    /// The element's key (field name) within its parent document.
     pub key: string,
+    /// String, binary, ObjectId hex, embedded-document, or array payload,
+    /// depending on `type_id`; unused (empty) for purely numeric types.
     pub str_val: string,
+    /// Primary numeric payload: int32/bool value, or the high 32 bits of a
+    /// packed 64-bit value (int64, double, datetime, timestamp) held across
+    /// `int_val`/`int_val2` as two 32-bit halves.
     pub int_val: long,
+    /// Low 32 bits of a packed 64-bit numeric payload; unused for types that
+    /// fit entirely in `int_val`.
     pub int_val2: int,
+    /// Decimal128 payload, used only when `type_id` is 19.
     pub dec_val: decimal,
 }
 
+/// A BSON document: an ordered list of key/value entries.
 pub struct BsonDocument {
+    /// The document's elements, in wire order.
     pub entries: List<BsonEntry>,
 }
 
+/// Builds a BSON UTF-8 string entry (type 2).
 pub fn entryString(key: string, val: string): BsonEntry {
     return BsonEntry{ type_id: 2, key: key, str_val: val, int_val: 0, int_val2: 0, dec_val: 0m };
 }
 
+/// Builds a BSON binary entry (type 5) with subtype 0 (generic binary).
 pub fn entryBinary(key: string, data: string): BsonEntry {
     return BsonEntry{ type_id: 5, key: key, str_val: data, int_val: 0, int_val2: 0, dec_val: 0m };
 }
 
+/// Builds a BSON binary entry (type 5) with an explicit subtype byte.
 pub fn entryBinarySubtype(key: string, data: string, subtype: int): BsonEntry {
     return BsonEntry{ type_id: 5, key: key, str_val: data, int_val: subtype as long, int_val2: 0, dec_val: 0m };
 }
 
+/// Builds a BSON int32 entry (type 16).
 pub fn entryInt(key: string, val: int): BsonEntry {
     return BsonEntry{ type_id: 16, key: key, str_val: "", int_val: val, int_val2: 0, dec_val: 0m };
 }
 
+/// Builds a BSON boolean entry (type 8); any non-zero `val` means true.
 pub fn entryBool(key: string, val: int): BsonEntry {
     return BsonEntry{ type_id: 8, key: key, str_val: "", int_val: val, int_val2: 0, dec_val: 0m };
 }
 
+/// Builds a BSON null entry (type 10).
 pub fn entryNull(key: string): BsonEntry {
     return BsonEntry{ type_id: 10, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: 0m };
 }
 
+/// Builds a BSON embedded-document entry (type 3) from an already-serialized
+/// BSON buffer. `doc_ptr` must point at a valid BSON document (its length is
+/// read from the buffer itself, not passed separately).
 pub fn entryDoc(key: string, doc_ptr: ptr): BsonEntry {
     return BsonEntry{ type_id: 3, key: key, str_val: doc_ptr as string, int_val: 0, int_val2: 0, dec_val: 0m };
 }
 
+/// Builds a BSON array entry (type 4) from an already-serialized BSON buffer
+/// (BSON arrays are documents with numeric string keys "0", "1", ...).
 pub fn entryArray(key: string, arr_ptr: ptr): BsonEntry {
     return BsonEntry{ type_id: 4, key: key, str_val: arr_ptr as string, int_val: 0, int_val2: 0, dec_val: 0m };
 }
 
+/// Builds a BSON int64 entry (type 18) from pre-split high/low 32-bit halves.
 pub fn entryInt64(key: string, hi: int, lo: int): BsonEntry {
     return BsonEntry{ type_id: 18, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
 }
 
+/// Builds a BSON double entry (type 1) from the IEEE-754 bit pattern already
+/// split into high/low 32-bit halves.
 pub fn entryDouble(key: string, hi: int, lo: int): BsonEntry {
     return BsonEntry{ type_id: 1, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
 }
 
+/// Builds a BSON double entry (type 1) from an actual `double` value,
+/// splitting its IEEE-754 bit pattern into the two 32-bit halves internally.
 pub fn entryDoubleVal(key: string, val: double): BsonEntry {
     let bits: long = nova_f64_bits(val);
     let hi: int = (bits >> 32) as int;
@@ -63,27 +113,37 @@ pub fn entryDoubleVal(key: string, val: double): BsonEntry {
     return BsonEntry{ type_id: 1, key: key, str_val: "", int_val: hi, int_val2: lo, dec_val: 0m };
 }
 
+/// Builds a BSON Decimal128 entry (type 19).
 pub fn entryDecimal(key: string, val: decimal): BsonEntry {
     return BsonEntry{ type_id: 19, key: key, str_val: "", int_val: 0, int_val2: 0, dec_val: val };
 }
 
+/// Builds a BSON ObjectId entry (type 7) from a 24-character hex string.
+/// The hex string is decoded to the 12 raw bytes stored on the wire; a
+/// string shorter than 24 hex characters is padded with zero nibbles.
 pub fn entryObjectId(key: string, hex: string): BsonEntry {
     return BsonEntry{ type_id: 7, key: key, str_val: hexToRaw12(hex), int_val: 0, int_val2: 0, dec_val: 0m };
 }
+/// Builds a BSON UTC datetime entry (type 9) from milliseconds since the
+/// Unix epoch.
 pub fn entryDate(key: string, millis: long): BsonEntry {
     return BsonEntry{ type_id: 9, key: key, str_val: "",
         int_val: (millis >> 32) & 4294967295, int_val2: (millis & 4294967295) as int, dec_val: 0m };
 }
+/// Builds a BSON int64 entry (type 18) from an actual `long` value, splitting
+/// it into the two 32-bit halves internally.
 pub fn entryInt64Val(key: string, val: long): BsonEntry {
     return BsonEntry{ type_id: 18, key: key, str_val: "",
         int_val: (val >> 32) & 4294967295, int_val2: (val & 4294967295) as int, dec_val: 0m };
 }
+// Converts one ASCII hex digit (0-9, a-f, A-F) to its numeric value; returns 0 for anything else.
 fn hexNibbleVal(ch: int): int {
     if (ch >= 48 && ch <= 57) { return ch - 48; }
     if (ch >= 97 && ch <= 102) { return ch - 97 + 10; }
     if (ch >= 65 && ch <= 70) { return ch - 65 + 10; }
     return 0;
 }
+// Decodes a hex string into 12 raw bytes (an ObjectId), zero-padding any missing nibbles.
 fn hexToRaw12(hex: string): string {
     let p = bytes.alloc(12);
     let i = 0;
@@ -96,6 +156,7 @@ fn hexToRaw12(hex: string): string {
     return p as string;
 }
 
+// Writes a BSON cstring (bytes plus a trailing NUL) at offset; returns the total bytes written.
 fn writeCstring(ptr: ptr, offset: int, s: string): int {
     let len = s.length;
     let i = 0;
@@ -107,6 +168,7 @@ fn writeCstring(ptr: ptr, offset: int, s: string): int {
     return len + 1;
 }
 
+// Reads a NUL-terminated cstring starting at offset, stopping at max_len if no NUL is found.
 fn readCstring(ptr: ptr, offset: int, max_len: int): string {
     let len = 0;
     while (len < max_len) {
@@ -125,6 +187,7 @@ fn readCstring(ptr: ptr, offset: int, max_len: int): string {
     return s_ptr as string;
 }
 
+// Computes the total encoded byte size of a document (header, all entries, trailing NUL) before allocating.
 fn getDocSize(doc: BsonDocument): int {
     let size = 5;
     let count = doc.entries.size();
@@ -177,6 +240,9 @@ fn getDocSize(doc: BsonDocument): int {
     return size;
 }
 
+/// Encodes a `BsonDocument` into a freshly allocated raw BSON byte buffer.
+/// Embedded document and array entries (types 3 and 4) are copied through
+/// as-is, since they already hold serialized BSON bytes.
 pub fn serialize(doc: BsonDocument): ptr {
     let total_size = getDocSize(doc);
     let ptr = bytes.alloc(total_size);
@@ -308,7 +374,9 @@ pub fn serialize(doc: BsonDocument): ptr {
     return ptr;
 }
 
+// Converts a nibble (0-15) to its lowercase ASCII hex digit.
 fn hexNibbleCh(v: int): int { if (v < 10) { return 48 + v; } return 97 + (v - 10); }
+// Reads 12 raw ObjectId bytes at off and renders them as a 24-character lowercase hex string.
 fn objectIdHex(ptr: ptr, off: int): string {
     let out = bytes.alloc(24);
     let i = 0;
@@ -321,6 +389,13 @@ fn objectIdHex(ptr: ptr, off: int): string {
     return out as string;
 }
 
+/// Decodes a raw BSON byte buffer into a `BsonDocument`.
+/// Bounds are checked against the document's own declared total size (its
+/// first 4 bytes), not the caller-supplied buffer, so `ptr` must genuinely
+/// contain at least that many bytes. On an invalid declared size, or an
+/// unsupported/unrecognised type byte, decoding stops early and whatever
+/// entries were already parsed are returned (a warning is logged to console
+/// in the invalid-size case); it does not throw.
 pub fn deserialize(ptr: ptr): BsonDocument {
     let doc = BsonDocument{ entries: List<BsonEntry>() };
 
@@ -479,6 +554,8 @@ pub fn deserialize(ptr: ptr): BsonDocument {
     return doc;
 }
 
+/// Finds the index of the entry with the given key, or -1 if absent.
+/// Returns the first match if the document has duplicate keys.
 pub fn docFind(doc: BsonDocument, key: string): int {
     let i = 0;
     while (i < doc.entries.size()) {
@@ -490,11 +567,15 @@ pub fn docFind(doc: BsonDocument, key: string): int {
     return -1;
 }
 
+/// Returns the BSON type code of the entry at index, or 0 (double's own code,
+/// used here as a sentinel) if index is out of range.
 pub fn docGetType(doc: BsonDocument, index: int): int {
     if (index < 0 || index >= doc.entries.size()) return 0;
     return doc.entries.at(index).type_id;
 }
 
+/// Returns the string value at index, or "" if the index is out of range or
+/// the entry is not a BSON string (type 2).
 pub fn docGetString(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
@@ -502,6 +583,8 @@ pub fn docGetString(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
+/// Returns the ObjectId at index as a 24-character hex string, or "" if the
+/// index is out of range or the entry is not an ObjectId (type 7).
 pub fn docGetObjectId(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
@@ -509,6 +592,7 @@ pub fn docGetObjectId(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
+// Escapes a string for embedding in a JSON string literal (quotes, backslashes, and control chars).
 fn jsonEscape(s: string): string {
     let out = "\"";
     let i = 0;
@@ -524,13 +608,16 @@ fn jsonEscape(s: string): string {
     }
     return out + "\"";
 }
+// Renders one byte as a two-character lowercase hex string.
 fn jbHexPair(b: int): string {
     let p = bytes.alloc(2);
     bytes.write_byte(p, 0, hexNibbleCh((b / 16) & 15));
     bytes.write_byte(p, 1, hexNibbleCh(b & 15));
     return p as string;
 }
+// Reassembles a packed 64-bit value from an entry's int_val (high 32 bits) and int_val2 (low 32 bits).
 fn i64Val(e: BsonEntry): long { return (e.int_val << 32) | ((e.int_val2 as long) & 4294967295); }
+// Reassembles a double entry's IEEE-754 bit pattern and renders it as a decimal string.
 fn dblStr(e: BsonEntry): string {
     let lo = e.int_val2;
     let hi = e.int_val as int;
@@ -541,6 +628,7 @@ fn dblStr(e: BsonEntry): string {
     bytes.write_byte(b, 6, (hi / 65536) & 255); bytes.write_byte(b, 7, (hi / 16777216) & 255);
     return nova_ieee_le_to_str(b as string, 8);
 }
+// Renders a binary payload as a JSON string literal of lowercase hex pairs.
 fn binHex(s: string): string {
     let out = "\"";
     let i = 0;
@@ -548,6 +636,10 @@ fn binHex(s: string): string {
     return out + "\"";
 }
 
+/// Renders a `BsonDocument` as a JSON object string.
+/// Embedded documents and arrays (types 3/4) are decoded and rendered
+/// recursively; binary payloads become hex-encoded JSON strings; types with
+/// no direct JSON equivalent render as `null`.
 pub fn docToJson(doc: BsonDocument): string {
     let out = "{";
     let i = 0;
@@ -559,6 +651,7 @@ pub fn docToJson(doc: BsonDocument): string {
     }
     return out + "}";
 }
+// Renders a single BSON entry's value as a JSON fragment; the recursive core of docToJson.
 fn entryToJson(e: BsonEntry): string {
     let t = e.type_id;
     if (t == 2) { return jsonEscape(e.str_val); }
@@ -585,6 +678,8 @@ fn entryToJson(e: BsonEntry): string {
     return "null";
 }
 
+/// Returns the raw binary payload at index, or "" if the index is out of
+/// range or the entry is not binary (type 5).
 pub fn docGetBinary(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
@@ -592,6 +687,8 @@ pub fn docGetBinary(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
+/// Returns the binary subtype byte at index, or -1 if the index is out of
+/// range or the entry is not binary (type 5).
 pub fn docGetBinarySubtype(doc: BsonDocument, index: int): int {
     if (index < 0 || index >= doc.entries.size()) return 0 - 1;
     let entry = doc.entries.at(index);
@@ -599,12 +696,18 @@ pub fn docGetBinarySubtype(doc: BsonDocument, index: int): int {
     return (entry.int_val & 0xff) as int;
 }
 
+/// Returns the int32 value at index, or 0 if the index is out of range or
+/// the entry is not int32 (type 16).
 pub fn docGetInt(doc: BsonDocument, index: int): int {
     if (index < 0 || index >= doc.entries.size()) return 0;
     let entry = doc.entries.at(index);
     if (entry.type_id != 16) return 0;
     return entry.int_val;
 }
+/// Returns the value at index as a `long`, or 0 if index is out of range.
+/// Accepts either an int32 entry (widened) or a packed 64-bit entry
+/// (int64/datetime/timestamp), unlike the other typed getters which reject a
+/// mismatched type.
 pub fn docGetInt64(doc: BsonDocument, index: int): long {
     if (index < 0 || index >= doc.entries.size()) return 0;
     let e = doc.entries.at(index);
@@ -613,12 +716,19 @@ pub fn docGetInt64(doc: BsonDocument, index: int): long {
     let lo = (e.int_val2 as long) & 4294967295;
     return (hi << 32) + lo;
 }
+/// Returns the datetime value at index as milliseconds since the Unix epoch.
+/// Alias for `docGetInt64`.
 pub fn docGetDate(doc: BsonDocument, index: int): long { return docGetInt64(doc, index); }
+/// Returns the double value at index, or 0.0 if the index is out of range.
+/// Does not check `type_id`, so calling this on a non-double entry
+/// reinterprets its packed 32-bit halves as an IEEE-754 bit pattern.
 pub fn docGetDouble(doc: BsonDocument, index: int): double {
     if (index < 0 || index >= doc.entries.size()) return 0.0;
     return string.parseFloat(dblStr(doc.entries.at(index)));
 }
 
+/// Returns the boolean value at index as 0 or 1, or 0 if the index is out of
+/// range or the entry is not boolean (type 8).
 pub fn docGetBool(doc: BsonDocument, index: int): int {
     if (index < 0 || index >= doc.entries.size()) return 0;
     let entry = doc.entries.at(index);
@@ -626,6 +736,8 @@ pub fn docGetBool(doc: BsonDocument, index: int): int {
     return entry.int_val;
 }
 
+/// Returns the Decimal128 value at index, or 0m if the index is out of range
+/// or the entry is not decimal (type 19).
 pub fn docGetDecimal(doc: BsonDocument, index: int): decimal {
     if (index < 0 || index >= doc.entries.size()) return 0m;
     let entry = doc.entries.at(index);
@@ -633,11 +745,16 @@ pub fn docGetDecimal(doc: BsonDocument, index: int): decimal {
     return entry.dec_val;
 }
 
+/// Returns 1 if the entry at index is BSON null (type 10), else 0 (including
+/// when index is out of range).
 pub fn docIsNull(doc: BsonDocument, index: int): int {
     if (index < 0 || index >= doc.entries.size()) return 0;
     return (doc.entries.at(index).type_id == 10) ? 1 : 0;
 }
 
+/// Returns the raw serialized-BSON bytes of the embedded document at index
+/// (pass to `deserialize` to expand), or "" if the index is out of range or
+/// the entry is not an embedded document (type 3).
 pub fn docGetDoc(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
@@ -645,6 +762,9 @@ pub fn docGetDoc(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
+/// Returns the raw serialized-BSON bytes of the array at index (pass to
+/// `deserialize` to expand), or "" if the index is out of range or the entry
+/// is not an array (type 4).
 pub fn docGetArray(doc: BsonDocument, index: int): string {
     if (index < 0 || index >= doc.entries.size()) return "";
     let entry = doc.entries.at(index);
@@ -652,31 +772,51 @@ pub fn docGetArray(doc: BsonDocument, index: int): string {
     return entry.str_val;
 }
 
+/// Looks up `key` and returns its string value, or "" if absent or not a
+/// string entry. Combines `docFind` and `docGetString`.
 pub fn findString(doc: BsonDocument, key: string): string {
     let idx = docFind(doc, key);
     return docGetString(doc, idx);
 }
 
+/// Looks up `key` and returns its int32 value, or 0 if absent or not an
+/// int32 entry. Combines `docFind` and `docGetInt`.
 pub fn findInt(doc: BsonDocument, key: string): int {
     let idx = docFind(doc, key);
     return docGetInt(doc, idx);
 }
 
+/// Looks up `key` and returns its boolean value, or 0 if absent or not a
+/// boolean entry. Combines `docFind` and `docGetBool`.
 pub fn findBool(doc: BsonDocument, key: string): int {
     let idx = docFind(doc, key);
     return docGetBool(doc, idx);
 }
 
+/// Looks up `key` and returns 1 if it is present and BSON null, else 0
+/// (including when `key` is absent). Combines `docFind` and `docIsNull`.
 pub fn findIsNull(doc: BsonDocument, key: string): int {
     let idx = docFind(doc, key);
     return docIsNull(doc, idx);
 }
 
+/// Looks up `key` and returns the raw serialized-BSON bytes of its embedded
+/// document, or "" if absent or not an embedded document. Combines
+/// `docFind` and `docGetDoc`.
 pub fn findDoc(doc: BsonDocument, key: string): string {
     let idx = docFind(doc, key);
     return docGetDoc(doc, idx);
 }
 
+/// Performs a bounds-checked structural scan of a raw buffer to confirm it
+/// looks like a well-formed BSON document, without fully decoding it: checks
+/// the declared size fits within `buf_len`, the trailing NUL is present, and
+/// walks every element advancing by its type's on-wire width, rejecting any
+/// length field that would run past the declared size. Returns 1 if the scan
+/// completes cleanly, 0 otherwise. Intended as a cheap sanity check on
+/// untrusted input before calling `deserialize`; it is not a full validator
+/// (it does not, for example, recurse into embedded documents/arrays or
+/// validate UTF-8).
 pub fn validate(ptr: ptr, buf_len: int): int {
     if (buf_len < 5) return 0;
     let declared_size = bytes.read_i32(ptr, 0);

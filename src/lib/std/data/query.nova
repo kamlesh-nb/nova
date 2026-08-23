@@ -1,20 +1,91 @@
+//! Fluent SQL query builder (`Query`).
+//!
+//! This file gives Nova application code a small, chainable builder for
+//! assembling parameterised `SELECT` and `DELETE` statements without hand
+//! concatenating SQL. Instead of writing the string yourself and risking an
+//! injection hole, you name a table, add `where` / `orderBy` / `limit` clauses
+//! one call at a time, and let [`Query.toSql`] render the final text with the
+//! values pulled out into positional placeholders.
+//!
+//! The central design decision is that user-supplied VALUES never touch the SQL
+//! string. Every value passed to a `where*` helper is pushed onto
+//! [`Query.boundParams`] as a [`data.db.DbValue`], and only a placeholder token
+//! like `$1`, `$2` goes into the clause text. The driver later binds the params
+//! over the wire, so the database parses the values as data, not as SQL. Column
+//! names, operators, join clauses, and raw conditions ARE interpolated verbatim,
+//! so those must come from trusted code (literals in the app), never from user
+//! input. That split is the safety contract of this file: identifiers are
+//! trusted, values are bound.
+//!
+//! A `Query` is a mutable `class` (reference type), and every builder method
+//! mutates the same instance in place and then returns `self`, which is what
+//! makes the fluent `from(t).whereEq(...).orderBy(...).limit(...)` chain read
+//! left to right while operating on one object. The placeholder numbering is
+//! derived from the running length of `boundParams`, so clauses must be added in
+//! the order their placeholders should appear; [`Query.toSql`] assembles the
+//! keywords in the fixed SQL order regardless of the order the pieces arrived.
+//!
+//! This is the query-construction layer of the `data` package. It sits above the
+//! [`data.db`] seam (which defines `DbValue`, `Connection`, and `ResultSet`) and
+//! is driver agnostic: it emits placeholder text and a param list, and the
+//! concrete driver behind the [`data.db.Connection`] decides how to bind and
+//! send them. See [`Query.run`] for the one method that actually reaches the
+//! database.
+
 import string;
 import list;
 import data.db;
 
+/// A mutable, chainable builder for one parameterised SQL statement.
+///
+/// A `Query` accumulates the pieces of a single `SELECT` (or, via
+/// [`Query.toDeleteSql`], a `DELETE`) as separate clause lists, keeping the
+/// bound values apart from the clause text so that rendering can emit
+/// placeholders. It is a reference `class`, so each builder call mutates this
+/// same instance and returns it for chaining; do not share one `Query` across
+/// concurrent uses expecting independent copies. Start one with [`from`] and
+/// finish with [`Query.toSql`] or [`Query.run`].
 pub class Query {
+    /// Name of the table the statement runs against, used verbatim after `FROM`
+    /// (and after `DELETE FROM`). This is trusted identifier text, not a bound
+    /// value.
     pub table: string,
+    /// Column expressions for the `SELECT` list, in output order. When empty,
+    /// [`Query.toSql`] emits `*`; otherwise the entries are joined with `, `.
     pub selectCols: list.List<string>,
+    /// Rendered `WHERE` predicate fragments, already carrying their placeholder
+    /// tokens (for example `age > $1`). Joined with ` AND ` at render time, so
+    /// every fragment is combined conjunctively.
     pub wheres: list.List<string>,
+    /// The values behind the placeholders, in placeholder order (`$1` is
+    /// index 0). Handed to the driver by [`Query.run`] / [`Query.params`] to
+    /// bind over the wire; user values live here and never in the SQL text.
     pub boundParams: list.List<db.DbValue>,
+    /// `ORDER BY` terms, each already a `column ASC`/`column DESC` fragment
+    /// produced by [`Query.orderBy`]. Joined with `, ` in the order added.
     pub orders: list.List<string>,
+    /// Fully spelled join clauses including the leading keyword, for example
+    /// `JOIN t ON ...` or `LEFT JOIN t ON ...`. Joined with a space and inserted
+    /// between the `FROM` table and the `WHERE` clause.
     pub joins: list.List<string>,
+    /// `GROUP BY` column expressions, joined with `, ` when present.
     pub groupCols: list.List<string>,
+    /// The single `HAVING` condition, or the empty string when none is set.
+    /// Stored as raw text (see [`Query.having`]) and emitted only if non-empty.
     pub havingCond: string,
+    /// Row limit for `LIMIT`, or `-1` for "no limit". A sentinel rather than an
+    /// optional so that `0` remains a valid, distinct value (limit of zero
+    /// rows); only a negative value suppresses the clause.
     pub limitN: int,
+    /// Row offset for `OFFSET`, or `-1` for "no offset". Same sentinel scheme as
+    /// [`Query.limitN`]: `0` is a real offset, only negative suppresses it.
     pub offsetN: int,
+    /// Whether to emit `SELECT DISTINCT`. Set by [`Query.distinct`].
     pub distinctFlag: bool,
 
+    /// Creates an empty builder for `table` with every clause list empty, no
+    /// `LIMIT`/`OFFSET` (both sentinelled to `-1`), and `DISTINCT` off. Prefer
+    /// the top-level [`from`] helper, which just calls this.
     init(table: string) {
         self.table = table;
         self.selectCols = list.List<string>();
@@ -29,24 +100,56 @@ pub class Query {
         self.distinctFlag = false;
     }
 
+    /// Appends every column in `cols` to the `SELECT` list, preserving order.
+    ///
+    /// Additive: calling it more than once, or mixing it with
+    /// [`Query.selectCol`], keeps accumulating columns. The `cols` entries are
+    /// trusted identifier text.
     pub fn select(self: Query, cols: list.List<string>): Query {
         let i = 0;
         while (i < cols.size()) { self.selectCols.push(cols.at(i)); i = i + 1; }
         return self;
     }
+    /// Appends a single column expression to the `SELECT` list.
     pub fn selectCol(self: Query, col: string): Query { self.selectCols.push(col); return self; }
+    /// Turns on `SELECT DISTINCT` for this statement.
     pub fn distinct(self: Query): Query { self.distinctFlag = true; return self; }
 
+    /// Returns the next positional placeholder token (`$1`, `$2`, ...) for the
+    /// value that is ABOUT to be pushed.
+    ///
+    /// It reads `boundParams.size() + 1`, so it must be called BEFORE the value
+    /// is pushed onto [`Query.boundParams`]; call it after and the numbers skew.
+    /// Placeholders are 1-based to match the driver's binding convention. This
+    /// is the single source of placeholder numbering, shared by every `where*`
+    /// helper.
     fn nextPlaceholder(self: Query): string { return "$" + `${self.boundParams.size() + 1}`; }
 
+    /// Adds a `column op $n` predicate and binds `val` to that placeholder.
+    ///
+    /// `col` and `op` are interpolated verbatim (trusted text), while `val` is
+    /// pushed onto [`Query.boundParams`] and represented only by a placeholder,
+    /// which is what keeps user values out of the SQL string. The placeholder is
+    /// minted by [`Query.nextPlaceholder`] before the push so the number lines up
+    /// with the param's index. Multiple predicates combine with `AND`.
     pub fn where(self: Query, col: string, op: string, val: db.DbValue): Query {
         let ph = self.nextPlaceholder();
         self.boundParams.push(val);
         self.wheres.push(col + " " + op + " " + ph);
         return self;
     }
+    /// Convenience for the common equality predicate `column = $n`; delegates to
+    /// [`Query.where`] with the `=` operator.
     pub fn whereEq(self: Query, col: string, val: db.DbValue): Query { return self.where(col, "=", val); }
 
+    /// Adds a `column IN (...)` predicate, binding one placeholder per value.
+    ///
+    /// Each value in `vals` gets its own placeholder and is pushed onto
+    /// [`Query.boundParams`] in order, so the `IN` list is fully parameterised.
+    /// An EMPTY `vals` list cannot produce a legal `IN ()`, so it emits the
+    /// always-false predicate `1 = 0` instead, which makes the whole `AND`-joined
+    /// `WHERE` match no rows. That is the intended semantics of "in the empty
+    /// set": nothing qualifies.
     pub fn whereIn(self: Query, col: string, vals: list.List<db.DbValue>): Query {
         if (vals.size() == 0) { self.wheres.push("1 = 0"); return self; }
         let frag = col + " IN (";
@@ -62,14 +165,36 @@ pub class Query {
         return self;
     }
 
+    /// Adds a `column IS NULL` predicate. No value is bound, since `IS NULL` is
+    /// not a value comparison.
     pub fn whereNull(self: Query, col: string): Query { self.wheres.push(col + " IS NULL"); return self; }
+    /// Adds a `column IS NOT NULL` predicate. No value is bound.
     pub fn whereNotNull(self: Query, col: string): Query { self.wheres.push(col + " IS NOT NULL"); return self; }
 
+    /// Adds a raw, pre-written predicate fragment to the `WHERE` clause.
+    ///
+    /// The fragment is inserted verbatim and combined with the others via `AND`.
+    /// This is the escape hatch for conditions the typed helpers cannot express,
+    /// and it carries the full injection risk: `cond` MUST be trusted text, and
+    /// any user values inside it must be interpolated as placeholders whose
+    /// params you also push (bypassing this builder's automatic numbering is your
+    /// responsibility here).
     pub fn whereRaw(self: Query, cond: string): Query { self.wheres.push(cond); return self; }
 
+    /// Adds an inner `JOIN clause`, prefixing the `JOIN` keyword. `clause`
+    /// carries the table and `ON` condition and is trusted text.
     pub fn join(self: Query, clause: string): Query { self.joins.push("JOIN " + clause); return self; }
+    /// Adds a `LEFT JOIN clause`, prefixing the `LEFT JOIN` keyword. `clause` is
+    /// trusted text (table plus `ON` condition).
     pub fn leftJoin(self: Query, clause: string): Query { self.joins.push("LEFT JOIN " + clause); return self; }
 
+    /// Adds an `ORDER BY` term for `col`, sorting ascending unless `dir`
+    /// requests descending.
+    ///
+    /// `dir` is normalised: `"DESC"` or `"desc"` yield `DESC`, and ANY other
+    /// value (including an unexpected or misspelled one) falls back to `ASC`, so
+    /// the rendered term is always one of the two valid directions. Terms take
+    /// effect in the order added.
     pub fn orderBy(self: Query, col: string, dir: string): Query {
         let d = if (string.eql(dir, "DESC") || string.eql(dir, "desc")) "DESC" else "ASC";
         self.orders.push(col + " " + d);

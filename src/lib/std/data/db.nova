@@ -1,3 +1,51 @@
+//! The database seam: the driver-neutral value, row, and result model.
+//!
+//! This file is the vocabulary that every Nova database driver speaks and that
+//! every consumer of a query reads. The concrete drivers (postgres, mysql,
+//! mssql, novadb, mongodb) live in their own `packages/nova-*` repos and depend
+//! ON this seam; nothing here knows about any wire protocol or any particular
+//! engine. Keeping the abstract model in the standard library, and the wire code
+//! out of it, is what lets one piece of application code run against any driver
+//! by holding a [`Connection`] trait object instead of a concrete type.
+//!
+//! The design is built around one performance idea: for the read-heavy render
+//! path, do NOT materialise an owned Nova `string` for every cell. A cell can
+//! instead stay LAZY, holding only a `{base, off, len}` window into the raw wire
+//! buffer the driver already received, and be decoded on demand straight into
+//! the output. That is why [`DbValue`] carries both an eager side (`i`, `f`, `s`)
+//! and a lazy side (`i` reused as the buffer base, plus `off`/`len`/`lazy`), and
+//! why [`DbValue.asView`] can hand back a borrowed [`str.Str`] with no copy. The
+//! same idea drives the wire helpers ([`wireField`], [`wireViewAt`] and friends)
+//! and the typed, zero-intermediate [`Rows`] path returned by [`query`].
+//!
+//! There are two parallel row representations here, on purpose:
+//!
+//!   1. The MATERIALISED model: [`Column`], [`Row`], [`ResultSet`]. Every cell is
+//!      already a [`DbValue`]. This is the convenient, self-owned shape a driver
+//!      builds when it fully decodes a result, and what most application code
+//!      touches through [`ResultSet.row`] and the `Row.getX` accessors.
+//!   2. The WIRE model: [`WireRows`] plus the `wire*` free functions. This keeps
+//!      the driver's raw response buffer and an index of per-row byte offsets,
+//!      and decodes fields lazily against a compact length-prefixed layout. It
+//!      is the substrate for the zero-copy [`Rows`] binding.
+//!
+//! Errors are carried as data, not thrown. [`DbError`] classifies a failure by a
+//! stable `kind` code (the `DBERR_*` constants), so a caller can, for example,
+//! ask [`DbError.isTransient`] and retry a deadlock without string-matching a
+//! driver-specific message. Both [`ResultSet`] and [`ExecResult`] embed a
+//! [`DbError`] and expose `ok()`/`hasError()`, so the happy path and the failure
+//! path share one return type rather than an exception channel.
+//!
+//! For streaming, [`RowStream`] is a synchronous cursor over an already-fetched
+//! [`ResultSet`], while [`Cursor`] over a [`RowBatchSource`] is the async,
+//! batch-at-a-time interface a driver implements when it wants to page a large
+//! result without holding it all in memory. [`MaterializedSource`] adapts an
+//! in-memory [`ResultSet`] to that async interface so the two worlds compose.
+//!
+//! On integer widths, mind the project rule that `int` is 32-bit and `long` is
+//! 64-bit. Raw buffer addresses live in `long` fields (for example
+//! [`DbValue`]'s `i` when lazy, and [`WireRows.base`]); narrowing an address to
+//! `int` would truncate it and produce a wild pointer.
 
 import list;
 import string;
@@ -6,34 +54,93 @@ import bytes;
 import mem.rawbuffer;
 import collections.string_builder;
 
+/// The logical type tag carried by a [`DbValue`].
+///
+/// This is a driver-neutral classification, not any one engine's OID space. A
+/// driver maps its own column types onto these variants, and the [`DbValue`]
+/// accessors branch on the tag to decide how to interpret the stored payload
+/// (for example, whether `asText` should stringify the integer field `i` or the
+/// float field `f`). The set is deliberately small and covers the common SQL
+/// scalar shapes plus `Array` for composite/array columns.
 pub enum DbType {
+    /// SQL NULL. A [`DbValue`] with this tag reports [`DbValue.isNull`] true and
+    /// the `asXOr` accessors return their supplied default.
     Null,
+    /// Boolean. Stored in the integer field `i` as 0 or non-zero.
     Bool,
+    /// Signed 32-bit integer. Stored in `i`.
     Int4,
+    /// Signed 64-bit integer. Stored in `i`.
     Int8,
+    /// Unsigned 32-bit integer. Stored in `i` (the sign bit is unused).
     Uint4,
+    /// Unsigned 64-bit integer. Stored in `i`.
     Uint8,
+    /// 32-bit floating point. Stored in the double field `f`.
     Float4,
+    /// 64-bit floating point. Stored in `f`.
     Float8,
+    /// A timestamp, carried in ISO text form in the string field `s`.
     Timestamp,
+    /// UTF-8 text, carried in `s` (or lazily in the wire buffer).
     Text,
+    /// Opaque binary data, carried as bytes in `s`.
     Blob,
+    /// Exact fixed-point decimal. Carried textually so no binary precision is
+    /// lost; the accessors parse it on demand (see [`decimalIntPart`]).
     Decimal,
+    /// A UUID in its canonical text form, carried in `s`.
     Uuid,
+    /// A JSON document, carried as text in `s`.
     Json,
+    /// A composite/array value whose elements live in [`DbValue`]'s `arr` list.
     Array,
 }
 
+/// A single database cell: one tagged value, eager or lazy.
+///
+/// A `DbValue` is a small value struct that carries a payload in whichever of a
+/// few overlapping fields matches its [`DbType`]. It has two storage modes:
+///
+///   * EAGER (`lazy == false`): the value is fully decoded and lives in `i`
+///     (integers and booleans), `f` (floats), or `s` (text, blob, timestamp,
+///     uuid, json). Decimals are kept as their text in `s`.
+///   * LAZY (`lazy == true`): the value has not been copied out of the driver's
+///     raw buffer yet. `i` holds the buffer BASE address, `off` the byte offset
+///     of the field within it, and `len` its length. Decoding happens on demand
+///     in [`DbValue.textOf`], so a cell that is never read costs no allocation.
+///
+/// The accessors ([`DbValue.asInt`], [`DbValue.asText`], [`DbValue.asView`] and
+/// the rest) hide this split: they branch on `lazy` and `kind` and always give
+/// back the requested shape. The one thing a caller must respect is that a lazy
+/// cell, and any [`str.Str`] taken from it via [`DbValue.asView`], borrows the
+/// driver's buffer and must not outlive it.
 pub struct DbValue {
+    /// The logical type tag that selects which field below is authoritative.
     pub kind: DbType,
+    /// Integer/boolean payload when eager; the raw buffer BASE address when
+    /// lazy. It is a `long` because it doubles as a 64-bit machine address.
     pub i: long,
+    /// Floating-point payload, used when `kind` is `Float4`/`Float8`.
     pub f: double,
+    /// Text/blob payload for eager string-shaped values, and the source of
+    /// truth for `Decimal` (kept textual to preserve exactness).
     pub s: string,
+    /// Byte offset of this field within the lazy buffer, relative to `i`.
     pub off: int,
+    /// Byte length of the lazy field starting at `i + off`.
     pub len: int,
+    /// True when the value is still a window into the driver's buffer rather
+    /// than a decoded payload. Governs the fast path in [`DbValue.textOf`].
     pub lazy: bool,
+    /// Element list for `Array` values, or `undefined` for every scalar. Kept
+    /// as an option so the common scalar case carries no allocation.
     pub arr: List<DbValue> | undefined,
 
+    /// Builds an eager scalar. The `dec` parameter is accepted for a uniform
+    /// call shape across the `dbX` constructors but is deliberately dropped:
+    /// decimals are represented through their text in `s`, so `dec` is bound to
+    /// `_` here. Sets the value non-lazy with an empty array slot.
     init(kind: DbType, i: long, f: double, dec: decimal, s: string) {
         self.kind = kind;
         self.i = i;
@@ -46,8 +153,21 @@ pub struct DbValue {
         let _ = dec;
     }
 
+    /// Attaches an element list and returns the same value, for fluent
+    /// construction of an `Array` cell. See [`dbArray`], which uses it.
     pub fn withArr(self: DbValue, elems: List<DbValue>): DbValue { self.arr = elems; return self; }
 
+    /// Renders the value as text, decoding lazily if needed. This is the shared
+    /// engine behind every text-shaped accessor.
+    ///
+    /// A lazy value is copied out of the raw buffer here (and only here): it
+    /// allocates a fresh `len`-byte string from `i + off`, so the returned
+    /// `string` is owned and independent of the driver buffer. A zero-length
+    /// lazy field yields `""` without allocating. For an eager value it returns
+    /// `s` when that is non-empty, and otherwise synthesises the text from the
+    /// numeric payload according to `kind` (integers and booleans from `i`,
+    /// floats from `f`). Being private, it assumes callers have already chosen
+    /// this path deliberately.
     fn textOf(self: DbValue): string {
         if (self.lazy) {
             if (self.len <= 0) { return ""; }
@@ -62,50 +182,94 @@ pub struct DbValue {
         return self.s;
     }
 
+    /// True when this cell is SQL NULL (its `kind` is `DbType.Null`).
     pub fn isNull(self: DbValue): bool { return self.kind == DbType.Null; }
+    /// Reads the value as a boolean: any non-zero integer payload is true.
     pub fn asBool(self: DbValue): bool { return self.i != 0; }
+    /// Reads the value as a 32-bit integer.
+    ///
+    /// A decimal is truncated to its integer part (via [`decimalIntPart`]); a
+    /// lazy value is decoded from its buffer text and parsed; otherwise the
+    /// stored `i` is narrowed to `int`. Note the narrowing: a value beyond
+    /// 32-bit range is truncated, so use [`DbValue.asLong`] when the column can
+    /// exceed that.
     pub fn asInt(self: DbValue): int {
         if (self.kind == DbType.Decimal) { return decimalIntPart(self.textOf()) as int; }
         if (self.lazy) { return string.parseI64(self.textOf()) as int; }
         return self.i as int;
     }
+    /// Reads the value as a 64-bit integer, decoding a decimal to its integer
+    /// part or parsing a lazy field's text, else returning the stored `i`.
     pub fn asLong(self: DbValue): long {
         if (self.kind == DbType.Decimal) { return decimalIntPart(self.textOf()); }
         if (self.lazy) { return string.parseI64(self.textOf()); }
         return self.i;
     }
+    /// Reads the value as a 64-bit float, parsing decimals and lazy fields from
+    /// their text and otherwise returning the stored `f`.
     pub fn asDouble(self: DbValue): double {
         if (self.kind == DbType.Decimal) { return string.parseFloat(self.textOf()); }
         if (self.lazy) { return string.parseFloat(self.textOf()); }
         return self.f;
     }
+    /// Reads the value as an exact `decimal`, parsed from its textual form so no
+    /// precision is lost through a binary float.
     pub fn asDecimal(self: DbValue): decimal { return decimal.fromString(self.textOf()); }
+    /// Reads the value as owned text (see [`DbValue.textOf`] for how each `kind`
+    /// is rendered). This always yields a self-owned `string`.
     pub fn asText(self: DbValue): string { return self.textOf(); }
+    /// Borrows the value's bytes as a [`str.Str`] with NO copy.
+    ///
+    /// For a lazy cell this returns a raw window `(i + off, len)` straight into
+    /// the driver buffer; for an eager cell it views the owned string `s`. The
+    /// returned view borrows its backing store and must not outlive it: a lazy
+    /// view is only valid while the driver buffer is alive. This is the entry
+    /// point for the zero-copy render path.
     pub fn asView(self: DbValue): str.Str {
         if (self.lazy) { return str.raw(self.i + (self.off as long), self.len); }
         return str.of(self.s);
     }
+    /// Reads a timestamp as its ISO text. A thin, intent-revealing alias over
+    /// [`DbValue.textOf`].
     pub fn asTimestamp(self: DbValue): string { return self.textOf(); }
+    /// Reads a UUID as its canonical text. Alias over [`DbValue.textOf`].
     pub fn asUuid(self: DbValue): string { return self.textOf(); }
+    /// Reads a JSON value as its text. Alias over [`DbValue.textOf`]; no parsing
+    /// is done here.
     pub fn asJson(self: DbValue): string { return self.textOf(); }
+    /// Reads an `Array` value's elements, or an empty list when there are none
+    /// (a scalar, or an array cell with no attached list).
     pub fn asArray(self: DbValue): List<DbValue> {
         let a = self.arr;
         if (a != undefined) { return a; }
         return List<DbValue>();
     }
+    /// Number of elements in an `Array` value, or 0 for a scalar.
     pub fn arrayLen(self: DbValue): int {
         let a = self.arr;
         if (a != undefined) { return a.size(); }
         return 0;
     }
 
+    /// Like [`DbValue.asInt`] but returns `dflt` when the cell is NULL.
     pub fn asIntOr(self: DbValue, dflt: int): int { if (self.isNull()) { return dflt; } return self.asInt(); }
+    /// Like [`DbValue.asLong`] but returns `dflt` when the cell is NULL.
     pub fn asLongOr(self: DbValue, dflt: long): long { if (self.isNull()) { return dflt; } return self.asLong(); }
+    /// Like [`DbValue.asDouble`] but returns `dflt` when the cell is NULL.
     pub fn asDoubleOr(self: DbValue, dflt: double): double { if (self.isNull()) { return dflt; } return self.asDouble(); }
+    /// Like [`DbValue.asText`] but returns `dflt` when the cell is NULL.
     pub fn asTextOr(self: DbValue, dflt: string): string { if (self.isNull()) { return dflt; } return self.textOf(); }
+    /// Like [`DbValue.asBool`] but returns `dflt` when the cell is NULL.
     pub fn asBoolOr(self: DbValue, dflt: bool): bool { if (self.isNull()) { return dflt; } return self.i != 0; }
 }
 
+/// Extracts the signed integer part of a decimal's TEXT form, as a `long`.
+///
+/// It takes everything before the first `.` (or the whole string if there is no
+/// dot) and parses that. Strings that carry only a sign or are empty (`""`,
+/// `"-"`, `"+"`) parse to 0 rather than failing. This exists so [`DbValue.asInt`]
+/// and [`DbValue.asLong`] can truncate a decimal without pulling in full decimal
+/// parsing on the integer path.
 fn decimalIntPart(s: string): long {
     let dot = string.indexOf(s, ".");
     let intPart = if (dot >= 0) string.slice(s, 0, dot) else s;
@@ -113,18 +277,37 @@ fn decimalIntPart(s: string): long {
     return string.parseI64(intPart);
 }
 
+/// Constructs a NULL cell.
 pub fn dbNull(): DbValue { return DbValue(DbType.Null, 0, 0.0, 0m, ""); }
+/// Constructs a boolean cell, storing 1 for true and 0 for false in `i`.
 pub fn dbBool(b: bool): DbValue { return DbValue(DbType.Bool, b ? 1 : 0, 0.0, 0m, ""); }
+/// Constructs a 32-bit integer cell (`DbType.Int4`).
 pub fn dbInt(n: int): DbValue { return DbValue(DbType.Int4, n, 0.0, 0m, ""); }
+/// Constructs a 64-bit integer cell (`DbType.Int8`).
 pub fn dbLong(n: long): DbValue { return DbValue(DbType.Int8, n, 0.0, 0m, ""); }
+/// Constructs a 64-bit float cell (`DbType.Float8`).
 pub fn dbDouble(d: double): DbValue { return DbValue(DbType.Float8, 0, d, 0m, ""); }
+/// Constructs an exact decimal cell, storing the decimal's TEXT in `s` (the
+/// `dec` init parameter is dropped, so the text is the source of truth).
 pub fn dbDecimal(d: decimal): DbValue { return DbValue(DbType.Decimal, 0, 0.0, d, `${d}`); }
+/// Constructs a text cell (`DbType.Text`) from an owned string.
 pub fn dbText(s: string): DbValue { return DbValue(DbType.Text, 0, 0.0, 0m, s); }
+/// Constructs a binary blob cell (`DbType.Blob`) carrying bytes in `s`.
 pub fn dbBlob(s: string): DbValue { return DbValue(DbType.Blob, 0, 0.0, 0m, s); }
+/// Constructs a timestamp cell from an ISO string.
 pub fn dbTimestamp(iso: string): DbValue { return DbValue(DbType.Timestamp, 0, 0.0, 0m, iso); }
+/// Constructs a UUID cell from its canonical text.
 pub fn dbUuid(s: string): DbValue { return DbValue(DbType.Uuid, 0, 0.0, 0m, s); }
+/// Constructs a JSON cell from its text (not parsed here).
 pub fn dbJson(s: string): DbValue { return DbValue(DbType.Json, 0, 0.0, 0m, s); }
+/// Constructs an array cell, attaching `elems` via [`DbValue.withArr`].
 pub fn dbArray(elems: List<DbValue>): DbValue { return DbValue(DbType.Array, 0, 0.0, 0m, "").withArr(elems); }
+/// Constructs a LAZY cell that windows into a raw buffer instead of copying.
+///
+/// `base` is the buffer's base address (kept in `i`), `off` the field's byte
+/// offset within it, and `len` its length. The cell decodes on demand and, like
+/// any lazy value, is only valid while `base` stays alive. Drivers use this to
+/// build rows that reference the received wire buffer directly.
 pub fn dbLazy(kind: DbType, base: long, off: int, len: int): DbValue {
     let v = DbValue(kind, base, 0.0, 0m, "");
     v.off = off;
@@ -132,10 +315,17 @@ pub fn dbLazy(kind: DbType, base: long, off: int, len: int): DbValue {
     v.lazy = true;
     return v;
 }
+/// The empty parameter list, for a statement that binds no parameters. A named
+/// helper so call sites read clearly rather than spelling `List<DbValue>()`.
 pub fn noParams(): List<DbValue> { return List<DbValue>(); }
 
+/// A result column's name and logical type. One entry per column in a result's
+/// schema (see [`ResultSet.columns`] and [`WireRows.cols`]).
 pub struct Column {
+    /// The column's name as reported by the driver.
     pub name: string,
+    /// The column's logical type. Named `type_oid` for familiarity with the
+    /// postgres wire vocabulary, though it holds a driver-neutral [`DbType`].
     pub type_oid: DbType,
     init(name: string, type_oid: DbType) {
         self.name = name;
@@ -143,6 +333,12 @@ pub struct Column {
     }
 }
 
+/// Finds the index of a column by name, case-INSENSITIVELY, or -1 if absent.
+///
+/// Both the query and each candidate are lower-cased before comparison, so a
+/// lookup for `"Id"` matches a column reported as `"id"`. This is a linear scan,
+/// intended for the modest column counts of a typical result. Returns the first
+/// match; if two columns share a name it finds the earlier one.
 pub fn colIndexOf(cols: List<Column>, name: string): int {
     let want = string.toLowerCase(name);
     let i = 0;
@@ -154,44 +350,100 @@ pub fn colIndexOf(cols: List<Column>, name: string): int {
     return -1;
 }
 
+/// One materialised result row: an ordered sequence of [`DbValue`] cells.
+///
+/// The cells live in a [`rawbuffer.RawBuffer`] (a compact, value-semantic buffer
+/// rather than a boxed list) which the driver fills column by column. `raw` can
+/// optionally hold the row's backing wire bytes so that any LAZY cells in
+/// `cells` have a live buffer to borrow from; keeping it on the row ties that
+/// buffer's lifetime to the row's.
 pub struct Row {
+    /// The cells of this row, in column order.
     pub cells: rawbuffer.RawBuffer<DbValue>,
+    /// Optional backing bytes that lazy cells in `cells` borrow from; empty when
+    /// every cell is eager.
     pub raw: string,
     init() { self.cells = rawbuffer.RawBuffer<DbValue>(8); self.raw = ""; }
 
+    /// Number of cells (columns) in the row.
     pub fn size(self: Row): int { return self.cells.count(); }
+    /// Reads the cell at column `i`, or a NULL cell if `i` is out of range.
+    ///
+    /// Out-of-range access is tolerant by design: it returns [`dbNull`] rather
+    /// than trapping, so the typed accessors below degrade to defaults on a bad
+    /// index instead of crashing.
     pub fn get(self: Row, i: int): DbValue {
         if (i < 0 || i >= self.cells.count()) { return dbNull(); }
         return self.cells.at(i);
     }
+    /// True if the cell at column `i` is NULL (or `i` is out of range).
     pub fn isNull(self: Row, i: int): bool { return self.get(i).isNull(); }
+    /// Reads column `i` as a boolean (see [`DbValue.asBool`]).
     pub fn getBool(self: Row, i: int): bool { return self.get(i).asBool(); }
+    /// Reads column `i` as a 32-bit integer (see [`DbValue.asInt`]).
     pub fn getInt(self: Row, i: int): int { return self.get(i).asInt(); }
+    /// Reads column `i` as a 64-bit integer (see [`DbValue.asLong`]).
     pub fn getLong(self: Row, i: int): long { return self.get(i).asLong(); }
+    /// Reads column `i` as a 64-bit float (see [`DbValue.asDouble`]).
     pub fn getDouble(self: Row, i: int): double { return self.get(i).asDouble(); }
+    /// Reads column `i` as an exact decimal (see [`DbValue.asDecimal`]).
     pub fn getDecimal(self: Row, i: int): decimal { return self.get(i).asDecimal(); }
+    /// Reads column `i` as owned text (see [`DbValue.asText`]).
     pub fn getText(self: Row, i: int): string { return self.get(i).asText(); }
+    /// Borrows column `i` as a zero-copy [`str.Str`] (see [`DbValue.asView`]).
+    /// The view is only valid while this row's backing buffer lives.
     pub fn getView(self: Row, i: int): str.Str { return self.get(i).asView(); }
+    /// Reads column `i` as an array of cells (see [`DbValue.asArray`]).
     pub fn getArray(self: Row, i: int): List<DbValue> { return self.get(i).asArray(); }
+    /// Reads column `i` as a timestamp string (see [`DbValue.asTimestamp`]).
     pub fn getTimestamp(self: Row, i: int): string { return self.get(i).asTimestamp(); }
 }
 
+/// Error kind: an unclassified or driver-specific failure. The default `kind`.
 pub const DBERR_UNKNOWN: int = 0;
+/// Error kind: a UNIQUE / primary-key constraint was violated. See
+/// [`DbError.isUniqueViolation`].
 pub const DBERR_UNIQUE_VIOLATION: int = 1;
+/// Error kind: a NOT NULL constraint was violated.
 pub const DBERR_NOT_NULL: int = 2;
+/// Error kind: a FOREIGN KEY constraint was violated.
 pub const DBERR_FOREIGN_KEY: int = 3;
+/// Error kind: a CHECK constraint was violated.
 pub const DBERR_CHECK: int = 4;
+/// Error kind: the transaction was chosen as a deadlock victim. Transient, so
+/// retrying the transaction is the usual response.
 pub const DBERR_DEADLOCK: int = 5;
+/// Error kind: a serialization failure under a snapshot/serializable isolation
+/// level. Transient; retry the transaction.
 pub const DBERR_SERIALIZATION: int = 6;
+/// Error kind: a lock acquisition timed out. Transient.
 pub const DBERR_LOCK_TIMEOUT: int = 7;
+/// Error kind: the SQL failed to parse or was otherwise malformed. Not
+/// transient; retrying the same statement will fail again.
 pub const DBERR_SYNTAX: int = 8;
+/// Error kind: authentication or authorisation was rejected.
 pub const DBERR_AUTH: int = 9;
+/// Error kind: the connection itself failed (dropped, refused, reset).
+/// Treated as transient because a reconnect may succeed.
 pub const DBERR_CONNECTION: int = 10;
 
+/// A database error carried as DATA rather than thrown.
+///
+/// Errors travel inside a [`ResultSet`] or [`ExecResult`] rather than through an
+/// exception channel, so success and failure share one return type. The `kind`
+/// field is the driver-neutral classification (one of the `DBERR_*` constants),
+/// which lets callers react to the CATEGORY of failure, for example retrying on
+/// a transient one, without matching a driver-specific message. `code` and
+/// `message` keep the driver's own SQLSTATE-style code and human text, and
+/// `number` its numeric error code where one exists.
 pub struct DbError {
+    /// The driver's own error code (for example a SQLSTATE), or `""` if none.
     pub code: string,
+    /// Human-readable error text from the driver.
     pub message: string,
+    /// The driver's numeric error code, or 0 if it does not use one.
     pub number: int,
+    /// The driver-neutral classification, one of the `DBERR_*` constants.
     pub kind: int,
     init(code: string, message: string) {
         self.code = code;
@@ -200,29 +452,55 @@ pub struct DbError {
         self.kind = 0;
     }
 
+    /// Fills in the numeric `number` and neutral `kind` and returns the same
+    /// error, for fluent construction where a driver maps its raw code to a
+    /// classification after building the message.
     pub fn with(self: DbError, number: int, kind: int): DbError {
         self.number = number;
         self.kind = kind;
         return self;
     }
 
+    /// True when this is the empty sentinel (no code and no message), that is,
+    /// no error. This is what [`ResultSet.ok`] and [`ExecResult.ok`] test.
     pub fn isEmpty(self: DbError): bool { return string.eql(self.code, "") && string.eql(self.message, ""); }
+    /// True when `kind` is a unique/primary-key violation.
     pub fn isUniqueViolation(self: DbError): bool { return self.kind == DBERR_UNIQUE_VIOLATION; }
+    /// True when `kind` marks this transaction as a deadlock victim.
     pub fn isDeadlock(self: DbError): bool { return self.kind == DBERR_DEADLOCK; }
+    /// True when the failure is worth retrying: a deadlock, a serialization
+    /// failure, a lock timeout, or a connection error. Callers use this to drive
+    /// an automatic retry loop without inspecting the specific code.
     pub fn isTransient(self: DbError): bool {
         return self.kind == DBERR_DEADLOCK || self.kind == DBERR_SERIALIZATION
             || self.kind == DBERR_LOCK_TIMEOUT || self.kind == DBERR_CONNECTION;
     }
 }
 
+/// The empty error sentinel used to mean "no error". A named helper so results
+/// can initialise their `err` field readably.
 pub fn noError(): DbError { return DbError("", ""); }
 
+/// A materialised query result: schema, rows, status, and any error.
+///
+/// This is the fully-decoded shape a driver returns from [`Connection.query`].
+/// A single statement may produce several result sets (for example a multi-
+/// statement batch), so `more` chains the additional ones after this, the first;
+/// [`ResultSet.resultSetCount`] and [`ResultSet.resultSet`] present that chain
+/// as a flat, 0-based sequence. The embedded [`DbError`] means a failed query is
+/// still a `ResultSet`, just one whose [`ResultSet.ok`] is false.
 pub struct ResultSet {
+    /// The result's column schema, in order.
     pub columns: List<Column>,
+    /// The result's rows.
     pub rows: List<Row>,
+    /// The driver's command tag / status string (for example `"SELECT 3"`).
     pub tag: string,
+    /// Rows affected, for statements that report one alongside a row set.
     pub rows_affected: long,
+    /// The error, or the empty sentinel when the query succeeded.
     pub err: DbError,
+    /// Additional result sets after this one, for multi-statement batches.
     pub more: List<ResultSet>,
 
     init() {
@@ -234,12 +512,22 @@ pub struct ResultSet {
         self.more = List<ResultSet>();
     }
 
+    /// Number of rows in this result.
     pub fn rowCount(self: ResultSet): int { return self.rows.size(); }
+    /// Number of columns in this result.
     pub fn colCount(self: ResultSet): int { return self.columns.size(); }
+    /// Reads row `i`, or an empty [`Row`] if `i` is out of range.
     pub fn row(self: ResultSet, i: int): Row { return self.rows.get(i) ?? Row(); }
+    /// True when the query succeeded (no error).
     pub fn ok(self: ResultSet): bool { return self.err.isEmpty(); }
+    /// True when the query carries an error.
     pub fn hasError(self: ResultSet): bool { return !self.err.isEmpty(); }
+    /// Total number of result sets in the chain, counting this one plus `more`.
     pub fn resultSetCount(self: ResultSet): int { return 1 + self.more.size(); }
+    /// Reads the `i`-th result set in the chain as a flat 0-based sequence.
+    ///
+    /// Index 0 (or any non-positive index) is this result set itself; index `k`
+    /// is `more[k - 1]`. An out-of-range index yields an empty [`ResultSet`].
     pub fn resultSet(self: ResultSet, i: int): ResultSet {
         if (i <= 0) { return self; }
         return self.more.get(i - 1) ?? ResultSet();

@@ -1,15 +1,80 @@
+//! SHA-1 message digest (FIPS 180-4).
+//!
+//! This file is a self-contained, pure-Nova implementation of the SHA-1 hash
+//! function. It produces a 160-bit (20-byte) digest from an arbitrary run of
+//! bytes. There are no external crypto dependencies: the whole algorithm, the
+//! Merkle-Damgard padding, and the big-endian word packing are written here in
+//! terms of the low-level `bytes` primitives, so it works identically on native
+//! and WASM targets without linking wolfSSL or any host library.
+//!
+//! WHY it exists, given SHA-1 is broken for signatures. SHA-1 is no longer
+//! collision-resistant and must NOT be used to authenticate messages or to sign
+//! anything. It survives here because several wire protocols still MANDATE it in
+//! places where collision resistance is not the security property being relied
+//! on: the WebSocket opening handshake computes `SHA-1(key + GUID)` (RFC 6455),
+//! Git object addressing, and legacy TLS/HMAC-SHA1 suites are the motivating
+//! callers. Treat this as a protocol-compatibility primitive, not a
+//! general-purpose security hash. For new code reach for SHA-256 or SHA-384 in
+//! the sibling files under `crypto/hash`.
+//!
+//! DESIGN. The core is the classic streaming shape shared by every
+//! Merkle-Damgard hash: a fixed 160-bit state of five 32-bit words, a 64-byte
+//! block buffer that absorbs input until it is full, and a compression function
+//! that mixes each complete block into the state. [`Sha1.update`] can be called
+//! any number of times with any chunk sizes; it buffers a partial trailing
+//! block between calls and compresses whole blocks in place straight out of the
+//! caller's buffer, so hashing a large input needs no intermediate copy.
+//! [`Sha1.final`] appends the standard `0x80` terminator, zero padding, and the
+//! 64-bit big-endian bit length, then emits the digest.
+//!
+//! INVARIANTS and memory. `Sha1` is a heap object holding two raw byte buffers
+//! ([`Sha1.h`] and [`Sha1.block`]) allocated in [`Sha1.create`]. All arithmetic
+//! is done on `ulong` values masked back to 32 bits via [`MASK32`], because Nova
+//! has no native 32-bit unsigned word: the mask is what makes the additions and
+//! rotations wrap the way SHA-1 requires. The buffers are owned by the object
+//! and MUST be released by calling [`Sha1.delete`] exactly once when done, or by
+//! using the one-shot [`hashInto`] which manages the lifecycle for you.
+
 import bytes;
 import mem.allocator;
 
+/// Bit mask that truncates a `ulong` back down to its low 32 bits.
+///
+/// SHA-1 is defined over 32-bit words, but Nova computes on 64-bit `ulong`, so
+/// every add and rotate can carry beyond bit 31. AND-ing with this mask after
+/// each such step reproduces the modulo-2^32 wraparound the specification
+/// requires. Used pervasively in [`rotl`], [`beWord`], and [`Sha1.compress`].
 const MASK32: ulong = 0xffffffff;
 
+/// Length in bytes of a SHA-1 digest: 20 bytes, i.e. 160 bits.
+///
+/// The `out` buffer handed to [`Sha1.final`] and [`hashInto`] must be at least
+/// this many bytes.
 pub const SHA1_DIGEST_LEN: int = 20;
+/// Size in bytes of the SHA-1 input block: 64 bytes, i.e. 512 bits.
+///
+/// This is the unit the compression function consumes and the size of the
+/// internal block buffer. The final-block padding rules in [`Sha1.final`] are
+/// all stated modulo this value.
 pub const SHA1_BLOCK_LEN: int = 64;
 
+/// Rotates the low 32 bits of `x` left by `n` bit positions (a circular shift).
+///
+/// Bits shifted off the top re-enter at the bottom. The result is masked to 32
+/// bits so that the top bits of the 64-bit `ulong` never leak in. `n` is
+/// expected in `1..31`, since the complementary right shift uses `32 - n`. This
+/// is the SHA-1 `ROTL` primitive used both to expand the message schedule and
+/// inside the round function of [`Sha1.compress`].
 fn rotl(x: ulong, n: int): ulong {
     return ((x << n) | (x >> (32 - n))) & MASK32;
 }
 
+/// Reads four bytes at `buf + off` as a big-endian 32-bit word.
+///
+/// SHA-1 fixes byte order as big-endian (most significant byte first), so the
+/// byte at the lowest address becomes the high 8 bits. Used to load message
+/// words from the input block and to read back state words from [`Sha1.h`],
+/// which is the exact inverse of [`putWord`]. The result is masked to 32 bits.
 fn beWord(buf: ptr, off: int): ulong {
     return (((bytes.read_byte(buf, off) as ulong) << 24)
         | ((bytes.read_byte(buf, off + 1) as ulong) << 16)
@@ -17,6 +82,12 @@ fn beWord(buf: ptr, off: int): ulong {
         | (bytes.read_byte(buf, off + 3) as ulong)) & MASK32;
 }
 
+/// Writes the low 32 bits of `w` to `out + off` in big-endian byte order.
+///
+/// The most significant byte lands at the lowest address, mirroring [`beWord`].
+/// Only the bottom four bytes of `w` are written; any higher bits are ignored.
+/// Used to seed and update the state words in [`Sha1.h`] and to emit the final
+/// digest bytes in [`Sha1.final`].
 fn putWord(out: ptr, off: int, w: ulong): void {
     bytes.write_byte(out, off, ((w >> 24) & 0xff) as int);
     bytes.write_byte(out, off + 1, ((w >> 16) & 0xff) as int);
@@ -24,12 +95,39 @@ fn putWord(out: ptr, off: int, w: ulong): void {
     bytes.write_byte(out, off + 3, (w & 0xff) as int);
 }
 
+/// A streaming SHA-1 hasher: absorb bytes with [`Sha1.update`], then read the
+/// digest with [`Sha1.final`].
+///
+/// The object holds mutable state across calls, so it is NOT a value: it owns
+/// two heap buffers and must be constructed with [`Sha1.create`] and released
+/// with [`Sha1.delete`]. Reuse across independent messages is possible by
+/// calling [`Sha1.reset`] between them. For a single buffer in one shot, prefer
+/// the free function [`hashInto`], which handles the lifecycle.
 pub struct Sha1 {
+    /// The 160-bit chaining state as five packed big-endian 32-bit words (20
+    /// bytes). Read and written through [`beWord`] and [`putWord`]. Seeded to
+    /// the SHA-1 initial constants by [`Sha1.reset`] and folded forward one
+    /// block at a time by [`Sha1.compress`]. Owned; freed by [`Sha1.delete`].
     pub h: ptr,
+    /// The 64-byte staging buffer that accumulates a partial input block
+    /// between [`Sha1.update`] calls until a full block is available to
+    /// compress. Owned; freed by [`Sha1.delete`].
     pub block: ptr,
+    /// Number of bytes currently buffered in [`Sha1.block`], always in
+    /// `0..SHA1_BLOCK_LEN`. When it reaches a full block the block is
+    /// compressed and this resets to 0.
     pub blockLen: int,
+    /// Running count of all message bytes absorbed so far. A `long` because a
+    /// message can exceed 4 GB, and it is multiplied by 8 in [`Sha1.final`] to
+    /// form the 64-bit length that SHA-1 appends to the padded message.
     pub total: long,
 
+    /// Allocates and initialises a fresh hasher ready to absorb input.
+    ///
+    /// Allocates the object plus its two owned buffers ([`Sha1.h`] and
+    /// [`Sha1.block`]) and calls [`Sha1.reset`] to load the initial state. The
+    /// caller owns the returned value and MUST eventually call [`Sha1.delete`]
+    /// to release the buffers.
     pub fn create(): Sha1 {
         let s = bytes.new_with_allocator<Sha1>(allocator.globalAllocator());
         s.h = bytes.alloc(5 * 4);
@@ -38,6 +136,12 @@ pub struct Sha1 {
         return s;
     }
 
+    /// Returns the hasher to its initial state so it can hash a new message.
+    ///
+    /// Loads the five SHA-1 initial hash values (the fixed constants H0..H4
+    /// from FIPS 180-4) into [`Sha1.h`] and clears the block buffer and byte
+    /// count. Call this to reuse one `Sha1` for several independent digests
+    /// without reallocating. Called automatically by [`Sha1.create`].
     pub fn reset(self: Sha1): void {
         putWord(self.h, 0, 0x67452301);
         putWord(self.h, 4, 0xefcdab89);
@@ -48,6 +152,21 @@ pub struct Sha1 {
         self.total = 0;
     }
 
+    /// Mixes one 64-byte block, read from `buf + off`, into the chaining state.
+    ///
+    /// This is the SHA-1 compression function and the heart of the algorithm.
+    /// It first builds the 80-word message schedule: words 0..15 are the block
+    /// read big-endian, and words 16..79 are `ROTL1` of the XOR of four earlier
+    /// words. It then runs 80 rounds over working variables `a..e` seeded from
+    /// [`Sha1.h`], where each round picks one of four `(f, k)` pairs by round
+    /// index (choose, parity, majority, parity again), and finally adds the
+    /// working variables back into the state. All intermediate values are kept
+    /// to 32 bits via [`MASK32`]; the additions rely on that wraparound. The
+    /// 80-word schedule buffer `w` is heap-allocated here and freed before
+    /// return, so this function leaks nothing per block.
+    ///
+    /// `buf` may be the caller's own input buffer (see [`Sha1.update`], which
+    /// compresses whole blocks in place) or the internal [`Sha1.block`].
     fn compress(self: Sha1, buf: ptr, off: int): void {
         let w = bytes.alloc(80 * 4);
         let t = 0;
@@ -101,6 +220,16 @@ pub struct Sha1 {
         bytes.free(w);
     }
 
+    /// Absorbs `len` bytes starting at `data` into the running digest.
+    ///
+    /// Safe to call any number of times with any chunk sizes; the result
+    /// depends only on the concatenation of all input, not on how it was split.
+    /// The logic has three phases: top up any partially filled [`Sha1.block`]
+    /// and compress it once full, then compress as many whole 64-byte blocks
+    /// as possible straight out of `data` (no copy), then stash the trailing
+    /// remainder back into [`Sha1.block`]. [`Sha1.total`] is advanced by `len`
+    /// up front so [`Sha1.final`] can append the correct bit length. Note that
+    /// [`Sha1.final`] itself calls this to feed the padding block.
     pub fn update(self: Sha1, data: ptr, len: int): void {
         self.total = self.total + (len as long);
         let i = 0;
@@ -126,6 +255,21 @@ pub struct Sha1 {
         }
     }
 
+    /// Finishes the digest and writes 20 bytes to `out`.
+    ///
+    /// Applies the standard Merkle-Damgard padding: a single `0x80` byte, then
+    /// enough zero bytes so that after appending an 8-byte length the total is
+    /// a whole number of blocks, then the message length in BITS as a 64-bit
+    /// big-endian integer. That padding is fed through [`Sha1.update`] so the
+    /// final block or two get compressed normally, after which the five state
+    /// words are serialised big-endian into `out`. The internal padding scratch
+    /// buffer is freed before return.
+    ///
+    /// `out` must have room for at least [`SHA1_DIGEST_LEN`] (20) bytes. This
+    /// consumes the hasher's state: after calling it, call [`Sha1.reset`]
+    /// before reusing the object, and [`Sha1.delete`] when finished. The bit
+    /// length is computed from [`Sha1.total`], read before the padding bytes
+    /// are counted into it.
     pub fn final(self: Sha1, out: ptr): void {
         let bitLen = self.total * 8;
         let pad = bytes.alloc(SHA1_BLOCK_LEN * 2);
@@ -151,6 +295,12 @@ pub struct Sha1 {
         bytes.free(pad);
     }
 
+    /// Releases the two heap buffers this hasher owns.
+    ///
+    /// Frees [`Sha1.h`] and [`Sha1.block`] and nulls the pointers, so a second
+    /// call is a safe no-op (the null guards prevent a double free). Must be
+    /// called exactly once for every [`Sha1.create`]. After this the object
+    /// must not be used again.
     pub fn delete(self: Sha1): void {
         if (self.h != 0) {
             bytes.free(self.h);
@@ -163,6 +313,14 @@ pub struct Sha1 {
     }
 }
 
+/// One-shot convenience: hashes `len` bytes at `data` and writes the 20-byte
+/// digest to `out`.
+///
+/// Creates a [`Sha1`], feeds the whole buffer through [`Sha1.update`], finalises
+/// into `out` with [`Sha1.final`], and deletes the hasher, so the caller need
+/// not manage the object lifecycle. `out` must hold at least
+/// [`SHA1_DIGEST_LEN`] (20) bytes. Use the streaming [`Sha1`] API directly when
+/// the input arrives in several pieces.
 pub fn hashInto(data: ptr, len: int, out: ptr): void {
     let s = Sha1.create();
     s.update(data, len);

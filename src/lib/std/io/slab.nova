@@ -1,14 +1,46 @@
+//! Fixed-size slab allocator with reference-counted blocks.
+//!
+//! `SlabPool` carves one large `bytes.alloc` region into `count` fixed-size
+//! blocks up front, avoiding per-block heap traffic for callers that
+//! repeatedly acquire and release blocks of the same size (for example,
+//! connection buffers or pooled request objects). Each block is prefixed with
+//! an 8-byte header: a 4-byte refcount, reused as a free-list `next` pointer
+//! while the block is unallocated. Free blocks form a singly linked list
+//! threaded through `freeHead`, so acquire and release are both O(1) and
+//! allocate no memory themselves.
+//!
+//! This is a low-level building block for the rest of the `io` layer: callers
+//! get back a `long` payload address (the block, past its header) rather than
+//! a Nova value, so it plays well with buffers that are shared and reference
+//! counted manually via `retain`/`release` rather than through ARC.
 
 import bytes;
 
+/// A pool of fixed-size, reference-counted blocks carved from one contiguous
+/// allocation.
+///
+/// Blocks are acquired and released by address; a block's payload starts
+/// immediately after its 8-byte header, so `payload - 8` recovers the header
+/// for refcount and free-list operations. The pool does not grow: once every
+/// block is checked out, `acquire` returns 0.
 pub class SlabPool {
+    /// Address of the start of the whole slab allocation (the first block's header).
     pub base: long,
+    /// Bytes from the start of one block to the start of the next: the 8-byte
+    /// header plus `blockSize` rounded up to an 8-byte boundary.
     pub stride: int,
+    /// Usable payload size of each block, in bytes, as requested by the caller.
     pub blockSize: int,
+    /// Total number of blocks in the pool.
     pub count: int,
+    /// Header address of the first free block, or 0 if the pool is exhausted.
     pub freeHead: long,
+    /// Number of blocks currently on the free list.
     pub freeCount: int,
 
+    /// Allocates the backing region and links every block into the free list
+    /// in order, so the first `count - 1` calls to `acquire` hand out blocks
+    /// sequentially by address.
     init(blockSize: int, count: int) {
         let aligned = (blockSize + 7) / 8 * 8;
         self.blockSize = blockSize;
@@ -27,6 +59,8 @@ pub class SlabPool {
         self.freeHead = self.base;
     }
 
+    /// Takes a block off the free list, sets its refcount to 1, and returns
+    /// its payload address. Returns 0 if the pool has no free blocks left.
     pub fn acquire(self: SlabPool): long {
         if (self.freeHead == 0) {
             return 0;
@@ -38,11 +72,17 @@ pub class SlabPool {
         return blk + 8;
     }
 
+    /// Increments the refcount of the block backing `payload`. Callers that
+    /// share a block across multiple owners must retain once per extra owner
+    /// and release the same number of times.
     pub fn retain(self: SlabPool, payload: long): void {
         let blk = payload - 8;
         bytes.write_i32(blk, 0, (bytes.read_i32(blk, 0) as int + 1) as long);
     }
 
+    /// Decrements the refcount of the block backing `payload`. When the count
+    /// drops to zero or below, the block is returned to the head of the free
+    /// list and becomes available to a future `acquire`.
     pub fn release(self: SlabPool, payload: long): void {
         let blk = payload - 8;
         let rc = (bytes.read_i32(blk, 0) as int) - 1;
@@ -54,14 +94,19 @@ pub class SlabPool {
         }
     }
 
+    /// Reads the current refcount of the block backing `payload`, without changing it.
     pub fn refcount(self: SlabPool, payload: long): int {
         return bytes.read_i32(payload - 8, 0) as int;
     }
 
+    /// Number of blocks currently on the free list, available for `acquire`.
     pub fn available(self: SlabPool): int {
         return self.freeCount;
     }
 
+    /// Frees the entire backing allocation and zeroes `base`, so calling
+    /// `destroy` twice is safe. Does not check that all blocks were released
+    /// first: any outstanding payload addresses become dangling.
     pub fn destroy(self: SlabPool): void {
         if (self.base != 0) {
             bytes.free(self.base);

@@ -1,3 +1,11 @@
+//! Pipeline behaviour that is meant to guard request handling against panics.
+//!
+//! This slots into the web mediator's pipeline chain (see `web.mediator`)
+//! alongside other cross-cutting behaviours: it wraps the call to the next
+//! stage so a failure partway through a request can be turned into a proper
+//! HTTP response instead of taking the whole reactor down. It sits next to
+//! `web.request`, `web.response`, and `web.status` because that is the
+//! vocabulary a recovery handler needs to build a fallback response.
 
 import serde.source;
 import web.request;
@@ -5,8 +13,13 @@ import web.response;
 import web.status;
 import web.mediator;
 
+/// Pipeline behaviour intended to recover from panics raised further down the chain.
 pub struct PanicRecoveryBehavior impl PipelineBehavior {
 
+    /// Invokes the next behaviour in the pipeline and returns its response.
+    ///
+    /// Currently this simply forwards to `next.proceed`, with no actual
+    /// panic trapping around the call.
     pub async fn handle(self: PanicRecoveryBehavior, ctx: RequestContext, next: Next): response.Response {
         return await next.proceed(ctx);
     }

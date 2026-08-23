@@ -1,30 +1,53 @@
+//! HPACK header compression (RFC 7541) for the HTTP/2 module.
+//!
+//! This file implements the static and dynamic header tables, the static
+//! Huffman code used for string literals, and the integer/string encoding
+//! and decoding primitives that HPACK needs. It is used by the HTTP/2
+//! connection and frame handling in `web/http2` to compress and decompress
+//! request and response header blocks, and has no dependants outside that
+//! module.
+//!
+//! The Huffman table (codes and bit lengths) is stored as hex strings and
+//! decoded once, at `Hpack` construction time, into parallel `codes`/`lens`
+//! lists plus a decode map keyed on `(bit length, code) -> symbol`, so both
+//! encode and decode work off the same tables.
+
 import string;
 import list;
 import map;
 import bytes;
 
+// RFC 7541 Appendix B canonical Huffman codes for the 256 HPACK symbols, packed as 8 hex digits (32 bits) per entry.
 const HUFF_CODES_HEX: string = "00001ff8007fffd80fffffe20fffffe30fffffe40fffffe50fffffe60fffffe70fffffe800ffffea3ffffffc0fffffe90fffffea3ffffffd0fffffeb0fffffec0fffffed0fffffee0fffffef0ffffff00ffffff10ffffff23ffffffe0ffffff30ffffff40ffffff50ffffff60ffffff70ffffff80ffffff90ffffffa0ffffffb00000014000003f8000003f900000ffa00001ff900000015000000f8000007fa000003fa000003fb000000f9000007fb000000fa000000160000001700000018000000000000000100000002000000190000001a0000001b0000001c0000001d0000001e0000001f0000005c000000fb00007ffc0000002000000ffb000003fc00001ffa000000210000005d0000005e0000005f000000600000006100000062000000630000006400000065000000660000006700000068000000690000006a0000006b0000006c0000006d0000006e0000006f000000700000007100000072000000fc00000073000000fd00001ffb0007fff000001ffc00003ffc0000002200007ffd000000030000002300000004000000240000000500000025000000260000002700000006000000740000007500000028000000290000002a000000070000002b000000760000002c00000008000000090000002d0000007700000078000000790000007a0000007b00007ffe000007fc00003ffd00001ffd0ffffffc000fffe6003fffd2000fffe7000fffe8003fffd3003fffd4003fffd5007fffd9003fffd6007fffda007fffdb007fffdc007fffdd007fffde00ffffeb007fffdf00ffffec00ffffed003fffd7007fffe000ffffee007fffe1007fffe2007fffe3007fffe4001fffdc003fffd8007fffe5003fffd9007fffe6007fffe700ffffef003fffda001fffdd000fffe9003fffdb003fffdc007fffe8007fffe9001fffde007fffea003fffdd003fffde00fffff0001fffdf003fffdf007fffeb007fffec001fffe0001fffe1003fffe0001fffe2007fffed003fffe1007fffee007fffef000fffea003fffe2003fffe3003fffe4007ffff0003fffe5003fffe6007ffff103ffffe003ffffe1000fffeb0007fff1003fffe7007ffff2003fffe801ffffec03ffffe203ffffe303ffffe407ffffde07ffffdf03ffffe500fffff101ffffed0007fff2001fffe303ffffe607ffffe007ffffe103ffffe707ffffe200fffff2001fffe4001fffe503ffffe803ffffe90ffffffd07ffffe307ffffe407ffffe5000fffec00fffff3000fffed001fffe6003fffe9001fffe7001fffe8007ffff3003fffea003fffeb01ffffee01ffffef00fffff400fffff503ffffea007ffff403ffffeb07ffffe603ffffec03ffffed07ffffe707ffffe807ffffe907ffffea07ffffeb0ffffffe07ffffec07ffffed07ffffee07ffffef07fffff003ffffee";
+// Matching bit lengths for each symbol, 2 hex digits (one byte) per entry, parallel to HUFF_CODES_HEX.
 const HUFF_LENS_HEX: string = "0d171c1c1c1c1c1c1c181e1c1c1e1c1c1c1c1c1c1c1c1e1c1c1c1c1c1c1c1c1c060a0a0c0d06080b0a0a080b080606060505050606060606060607080f060c0a0d06070707070707070707070707070707070707070707070807080d130d0e060f05060506050606060507070606060506070605050607070707070f0b0e0d1c141614141616161716171717171718171818161718171717171516171617171816151416161717151716161815161717151516151716171714161616171616171a1a1413161716191a1a1a1b1b1a181913151a1b1b1a1b1815151a1a1c1b1b1b14181415161515171616191918181a171a1b1a1a1b1b1b1b1b1c1b1b1b1b1b1a";
 
+// Converts one hex digit character to its numeric value; non-hex input yields 0.
 fn hx(c: int): int {
     if (c >= '0' && c <= '9') { return c - '0'; }
     if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
     return 0;
 }
+// Parses 8 hex digits starting at index i into a 32-bit value (used to read a Huffman code).
 fn hex8(s: string, i: int): int {
     let v = 0;
     let k = 0;
     while (k < 8) { v = (v << 4) | hx(s[i + k]); k = k + 1; }
     return v;
 }
+// Parses 2 hex digits starting at index i into a byte value (used to read a Huffman code length).
 fn hex2At(s: string, i: int): int { return (hx(s[i]) << 4) | hx(s[i + 1]); }
 
+/// A single decoded or to-be-encoded HTTP header, as a name/value pair.
 pub struct HeaderField {
+    /// The header name, for example ":method" or "content-type".
     pub name: string,
+    /// The header value.
     pub value: string,
     init(name: string, value: string) { self.name = name; self.value = value; }
 }
 
+// Names of the 61 static-table entries defined by RFC 7541 Appendix A, in table order (index 1 = first).
 fn staticNames(): List<string> {
     let n = List<string>();
     n.push(":authority"); n.push(":method"); n.push(":method"); n.push(":path"); n.push(":path");
@@ -43,6 +66,7 @@ fn staticNames(): List<string> {
     n.push("user-agent"); n.push("vary"); n.push("via"); n.push("www-authenticate");
     return n;
 }
+// Values matching staticNames(); most static-table entries carry no fixed value, so those slots are "".
 fn staticValues(): List<string> {
     let v = List<string>();
     v.push(""); v.push("GET"); v.push("POST"); v.push("/"); v.push("/index.html");
@@ -62,15 +86,31 @@ fn staticValues(): List<string> {
     return v;
 }
 
+/// One HPACK codec instance for a single HTTP/2 connection.
+///
+/// An `Hpack` holds the Huffman tables (shared, read-only after construction),
+/// the RFC 7541 static header table, and this connection's dynamic header
+/// table. Because the dynamic table evolves with every header block encoded
+/// or decoded, encoder and decoder state must not be shared across
+/// connections: create one `Hpack` per connection.
 pub class Hpack {
+    /// Huffman code for each of the 256 symbols (index = byte value), decoded from HUFF_CODES_HEX.
     pub codes: List<int>,
+    /// Bit length of the Huffman code for each symbol, decoded from HUFF_LENS_HEX.
     pub lens: List<int>,
+    /// Maps a packed (bit length << 32 | code) key to its symbol, for Huffman decoding.
     pub decMap: Map<long, int>,
+    /// Static-table header names (RFC 7541 Appendix A), indexed 0..60 for table indices 1..61.
     pub sNames: List<string>,
+    /// Static-table header values matching sNames.
     pub sValues: List<string>,
+    /// Dynamic-table header names, most recently inserted first (index 0 = table index 62).
     pub dynNames: List<string>,
+    /// Dynamic-table header values matching dynNames.
     pub dynValues: List<string>,
+    /// Current size of the dynamic table in bytes, per the RFC 7541 accounting: name.length + value.length + 32 per entry.
     pub dynSize: int,
+    /// Maximum allowed size of the dynamic table in bytes; entries are evicted (oldest first) to stay within it.
     pub maxDynSize: int,
 
     init() {
@@ -95,6 +135,7 @@ pub class Hpack {
         self.maxDynSize = 4096;
     }
 
+    // Computes the encoded length in bytes if s were Huffman-coded, without producing the bytes.
     fn huffEncodeLen(self: Hpack, s: string): int {
         let bits = 0;
         let i = 0;
@@ -102,6 +143,7 @@ pub class Hpack {
         return (bits + 7) / 8;
     }
 
+    // Huffman-encodes s into out starting at byte offset o0, padding the final byte with 1-bits; returns the offset past the written bytes.
     fn huffEncode(self: Hpack, out: ptr, o0: int, s: string): int {
         let o = o0;
         let acc = 0 as long;
@@ -129,6 +171,7 @@ pub class Hpack {
         return o;
     }
 
+    // Huffman-decodes len bytes from buf at off back into a string, matching bits against decMap greedily.
     fn huffDecode(self: Hpack, buf: ptr, off: int, len: int): string {
         let out = bytes.alloc(len * 8 + 2);
         let o = 0;
@@ -159,6 +202,7 @@ pub class Hpack {
         return out as string;
     }
 
+    // Encodes v0 using RFC 7541 §5.1 variable-length integer encoding with an n-bit prefix, ORing in flags on the first byte.
     fn encInt(self: Hpack, out: ptr, o0: int, n: int, flags: int, v0: int): int {
         let o = o0;
         let max = (1 << n) - 1;
@@ -175,6 +219,7 @@ pub class Hpack {
         return o;
     }
 
+    // Encodes s as an RFC 7541 §5.2 string literal, choosing Huffman coding only when it is shorter than the raw bytes.
     fn encStr(self: Hpack, out: ptr, o0: int, s: string): int {
         let o = o0;
         let hl = self.huffEncodeLen(s);
@@ -189,6 +234,7 @@ pub class Hpack {
         return o;
     }
 
+    // Inserts a name/value pair at the front of the dynamic table, evicting the oldest entries first to stay within maxDynSize.
     fn dynAdd(self: Hpack, name: string, value: string): void {
         let sz = name.length + value.length + 32;
         while (self.dynSize + sz > self.maxDynSize && self.dynNames.size() > 0) {
@@ -206,12 +252,14 @@ pub class Hpack {
         }
     }
 
+    // Resolves a combined static/dynamic table index (1-based) to its header name, or "" if out of range.
     fn tableName(self: Hpack, idx: int): string {
         if (idx >= 1 && idx <= 61) { return self.sNames.at(idx - 1); }
         let d = idx - 62;
         if (d >= 0 && d < self.dynNames.size()) { return self.dynNames.at(d); }
         return "";
     }
+    // Resolves a combined static/dynamic table index (1-based) to its header value, or "" if out of range.
     fn tableValue(self: Hpack, idx: int): string {
         if (idx >= 1 && idx <= 61) { return self.sValues.at(idx - 1); }
         let d = idx - 62;
@@ -219,6 +267,7 @@ pub class Hpack {
         return "";
     }
 
+    // Searches the static table for name/value: returns +index on an exact match, -index on a name-only match, or 0 for no match.
     fn staticFind(self: Hpack, name: string, value: string): int {
         let nameOnly = 0;
         let i = 0;
@@ -233,6 +282,14 @@ pub class Hpack {
     }
 
 
+    /// Encodes a list of header fields into an HPACK header block.
+    ///
+    /// Every field is encoded as an "indexed name" reference (RFC 7541 §6.2.1)
+    /// when the name matches the static table but the value does not, or as a
+    /// literal with both name and value when neither matches. Fields that
+    /// exactly match a static-table entry are emitted as a single indexed
+    /// reference (§6.1). Returns the allocated output buffer and the number
+    /// of bytes written into it.
     pub fn encode(self: Hpack, fields: List<HeaderField>): (ptr, int) {
         let cap = 64;
         let i = 0;
@@ -258,6 +315,14 @@ pub class Hpack {
         return (out, o);
     }
 
+    /// Decodes an HPACK header block of len bytes starting at off within buf into a list of header fields.
+    ///
+    /// Dispatches on the leading byte per RFC 7541 §6: indexed field (bit 7),
+    /// literal with incremental indexing (bit 6, added to the dynamic table),
+    /// dynamic table size update (bits 5, adjusts maxDynSize and evicts as
+    /// needed), or literal without indexing (fallback). Mutates this
+    /// codec's dynamic table as a side effect, so header blocks from the
+    /// same connection must be decoded in order.
     pub fn decode(self: Hpack, buf: ptr, off: int, len: int): List<HeaderField> {
         let out = List<HeaderField>();
         let p = off;
@@ -300,11 +365,13 @@ pub class Hpack {
         return out;
     }
 
+    // Resolves a header name: from the table when idx is non-zero, otherwise decodes it as an inline string literal.
     fn decNameOrStr(self: Hpack, buf: ptr, p0: int, end: int, idx: int): (string, int) {
         if (idx != 0) { return (self.tableName(idx), p0); }
         return self.decStr(buf, p0, end);
     }
 
+    // Decodes an RFC 7541 §5.1 variable-length integer with an n-bit prefix starting at p0; returns the value and the offset past it.
     fn decInt(self: Hpack, buf: ptr, p0: int, end: int, n: int): (int, int) {
         let p = p0;
         let max = (1 << n) - 1;
@@ -322,6 +389,7 @@ pub class Hpack {
         return (v, p);
     }
 
+    // Decodes an RFC 7541 §5.2 string literal at p0, Huffman-decoding it when the leading bit marks it as coded.
     fn decStr(self: Hpack, buf: ptr, p0: int, end: int): (string, int) {
         let huff = (bytes.read_byte(buf, p0) & 128) != 0;
         let (slen, p) = self.decInt(buf, p0, end, 7);
@@ -338,10 +406,12 @@ pub class Hpack {
     }
 }
 
+// Hash function for the long-keyed decMap: folds a long into a non-negative int within Map's expected range.
 fn longHash(k: long): int {
     let x = k;
     if (x < 0) { x = 0 - x; }
     return (x % 2147483647) as int;
 }
 
+/// Creates a fresh Hpack codec with empty dynamic table and default 4096-byte dynamic table size.
 pub fn newHpack(): Hpack { return Hpack(); }

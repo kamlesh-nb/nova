@@ -1,11 +1,82 @@
+//! ChaCha20-Poly1305 AEAD (RFC 8439).
+//!
+//! This file assembles the ChaCha20 stream cipher and the Poly1305 one-time
+//! authenticator into a single authenticated-encryption-with-associated-data
+//! (AEAD) construction, exactly as specified in RFC 8439 section 2.8. It is the
+//! IETF variant: a 32-byte key, a 96-bit (12-byte) nonce, and a 128-bit
+//! (16-byte) tag. Given a key, a nonce, some associated data (AAD) that is
+//! authenticated but not encrypted, and a plaintext, [`seal`] produces a
+//! ciphertext of the same length plus a tag. [`open`] verifies the tag and only
+//! then decrypts, so a forged or tampered message is rejected before any
+//! plaintext is revealed.
+//!
+//! WHY it exists: this is one of the two AEADs a TLS 1.3 stack must offer, and
+//! it is the fallback that keeps a server fast when the CPU has no hardware AES
+//! (AES-GCM wins where AES-NI is present, ChaCha20-Poly1305 wins where it is
+//! not). Nova's crypto and TLS are pure Nova rather than a bound C library, so
+//! this construction has to live here in the standard library alongside the
+//! [`chacha20`] cipher and the [`poly1305`] MAC it composes.
+//!
+//! The construction glues the two primitives together in the specific way RFC
+//! 8439 mandates, and the details matter for both correctness and security:
+//!
+//!   1. The Poly1305 one-time key is DERIVED from the same ChaCha20 key and
+//!      nonce, by taking the first 32 bytes of the keystream at counter 0 (see
+//!      [`poly1305KeyGen`]). A Poly1305 key must never be reused across
+//!      messages, and pinning it to counter 0 per (key, nonce) achieves that as
+//!      long as the caller never reuses a nonce with a given key.
+//!   2. The message itself is encrypted starting at counter 1, so the block
+//!      that produced the authenticator key is never used as keystream. Both
+//!      [`seal`] and [`open`] pass a starting counter of 1 to
+//!      [`chacha20.applyKeystream`].
+//!   3. The tag is computed over AAD and ciphertext, each zero-padded up to a
+//!      16-byte boundary, followed by a 16-byte trailer holding the two lengths
+//!      as little-endian 64-bit integers (see [`computeTag`]). The padding and
+//!      length framing are what stop an attacker from shifting bytes between the
+//!      AAD and the ciphertext without detection.
+//!
+//! An important invariant on the decrypt side: [`open`] compares the expected
+//! and received tags with a CONSTANT-TIME OR-of-XORs accumulator, not an early
+//! return on the first differing byte, because a data-dependent compare would
+//! leak how much of a forged tag was correct and let an attacker recover a valid
+//! tag one byte at a time. Decryption is skipped entirely when the tag does not
+//! match, so `ptOut` is only written on success.
+//!
+//! Buffer contract: every parameter here is a raw [`ptr`] into caller-owned
+//! memory, and this module allocates only small fixed scratch buffers that it
+//! frees before returning. The caller sizes and owns `ctOut`, `tagOut`, and
+//! `ptOut`; `ctOut` and `ptOut` must each hold at least the message length, and
+//! `tagOut` must hold [`TAG_LEN`] bytes.
+
 import bytes;
 import crypto.cipher.chacha20;
 import crypto.mac.poly1305;
 
+/// Length in bytes of the ChaCha20 key this AEAD expects: 256 bits.
+///
+/// A `key` argument to [`seal`] or [`open`] must point at exactly this many
+/// bytes. Provided as a named constant so callers do not hard-code `32`.
 pub const KEY_LEN: int = 32;
+/// Length in bytes of the nonce: 96 bits, the IETF ChaCha20-Poly1305 variant.
+///
+/// The nonce must be UNIQUE per message under a given key; reusing a (key,
+/// nonce) pair reuses the derived Poly1305 authenticator key and breaks the
+/// integrity guarantee catastrophically. A `nonce` argument must point at
+/// exactly this many bytes.
 pub const NONCE_LEN: int = 12;
+/// Length in bytes of the Poly1305 authentication tag: 128 bits.
+///
+/// [`seal`] writes this many bytes to `tagOut`, and [`open`] reads this many
+/// from `tag` and compares against its freshly computed value.
 pub const TAG_LEN: int = 16;
 
+/// Writes `v` as a little-endian unsigned 64-bit integer into `buf` at `off`.
+///
+/// Used to lay down the AAD length and ciphertext length in the tag's 16-byte
+/// length trailer (see [`computeTag`]), which RFC 8439 specifies as two
+/// little-endian 64-bit counts. The value is widened to `long` first so the
+/// shift by up to 56 bits is a 64-bit shift, not a 32-bit one that would drop
+/// the high bytes. The caller must ensure `buf` has 8 writable bytes at `off`.
 fn putLen64(buf: ptr, off: int, v: int): void {
     let vl = v as long;
     let i = 0;
@@ -15,6 +86,16 @@ fn putLen64(buf: ptr, off: int, v: int): void {
     }
 }
 
+/// Derives the Poly1305 one-time key for a message from the ChaCha20 key and
+/// nonce, writing 32 bytes into `otk`.
+///
+/// This is the `poly1305_key_gen` procedure of RFC 8439 section 2.6: run
+/// ChaCha20 once at counter 0 for this (key, nonce) and take the first 32 bytes
+/// of the resulting 64-byte keystream block as the authenticator key. Because
+/// the message is later encrypted from counter 1 onward, this block is never
+/// reused as keystream, and the one-time key is unique as long as the nonce is
+/// unique under the key. The scratch block is freed before returning; `otk` must
+/// hold at least 32 writable bytes.
 fn poly1305KeyGen(key: ptr, nonce: ptr, otk: ptr): void {
     let block = bytes.alloc(64);
     chacha20.keystreamBlock(key, 0, nonce, block);
@@ -23,6 +104,19 @@ fn poly1305KeyGen(key: ptr, nonce: ptr, otk: ptr): void {
     bytes.free(block);
 }
 
+/// Computes the Poly1305 tag over the AAD and ciphertext, writing 16 bytes to
+/// `tag`.
+///
+/// This is the exact authenticated-data layout of RFC 8439 section 2.8: feed
+/// the AAD, then zero-padding up to the next 16-byte boundary, then the
+/// ciphertext, then its zero-padding, and finally a 16-byte trailer holding
+/// `aadLen` and `ctLen` as little-endian 64-bit integers (via [`putLen64`]).
+/// The padding realigns each section to a Poly1305 block and, together with the
+/// explicit length trailer, prevents an attacker from moving bytes across the
+/// AAD/ciphertext boundary without changing the tag. `otk` is the one-time key
+/// from [`poly1305KeyGen`]. Both [`seal`] and [`open`] call this with identical
+/// inputs so their tags are comparable. The two scratch buffers are freed and
+/// the Poly1305 state is deleted before returning.
 fn computeTag(otk: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr): void {
     let p = poly1305.Poly1305.create(otk);
     let zeros = bytes.alloc(16);
@@ -46,6 +140,18 @@ fn computeTag(otk: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr): v
     bytes.free(lens);
 }
 
+/// Encrypts and authenticates a message: the AEAD "seal" (encrypt) direction.
+///
+/// Derives the Poly1305 one-time key at counter 0, encrypts `pt` (of `ptLen`
+/// bytes) into `ctOut` with ChaCha20 starting at counter 1, then authenticates
+/// the associated data and the resulting ciphertext into `tagOut`. AAD is
+/// authenticated but not encrypted; pass `aadLen == 0` when there is none.
+///
+/// The caller owns and sizes the output buffers: `ctOut` must hold at least
+/// `ptLen` bytes and `tagOut` must hold [`TAG_LEN`] bytes. `key`, `nonce`, and
+/// `aad` are read-only inputs of [`KEY_LEN`], [`NONCE_LEN`], and `aadLen` bytes
+/// respectively. The nonce MUST be fresh for this key (see [`NONCE_LEN`]).
+/// Inverse of [`open`].
 pub fn seal(key: ptr, nonce: ptr, aad: ptr, aadLen: int, pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
     let otk = bytes.alloc(32);
     poly1305KeyGen(key, nonce, otk);
@@ -54,6 +160,22 @@ pub fn seal(key: ptr, nonce: ptr, aad: ptr, aadLen: int, pt: ptr, ptLen: int, ct
     bytes.free(otk);
 }
 
+/// Verifies the tag and, only if it matches, decrypts: the AEAD "open"
+/// (decrypt) direction. Returns `true` on a valid message, `false` on a
+/// forgery.
+///
+/// Recomputes the expected tag over `aad` and `ct` exactly as [`seal`] did, then
+/// compares it against the received `tag`. The comparison is CONSTANT-TIME: it
+/// ORs together the XOR of every byte pair and checks the accumulator against
+/// zero at the end, rather than returning early on the first mismatch, so the
+/// time taken does not reveal how many leading tag bytes were correct. This
+/// closes the timing side channel that would otherwise let an attacker forge a
+/// tag byte by byte.
+///
+/// Decryption runs ONLY when the tag matches, so `ptOut` is left untouched for a
+/// rejected message and no unauthenticated plaintext is ever produced. On
+/// success `ptOut` receives `ctLen` decrypted bytes; the caller must size it to
+/// at least `ctLen`. `tag` is read as [`TAG_LEN`] bytes. Inverse of [`seal`].
 pub fn open(key: ptr, nonce: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
     let otk = bytes.alloc(32);
     poly1305KeyGen(key, nonce, otk);

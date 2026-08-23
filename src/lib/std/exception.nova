@@ -1,4 +1,16 @@
+//! Exception introspection helpers.
+//!
+//! This file is a thin wrapper around the runtime's stack unwinding support,
+//! giving Nova code a way to capture a human-readable trace of the current
+//! call stack. It sits alongside the language's `try`/`catch`/`errdefer`
+//! error model as a diagnostic aid: it does not throw or handle exceptions
+//! itself, it only reports where the program currently is.
 
+/// Captures the current call stack as a formatted, human-readable string.
+///
+/// Delegates to the native runtime (`nova_get_stacktrace`), so the exact
+/// formatting and the amount of detail available (symbol names, file/line
+/// information) depend on the host platform and how the binary was built.
 pub fn stackTrace(): string {
     return nova_get_stacktrace();
 }

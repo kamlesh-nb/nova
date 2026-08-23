@@ -1,31 +1,58 @@
+//! Pluggable allocator abstraction.
+//!
+//! `Allocator` is a small value struct that packages a raw allocate/free
+//! function pair (plus an opaque context pointer) behind one type, so code
+//! that needs to allocate memory does not have to be hardwired to a single
+//! backing allocator. Today the only implementation provided is
+//! `globalAllocator()`, which forwards straight to the `bytes` module's
+//! persistent heap, but the indirection leaves room for callers (arenas,
+//! pool allocators, and the like) to supply their own `allocFn`/`freeFn`
+//! pair and `ctx` without changing call sites that only know about
+//! `Allocator`.
 
 import bytes;
 
+/// A value struct bundling an allocate/free function pair with the context
+/// they operate on, giving callers a swappable allocation strategy.
 pub struct Allocator {
+    /// Discriminator identifying which allocator implementation this is
+    /// (`1` for the global persistent-heap allocator from `globalAllocator()`).
     pub kind: int,
+    /// Opaque state passed through to `allocFn`/`freeFn` on every call.
+    /// Unused (`0`) by the global allocator; a custom allocator can stash
+    /// e.g. an arena pointer here.
     pub ctx: ptr,
+    /// Underlying allocation function: `(ctx, size) -> ptr`.
     pub allocFn: (ptr, int) -> ptr,
+    /// Underlying free function: `(ctx, ptr) -> void`.
     pub freeFn: (ptr, ptr) -> void,
 
+    /// Allocates `size` bytes via this allocator's `allocFn`.
     pub fn alloc(self: Allocator, size: int): ptr {
         let f = self.allocFn;
         return f(self.ctx, size);
     }
 
+    /// Frees a pointer previously returned by `alloc` on this same allocator.
     pub fn free(self: Allocator, ptr: ptr): void {
         let f = self.freeFn;
         f(self.ctx, ptr);
     }
 }
 
+// Default allocFn backing the global allocator: delegates to the persistent heap.
 fn cAllocFn(ctx: ptr, size: int): ptr {
     return bytes.alloc_persistent(size);
 }
 
+// Default freeFn backing the global allocator: delegates to bytes.free.
 fn cFreeFn(ctx: ptr, ptr: ptr): void {
     bytes.free(ptr);
 }
 
+/// Returns the process-wide default `Allocator`, backed by `bytes`'s
+/// persistent heap (`alloc_persistent`/`free`). This is the allocator to
+/// reach for unless a caller specifically needs a different strategy.
 pub fn globalAllocator(): Allocator {
     return Allocator {
         kind: 1,

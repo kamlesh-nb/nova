@@ -1,24 +1,60 @@
+//! Darwin (macOS/BSD) backend constants for the `os` layer.
+//!
+//! This module is the target-conditional file selected when `platform.os ==
+//! "darwin"`: it supplies the platform-specific numeric ABI values (syscall
+//! flags, structure offsets, socket option numbers) that the rest of the
+//! `os`/`net` stack builds on, so shared callers stay unchanged across
+//! platforms while each backend fills in its own constants. It pairs with the
+//! Linux and Windows equivalents; on Darwin the reactor is kqueue, which is a
+//! readiness-based model, not completion-based.
+//!
+//! Values here are read directly off macOS/BSD system headers (`fcntl.h`,
+//! `sys/socket.h`, `sys/mman.h`, `sys/stat.h`, `sys/dirent.h`, `sys/errno.h`,
+//! `netdb.h`) and must match the running kernel's ABI exactly: they are not
+//! derived at compile time.
+
+/// Identifies this backend to callers that branch on reactor implementation.
 pub fn name(): string { return "kqueue"; }
+/// Size in bytes of the native `struct kevent`, used when sizing/stepping
+/// through raw kevent buffers.
 pub const EVENT_SIZE: int = 32;
+/// kqueue is readiness-based (tells you an fd is ready, then you do the I/O
+/// yourself), not completion-based like IOCP or io_uring.
 pub const COMPLETION_BASED: bool = false;
 
 
+/// `open()` flag: create the file if it does not exist.
 pub const OPEN_CREAT: int = 512;
+/// `open()` flag: truncate an existing file to zero length.
 pub const OPEN_TRUNC: int = 1024;
+/// `open()` flag: writes go to the end of the file.
 pub const OPEN_APPEND: int = 8;
+/// `open()` flag: open the file descriptor in non-blocking mode.
 pub const OPEN_NONBLOCK: int = 4;
 
+/// `mmap()` flag: the mapping is not backed by a file.
 pub const MMAP_ANON: int = 4096;
 
+/// `setsockopt`/`getsockopt` level for socket-layer (as opposed to
+/// protocol-layer) options on Darwin (`SOL_SOCKET`).
 pub const SOCKOPT_LEVEL: int = 65535;
+/// Option name for retrieving a pending socket error (`SO_ERROR`).
 pub const SOCKOPT_ERROR: int = 4103;
+/// Option name for allowing address reuse (`SO_REUSEADDR`).
 pub const SOCKOPT_REUSEADDR: int = 4;
+/// Option name for allowing port reuse (`SO_REUSEPORT`).
 pub const SOCKOPT_REUSEPORT: int = 512;
 
+/// Byte offset of `st_mode` within Darwin's `struct stat` layout.
 pub const STAT_MODE_OFFSET: int = 4;
+/// Byte offset of the `d_name` field within Darwin's `struct dirent` layout.
 pub const DIRENT_NAME_OFFSET: int = 21;
 
+/// `errno` value for `EAGAIN` (operation would block).
 pub const ERR_AGAIN: int = 35;
+/// `errno` value for `EINPROGRESS` (non-blocking operation still in flight).
 pub const ERR_INPROGRESS: int = 36;
 
+/// Byte offset of the `ai_addr` pointer within Darwin's `struct addrinfo`
+/// layout, used when walking the linked list returned by `getaddrinfo`.
 pub const ADDRINFO_ADDR_OFFSET: int = 32;

@@ -1,16 +1,38 @@
 
+//! Request body size guard for the web framework's middleware pipeline.
+//!
+//! `BodyLimitMiddleware` inspects the incoming request's `Content-Length`
+//! header before the handler runs and rejects oversized requests early with
+//! a `413 Payload Too Large` response, so a handler never has to defend
+//! itself against an unbounded body. It only checks the declared length: it
+//! does not stream-count actual bytes read, so a request that lies about (or
+//! omits) `Content-Length` is not caught here. Plug it into the middleware
+//! chain alongside the other `web.middleware` implementations.
+
 import web.request;
 import web.response;
 import web.middleware;
 import web.status;
 
+/// Middleware that rejects requests whose declared `Content-Length` exceeds
+/// a configured maximum, before the request reaches the route handler.
 pub struct BodyLimitMiddleware impl Middleware {
+    /// Maximum allowed body size in bytes, as declared by `Content-Length`.
     pub maxSize: int,
 
     init(maxSize: int) {
         self.maxSize = maxSize;
     }
 
+    /// Checks the request's `Content-Length` header against `maxSize`.
+    ///
+    /// If the header is present (checked case-sensitively as `Content-Length`,
+    /// then falling back to lower-case `content-length`) and its numeric value
+    /// exceeds `maxSize`, sets a `413` JSON error body on `res` and returns
+    /// `MiddlewareAction.Stop` to halt the pipeline. Otherwise returns
+    /// `MiddlewareAction.Next` so the next middleware or handler runs. A
+    /// missing or non-numeric header is treated as unbounded and allowed
+    /// through.
     pub fn execute(self: BodyLimitMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
         let len_str = req.headers.get("Content-Length") ?? req.headers.get("content-length") ?? "";
         if (len_str != "") {
@@ -24,10 +46,12 @@ pub struct BodyLimitMiddleware impl Middleware {
         return MiddlewareAction.Next;
     }
 
+    /// Post-route hook required by the `Middleware` trait; this middleware has nothing to do after the handler runs.
     pub fn after(self: BodyLimitMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
     }
 }
 
+// Parses a leading run of ASCII digits into an int, stopping at the first non-digit and returning 0 for an empty or non-numeric string.
 fn parseNumber(s: string): int {
     let len = s.length;
     if (len == 0) return 0;

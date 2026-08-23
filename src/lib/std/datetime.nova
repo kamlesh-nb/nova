@@ -1,23 +1,51 @@
+//! Calendar and clock helpers built on Unix timestamps.
+//!
+//! A "timestamp" throughout this file is a `long` count of seconds since the
+//! Unix epoch (1970-01-01T00:00:00 UTC), treated as wall clock in UTC unless a
+//! caller applies its own offset. There is no separate `DateTime` struct: the
+//! module works directly on `long` so it stays a cheap value everywhere it is
+//! passed, and provides ISO 8601 parsing/formatting, `strftime`-style custom
+//! formatting, calendar arithmetic (`isLeapYear`, `daysInMonth`, `addDays`
+//! and friends), and a `Duration` breakdown for the gap between two
+//! timestamps.
+//!
+//! The date maths (`dateToTimestamp` / `timestampToDate`) is a plain
+//! proleptic Gregorian calculation done by counting whole years and months,
+//! it does not consult the host's C library or any timezone database, so the
+//! only timezone it understands is a fixed UTC offset in seconds supplied by
+//! the caller (see `tzOffsetSeconds`, `fromIsoUtc`, `formatOffset`).
 
 import bytes;
 import string;
 import assert;
 
+/// Number of seconds in one minute, as a `long` so it composes directly with timestamp arithmetic.
 const SECONDS_PER_MINUTE: long = 60;
 const MINUTES_PER_HOUR: long = 60;
 const HOURS_PER_DAY: long = 24;
 const SECONDS_PER_HOUR = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
 const SECONDS_PER_DAY = SECONDS_PER_HOUR * HOURS_PER_DAY;
 
+// Days per month for a non-leap year, indexed 0 (January) to 11 (December).
 const MONTH_DAYS: int[12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
+/// A breakdown of an elapsed span into days, hours, minutes and seconds.
+///
+/// Produced by `dateDiff`. The fields are the non-negative components of the
+/// gap between two timestamps; they are not independently clamped, so
+/// `hours` is always in 0..23, `minutes` and `seconds` in 0..59.
 pub struct Duration {
+    /// Whole days in the span.
     pub days: int,
+    /// Remaining whole hours after `days` is removed.
     pub hours: int,
+    /// Remaining whole minutes after `days` and `hours` are removed.
     pub minutes: int,
+    /// Remaining whole seconds after `days`, `hours` and `minutes` are removed.
     pub seconds: int,
 }
 
+/// Reports whether `year` is a Gregorian leap year (divisible by 4, except centuries not divisible by 400).
 pub fn isLeapYear(year: int): bool {
     if (year % 400 == 0) {
         return true;
@@ -28,6 +56,9 @@ pub fn isLeapYear(year: int): bool {
     return (year % 4 == 0);
 }
 
+/// Number of days in `month` (1..12) of `year`, accounting for February in leap years.
+///
+/// Returns 0 for an out-of-range month rather than erroring.
 pub fn daysInMonth(year: int, month: int): int {
     if (month < 1 || month > 12) {
         return 0;
@@ -39,22 +70,29 @@ pub fn daysInMonth(year: int, month: int): int {
     return dim;
 }
 
+/// The current wall-clock time as a Unix timestamp (whole seconds since the epoch).
 pub fn now(): long {
     return nowNs() / 1000000000;
 }
 
+/// The current wall-clock time as nanoseconds since the Unix epoch, sourced from the host runtime clock.
 pub fn nowNs(): long {
     return nova_time_now_ns();
 }
 
+/// Parses an ISO 8601-ish date or date-time string into a timestamp; returns `undefined` if `s` is malformed.
 pub fn parse(s: string): long | undefined {
     return parseIso(s);
 }
 
+/// Alias for `parse`: parses an ISO 8601-ish string into a timestamp.
 pub fn fromIso(s: string): long | undefined {
     return parseIso(s);
 }
 
+// Parses "YYYY-MM-DD" optionally followed by a 'T' or space and "HH:MM:SS".
+// The wall clock is taken literally, with no timezone applied. Returns
+// `undefined` on any structural or range violation.
 fn parseIso(s: string): long | undefined {
     let len = s.length;
     if (len < 10) {
@@ -102,6 +140,7 @@ fn parseIso(s: string): long | undefined {
     return timestamp;
 }
 
+// Parses digits of s[start..end) as an unsigned integer; returns undefined on an empty or non-digit range.
 fn parseIntRange(s: string, start: int, end: int): int | undefined {
     if (start < 0 || end > s.length || start >= end) {
         return undefined;
@@ -119,6 +158,7 @@ fn parseIntRange(s: string, start: int, end: int): int | undefined {
     return res;
 }
 
+// Converts a calendar date and time of day to a Unix timestamp by summing whole years, whole months, and the remaining day/time.
 fn dateToTimestamp(year: int, month: int, day: int, hour: int, minute: int, second: int): long {
 
     let days: long = 0;
@@ -136,6 +176,14 @@ fn dateToTimestamp(year: int, month: int, day: int, hour: int, minute: int, seco
     return days * SECONDS_PER_DAY + (hour as long) * SECONDS_PER_HOUR + (minute as long) * SECONDS_PER_MINUTE + (second as long);
 }
 
+/// Formats timestamp `t` (treated as UTC wall clock) according to `fmt`.
+///
+/// Supports two token styles mixed in the same string: `%`-prefixed
+/// (`%Y %m %d %H %M %S %%`), and bare-letter run-length tokens (`Y`/`YYYY`
+/// four-digit year, `YY` two-digit year, `M`/`MM` month, `D`/`DD` day,
+/// `h`/`hh` hour, `m`/`mm` minute, `s`/`ss` second, `TZD` literal `Z`). Any
+/// other character is copied through unchanged. See `toIso` for the
+/// canonical ISO 8601 pattern.
 pub fn format(t: long, fmt: string): string {
     let (year, month, day, hour, minute, second) = timestampToDate(t);
 
@@ -270,6 +318,7 @@ pub fn format(t: long, fmt: string): string {
     return result as string;
 }
 
+// Writes val as decimal digits into ptr at offset, zero-padded on the left to at least min_digits; returns the number of bytes written.
 fn writeNumber(ptr: int, offset: int, val: int, min_digits: int): int {
 
     let temp = val;
@@ -301,6 +350,7 @@ fn writeNumber(ptr: int, offset: int, val: int, min_digits: int): int {
     return total;
 }
 
+// Inverse of dateToTimestamp: decomposes a Unix timestamp into (year, month, day, hour, minute, second) by successive division and year/month walking.
 fn timestampToDate(t: long): (int, int, int, int, int, int) {
     let total_sec: long = t;
     let second = (total_sec % SECONDS_PER_MINUTE) as int;
@@ -335,26 +385,35 @@ fn timestampToDate(t: long): (int, int, int, int, int, int) {
     return (year, month, day, hour, minute, second);
 }
 
+/// Formats timestamp `t` as `YYYY-MM-DDThh:mm:ssZ` (ISO 8601, UTC, `Z` suffix).
 pub fn toIso(t: long): string {
     return format(t, "YYYY-MM-DDThh:mm:ssTZD");
 }
 
+/// Returns `t` shifted by `days` (negative to go backwards).
 pub fn addDays(t: long, days: int): long {
     return t + days * SECONDS_PER_DAY;
 }
 
+/// Returns `t` shifted by `hours` (negative to go backwards).
 pub fn addHours(t: long, hours: int): long {
     return t + hours * SECONDS_PER_HOUR;
 }
 
+/// Returns `t` shifted by `minutes` (negative to go backwards).
 pub fn addMinutes(t: long, minutes: int): long {
     return t + minutes * SECONDS_PER_MINUTE;
 }
 
+/// Returns `t` shifted by `seconds` (negative to go backwards).
 pub fn addSeconds(t: long, seconds: int): long {
     return t + seconds;
 }
 
+/// The absolute elapsed span between `t1` and `t2`, broken down into a `Duration`.
+///
+/// Order does not matter: the difference is taken as an absolute value, so
+/// `dateDiff(a, b)` and `dateDiff(b, a)` return the same result.
 pub fn dateDiff(t1: long, t2: long): Duration {
     let total_sec = t2 - t1;
     if (total_sec < 0) {
@@ -375,10 +434,16 @@ pub fn dateDiff(t1: long, t2: long): Duration {
     };
 }
 
+/// Destructor for `Duration`; a no-op since all its fields are plain scalars.
 pub fn delete(self: Duration): void {
 }
 
 
+/// Parses the trailing timezone designator of an ISO 8601 string `s` into an offset in seconds east of UTC.
+///
+/// Accepts a trailing `Z`/`z` (offset 0), `+HH:MM`, `+HHMM`, or `+HH` (and
+/// their `-` equivalents); an absent designator also yields 0. Returns
+/// `undefined` if a `+`/`-` designator is present but malformed.
 pub fn tzOffsetSeconds(s: string): int | undefined {
     let len = s.length;
     if (len == 0) { return 0; }
@@ -412,6 +477,11 @@ pub fn tzOffsetSeconds(s: string): int | undefined {
     return 0;
 }
 
+/// Parses an ISO 8601 string `s` (with an optional timezone designator) and returns the equivalent UTC timestamp.
+///
+/// Combines `parseIso` with `tzOffsetSeconds` to convert a local wall clock
+/// plus offset into a true UTC instant. Returns `undefined` if either the
+/// date/time or the timezone designator fails to parse.
 pub fn fromIsoUtc(s: string): long | undefined {
     let wall = parseIso(s);
     if (wall == undefined) { return undefined; }
@@ -420,6 +490,10 @@ pub fn fromIsoUtc(s: string): long | undefined {
     return (wall ?? 0) - (off ?? 0);
 }
 
+/// Formats UTC timestamp `t` as ISO 8601 in the local time implied by `offsetSeconds` (seconds east of UTC).
+///
+/// Emits a trailing `Z` when `offsetSeconds` is 0, otherwise a signed
+/// `+hh:mm` / `-hh:mm` suffix.
 pub fn formatOffset(t: long, offsetSeconds: int): string {
     let local = t + offsetSeconds;
     let base = format(local, "YYYY-MM-DDThh:mm:ss");
@@ -432,6 +506,7 @@ pub fn formatOffset(t: long, offsetSeconds: int): string {
     return base + sign + pad2(hh) + ":" + pad2(mm);
 }
 
+// Formats v as a zero-padded two-digit string (used for the offset hh:mm in formatOffset).
 fn pad2(v: int): string {
     let buf = bytes.alloc(3);
     bytes.write_byte(buf, 0, ((v / 10) % 10) + 48);

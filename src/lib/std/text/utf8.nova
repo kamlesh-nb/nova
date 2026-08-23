@@ -1,9 +1,24 @@
 
+//! UTF-8 codec helpers for Nova strings.
+//!
+//! Nova `string` values are stored as raw UTF-8 bytes, so `s.length` is a
+//! BYTE count, not a character count. This module provides the operations
+//! that read and write actual Unicode codepoints on top of that byte buffer:
+//! decoding the codepoint at a given byte offset, measuring how many bytes a
+//! lead byte's sequence occupies, encoding a codepoint back into UTF-8,
+//! splitting a string into its constituent characters, and validating that a
+//! buffer is well-formed UTF-8. It sits alongside `str.nova` (the borrowed
+//! `Str` view) and `string.nova` (the owned string type) as the layer that
+//! understands multi-byte encoding rather than raw bytes.
+
 import bytes;
 import list;
 import string;
 import assert;
 
+// Returns the byte width of the UTF-8 sequence that starts with lead byte `b0`.
+// Does not validate the input: an invalid continuation-only byte (128-191)
+// is reported as width 1, and any byte from 248 upward also falls back to 1.
 fn widthOfLead(b0: int): int {
     if (b0 < 128) { return 1; }
     if (b0 < 192) { return 1; }
@@ -13,6 +28,12 @@ fn widthOfLead(b0: int): int {
     return 1;
 }
 
+/// Decodes the Unicode codepoint that starts at byte offset `i` in `s`.
+///
+/// `i` must point at the first byte of a UTF-8 sequence (typically obtained
+/// from a previous `widthAt` step or offset 0). The function does not bounds
+/// check trailing continuation bytes, so calling it on invalid UTF-8 or a
+/// mid-sequence offset produces a garbage codepoint rather than an error.
 pub fn codepointAt(s: string, i: int): int {
     let b0 = bytes.read_byte(s, i);
     if (b0 < 128) { return b0; }
@@ -31,10 +52,16 @@ pub fn codepointAt(s: string, i: int): int {
     return ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63);
 }
 
+/// Returns the byte width (1 to 4) of the UTF-8 character starting at offset `i` in `s`.
 pub fn widthAt(s: string, i: int): int {
     return widthOfLead(bytes.read_byte(s, i));
 }
 
+/// Counts the number of Unicode codepoints (characters) in `s`.
+///
+/// This is an O(n) scan over the bytes, distinct from `s.length`, which
+/// reports the byte count. A string with multi-byte characters always has
+/// `codepointCount(s) <= s.length`.
 pub fn codepointCount(s: string): int {
     let n = s.length;
     let i = 0;
@@ -46,6 +73,11 @@ pub fn codepointCount(s: string): int {
     return count;
 }
 
+/// Encodes a single Unicode codepoint as a new UTF-8 string.
+///
+/// Chooses the shortest valid encoding (1 to 4 bytes) based on the codepoint's
+/// value. Does not validate that `cp` is a legal Unicode scalar value (for
+/// example, surrogate-range values are encoded as though they were valid).
 pub fn fromCodepoint(cp: int): string {
     if (cp < 128) {
         let p = bytes.alloc(1);
@@ -73,6 +105,10 @@ pub fn fromCodepoint(cp: int): string {
     return p as string;
 }
 
+/// Splits `s` into a list of single-character substrings, one per Unicode codepoint.
+///
+/// Each element is a newly sliced UTF-8 substring (1 to 4 bytes), so a string
+/// with `n` codepoints produces a list of length `n`, not `s.length`.
 pub fn chars(s: string): list.List<string> {
     let result = list.List<string>();
     let n = s.length;
@@ -85,6 +121,11 @@ pub fn chars(s: string): list.List<string> {
     return result;
 }
 
+/// Checks whether `s` is well-formed UTF-8.
+///
+/// Rejects stray continuation bytes, lead bytes outside the valid 1-4 byte
+/// range, and sequences that would run past the end of the buffer. Returns
+/// `true` for the empty string.
 pub fn isValid(s: string): bool {
     let n = s.length;
     let i = 0;

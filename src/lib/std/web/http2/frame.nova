@@ -1,41 +1,86 @@
+//! HTTP/2 frame layer (RFC 7540 section 4): frame type and flag constants,
+//! the nine-byte frame header codec, and byte-level writers for the frames
+//! this stdlib's HTTP/2 server needs to emit.
+//!
+//! Every value here operates on raw memory through the `bytes` module rather
+//! than on owned strings, because frames are assembled directly into an
+//! output buffer that is later written to the socket. The `write*` helpers
+//! all take an output pointer and an offset, write their frame at that
+//! offset, and return the offset just past what they wrote, so calls chain
+//! naturally when packing several frames into one buffer. This file only
+//! covers the frames actually produced by this implementation (SETTINGS,
+//! WINDOW_UPDATE, PING ack, GOAWAY, RST_STREAM, and a generic DATA/HEADERS
+//! writer); HPACK header compression lives elsewhere in `web/http2`.
+
 import bytes;
 
+/// Frame type identifier for a DATA frame (carries request/response body bytes).
 pub const FRAME_DATA: int = 0;
+/// Frame type identifier for a HEADERS frame (carries the compressed header block).
 pub const FRAME_HEADERS: int = 1;
+/// Frame type identifier for a PRIORITY frame (stream dependency/weight signalling).
 pub const FRAME_PRIORITY: int = 2;
+/// Frame type identifier for an RST_STREAM frame (abrupt stream termination).
 pub const FRAME_RST_STREAM: int = 3;
+/// Frame type identifier for a SETTINGS frame (connection-level parameter exchange).
 pub const FRAME_SETTINGS: int = 4;
+/// Frame type identifier for a PUSH_PROMISE frame (server push, not emitted by the writers below).
 pub const FRAME_PUSH_PROMISE: int = 5;
+/// Frame type identifier for a PING frame (liveness/round-trip probing).
 pub const FRAME_PING: int = 6;
+/// Frame type identifier for a GOAWAY frame (graceful connection shutdown).
 pub const FRAME_GOAWAY: int = 7;
+/// Frame type identifier for a WINDOW_UPDATE frame (flow-control credit).
 pub const FRAME_WINDOW_UPDATE: int = 8;
+/// Frame type identifier for a CONTINUATION frame (header block continuation).
 pub const FRAME_CONTINUATION: int = 9;
 
+/// DATA/HEADERS flag: this frame ends the stream (no more DATA frames will follow).
 pub const FLAG_END_STREAM: int = 1;
+/// SETTINGS/PING flag: this frame is an acknowledgement of a previously received frame.
+/// Shares bit 0x1 with `FLAG_END_STREAM`; the two never apply to the same frame type.
 pub const FLAG_ACK: int = 1;
+/// HEADERS flag: the header block is complete in this frame (no CONTINUATION follows).
 pub const FLAG_END_HEADERS: int = 4;
+/// DATA/HEADERS flag: the frame payload includes a pad length and trailing padding.
 pub const FLAG_PADDED: int = 8;
+/// HEADERS flag: the frame includes the exclusive/dependency/weight priority fields.
 pub const FLAG_PRIORITY: int = 32;
 
+/// SETTINGS parameter id: HPACK dynamic table size the sender is willing to use.
 pub const SETTINGS_HEADER_TABLE_SIZE: int = 1;
+/// SETTINGS parameter id: whether server push is permitted (1) or disabled (0).
 pub const SETTINGS_ENABLE_PUSH: int = 2;
+/// SETTINGS parameter id: maximum number of concurrent streams the sender permits.
 pub const SETTINGS_MAX_CONCURRENT_STREAMS: int = 3;
+/// SETTINGS parameter id: initial flow-control window size for new streams.
 pub const SETTINGS_INITIAL_WINDOW_SIZE: int = 4;
+/// SETTINGS parameter id: largest frame payload size the sender is willing to receive.
 pub const SETTINGS_MAX_FRAME_SIZE: int = 5;
+/// SETTINGS parameter id: maximum size of the header list the sender is willing to accept.
 pub const SETTINGS_MAX_HEADER_LIST_SIZE: int = 6;
 
+/// The fixed 24-byte HTTP/2 connection preface every client must send first,
+/// before any frame, so the server can confirm it is speaking HTTP/2.
 pub const PREFACE: string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// A decoded nine-byte HTTP/2 frame header: payload length, frame type, flags
+/// and the owning stream id (top reserved bit already masked off).
 pub struct FrameHeader {
+    /// Length of the frame payload in bytes (24-bit field, so at most 2^24 - 1).
     pub length: int,
+    /// Frame type, one of the `FRAME_*` constants above.
     pub ftype: int,
+    /// Frame-type-specific flag bits, an OR of the relevant `FLAG_*` constants.
     pub flags: int,
+    /// Stream id this frame belongs to, or 0 for connection-level frames.
     pub streamId: int,
     init(length: int, ftype: int, flags: int, streamId: int) {
         self.length = length; self.ftype = ftype; self.flags = flags; self.streamId = streamId;
     }
 }
 
+/// Decodes the nine-byte frame header starting at `off` in `buf`.
 pub fn readHeader(buf: ptr, off: int): FrameHeader {
     let len = (bytes.read_byte(buf, off) << 16) | (bytes.read_byte(buf, off + 1) << 8) | bytes.read_byte(buf, off + 2);
     let ftype = bytes.read_byte(buf, off + 3);
@@ -44,6 +89,8 @@ pub fn readHeader(buf: ptr, off: int): FrameHeader {
     return FrameHeader(len, ftype, flags, sid);
 }
 
+/// Writes a nine-byte frame header at offset `o` in `out` and returns the
+/// offset immediately after it, where the payload should start.
 pub fn writeHeader(out: ptr, o: int, length: int, ftype: int, flags: int, streamId: int): int {
     bytes.write_byte(out, o, (length >> 16) & 255);
     bytes.write_byte(out, o + 1, (length >> 8) & 255);
@@ -57,6 +104,9 @@ pub fn writeHeader(out: ptr, o: int, length: int, ftype: int, flags: int, stream
     return o + 9;
 }
 
+/// Writes a header plus `len` bytes copied from `src` starting at `srcOff`,
+/// producing one complete frame of any type. Returns the offset after the
+/// copied payload, ready for the next frame.
 pub fn writeFrame(out: ptr, o: int, ftype: int, flags: int, streamId: int, src: ptr, srcOff: int, len: int): int {
     let p = writeHeader(out, o, len, ftype, flags, streamId);
     let i = 0;
@@ -64,6 +114,8 @@ pub fn writeFrame(out: ptr, o: int, ftype: int, flags: int, streamId: int, src: 
     return p + len;
 }
 
+/// Writes a SETTINGS frame carrying exactly one id/value parameter pair
+/// (a 6-byte payload). Used for individual settings, not a batched frame.
 pub fn writeSettings(out: ptr, o: int, id: int, value: int): int {
     let p = writeHeader(out, o, 6, FRAME_SETTINGS, 0, 0);
     bytes.write_byte(out, p, (id >> 8) & 255);
@@ -75,10 +127,15 @@ pub fn writeSettings(out: ptr, o: int, id: int, value: int): int {
     return p + 6;
 }
 
+/// Writes an empty SETTINGS frame (no parameters), typically sent as the
+/// server's initial settings on connection start.
 pub fn writeSettingsEmpty(out: ptr, o: int): int { return writeHeader(out, o, 0, FRAME_SETTINGS, 0, 0); }
 
+/// Writes an empty SETTINGS frame with `FLAG_ACK` set, acknowledging the peer's SETTINGS frame.
 pub fn writeSettingsAck(out: ptr, o: int): int { return writeHeader(out, o, 0, FRAME_SETTINGS, FLAG_ACK, 0); }
 
+/// Writes a WINDOW_UPDATE frame granting `increment` bytes of additional
+/// flow-control credit on `streamId` (or the connection, if `streamId` is 0).
 pub fn writeWindowUpdate(out: ptr, o: int, streamId: int, increment: int): int {
     let p = writeHeader(out, o, 4, FRAME_WINDOW_UPDATE, 0, streamId);
     bytes.write_byte(out, p, (increment >> 24) & 127);
@@ -88,6 +145,8 @@ pub fn writeWindowUpdate(out: ptr, o: int, streamId: int, increment: int): int {
     return p + 4;
 }
 
+/// Writes a PING frame with `FLAG_ACK` set, echoing back the 8 opaque bytes
+/// read from `src` at `srcOff` as required by RFC 7540 to answer a ping.
 pub fn writePingAck(out: ptr, o: int, src: ptr, srcOff: int): int {
     let p = writeHeader(out, o, 8, FRAME_PING, FLAG_ACK, 0);
     let i = 0;
@@ -95,6 +154,8 @@ pub fn writePingAck(out: ptr, o: int, src: ptr, srcOff: int): int {
     return p + 8;
 }
 
+/// Writes a connection-level GOAWAY frame announcing that no streams above
+/// `lastStreamId` will be processed further, with `errorCode` explaining why.
 pub fn writeGoaway(out: ptr, o: int, lastStreamId: int, errorCode: int): int {
     let p = writeHeader(out, o, 8, FRAME_GOAWAY, 0, 0);
     bytes.write_byte(out, p, (lastStreamId >> 24) & 127);
@@ -108,6 +169,7 @@ pub fn writeGoaway(out: ptr, o: int, lastStreamId: int, errorCode: int): int {
     return p + 8;
 }
 
+/// Writes an RST_STREAM frame abruptly terminating `streamId` with `errorCode`.
 pub fn writeRstStream(out: ptr, o: int, streamId: int, errorCode: int): int {
     let p = writeHeader(out, o, 4, FRAME_RST_STREAM, 0, streamId);
     bytes.write_byte(out, p, (errorCode >> 24) & 255);
@@ -117,6 +179,8 @@ pub fn writeRstStream(out: ptr, o: int, streamId: int, errorCode: int): int {
     return p + 4;
 }
 
+/// Reads a big-endian 31-bit unsigned integer at `off` in `buf`, masking off
+/// the reserved top bit as used by WINDOW_UPDATE increments and stream ids.
 pub fn readU32(buf: ptr, off: int): int {
     return ((bytes.read_byte(buf, off) & 127) << 24) | (bytes.read_byte(buf, off + 1) << 16) | (bytes.read_byte(buf, off + 2) << 8) | bytes.read_byte(buf, off + 3);
 }

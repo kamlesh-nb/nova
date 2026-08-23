@@ -1,19 +1,48 @@
+//! Middleware pipeline contract for the web framework.
+//!
+//! This file defines the shared shape that request-handling middleware plugs
+//! into: the `Middleware` trait itself, the `MiddlewareAction` a middleware
+//! returns to say whether the pipeline should keep going, and `MatchedRoute`,
+//! the route information handed to a middleware's `after` hook once routing
+//! has resolved. Concrete middleware (logging, auth, compression and so on)
+//! implement `Middleware` and are registered with the web app; the reactor's
+//! request dispatch loop drives `execute` before the route handler runs and
+//! `after` once it has finished.
 
 import web.request;
 import web.response;
 import web.methods;
 
+/// Outcome of running one middleware's `execute` step, telling the dispatch
+/// loop whether to continue.
 pub enum MiddlewareAction {
+    /// Continue to the next middleware in the chain, or to the route handler
+    /// if this was the last one.
     Next,
+    /// Halt the pipeline here: no further middleware or the route handler
+    /// runs. The middleware is expected to have written the response itself.
     Stop,
 }
 
+/// The route that was matched for the current request, passed to a
+/// middleware's `after` hook so it can inspect what actually handled the
+/// request (for logging, metrics and the like).
 pub struct MatchedRoute {
+    /// HTTP method the matched route was registered for.
     pub method: Method,
+    /// Route pattern as registered (for example `/users/:id`), not the
+    /// literal request path.
     pub pattern: string,
 }
 
+/// Contract implemented by anything that wants to run in the request
+/// pipeline, before and after the route handler.
 pub trait Middleware {
+    /// Runs before route dispatch. Return `MiddlewareAction.Next` to let the
+    /// request continue through the chain, or `MiddlewareAction.Stop` to end
+    /// processing early (after having written to `res` as needed).
     fn execute(self: Middleware, req: request.Request, res: response.Response): MiddlewareAction;
+    /// Runs after the route handler has completed, once the route is known.
+    /// Not called if an earlier middleware returned `MiddlewareAction.Stop`.
     fn after(self: Middleware, req: request.Request, res: response.Response, matched: MatchedRoute): void;
 }

@@ -1,15 +1,32 @@
+//! Parser for `multipart/form-data` request bodies (RFC 7578), used by the web
+//! framework to decode file uploads and multi-field HTML forms.
+//!
+//! The entry point is `parseMultipart`, which reads the boundary out of the
+//! request's `Content-Type` header and splits the body into a `List<Part>`,
+//! one entry per form field or uploaded file. The parser works directly on
+//! the raw body string: it does not depend on any other web module, so it can
+//! be used standalone by anything that has a content type and a body to hand.
 
 import collections.list;
 import string;
 import assert;
 
+/// A single decoded segment of a multipart body: either a plain form field or
+/// an uploaded file, depending on whether `filename` is present.
 pub struct Part {
+    /// The field name from the part's `Content-Disposition: form-data; name="..."` parameter.
     pub name: string,
+    /// The uploaded file's original name, from the `filename="..."` parameter.
+    /// Empty for a plain (non-file) form field.
     pub filename: string,
+    /// The part's `Content-Type` header value, if it declared one. Empty otherwise.
     pub contentType: string,
+    /// The part's raw body bytes, with the surrounding CRLF/LF delimiters stripped.
     pub data: string,
 }
 
+// Pulls the boundary token out of a `Content-Type: multipart/form-data; boundary=...` header,
+// unquoting it if it was wrapped in double quotes. Returns "" if no boundary parameter is present.
 fn extractBoundary(contentType: string): string {
     let idx = string.indexOf(contentType, "boundary=");
     if (idx == -1) return "";
@@ -23,6 +40,9 @@ fn extractBoundary(contentType: string): string {
     return string.trim(boundary);
 }
 
+// Extracts the quoted value of a `paramName="..."` parameter from a header line
+// (for example `name` or `filename` inside a Content-Disposition header). Returns "" if the
+// parameter is absent or is not double-quoted.
 fn extractParam(header: string, paramName: string): string {
     let search = paramName + "=";
     let idx = string.indexOf(header, search);
@@ -37,6 +57,14 @@ fn extractParam(header: string, paramName: string): string {
     return "";
 }
 
+/// Parses a `multipart/form-data` request body into its constituent parts.
+///
+/// Reads the boundary from `contentType`, splits `body` on it, and for each
+/// segment parses the `Content-Disposition` and `Content-Type` headers to
+/// populate a `Part`. Segments with no `name` parameter (including the
+/// closing `--boundary--` delimiter and blank segments) are skipped rather
+/// than producing empty `Part` entries. Accepts both CRLF and bare LF line
+/// endings. Returns an empty list if `contentType` has no boundary parameter.
 pub fn parseMultipart(contentType: string, body: string): List<Part> {
     let result = List<Part>();
     let boundary = extractBoundary(contentType);

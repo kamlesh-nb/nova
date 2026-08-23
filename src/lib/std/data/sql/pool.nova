@@ -1,3 +1,14 @@
+//! Connection pooling for `db.Driver` connections, plus a circuit-breaker
+//! wrapped variant for resilient query execution.
+//!
+//! `Pool` keeps a bounded set of idle connections and hands them out to
+//! callers on `acquire`, opening new connections on demand up to `maxOpen`
+//! and waiting (or overflowing) when the pool is exhausted. `ResilientPool`
+//! layers a `resilience.breaker.CircuitBreaker` on top so that a struggling
+//! backend is given a cooldown instead of being hammered with new
+//! connections on every failed query. Both types sit above the generic `db`
+//! seam (`Driver`, `Connection`, `DbValue`, `ResultSet`, `ExecResult`) that
+//! the concrete SQL drivers implement, so this file is driver-agnostic.
 
 import db;
 import string;
@@ -7,34 +18,66 @@ import net.httpsclient;
 import net.aio;
 import metrics;
 
+// Current wall-clock time in whole milliseconds, used for idle-connection age checks.
 fn nowMs(): long { return datetime.nowNs() / 1000000; }
 
+// An idle connection paired with the timestamp it was returned to the pool, used to enforce maxLifetimeMs.
 struct Pooled {
     pub conn: Connection,
     pub born: long,
     init(conn: Connection, born: long) { self.conn = conn; self.born = born; }
 }
 
+/// A bounded pool of `Driver` connections with idle reuse, lifetime eviction,
+/// optional borrow-time validation, and simple wait/overflow behaviour when
+/// exhausted.
+///
+/// Connections are stored idle-first (LIFO): `acquire` pops from the end of
+/// `idle` so the most recently released connection is reused first. When
+/// `idle` is empty and `borrowed` has not reached `maxOpen` (or `maxOpen` is
+/// 0, meaning unlimited), a new connection is opened. Otherwise the caller
+/// waits in `waitStepMs` increments until either a connection is released,
+/// `acquireTimeoutMs` elapses (at which point the pool overflows and opens
+/// one anyway), or `acquireTimeoutMs` is 0 (wait indefinitely).
 pub class Pool {
+    /// The driver used to open new connections against `dsn`.
     pub driver: Driver,
+    /// Connection string passed to `driver.connect` for every new connection.
     pub dsn: string,
+    /// Idle connections available for reuse, ordered oldest-first (acquire pops the tail).
     pub idle: List<Pooled>,
+    /// Maximum number of idle connections retained by `release`; excess connections are closed instead.
     pub maxIdle: int,
+    /// Maximum number of connections borrowed at once, or 0 for unlimited.
     pub maxOpen: int,
+    /// Maximum age (in milliseconds) an idle connection may reach before `acquire` closes it instead of reusing it, or 0 to disable lifetime eviction.
     pub maxLifetimeMs: long,
+    /// Per-query timeout (in milliseconds) applied to every connection handed out by `acquire`, or 0 to disable.
     pub queryTimeoutMs: int,
+    /// When true, `acquire` pings a reused idle connection before returning it and discards it on failure.
     pub validateOnBorrow: bool,
+    /// Total number of connections ever opened by this pool.
     pub opened: int,
+    /// Number of connections currently open (idle plus borrowed).
     pub live: int,
+    /// Number of connections currently borrowed by callers.
     pub borrowed: int,
+    /// Highest value `borrowed` has reached.
     pub highWater: int,
+    /// Number of times `acquire` opened a connection beyond `maxOpen` after `acquireTimeoutMs` elapsed.
     pub overflow: int,
+    /// Number of callers currently waiting in `acquire` for a connection to free up.
     pub waiters: int,
+    /// Total number of wait steps taken across all `acquire` calls.
     pub waitedTotal: int,
+    /// Total number of connections discarded due to lifetime expiry or failed validation.
     pub evicted: int,
+    /// Milliseconds to sleep between wait retries in `acquire`.
     pub waitStepMs: int,
+    /// Maximum total time (in milliseconds) `acquire` will wait before overflowing past `maxOpen`, or 0 to wait indefinitely.
     pub acquireTimeoutMs: int,
 
+    /// Creates a pool for `driver`/`dsn` with the given idle-connection cap (coerced to at least 1). All other limits start disabled (0) and must be set via `configure`/`configureWait`/`configureTimeouts`.
     init(driver: Driver, dsn: string, maxIdle: int) {
         self.driver = driver;
         self.dsn = dsn;
@@ -56,35 +99,48 @@ pub class Pool {
         self.acquireTimeoutMs = 0;
     }
 
+    /// Sets the open-connection cap, idle-connection lifetime, and whether reused connections are validated before use.
     pub fn configure(self, maxOpen: int, maxLifetimeMs: long, validateOnBorrow: bool): void {
         self.maxOpen = maxOpen;
         self.maxLifetimeMs = maxLifetimeMs;
         self.validateOnBorrow = validateOnBorrow;
     }
 
+    /// Sets how long `acquire` waits for a free connection before overflowing, and the polling interval between wait retries (a non-positive `waitStepMs` leaves the current step unchanged).
     pub fn configureWait(self, acquireTimeoutMs: int, waitStepMs: int): void {
         self.acquireTimeoutMs = acquireTimeoutMs;
         if (waitStepMs > 0) { self.waitStepMs = waitStepMs; }
     }
 
+    /// Sets the per-query timeout applied to connections returned by `acquire`.
     pub fn configureTimeouts(self, queryTimeoutMs: int): void {
         self.queryTimeoutMs = queryTimeoutMs;
     }
 
+    // Applies queryTimeoutMs to a connection just before it is handed to a caller, if a timeout is configured.
     fn applyTimeout(self, c: Connection): void {
         if (self.queryTimeoutMs > 0) { c.setTimeout(self.queryTimeoutMs); }
     }
 
+    // Issues a trivial SELECT 1 to check that a connection is still usable.
     async fn ping(self, c: Connection): bool {
         let r = await c.query("SELECT 1", List<DbValue>());
         return r.ok();
     }
 
+    // Increments borrowed and updates highWater in one step.
     fn markBorrowed(self): void {
         self.borrowed = self.borrowed + 1;
         if (self.borrowed > self.highWater) { self.highWater = self.borrowed; }
     }
 
+    /// Borrows a connection from the pool, reusing an idle one when available and otherwise opening a new one.
+    ///
+    /// Idle connections older than `maxLifetimeMs` (when set) are closed and skipped rather than
+    /// returned. If `validateOnBorrow` is set, a reused connection is pinged first and discarded
+    /// on failure. When no idle connection qualifies and `maxOpen` has been reached, this call
+    /// waits in `waitStepMs` steps until a slot frees up or `acquireTimeoutMs` elapses, at which
+    /// point it opens a connection anyway and counts it as `overflow`.
     pub async fn acquire(self): Connection {
         let waited = 0;
         while (true) {
@@ -134,6 +190,7 @@ pub class Pool {
         return await self.newConn();
     }
 
+    /// Returns a borrowed connection to the pool, keeping it idle for reuse if under `maxIdle`, otherwise closing it.
     pub fn release(self, c: Connection): void {
         if (self.borrowed > 0) { self.borrowed = self.borrowed - 1; }
         if (self.idle.size() < self.maxIdle) {
@@ -144,6 +201,7 @@ pub class Pool {
         }
     }
 
+    // Opens a fresh connection via the driver and updates opened/live counters.
     async fn newConn(self): Connection {
         let c = await self.driver.connect(self.dsn);
         self.opened = self.opened + 1;
@@ -151,17 +209,20 @@ pub class Pool {
         return c;
     }
 
+    /// Returns a borrowed connection to the pool by closing it outright rather than keeping it idle. Use this for connections known to be in a bad state, without counting it as an eviction.
     pub fn discard(self, c: Connection): void {
         if (self.borrowed > 0) { self.borrowed = self.borrowed - 1; }
         c.close();
         if (self.live > 0) { self.live = self.live - 1; }
     }
 
+    /// Like `discard`, but also records the connection as evicted in the pool's metrics.
     pub fn evict(self, c: Connection): void {
         self.evicted = self.evicted + 1;
         self.discard(c);
     }
 
+    /// Publishes the pool's current gauges (idle/live/borrowed/high-water/opened/overflow/waiters/waited/evicted counts) to `reg` under `prefix + "_pool_..."` keys.
     pub fn publishMetrics(self, reg: metrics.Registry, prefix: string): void {
         reg.setGauge(prefix + "_pool_idle", self.idle.size() as long);
         reg.setGauge(prefix + "_pool_live", self.live as long);
@@ -174,16 +235,26 @@ pub class Pool {
         reg.setGauge(prefix + "_pool_evicted_total", self.evicted as long);
     }
 
+    /// Number of connections currently idle and available for reuse.
     pub fn idleCount(self): int { return self.idle.size(); }
+    /// Total number of connections ever opened by this pool.
     pub fn openedCount(self): int { return self.opened; }
+    /// Number of connections currently open (idle plus borrowed).
     pub fn liveCount(self): int { return self.live; }
+    /// Number of connections currently borrowed by callers.
     pub fn borrowedCount(self): int { return self.borrowed; }
+    /// Highest number of connections borrowed at once, ever.
     pub fn highWaterCount(self): int { return self.highWater; }
+    /// Number of times the pool opened a connection beyond `maxOpen` after waiting.
     pub fn overflowCount(self): int { return self.overflow; }
+    /// Number of callers currently waiting for a connection.
     pub fn waitersCount(self): int { return self.waiters; }
+    /// Total number of wait steps taken across all `acquire` calls.
     pub fn waitedTotalCount(self): int { return self.waitedTotal; }
+    /// Total number of connections evicted due to lifetime expiry or failed validation.
     pub fn evictedCount(self): int { return self.evicted; }
 
+    /// Closes every idle connection and drains the idle list, leaving borrowed connections untouched.
     pub fn closeAll(self): void {
         while (self.idle.size() > 0) {
             let last = self.idle.size() - 1;
@@ -195,15 +266,23 @@ pub class Pool {
     }
 }
 
+/// A `Pool` wrapped with a `CircuitBreaker` so that repeated query/exec
+/// failures trip the breaker and short-circuit further attempts (returning a
+/// `"CIRCUIT_OPEN"`-tagged result) instead of continuing to borrow and evict
+/// connections against a backend that is down.
 pub class ResilientPool {
+    /// The underlying connection pool.
     pub pool: Pool,
+    /// The circuit breaker guarding `query`/`exec` calls.
     pub breaker: breaker.CircuitBreaker,
 
+    /// Creates a resilient pool over `driver`/`dsn` with the given idle-connection cap, plus the breaker's failure/success thresholds and cooldown period.
     init(driver: Driver, dsn: string, maxIdle: int, failThreshold: int, successThreshold: int, cooldownMs: long) {
         self.pool = Pool(driver, dsn, maxIdle);
         self.breaker = breaker.CircuitBreaker(failThreshold, successThreshold, cooldownMs);
     }
 
+    /// Runs a query through the pool with breaker protection: acquires a connection, records success or failure on the breaker, and releases (on success) or evicts (on error) the connection. Returns a result tagged `"CIRCUIT_OPEN"` without touching the pool if the breaker is currently tripped.
     pub async fn query(self, sql: string, params: List<DbValue>): ResultSet {
         if (!self.breaker.shouldAllow()) {
             let rs = ResultSet();
@@ -222,6 +301,7 @@ pub class ResilientPool {
         return rs;
     }
 
+    /// Runs an exec statement through the pool with the same breaker-protected acquire/release-or-evict behaviour as `query`.
     pub async fn exec(self, sql: string, params: List<DbValue>): ExecResult {
         if (!self.breaker.shouldAllow()) {
             return ExecResult(0, "CIRCUIT_OPEN");
@@ -238,10 +318,14 @@ pub class ResilientPool {
         return ex;
     }
 
+    /// Returns the breaker's current state, as one of the `breaker.STATE_*` constants.
     pub fn state(self): int { return self.breaker.getState(); }
+    /// True when the breaker is currently tripped and rejecting new calls.
     pub fn isOpen(self): bool { return self.breaker.getState() == breaker.STATE_OPEN; }
+    /// Closes every idle connection in the underlying pool.
     pub fn closeAll(self): void { self.pool.closeAll(); }
 
+    /// Probes `healthUrl` with an HTTP GET (TLS-verified against `caPem` when non-empty) and records the outcome on the breaker; a 2xx response counts as success, anything else as failure. Returns whether the probe was healthy.
     pub async fn probeHealth(self: ResilientPool, healthUrl: string, caPem: string): bool {
         let code = 0;
         if (caPem.length > 0) {

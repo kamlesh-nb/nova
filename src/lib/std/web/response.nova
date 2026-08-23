@@ -1,3 +1,16 @@
+//! HTTP response building, HTML escaping, and wire parsing for the `web` framework.
+//!
+//! This file provides the `Response` struct that route handlers construct and
+//! return (status, body, headers, cookies), plus `Response.serialize` to render
+//! it as raw HTTP/1.1 bytes and `Response.parse` to read a response back off
+//! the wire (used by the HTTP client side and by tests). `HttpError` is the
+//! error type route handlers can throw to short-circuit into a status-coded
+//! response.
+//!
+//! It also carries the HTML-escaping helpers used by the template/render path:
+//! `escapeHtml` for owned strings and `escapeHtmlIntoView` for the zero-copy
+//! path that escapes straight out of a borrowed `str.Str` (see `str.nova`)
+//! into a `StringBuilder` without minting an intermediate owned string.
 
 import string;
 import str;
@@ -11,6 +24,8 @@ import web.status;
 import web.request;
 import compress.gzip;
 
+/// Scans a raw byte buffer for the first occurrence of byte `b` within
+/// `[start, end)`, returning its offset or -1 if not found.
 fn idxByte(buf: long, start: int, end: int, b: int): int {
     if (start >= end) { return -1; }
     let p = sys.memchr(buf + (start as long), b, (end - start) as long);
@@ -18,6 +33,7 @@ fn idxByte(buf: long, start: int, end: int, b: int): int {
     return (p - buf) as int;
 }
 
+/// Case-insensitive ASCII string comparison, used for HTTP header name lookup.
 fn ciEquals(a: string, b: string): bool {
     if (a.length != b.length) { return false; }
     let i = 0;
@@ -32,6 +48,8 @@ fn ciEquals(a: string, b: string): bool {
     return true;
 }
 
+/// Escapes `&`, `<`, `>`, `"` and `'` in `s` (HTML entity form) and appends the
+/// result into `sb`, in place, without building an intermediate string.
 pub fn escapeHtmlInto(sb: StringBuilder, s: string): void {
     let n = string.len(s);
     let base = s as long;
@@ -51,6 +69,10 @@ pub fn escapeHtmlInto(sb: StringBuilder, s: string): void {
     if (n > runStart) { sb.appendRange(s, runStart, n); }
 }
 
+/// Same as `escapeHtmlInto`, but reads directly from a borrowed `str.Str`
+/// view instead of an owned `string`. This is the zero-copy path used by the
+/// template render path: it escapes straight out of the source buffer into
+/// `sb` without allocating an owned intermediate string.
 pub fn escapeHtmlIntoView(sb: StringBuilder, v: str.Str): void {
     let base = v.ptr;
     let n = v.len;
@@ -70,6 +92,10 @@ pub fn escapeHtmlIntoView(sb: StringBuilder, v: str.Str): void {
     if (n > runStart) { sb.appendBytes(base + (runStart as long), n - runStart); }
 }
 
+/// Returns an HTML-escaped copy of `s`, escaping `&`, `<`, `>`, `"` and `'`.
+///
+/// If `s` contains none of these characters, the original string `s` is
+/// returned unchanged (no copy is made), so the common case is free.
 pub fn escapeHtml(s: string): string {
     let n = string.len(s);
     let first = -1;
@@ -101,8 +127,12 @@ pub fn escapeHtml(s: string): string {
     return sb.toString();
 }
 
+/// An error that a route handler can throw to short-circuit request handling
+/// into a status-coded response, instead of returning a `Response` directly.
 pub struct HttpError {
+    /// HTTP status code, e.g. 404 or 500.
     pub status: int,
+    /// Body text carried into the resulting response.
     pub message: string,
 
     init(status: int, message: string) {
@@ -110,16 +140,27 @@ pub struct HttpError {
         self.message = message;
     }
 
+    /// Converts this error into a plain-text `Response` with `status` mapped
+    /// through `Status.fromCode` and `message` as the body.
     pub fn toResponse(self: HttpError): Response {
         let r = Response(Status.fromCode(self.status), self.message);
         return r;
     }
 }
 
+/// An HTTP response: status, body, headers, and cookies to be set. Route
+/// handlers build and return this; `serialize` renders it to wire bytes.
 pub struct Response {
+    /// The HTTP status line code and reason phrase.
     pub status: Status,
+    /// The response body. `serialize` fills in Content-Length from this if
+    /// the caller hasn't set it explicitly.
     pub body: string,
+    /// Response headers, keyed by name. Lookup via `getHeader` is
+    /// case-insensitive even though the map itself is not.
     pub headers: Map<string, string>,
+    /// Cookies to emit as `Set-Cookie` headers on serialize, each with
+    /// `Path=/`.
     pub cookies: Map<string, string>,
 
     init(stat: Status, body: string) {
@@ -129,10 +170,13 @@ pub struct Response {
         self.cookies = Map<string, string>(16, string.hash);
     }
 
+    /// Builds a 200 OK response with the given body and no headers or cookies.
     pub fn ok(body: string): Response {
         return Response(Status.Ok, body);
     }
 
+    /// Builds a response with an explicit status, body, and header map;
+    /// cookies start empty.
     pub fn withHeaders(stat: Status, body: string, headers: Map<string, string>): Response {
         let cookies = Map<string, string>(16, string.hash);
         return Response{
@@ -143,16 +187,22 @@ pub struct Response {
         };
     }
 
+    /// Sets a header, overwriting any existing value for `key`, and returns
+    /// `self` for chaining.
     pub fn setHeader(self: Response, key: string, value: string): Response {
         self.headers.set(key, value);
         return self;
     }
 
+    /// Sets a cookie to be emitted via `Set-Cookie: name=value; Path=/` on
+    /// serialize, and returns `self` for chaining.
     pub fn setCookie(self: Response, name: string, value: string): Response {
         self.cookies.set(name, value);
         return self;
     }
 
+    /// Looks up a header by name, case-insensitively, returning `undefined`
+    /// if absent. This is a linear scan over all header keys.
     pub fn getHeader(self: Response, name: string): string | undefined {
         let keys = self.headers.keys();
         let keysLen = keys.size();
@@ -167,6 +217,9 @@ pub struct Response {
         return undefined;
     }
 
+    /// Renders the full HTTP/1.1 response: status line, headers, Set-Cookie
+    /// lines, a blank line, then the body. Sets Content-Length automatically
+    /// if not already present in `headers`.
     pub fn serialize(self: Response): string {
         if (self.headers.get("Content-Length") == undefined) {
             self.headers.set("Content-Length", intToStr(self.body.length));
@@ -197,6 +250,9 @@ pub struct Response {
         return sb.toString();
     }
 
+    /// Same as `serialize` but without the body: status line, headers,
+    /// Set-Cookie lines, and the trailing blank line. Used when the body is
+    /// streamed separately.
     pub fn serializeHeaders(self: Response): string {
         if (self.headers.get("Content-Length") == undefined) {
             self.headers.set("Content-Length", intToStr(self.body.length));
@@ -225,6 +281,12 @@ pub struct Response {
         return sb.toString();
     }
 
+    /// Parses a raw HTTP/1.1 response (status line, headers, blank line,
+    /// body) into a `Response`. Automatically dechunks a
+    /// `Transfer-Encoding: chunked` body and gunzips a
+    /// `Content-Encoding: gzip` body. Malformed input that lacks even a
+    /// status-line terminator returns a 200 OK with an empty body rather
+    /// than failing.
     pub fn parse(raw: string): Response {
         let n = raw.length;
         let buf = raw as long;
@@ -277,6 +339,9 @@ pub struct Response {
     }
 }
 
+/// Case-insensitive header lookup that returns the lower-cased value, or an
+/// empty string if the header is absent. Used to match tokens such as
+/// "chunked" or "gzip" without worrying about header-value casing.
 fn decodedHeader(headers: Map<string, string>, name: string): string {
     let keys = headers.keys();
     let i = 0;
@@ -305,6 +370,8 @@ fn test_parse_chunked(): void {
     assert.equalStr(r.body, "Wikipedia");
 }
 
+/// Converts a non-negative int to its decimal string form (`val == 0` is
+/// handled as a special case; negative values are not handled).
 fn intToStr(val: int): string {
     if (val == 0) return "0";
     let temp = val;

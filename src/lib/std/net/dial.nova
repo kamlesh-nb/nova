@@ -1,11 +1,27 @@
+//! Blocking TCP dial helper that hides the IPv4/IPv6 address family choice
+//! from callers. It is a thin convenience layer over `os.socket` and
+//! `net.dns`: given just a host string and a port, it works out whether the
+//! host is a literal IPv6 address and routes the connect through the correct
+//! socket path, so callers of `dial` never need to branch on address family
+//! themselves.
 
 import bytes;
 import string;
 import net.dns;
 import os.socket;
 
+/// Reports whether `host` looks like a literal IPv6 address rather than a
+/// hostname or an IPv4 dotted address, by checking for a colon.
+/// This is a syntactic check only: it does not validate the address, it just
+/// distinguishes the address family so `dial` can pick the right connect path.
 pub fn isIPv6Literal(host: string): bool { return string.indexOf(host, ":") >= 0; }
 
+/// Opens a blocking TCP connection to `host:port` and returns the connected
+/// socket file descriptor, or -1 on failure.
+/// If `host` is an IPv6 literal, it is parsed into a 16-byte address and
+/// connected via `socket.connectBlocking6`; parse failure also returns -1.
+/// Otherwise `host` (a hostname or IPv4 address) is resolved and connected
+/// via `socket.connectBlocking`.
 pub fn dial(host: string, port: int): int {
     if (isIPv6Literal(host)) {
         let addr = bytes.alloc(16);

@@ -1,3 +1,20 @@
+//! A YAML 1.1/1.2-ish reader and writer built around a single dynamic-value tree.
+//!
+//! `YamlValue` is the in-memory representation: a tagged union mirroring YAML's
+//! own model of scalars (null, bool, integer, decimal, string), sequences, and
+//! mappings. `parse` reads a document into a `YamlValue`, `parseDocuments`
+//! handles a multi-document stream (`---` separated), and `stringify` writes a
+//! `YamlValue` back out as block-style YAML. The parser is hand-rolled and
+//! line-oriented: it tracks indentation itself rather than building a full
+//! event stream, and supports block and flow collections, single- and
+//! double-quoted scalars with escapes, block scalars (`|` and `>` with chomping
+//! indicators), anchors/aliases (`&name` / `*name`), merge keys (`<<`), and the
+//! core YAML tags (`!!str`, `!!int`, `!!float`, `!!bool`, `!!null`).
+//!
+//! This module sits alongside `serde/json.nova` and `serde/bson.nova` as one of
+//! the standard library's serialisation formats, and follows the same shape:
+//! a `*Value` tree plus `parse`/`stringify` free functions, so callers moving
+//! between formats see a familiar API.
 
 import string;
 import list;
@@ -5,6 +22,11 @@ import map;
 import bytes;
 import assert;
 
+/// The dynamic value tree for a parsed (or to-be-serialised) YAML document.
+///
+/// Mirrors YAML's core schema: `Number` holds integral scalars as `long`,
+/// `Decimal` holds floating-point scalars as `decimal`, and `Array`/`Object`
+/// hold nested `YamlValue`s so the whole document is one recursive tree.
 pub enum YamlValue {
     Null,
     Bool(bool),
@@ -15,34 +37,42 @@ pub enum YamlValue {
     Object(Map<string, YamlValue>),
 }
 
+/// Builds a `YamlValue.Null`.
 pub fn null(): YamlValue {
     return YamlValue.Null;
 }
 
+/// Wraps a `bool` as a `YamlValue.Bool`.
 pub fn bool(val: bool): YamlValue {
     return YamlValue.Bool(val);
 }
 
+/// Wraps an integral scalar as a `YamlValue.Number`.
 pub fn number(val: long): YamlValue {
     return YamlValue.Number(val);
 }
 
+/// Wraps a `decimal` as a `YamlValue.Decimal`.
 pub fn decimalValue(val: decimal): YamlValue {
     return YamlValue.Decimal(val);
 }
 
+/// Wraps a `string` as a `YamlValue.String`.
 pub fn str(val: string): YamlValue {
     return YamlValue.String(val);
 }
 
+/// Wraps a `List<YamlValue>` as a `YamlValue.Array`.
 pub fn array(val: List<YamlValue>): YamlValue {
     return YamlValue.Array(val);
 }
 
+/// Wraps a `Map<string, YamlValue>` as a `YamlValue.Object`.
 pub fn object(val: Map<string, YamlValue>): YamlValue {
     return YamlValue.Object(val);
 }
 
+/// Reports whether `val` is `YamlValue.Null`.
 pub fn isNull(val: YamlValue): bool {
     switch (val) {
         case YamlValue.Null: { return true; }
@@ -50,6 +80,7 @@ pub fn isNull(val: YamlValue): bool {
     }
 }
 
+/// Extracts a `bool`, or `undefined` if `val` is not `YamlValue.Bool`.
 pub fn asBool(val: YamlValue): bool | undefined {
     switch (val) {
         case YamlValue.Bool(b): { return b; }
@@ -57,6 +88,7 @@ pub fn asBool(val: YamlValue): bool | undefined {
     }
 }
 
+/// Extracts a `long`, or `undefined` if `val` is not `YamlValue.Number`.
 pub fn asNumber(val: YamlValue): long | undefined {
     switch (val) {
         case YamlValue.Number(n): { return n; }
@@ -64,6 +96,7 @@ pub fn asNumber(val: YamlValue): long | undefined {
     }
 }
 
+/// Extracts a `decimal`, or `undefined` if `val` is not `YamlValue.Decimal`.
 pub fn asDecimal(val: YamlValue): decimal | undefined {
     switch (val) {
         case YamlValue.Decimal(d): { return d; }
@@ -71,6 +104,7 @@ pub fn asDecimal(val: YamlValue): decimal | undefined {
     }
 }
 
+/// Extracts a `string`, or `undefined` if `val` is not `YamlValue.String`.
 pub fn asString(val: YamlValue): string | undefined {
     switch (val) {
         case YamlValue.String(s): { return s; }
@@ -78,6 +112,7 @@ pub fn asString(val: YamlValue): string | undefined {
     }
 }
 
+/// Extracts the element list, or `undefined` if `val` is not `YamlValue.Array`.
 pub fn asArray(val: YamlValue): List<YamlValue> | undefined {
     switch (val) {
         case YamlValue.Array(arr): { return arr; }
@@ -85,6 +120,7 @@ pub fn asArray(val: YamlValue): List<YamlValue> | undefined {
     }
 }
 
+/// Extracts the key/value map, or `undefined` if `val` is not `YamlValue.Object`.
 pub fn asObject(val: YamlValue): Map<string, YamlValue> | undefined {
     switch (val) {
         case YamlValue.Object(obj): { return obj; }
@@ -92,6 +128,10 @@ pub fn asObject(val: YamlValue): Map<string, YamlValue> | undefined {
     }
 }
 
+/// Looks up `key` in `val` if it is an object.
+///
+/// Returns `YamlValue.Null` when `val` is not an object, or when the key is
+/// absent, so lookups can be chained without checking `isNull` at every step.
 pub fn get(val: YamlValue, key: string): YamlValue {
     switch (val) {
         case YamlValue.Object(obj): {
@@ -103,6 +143,10 @@ pub fn get(val: YamlValue, key: string): YamlValue {
     }
 }
 
+/// Looks up index `idx` in `val` if it is an array.
+///
+/// Returns `YamlValue.Null` when `val` is not an array or `idx` is out of
+/// bounds, rather than raising an error.
 pub fn at(val: YamlValue, idx: int): YamlValue {
     switch (val) {
         case YamlValue.Array(arr): {
@@ -113,6 +157,7 @@ pub fn at(val: YamlValue, idx: int): YamlValue {
     }
 }
 
+/// Serialises `val` to block-style YAML text, starting at zero indentation.
 pub fn stringify(val: YamlValue): string {
     return stringifyIndent(val, 0);
 }
@@ -199,6 +244,7 @@ fn stringifyIndent(val: YamlValue, indent: int): string {
 }
 
 
+// Splits on "\n" and strips a trailing "\r" from each line (CRLF tolerance).
 fn splitLines(s: string): List<string> {
     let raw = string.split(s, "\n");
     let out = List<string>();
@@ -212,6 +258,7 @@ fn splitLines(s: string): List<string> {
     return out;
 }
 
+// Removes a trailing "# ..." comment, honouring quoted strings so a '#' inside them is not mistaken for one.
 fn stripComment(line: string): string {
     let inS = false;
     let inD = false;
@@ -241,6 +288,7 @@ fn rtrim(s: string): string {
     return string.slice(s, 0, end);
 }
 
+// Finds the index of the mapping-key colon in `t` (the first unquoted, non-flow-nested ": " or trailing ":"), or -1 if there is none.
 fn findKeyColon(t: string): int {
     let inS = false;
     let inD = false;
@@ -265,6 +313,7 @@ fn findKeyColon(t: string): int {
     return 0 - 1;
 }
 
+// Unquotes and unescapes a mapping key that may be plain, single-, or double-quoted.
 fn parseKey(raw: string): string {
     let t = trim(raw);
     if (t.length >= 2 && t[0] == '"' && t[t.length - 1] == '"') { return unescapeDouble(string.slice(t, 1, t.length - 1)); }
@@ -272,6 +321,7 @@ fn parseKey(raw: string): string {
     return t;
 }
 
+// Unescapes a single-quoted scalar body, where '' is YAML's escape for a literal quote.
 fn unescapeSingle(s: string): string {
     let out = bytes.alloc(s.length + 1);
     let o = 0;
@@ -307,6 +357,7 @@ fn encodeUtf8(out: ptr, o: int, cp: int): int {
     return o + 3;
 }
 
+// Unescapes a double-quoted scalar body: \n \t \r \0 \" \\ \/, plus \xHH and \uHHHH (re-encoded as UTF-8).
 fn unescapeDouble(s: string): string {
     let out = bytes.alloc(s.length + 1);
     let o = 0;
@@ -338,6 +389,7 @@ fn unescapeDouble(s: string): string {
     return out as string;
 }
 
+// Parses a single scalar token, handling quoted strings before falling back to `parseScalar`'s type sniffing.
 fn scalarToken(t0: string): YamlValue {
     let t = trim(t0);
     if (t.length >= 2 && t[0] == '"' && t[t.length - 1] == '"') { return YamlValue.String(unescapeDouble(string.slice(t, 1, t.length - 1))); }
@@ -345,6 +397,7 @@ fn scalarToken(t0: string): YamlValue {
     return parseScalar(t);
 }
 
+// Coerces `v` per an explicit YAML tag (!!str/!!null/!!bool/!!int/!!float); unrecognised tags pass `v` through unchanged.
 fn applyTag(tag: string, v: YamlValue): YamlValue {
     if (tag.length == 0) { return v; }
     if (tag == "!!str" || tag == "!str") {
@@ -368,6 +421,10 @@ fn applyTag(tag: string, v: YamlValue): YamlValue {
     return v;
 }
 
+/// Deep-copies a `YamlValue` tree, recursing into arrays and objects.
+///
+/// Used when resolving an alias (`*name`) so each use of an anchored value
+/// gets its own independent tree rather than sharing structure.
 pub fn cloneValue(v: YamlValue): YamlValue {
     switch (v) {
         case YamlValue.Array(a): {
@@ -391,9 +448,19 @@ pub fn cloneValue(v: YamlValue): YamlValue {
     }
 }
 
+/// A single-pass, line-oriented YAML parser working over a pre-split source.
+///
+/// Indentation is tracked by re-reading each line's leading spaces rather
+/// than by an event stream, so block sequences/mappings are recognised by
+/// comparing indent levels as the cursor advances. Anchors are scoped per
+/// document: `parseDocument` resets `anchors` before each document in a
+/// multi-document stream.
 class YamlParser {
+    /// Source lines (without newlines), one per input line.
     pub lines: List<string>,
+    /// Index of the line the parser is currently positioned at.
     pub pos: int,
+    /// Anchors (`&name`) captured so far in the current document, for `*name` alias lookups.
     pub anchors: Map<string, YamlValue>,
 
     init(lines: List<string>) {
@@ -421,6 +488,11 @@ class YamlParser {
         return t == "---" || t == "..." || string.startsWith(t, "--- ") || string.startsWith(t, "... ");
     }
 
+    /// Parses the whole input as a stream of `---`-separated documents.
+    ///
+    /// If a document fails to advance the cursor (an otherwise-unreachable
+    /// pathological line), the parser forces progress by one line rather
+    /// than looping forever.
     pub fn parseAll(self: YamlParser): List<YamlValue> {
         let docs = List<YamlValue>();
         while (true) {
@@ -580,6 +652,7 @@ class YamlParser {
         return buf;
     }
 
+    // Reads a `|` (literal) or `>` (folded) block scalar body, applying the header's chomping indicator (- strip, + keep, default clip) and optional explicit indent digit.
     fn parseBlockScalar(self: YamlParser, parentIndent: int, header: string): YamlValue {
         let style = header[0];
         let chomp = 0;
@@ -706,6 +779,7 @@ class YamlParser {
     }
 }
 
+// Net bracket depth of `s` (counting [ { as +1 and ] } as -1, ignoring bracket-like characters inside quotes); used to detect when a flow collection continues onto the next line.
 fn flowDepth(s: string): int {
     let inS = false;
     let inD = false;
@@ -740,6 +814,7 @@ fn indexOfSpace(s: string): int {
     return 0 - 1;
 }
 
+// Reads a quoted token starting at i0 in flow context, returning its raw (still-escaped) text and the index just past the closing quote.
 fn readFlowQuoted(s: string, i0: int): (string, int) {
     let q = s[i0];
     let i = i0 + 1;
@@ -754,6 +829,9 @@ fn readFlowQuoted(s: string, i0: int): (string, int) {
     return (string.slice(s, i0, i), i);
 }
 
+/// Parses `yaml` and returns the first (or only) document's value.
+///
+/// Returns `YamlValue.Null` if the input contains no documents at all.
 pub fn parse(yaml: string): YamlValue {
     let p = YamlParser(splitLines(yaml));
     let docs = p.parseAll();
@@ -761,6 +839,7 @@ pub fn parse(yaml: string): YamlValue {
     return docs.at(0);
 }
 
+/// Parses `yaml` as a `---`-separated multi-document stream, one value per document.
 pub fn parseDocuments(yaml: string): List<YamlValue> {
     let p = YamlParser(splitLines(yaml));
     return p.parseAll();
@@ -836,6 +915,7 @@ fn getDigits(val: long): int {
     return count;
 }
 
+// Quotes `s` for output if leaving it plain would change its meaning (empty, a keyword-like or numeric-looking value, or containing YAML-significant characters).
 fn quoteStringIfNeeded(s: string): string {
     if (s.length == 0) {
         return "\"\"";
@@ -948,6 +1028,7 @@ fn quoteString(s: string): string {
     return result as string;
 }
 
+// Sniffs a plain (unquoted) scalar's type: null keywords, bool keywords, integer, decimal, or falls back to a string.
 fn parseScalar(s: string): YamlValue {
     let t = trim(s);
     if (t.length == 0) {

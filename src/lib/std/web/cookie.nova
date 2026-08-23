@@ -1,18 +1,43 @@
+//! HTTP cookie construction for the `Set-Cookie` response header.
+//!
+//! This module models a single cookie as a `Cookie` value struct and turns it
+//! into the wire-format string via `serialize`. It is a builder, not a parser:
+//! it does not read `Cookie` request headers sent by the client, only produces
+//! the `Set-Cookie` value a server hands back. It is used by the web framework
+//! when a handler wants to set a session, flash, or preference cookie.
 
 import collections.string_builder;
 import assert;
 
+/// A single HTTP cookie, ready to be turned into a `Set-Cookie` header value
+/// via `serialize`. Fields left at their zero value (empty string, or a
+/// negative `maxAge`) are omitted from the serialized output rather than
+/// written out empty.
 pub struct Cookie {
+    /// The cookie's name, written before the `=` in the header value.
     pub name: string,
+    /// The cookie's value, written after the `=`.
     pub value: string,
+    /// `Path` attribute. Omitted from the output when empty.
     pub path: string,
+    /// `Domain` attribute. Omitted from the output when empty.
     pub domain: string,
+    /// `Max-Age` attribute in seconds. Omitted from the output when negative;
+    /// a non-negative value (including 0) is always emitted.
     pub maxAge: int,
+    /// Whether to append the `Secure` attribute (cookie sent only over HTTPS).
     pub secure: bool,
+    /// Whether to append the `HttpOnly` attribute (cookie hidden from JS).
     pub httpOnly: bool,
+    /// `SameSite` attribute value (for example `"Lax"`, `"Strict"`, `"None"`).
+    /// Omitted from the output when empty.
     pub sameSite: string,
 }
 
+/// Renders a `Cookie` into the `name=value; Attr=...` form suitable for a
+/// `Set-Cookie` header. Attributes with an empty string or a negative
+/// `maxAge` are skipped; boolean attributes (`Secure`, `HttpOnly`) are
+/// appended only when true, with no value.
 pub fn serialize(cookie: Cookie): string {
     let sb = string_builder.StringBuilder();
     sb.append(cookie.name);

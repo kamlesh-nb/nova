@@ -1,8 +1,18 @@
 
+//! In-process metrics registry for counters and gauges, with export in both
+//! Prometheus text format and JSON. Applications call `newRegistry()` once,
+//! then `add`/`inc` to accumulate counters or `setGauge` to record a point
+//! value, and expose the snapshot on a metrics endpoint for scraping or
+//! debugging. There is no aggregation across processes: this is purely a
+//! per-instance registry, so multi-instance rollups are the scraper's job.
+
 import string;
 import map;
 import list;
 
+/// Renders a `long` as its decimal string, handling zero and negative values.
+/// Used internally to format counter and gauge values without pulling in a
+/// general-purpose numeric formatter.
 pub fn numStr(n: long): string {
     if (n == 0) { return "0"; }
     let neg = n < 0;
@@ -17,9 +27,18 @@ pub fn numStr(n: long): string {
     return digits;
 }
 
+/// A registry of named counters and gauges, exportable as Prometheus text or JSON.
+///
+/// A metric name is tracked as either a counter or a gauge depending on which
+/// setter first touches it (`add`/`inc` mark it a counter, `setGauge` marks it
+/// a gauge); reusing the same name across both kinds is not supported and the
+/// counter reading (if present) wins when both maps happen to hold the name.
 pub struct Registry {
+    /// Accumulated counter values, keyed by metric name.
     pub counters: Map<string, long>,
+    /// Latest gauge values, keyed by metric name.
     pub gauges: Map<string, long>,
+    /// Metric names in first-seen order, so snapshots are emitted deterministically.
     pub names: List<string>,
 
     init() {
@@ -28,6 +47,7 @@ pub struct Registry {
         self.names = List<string>();
     }
 
+    // Records a name in `names` the first time it is seen (linear scan; fine at metrics scale).
     fn track(self: Registry, name: string): void {
         let i = 0;
         while (i < self.names.size()) {
@@ -37,20 +57,29 @@ pub struct Registry {
         self.names.push(name);
     }
 
+    /// Adds `n` to the named counter, creating it at `n` if it does not exist yet.
     pub fn add(self: Registry, name: string, n: long): void {
         let cur = self.counters.get(name) ?? 0;
         self.counters.set(name, cur + n);
         self.track(name);
     }
+    /// Increments the named counter by 1. Shorthand for `add(name, 1)`.
     pub fn inc(self: Registry, name: string): void { self.add(name, 1); }
+    /// Reads the current value of the named counter, or 0 if it has never been set.
     pub fn counter(self: Registry, name: string): long { return self.counters.get(name) ?? 0; }
 
+    /// Sets the named gauge to `v`, overwriting any previous value.
     pub fn setGauge(self: Registry, name: string, v: long): void {
         self.gauges.set(name, v);
         self.track(name);
     }
+    /// Reads the current value of the named gauge, or 0 if it has never been set.
     pub fn gauge(self: Registry, name: string): long { return self.gauges.get(name) ?? 0; }
 
+    /// Renders all tracked metrics in Prometheus text exposition format,
+    /// with a `# TYPE` line per metric followed by its `name value` line.
+    /// A name present in `counters` is emitted as a counter even if it was
+    /// also set as a gauge; every other tracked name is emitted as a gauge.
     pub fn snapshotProm(self: Registry): string {
         let out = "";
         let i = 0;
@@ -67,6 +96,8 @@ pub struct Registry {
         return out;
     }
 
+    /// Renders all tracked metrics as a flat JSON object of `"name": value` pairs.
+    /// Uses the same counter-takes-precedence-over-gauge rule as `snapshotProm`.
     pub fn snapshotJson(self: Registry): string {
         let out = "{";
         let i = 0;
@@ -82,5 +113,6 @@ pub struct Registry {
     }
 }
 
+/// Creates an empty `Registry` with no tracked metrics.
 pub fn newRegistry(): Registry { return Registry(); }
 

@@ -1,4 +1,14 @@
+//! Byte-order tags for reading and writing multi-byte values.
+//!
+//! This module just names the two orderings a caller may need when packing
+//! or unpacking integers into raw bytes, for example over a wire protocol or
+//! a binary file format. It does not do the packing itself; other modules
+//! (such as `bytes`) take an `Endian` value to decide how to lay bytes out.
+
+/// The byte order to use when reading or writing a multi-byte number.
 pub enum Endian {
+    /// Least significant byte first (the native order on x86/ARM).
     little,
+    /// Most significant byte first (the order used by most network protocols).
     big,
 }

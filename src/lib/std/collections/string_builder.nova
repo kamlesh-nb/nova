@@ -1,18 +1,81 @@
+//! Growable byte buffer for building strings without repeated reallocation.
+//!
+//! `StringBuilder` is the amortised O(n) way to assemble a `string` from many
+//! small pieces. The naive alternative, concatenating with `+` in a loop,
+//! copies the whole accumulated result on every step, so building an n-byte
+//! string that way costs O(n^2). This type instead keeps one contiguous
+//! heap buffer and appends into the free space at the end, doubling the
+//! capacity only when it runs out. That makes a sequence of appends amortised
+//! O(total bytes), and materialises an owned `string` only once, at `toString`.
+//!
+//! It is a `class`, not a value `struct`, deliberately: the buffer is mutated
+//! in place across many method calls and callers pass the same builder around
+//! by reference, so reference semantics are what is wanted here. Because it
+//! owns a raw heap allocation (`buf`) rather than an ARC-managed object, the
+//! memory is NOT reclaimed automatically: the owner must call [`StringBuilder.delete`]
+//! when finished, or the buffer leaks.
+//!
+//! The buffer holds raw bytes and is not NUL-terminated or otherwise framed;
+//! [`StringBuilder.len`] is the sole source of truth for how many bytes are
+//! live. Appends are byte-oriented, so a `string` argument is copied by its
+//! UTF-8 byte length with no codepoint interpretation, and it is the caller's
+//! job to keep multi-byte sequences intact when using the range and raw-pointer
+//! append paths.
+//!
+//! This is a core stdlib primitive. In particular it backs the zero-copy render
+//! path: [`StringBuilder.appendBytes`] copies straight out of a borrowed buffer
+//! (for example a `Str` view over a database row) into the output, minting no
+//! intermediate owned string. See the companion borrowed-view type in
+//! `std.str`.
 
 import bytes;
 import assert;
 
+/// Growable heap-backed buffer that accumulates bytes and yields an owned
+/// `string` on demand.
+///
+/// Holds a single contiguous allocation and appends into the tail, doubling
+/// capacity when needed so that a run of appends is amortised O(total bytes).
+/// Owns raw memory that is not ARC-tracked, so the owner MUST call
+/// [`StringBuilder.delete`] to release it. See the file header for the design
+/// rationale and the zero-copy render use case.
 pub class StringBuilder {
+    /// Base address of the current heap allocation holding the live bytes.
+    ///
+    /// A raw, non-ARC pointer that this builder owns and reallocates in place.
+    /// Set to `0` after [`StringBuilder.delete`] to mark the buffer freed and
+    /// guard against a double free. The first [`StringBuilder.len`] bytes are
+    /// live; the rest up to [`StringBuilder.cap`] is uninitialised spare room.
     pub buf: ptr,
+    /// Number of bytes currently written into `buf`, from offset 0.
+    ///
+    /// The single source of truth for the string's length. The buffer is not
+    /// NUL-terminated, so nothing else records where the content ends.
     pub len: int,
+    /// Total bytes the current `buf` allocation can hold before it must grow.
+    ///
+    /// Always at least [`StringBuilder.len`]. Grown by doubling in
+    /// [`StringBuilder.ensureCapacity`] so appends stay amortised O(1) per byte.
     pub cap: int,
 
+    /// Creates an empty builder with a small pre-allocated 16-byte buffer.
+    ///
+    /// Starts with spare capacity so the first few small appends do not each
+    /// trigger a reallocation. Uses `alloc_persistent_nz` (non-zeroed), which is
+    /// safe here because only the first [`StringBuilder.len`] bytes are ever read
+    /// back and those are always written before use.
     init() {
         self.cap = 16;
         self.len = 0;
         self.buf = bytes.alloc_persistent_nz(16);
     }
 
+    /// Appends the full UTF-8 bytes of `s` to the end of the buffer.
+    ///
+    /// Copies `s.length` bytes, growing capacity first if needed. An empty
+    /// string is a no-op and does not touch the buffer. The copy is by byte
+    /// count, so no codepoint interpretation happens; the source string is not
+    /// retained, only its bytes are copied.
     pub fn append(self: StringBuilder, s: string): void {
         let slen = s.length;
         if (slen == 0) return;
@@ -21,12 +84,24 @@ pub class StringBuilder {
         self.len = self.len + slen;
     }
 
+    /// Appends a single raw byte, taking the low 8 bits of `c`.
+    ///
+    /// This writes ONE byte, not a Unicode codepoint. To append a character
+    /// above U+007F, encode it to UTF-8 first and append those bytes, otherwise
+    /// only the low byte lands and the buffer holds an invalid sequence.
     pub fn appendChar(self: StringBuilder, c: int): void {
         self.ensureCapacity(self.len + 1);
         bytes.write_byte(self.buf, self.len, c);
         self.len = self.len + 1;
     }
 
+    /// Appends the half-open byte range `[start, end)` of `s`.
+    ///
+    /// Copies `end - start` bytes starting `start` bytes into `s`. If the range
+    /// is empty or inverted (`end <= start`) it is a no-op. The bounds are NOT
+    /// checked against `s.length`, so the caller must keep
+    /// `0 <= start <= end <= s.length`; an out-of-range end reads past the source
+    /// string. Offsets are byte offsets, not codepoint offsets.
     pub fn appendRange(self: StringBuilder, s: string, start: int, end: int): void {
         let n = end - start;
         if (n <= 0) return;
@@ -35,6 +110,14 @@ pub class StringBuilder {
         self.len = self.len + n;
     }
 
+    /// Appends `n` bytes read from the raw address `srcPtr`.
+    ///
+    /// The zero-copy ingress point: it copies straight out of any foreign buffer
+    /// (for example a `Str` view over a database row's wire buffer) without first
+    /// building an owned `string`. `srcPtr` is a `long` because it is a machine
+    /// address and an `int` would truncate anything above 4 GB. A non-positive
+    /// `n` is a no-op. The caller guarantees `srcPtr` points at `n` valid,
+    /// live bytes.
     pub fn appendBytes(self: StringBuilder, srcPtr: long, n: int): void {
         if (n <= 0) return;
         self.ensureCapacity(self.len + n);
@@ -42,6 +125,16 @@ pub class StringBuilder {
         self.len = self.len + n;
     }
 
+    /// Materialises the accumulated bytes into a fresh, independent owned
+    /// `string`.
+    ///
+    /// Allocates a new buffer of exactly [`StringBuilder.len`] bytes and copies
+    /// the content into it, so the returned `string` is self-owned (ARC-managed)
+    /// and does not alias the builder's buffer. The builder is left unchanged and
+    /// may be appended to and stringified again. An empty builder returns the
+    /// empty string literal without allocating. Note that this is a snapshot: the
+    /// builder still owns its own buffer, and [`StringBuilder.delete`] is still
+    /// required to release it.
     pub fn toString(self: StringBuilder): string {
         if (self.len == 0) return "";
 
@@ -50,6 +143,16 @@ pub class StringBuilder {
         return sptr as string;
     }
 
+    /// Ensures the buffer can hold at least `minCap` bytes, reallocating if not.
+    ///
+    /// The growth engine behind every append. If the current capacity already
+    /// suffices it returns immediately. Otherwise it grows geometrically,
+    /// doubling capacity, and if double is still too small it jumps straight to
+    /// `minCap`; that doubling is what keeps a run of appends amortised O(1) per
+    /// byte rather than O(n). The live bytes are copied into the new allocation
+    /// and the old one is freed (guarded on `buf != 0`, so it is safe even
+    /// straight after construction). Although `pub`, it is an internal helper the
+    /// append methods call, not something callers normally invoke.
     pub fn ensureCapacity(self: StringBuilder, minCap: int): void {
         if (minCap <= self.cap) return;
         let newCap = self.cap * 2;
@@ -63,6 +166,14 @@ pub class StringBuilder {
         self.cap = newCap;
     }
 
+    /// Frees the underlying heap buffer and marks the builder emptied.
+    ///
+    /// Required for correct cleanup: the buffer is raw memory that is NOT
+    /// ARC-tracked, so without this call it leaks. Sets [`StringBuilder.buf`] to
+    /// `0` after freeing, which makes the call idempotent (a second `delete` sees
+    /// `0` and does nothing) and prevents a double free. Do not append after
+    /// calling this. Note that [`StringBuilder.len`] and [`StringBuilder.cap`]
+    /// are left as-is, so treat a deleted builder as spent.
     pub fn delete(self: StringBuilder): void {
         if (self.buf != 0) {
             bytes.free(self.buf);
@@ -71,6 +182,8 @@ pub class StringBuilder {
     }
 }
 
+/// Sanity check that a sequence of appends followed by `toString` yields the
+/// concatenation, exercising both the buffer growth and the final materialise.
 @test
 fn test_string_builder(): void {
     let sb = StringBuilder();

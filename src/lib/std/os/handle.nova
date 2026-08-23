@@ -1,5 +1,18 @@
+//! Safe wrapper over a raw OS file descriptor.
+//!
+//! `Fd` is a reference-type (`class`) guard around the plain integer handle
+//! that `os.socket` deals in: it tracks whether the descriptor has already
+//! been closed, so callers cannot double-close it, and it closes the
+//! descriptor automatically on `delete` if the owner never called `close`
+//! explicitly. This is the building block that higher-level socket and
+//! stream types hold onto instead of passing bare integers around.
+
 import os.socket;
 
+/// A reference-counted guard around one raw OS file descriptor.
+///
+/// Tracks close state internally so repeated or automatic closes are safe:
+/// once `closed` is set, further close attempts are no-ops.
 pub class Fd {
     raw: int,
     closed: bool,
@@ -9,16 +22,26 @@ pub class Fd {
         self.closed = false;
     }
 
+    /// Returns the raw underlying file descriptor value.
     pub fn get(self: Fd): int { return self.raw; }
 
+    /// Reports whether this descriptor has already been closed.
     pub fn isClosed(self: Fd): bool { return self.closed; }
 
+    /// Closes the descriptor via `socket.close`, returning its result code.
+    ///
+    /// Safe to call more than once: after the first successful call the
+    /// descriptor is marked closed and subsequent calls just return `0`
+    /// without touching the OS handle again.
     pub fn close(self: Fd): int {
         if (self.closed) { return 0; }
         self.closed = true;
         return socket.close(self.raw);
     }
 
+    /// Destructor: closes the descriptor if it was never explicitly closed,
+    /// discarding the close result. Guards against leaking the OS handle
+    /// when an `Fd` goes out of scope unclosed.
     pub fn delete(self: Fd): void {
         if (!self.closed) {
             self.closed = true;

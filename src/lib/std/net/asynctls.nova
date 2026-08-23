@@ -1,9 +1,28 @@
+//! Asynchronous TLS streams built on top of the non-blocking `net.aio` transport.
+//!
+//! `TlsStream` wires a TLS memory-BIO (`net.tlsmembio` for TLS 1.3, `net.tls12bio`
+//! for the TLS 1.2 client-certificate path) to an underlying `aio.AsyncStream`:
+//! the BIO produces and consumes plaintext/ciphertext purely in memory, and this
+//! module pumps the ciphertext across the async socket, awaiting each send or
+//! receive so the reactor is never blocked while a handshake or record is in
+//! flight. It implements the `AsyncIO` trait, so a `TlsStream` can be used
+//! anywhere plain async sockets are, once wrapped over one.
+//!
+//! The bulk of the public surface is a family of `tlsConnect*`/`tlsAccept*`
+//! helper functions covering the connect-vs-upgrade, verify-vs-no-verify,
+//! deadline-vs-no-deadline, and client-certificate combinations, plus ALPN
+//! variants for protocol negotiation (used by HTTP/2). Callers should prefer
+//! the `*Deadline` and `*Verify` variants for anything talking to the network;
+//! the no-verify, no-deadline forms exist mainly for tests and trusted
+//! upgrades of an already-authenticated transport.
+
 import bytes;
 import net.aio;
 import net.tlsmembio;
 import net.tls12bio;
 import crypto.tls.truststore;
 
+// Copies n bytes out of a raw scratch buffer into a fresh owned string.
 fn bufToStr(buf: ptr, n: int): string {
     if (n <= 0) { return ""; }
     let out = bytes.alloc(n);
@@ -12,12 +31,24 @@ fn bufToStr(buf: ptr, n: int): string {
     return out as string;
 }
 
+/// An async TLS-wrapped socket: the async plaintext transport underneath
+/// plus the in-memory TLS state machine driving it.
+///
+/// Construction alone does not perform a handshake; callers use one of the
+/// `tlsConnect*`/`tlsAccept*` module functions, which construct a `TlsStream`
+/// and then drive `handshake()` to completion.
 pub class TlsStream impl AsyncIO {
+    /// The underlying non-blocking socket that ciphertext is sent over and read from.
     pub base: aio.AsyncStream,
+    /// The TLS memory-BIO state machine: consumes/produces plaintext and ciphertext with no I/O of its own.
     pub bio: tlsmembio.TlsBio,
+    /// Fixed-size scratch buffer used to shuttle ciphertext between the BIO and the socket.
     pub scratch: ptr,
+    /// Capacity in bytes of `scratch` (currently always 16384).
     pub cap: int,
+    /// True until `close()` has been called; guards against a double close.
     pub open: bool,
+    /// True once `handshake()` has completed the TLS handshake successfully.
     pub handshakeOk: bool,
 
     init(base: aio.AsyncStream, bio: tlsmembio.TlsBio) {
@@ -29,6 +60,9 @@ pub class TlsStream impl AsyncIO {
         self.handshakeOk = false;
     }
 
+    /// Drains any ciphertext the BIO has queued for the network, sending it over
+    /// `base`. Returns 0 on success (including when there is nothing pending)
+    /// or -1 if the underlying send fails.
     pub async fn flushOut(self: TlsStream): int {
         while (self.bio.pendingOut() > 0) {
             let n = self.bio.pull(self.scratch, self.cap);
@@ -39,6 +73,9 @@ pub class TlsStream impl AsyncIO {
         return 0;
     }
 
+    /// Reads one chunk of ciphertext off the socket into `scratch` and feeds it
+    /// to the BIO. Returns the number of bytes read; a value <= 0 means the
+    /// peer closed or the read failed, and marks the BIO closed accordingly.
     pub async fn pumpIn(self: TlsStream): int {
         let n = await self.base.recvInto(self.scratch as long, self.cap);
         if (n <= 0) { self.bio.markClosed(); return n; }
@@ -46,6 +83,11 @@ pub class TlsStream impl AsyncIO {
         return n;
     }
 
+    /// Drives the TLS handshake to completion by repeatedly stepping the BIO,
+    /// flushing any produced ciphertext, and pumping in more ciphertext until
+    /// the BIO reports done. Sets `handshakeOk` and returns 0 on success, or
+    /// returns -1 (leaving `handshakeOk` false) on a step failure, a flush
+    /// failure, or the peer closing before the handshake finishes.
     pub async fn handshake(self: TlsStream): int {
         while (true) {
             let st = self.bio.step();
@@ -58,6 +100,9 @@ pub class TlsStream impl AsyncIO {
         return 0 - 1;
     }
 
+    /// Encrypts `data` through the BIO and flushes the resulting ciphertext to
+    /// the socket. Returns the number of plaintext bytes accepted by the BIO,
+    /// or -1 if encryption or the flush fails.
     pub async fn sendStr(self: TlsStream, data: string): int {
         let w = self.bio.writeApp(data as ptr, data.length);
         if (w < 0) { return 0 - 1; }
@@ -65,6 +110,10 @@ pub class TlsStream impl AsyncIO {
         return w;
     }
 
+    /// Reads up to `max` bytes of decrypted plaintext into `buf`, pumping more
+    /// ciphertext off the socket and through the BIO as needed until plaintext
+    /// is available. Returns the number of bytes read (> 0), 0 or a negative
+    /// value if the peer closed, or -1 on a decrypt or flush error.
     pub async fn recvInto(self: TlsStream, buf: long, max: int): int {
         while (true) {
             let n = self.bio.readApp(buf as ptr, max);
@@ -77,14 +126,20 @@ pub class TlsStream impl AsyncIO {
         return 0 - 1;
     }
 
+    /// True once the TLS handshake has completed successfully.
     pub fn ok(self: TlsStream): bool { return self.handshakeOk; }
+    /// True until `close()` has been called on this stream.
     pub fn isOpen(self: TlsStream): bool { return self.open; }
+    /// The ALPN protocol negotiated during the handshake, or an empty string if none was.
     pub fn selectedAlpn(self: TlsStream): string { return self.bio.selectedAlpn(); }
 
+    /// Sets the read/write timeout (in milliseconds) on the underlying socket; 0 disables it.
     pub fn setTimeout(self: TlsStream, ms: int): int {
         return self.base.setTimeout(ms);
     }
 
+    /// Closes the TLS session and the underlying socket, and frees the scratch
+    /// buffer. Safe to call more than once.
     pub fn close(self: TlsStream): void {
         if (self.open) {
             self.bio.closeBio();
@@ -98,6 +153,10 @@ pub class TlsStream impl AsyncIO {
     }
 }
 
+/// Connects to `host:port` and performs a TLS client handshake without
+/// certificate verification. The `verify` parameter is currently unused; use
+/// `tlsConnectVerify` or `tlsConnectVerifyDeadline` for verified connections.
+/// Check `ok()` on the returned stream to see whether the handshake succeeded.
 pub async fn tlsConnect(host: string, port: int, verify: bool): TlsStream {
     let base = await aio.asyncConnect(host, port);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
@@ -106,6 +165,7 @@ pub async fn tlsConnect(host: string, port: int, verify: bool): TlsStream {
     return ts;
 }
 
+// Runs the handshake with a socket timeout applied for its duration, then clears the timeout.
 async fn handshakeBounded(ts: TlsStream, timeoutMs: int): int {
     if (timeoutMs > 0) { let _ = ts.setTimeout(timeoutMs); }
     let hs = await ts.handshake();
@@ -113,6 +173,9 @@ async fn handshakeBounded(ts: TlsStream, timeoutMs: int): int {
     return hs;
 }
 
+/// Connects to `host:port` with a deadline (milliseconds) covering both the TCP
+/// connect and the TLS handshake, without certificate verification. If the TCP
+/// connect fails, returns early with `ok() == false` and skips the handshake.
 pub async fn tlsConnectDeadline(host: string, port: int, verify: bool, timeoutMs: int): TlsStream {
     let base = await aio.asyncConnectDeadline(host, port, timeoutMs);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
@@ -121,6 +184,8 @@ pub async fn tlsConnectDeadline(host: string, port: int, verify: bool, timeoutMs
     let _ = await handshakeBounded(ts, timeoutMs);
     return ts;
 }
+/// Connects to `host:port` with a deadline, verifying the peer certificate
+/// against the CA bundle in `caPem` (PEM text, may contain multiple certificates).
 pub async fn tlsConnectVerifyDeadline(host: string, port: int, caPem: string, timeoutMs: int): TlsStream {
     let base = await aio.asyncConnectDeadline(host, port, timeoutMs);
     let store = truststore.loadPemBundle(caPem);
@@ -130,6 +195,9 @@ pub async fn tlsConnectVerifyDeadline(host: string, port: int, caPem: string, ti
     let _ = await handshakeBounded(ts, timeoutMs);
     return ts;
 }
+/// Connects to `host:port` with a deadline, presenting a client certificate
+/// (`certPem`/`keyPem`) for mutual TLS over the TLS 1.2 BIO path. If `caPem`
+/// is non-empty, the peer certificate is also verified against it.
 pub async fn tlsConnectClientCertDeadline(host: string, port: int, caPem: string, certPem: string, keyPem: string, timeoutMs: int): TlsStream {
     let base = await aio.asyncConnectDeadline(host, port, timeoutMs);
     let bio: tlsmembio.TlsBio = tls12bio.newClient12BioClientCert(host, certPem, keyPem);
@@ -141,12 +209,16 @@ pub async fn tlsConnectClientCertDeadline(host: string, port: int, caPem: string
     let _ = await handshakeBounded(ts, timeoutMs);
     return ts;
 }
+/// Upgrades an already-connected `base` stream to TLS, with a deadline
+/// (milliseconds) on the handshake only, without certificate verification.
 pub async fn tlsClientUpgradeDeadline(base: aio.AsyncStream, host: string, timeoutMs: int): TlsStream {
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
     let ts = TlsStream(base, bio);
     let _ = await handshakeBounded(ts, timeoutMs);
     return ts;
 }
+/// Upgrades an already-connected `base` stream to TLS with a handshake
+/// deadline, verifying the peer certificate against `caPem`.
 pub async fn tlsClientUpgradeVerifyDeadline(base: aio.AsyncStream, host: string, caPem: string, timeoutMs: int): TlsStream {
     let store = truststore.loadPemBundle(caPem);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBioVerify(host, store);
@@ -155,6 +227,9 @@ pub async fn tlsClientUpgradeVerifyDeadline(base: aio.AsyncStream, host: string,
     return ts;
 }
 
+/// Connects to `host:port` and performs a TLS handshake offering `alpn` as the
+/// ALPN protocol list, without certificate verification or a deadline. Use
+/// `selectedAlpn()` on the result to see which protocol the peer picked.
 pub async fn tlsConnectAlpn(host: string, port: int, alpn: string): TlsStream {
     let base = await aio.asyncConnect(host, port);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBioAlpn(host, alpn);
@@ -163,6 +238,8 @@ pub async fn tlsConnectAlpn(host: string, port: int, alpn: string): TlsStream {
     return ts;
 }
 
+/// Connects to `host:port` and performs a TLS handshake, verifying the peer
+/// certificate against `caPem`, with no deadline.
 pub async fn tlsConnectVerify(host: string, port: int, caPem: string): TlsStream {
     let base = await aio.asyncConnect(host, port);
     let store = truststore.loadPemBundle(caPem);
@@ -172,6 +249,9 @@ pub async fn tlsConnectVerify(host: string, port: int, caPem: string): TlsStream
     return ts;
 }
 
+/// Upgrades an already-connected `base` stream to TLS as a client, without
+/// certificate verification or a deadline. Use for wrapping a connection that
+/// was accepted or opened by other means (e.g. an HTTP CONNECT tunnel).
 pub async fn tlsClientUpgrade(base: aio.AsyncStream, host: string): TlsStream {
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBio(host);
     let ts = TlsStream(base, bio);
@@ -179,6 +259,8 @@ pub async fn tlsClientUpgrade(base: aio.AsyncStream, host: string): TlsStream {
     return ts;
 }
 
+/// Upgrades an already-connected `base` stream to TLS as a client, verifying
+/// the peer certificate against `caPem`, with no deadline.
 pub async fn tlsClientUpgradeVerify(base: aio.AsyncStream, host: string, caPem: string): TlsStream {
     let store = truststore.loadPemBundle(caPem);
     let bio: tlsmembio.TlsBio = tlsmembio.newClientBioVerify(host, store);
@@ -187,6 +269,9 @@ pub async fn tlsClientUpgradeVerify(base: aio.AsyncStream, host: string, caPem: 
     return ts;
 }
 
+/// Connects to `host:port` and performs a TLS 1.2 handshake presenting a
+/// client certificate (`certPem`/`keyPem`), with no deadline. If `caPem` is
+/// non-empty, the peer certificate is also verified.
 pub async fn tlsConnectClientCert(host: string, port: int, caPem: string, certPem: string, keyPem: string): TlsStream {
     let base = await aio.asyncConnect(host, port);
     let bio: tlsmembio.TlsBio = tls12bio.newClient12BioClientCert(host, certPem, keyPem);
@@ -198,6 +283,8 @@ pub async fn tlsConnectClientCert(host: string, port: int, caPem: string, certPe
     return ts;
 }
 
+/// Accepts a TLS handshake on `base` as a server, presenting `cert`/`key` (PEM
+/// text) as the server certificate and private key.
 pub async fn tlsAccept(base: aio.AsyncStream, cert: string, key: string): TlsStream {
     let bio: tlsmembio.TlsBio = tlsmembio.newServerBioPem(cert, key);
     let ts = TlsStream(base, bio);
@@ -205,6 +292,10 @@ pub async fn tlsAccept(base: aio.AsyncStream, cert: string, key: string): TlsStr
     return ts;
 }
 
+/// Accepts a TLS handshake on `base` as a server, presenting `cert`/`key` and
+/// offering `alpn` as the server's supported ALPN protocol list (used to
+/// negotiate HTTP/2 vs HTTP/1.1). Use `selectedAlpn()` on the result to see
+/// what the client agreed to.
 pub async fn tlsAcceptAlpn(base: aio.AsyncStream, cert: string, key: string, alpn: string): TlsStream {
     let sb = tlsmembio.newServerBioPem(cert, key);
     sb.offerAlpn(alpn);

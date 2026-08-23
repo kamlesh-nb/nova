@@ -1,4 +1,21 @@
 
+//! HTTP request parsing for the web framework.
+//!
+//! This file turns raw HTTP/1.1 bytes into a `Request` struct: method, path,
+//! query parameters, headers, cookies and body, plus the helper routines used
+//! upstream by the connection reader to find message boundaries before a full
+//! `Request` can even be built (header-end detection, Content-Length and
+//! chunked-encoding parsing, dechunking). It also provides `MultiMapSource`,
+//! a `ValueSource` implementation over `application/x-www-form-urlencoded`
+//! and multipart form bodies, so form data can be bound into typed structs
+//! the same way `serde` binds JSON.
+//!
+//! Two families of routines exist side by side: string-based ones that work
+//! on an already materialised `string` (`Request.fromString`, `parseQuery`),
+//! and buffer-based ones that scan a raw pointer directly (`buf*` functions),
+//! used on the hot path so the connection reader does not have to copy the
+//! whole request into a `string` before it knows the body length.
+
 import string;
 import str;
 import list;
@@ -11,6 +28,7 @@ import web.multipart;
 import serde.source;
 
 
+/// Finds the first occurrence of byte `b` in `buf[start:end]`, or -1 if not found.
 fn idxByte(buf: long, start: int, end: int, b: int): int {
     if (start >= end) { return -1; }
     let p = sys.memchr(buf + (start as long), b, (end - start) as long);
@@ -18,6 +36,7 @@ fn idxByte(buf: long, start: int, end: int, b: int): int {
     return (p - buf) as int;
 }
 
+/// Case-insensitive ASCII string equality, used for HTTP header name matching.
 fn ciEquals(a: string, b: string): bool {
     if (a.length != b.length) { return false; }
     let i = 0;
@@ -32,14 +51,25 @@ fn ciEquals(a: string, b: string): bool {
     return true;
 }
 
+/// A parsed HTTP/1.1 request: the request line, headers, cookies and body.
 pub struct Request {
+    /// The HTTP method, for example "GET" or "POST".
     pub method: string,
+    /// The request path, with the query string removed.
     pub path: string,
+    /// Query string parameters, URL-decoded.
     pub query: Map<string, string>,
+    /// Header names as they appeared on the wire, mapped to their values. Use
+    /// `getHeader` for case-insensitive lookup.
     pub headers: Map<string, string>,
+    /// Cookies parsed out of the `Cookie` header, keyed by cookie name.
     pub cookies: Map<string, string>,
+    /// The raw request body.
     pub body: string,
 
+    /// Parses a full raw HTTP/1.1 request out of an already materialised string.
+    /// Returns `Request.empty()` if the request line or headers are malformed
+    /// (missing spaces, no CRLF terminator).
     pub fn fromString(raw: string): Request {
         let n = raw.length;
         let buf = raw as long;
@@ -110,11 +140,14 @@ pub struct Request {
         };
     }
 
+    /// Reads `len` bytes starting at `ptr` and parses them as an HTTP request.
     pub fn parse(ptr: int, len: int): Request {
         let raw = bytes.read_string(ptr, len);
         return Request.fromString(raw);
     }
 
+    /// An empty request with blank method, path and body, and empty maps.
+    /// Used as the fallback when parsing fails.
     pub fn empty(): Request {
         return Request{
             method: "",
@@ -126,6 +159,8 @@ pub struct Request {
         };
     }
 
+    /// Looks up a header by name, case-insensitively. Returns `undefined` if
+    /// the header was not present on the request.
     pub fn getHeader(self: Request, name: string): string | undefined {
         let keys = self.headers.keys();
         let keysLen = keys.size();
@@ -140,11 +175,13 @@ pub struct Request {
         return undefined;
     }
 
+    /// Looks up a cookie by name (exact match). Returns `undefined` if absent.
     pub fn getCookie(self: Request, name: string): string | undefined {
         return self.cookies.get(name);
     }
 }
 
+/// Splits a request-target into its path and its parsed query map, at the first `?`.
 fn splitPathQuery(full_path: string): (string, Map<string, string>) {
     let idx = string.indexOf(full_path, "?");
     if (idx == -1) {
@@ -156,6 +193,8 @@ fn splitPathQuery(full_path: string): (string, Map<string, string>) {
     return (path, query);
 }
 
+/// Parses an `&`-separated, `=`-joined query string into a map, URL-decoding
+/// both keys and values. A pair with no `=` yields an entry with an empty value.
 pub fn parseQuery(query_str: string): Map<string, string> {
 
     let result = Map<string, string>(4, string.hash);
@@ -169,6 +208,7 @@ pub fn parseQuery(query_str: string): Map<string, string> {
     return result;
 }
 
+/// Strips leading and trailing spaces, tabs, CR and LF from `s`.
 fn trimWhitespace(s: string): string {
     let len = s.length;
     let start = 0;
@@ -194,11 +234,15 @@ fn trimWhitespace(s: string): string {
 }
 
 
+/// Lowercases an ASCII byte; non-letters pass through unchanged.
 fn lowerByte(b: int): int {
     if (b >= 65 && b <= 90) { return b + 32; }
     return b;
 }
 
+/// Scans `buf[start:end]` for the blank-line CRLFCRLF that ends the HTTP
+/// header block, returning the index of its first byte, or -1 if not yet
+/// present (the caller should keep reading more bytes off the socket).
 pub fn bufFindHeaderEnd(buf: long, start: int, end: int): int {
     let i = start;
     while (i + 4 <= end) {
@@ -211,6 +255,8 @@ pub fn bufFindHeaderEnd(buf: long, start: int, end: int): int {
     return -1;
 }
 
+/// Case-insensitive search for `needle` in `buf[start:end]`, returning the
+/// index of the first match or -1. An empty needle matches at `start`.
 pub fn bufFindCI(buf: long, start: int, end: int, needle: string): int {
     let nlen = needle.length;
     if (nlen == 0) { return start; }
@@ -228,6 +274,8 @@ pub fn bufFindCI(buf: long, start: int, end: int, needle: string): int {
     return -1;
 }
 
+/// Reads the `Content-Length` header value out of `buf[start:hdrEnd]` and
+/// parses it as a decimal integer. Returns 0 if the header is absent.
 pub fn bufContentLength(buf: long, start: int, hdrEnd: int): int {
     let idx = bufFindCI(buf, start, hdrEnd, "content-length:");
     if (idx == -1) { return 0; }
@@ -243,10 +291,13 @@ pub fn bufContentLength(buf: long, start: int, hdrEnd: int): int {
     return n;
 }
 
+/// Reports whether the headers in `buf[start:hdrEnd]` declare chunked
+/// transfer encoding (`Transfer-Encoding: chunked`, exact spacing required).
 pub fn bufIsChunked(buf: long, start: int, hdrEnd: int): bool {
     return bufFindCI(buf, start, hdrEnd, "transfer-encoding: chunked") != -1;
 }
 
+/// Finds the next CRLF in `buf[from:len]`, returning the index of the CR, or -1.
 pub fn bufFindCRLF(buf: long, from: int, len: int): int {
     let p = from;
     while (p + 1 < len) {
@@ -256,6 +307,8 @@ pub fn bufFindCRLF(buf: long, from: int, len: int): int {
     return -1;
 }
 
+/// Parses a hexadecimal integer from `buf[from:to]`, stopping at the first
+/// non-hex-digit byte. Used to read chunk-size lines in chunked encoding.
 pub fn bufParseHex(buf: long, from: int, to: int): int {
     let v = 0;
     let p = from;
@@ -272,6 +325,9 @@ pub fn bufParseHex(buf: long, from: int, to: int): int {
     return v;
 }
 
+/// Walks a chunked-encoded body starting at `start` and returns the index
+/// just past the terminating zero-size chunk and its trailing CRLF, or -1 if
+/// the body is not yet complete in `buf[..len]` (more bytes are needed).
 pub fn bufChunkedEnd(buf: long, start: int, len: int): int {
     let p = start;
     while (p < len) {

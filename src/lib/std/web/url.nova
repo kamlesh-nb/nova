@@ -1,9 +1,22 @@
 
+//! URL percent-encoding and decoding (`application/x-www-form-urlencoded` style).
+//!
+//! This module provides `encode` and `decode` for turning raw bytes into a
+//! form safe to embed in a URL query string or a form-encoded request body,
+//! and back again. Spaces are encoded as `+` (not `%20`), matching the
+//! `application/x-www-form-urlencoded` convention used by HTML forms and
+//! query strings, rather than the stricter RFC 3986 path/component encoding.
+//! It is used by the web framework wherever query parameters or form bodies
+//! need to move between wire format and plain Nova strings.
+
 import collections.string_builder;
 import assert;
 
+/// Uppercase hex digits used when emitting `%XX` escapes.
 const HEX_CHARS = "0123456789ABCDEF";
 
+/// Reports whether byte `c` may appear unescaped: ASCII letters, digits,
+/// and the characters `-`, `_`, `.`, `~`.
 fn isUnreserved(c: int): bool {
     if (c >= 65 && c <= 90) return true;
     if (c >= 97 && c <= 122) return true;

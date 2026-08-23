@@ -1,10 +1,66 @@
+//! Base64 encoding and decoding (RFC 4648).
+//!
+//! Base64 rewrites arbitrary bytes into a 64-character text alphabet so binary
+//! data can travel through channels that only accept printable ASCII: HTTP
+//! headers, JSON string fields, data URIs, and the like. Every three input
+//! bytes (24 bits) become four output characters (4 x 6 bits), which is why
+//! Base64 inflates its input by roughly a third.
+//!
+//! This module offers the two variants that matter in practice, both driven by
+//! a single shared codec so the bit arithmetic lives in exactly one place:
+//!
+//!   1. Standard Base64 ([`encode`]), which uses `+` and `/` for the last two
+//!      symbols and pads the output to a multiple of four with `=`.
+//!   2. URL-safe Base64 ([`encodeUrl`]), which swaps `+`/`/` for `-`/`_` so the
+//!      result is safe inside URLs and filenames, and (as configured here)
+//!      omits the `=` padding.
+//!
+//! Decoding ([`decode`]) is deliberately lenient and alphabet-agnostic: it
+//! accepts BOTH alphabets in the same input, ignores `=` padding, and skips any
+//! character that is not a Base64 symbol (whitespace, newlines in wrapped
+//! MIME text, stray punctuation). That means one decoder handles standard,
+//! URL-safe, padded, and unpadded input without the caller having to declare
+//! which flavour they hold.
+//!
+//! Everything works on raw bytes via the `bytes` intrinsics (`read_byte`,
+//! `write_byte`, `alloc`), so the codec is byte-exact and makes no assumption
+//! that the input is valid UTF-8; it treats `string` purely as a byte buffer.
+//! Output lengths are computed up front and a single buffer is allocated per
+//! call, so there is no intermediate growth or reallocation. Correctness is
+//! pinned to the RFC 4648 test vectors by the `@test` functions at the foot of
+//! the file.
 
 import bytes;
 import assert;
 
+/// The standard RFC 4648 alphabet, indexed 0..63 by six-bit value.
+///
+/// Positions 62 and 63 are `+` and `/`. This is the alphabet used by
+/// [`encode`], and its `=` padding (byte value 61) is emitted separately by
+/// [`encodeWith`] rather than being part of this string.
 const STD: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// The URL- and filename-safe RFC 4648 alphabet, indexed 0..63.
+///
+/// Identical to [`STD`] except positions 62 and 63 are `-` and `_`, which are
+/// legal in URLs and file names where `+` and `/` are not. Used by
+/// [`encodeUrl`].
 const URL: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/// Encodes `input` with the supplied 64-character `alphabet`, optionally padded.
+///
+/// This is the shared engine behind both [`encode`] and [`encodeUrl`]. It walks
+/// the input three bytes at a time, packing each 24-bit group into four 6-bit
+/// indices used to look up output characters in `alphabet`. The tail handles
+/// the two partial cases: one leftover byte produces two characters, two
+/// leftover bytes produce three.
+///
+/// `pad` controls the tail only. When true, the output is rounded up to a
+/// multiple of four by appending `=` (byte value 61) so the length always
+/// carries the group count. When false, no `=` is written and `out_len` is
+/// pre-shrunk to the exact number of meaningful characters (2 for a one-byte
+/// remainder, 3 for a two-byte remainder), which is why the URL-safe path
+/// produces unpadded output. The empty input yields the empty string with no
+/// allocation.
 fn encodeWith(input: string, alphabet: string, pad: bool): string {
     let n = input.length;
     if (n == 0) { return ""; }
@@ -50,6 +106,13 @@ fn encodeWith(input: string, alphabet: string, pad: bool): string {
     return out as string;
 }
 
+/// Maps a single ASCII byte to its 0..63 Base64 value, or -1 if it is not a
+/// Base64 symbol.
+///
+/// Accepts both alphabets at once: `+` (43) and `-` (45) both decode to 62, and
+/// `/` (47) and `_` (95) both decode to 63, so the same helper serves standard
+/// and URL-safe input. Any other byte, including `=` padding, whitespace, and
+/// newlines, returns -1, which [`decodeAny`] treats as "skip this character".
 fn charVal(c: int): int {
     if (c >= 65 && c <= 90) { return c - 65; }
     if (c >= 97 && c <= 122) { return c - 97 + 26; }
@@ -59,6 +122,21 @@ fn charVal(c: int): int {
     return -1;
 }
 
+/// Decodes any mix of standard and URL-safe Base64 into the original bytes.
+///
+/// This is the workhorse behind [`decode`]. It runs in two passes. The first
+/// counts `m`, the number of genuine Base64 symbols (everything [`charVal`]
+/// accepts), so the exact output length `(m * 6) / 8` can be sized before
+/// allocating. Padding, whitespace, and stray characters are excluded from the
+/// count, which is what makes the decoder tolerant of wrapped MIME text and
+/// missing `=`.
+///
+/// The second pass streams the symbols through a bit accumulator: each symbol
+/// shifts six fresh bits into `acc`, and whenever at least eight bits have
+/// accumulated the top byte is emitted. The `o < out_len` guard drops the final
+/// leftover bits of the last group (0, 2, or 4 bits that do not form a whole
+/// byte), so trailing partial groups never over-write. An input with no valid
+/// symbols, or one so short it yields zero bytes, returns the empty string.
 fn decodeAny(input: string): string {
     let n = input.length;
 
@@ -94,18 +172,40 @@ fn decodeAny(input: string): string {
     return out as string;
 }
 
+/// Encodes `input` as standard, padded RFC 4648 Base64.
+///
+/// Uses the [`STD`] alphabet (`+`/`/`) and appends `=` padding so the output
+/// length is always a multiple of four. This is the default choice for MIME,
+/// JSON payloads, and anywhere the classic alphabet is expected. Round-trips
+/// through [`decode`].
 pub fn encode(input: string): string {
     return encodeWith(input, STD, true);
 }
 
+/// Encodes `input` as URL- and filename-safe Base64, without padding.
+///
+/// Uses the [`URL`] alphabet (`-`/`_`) and emits no `=`, so the result can be
+/// dropped straight into a URL path, query string, or file name. Decode it with
+/// [`decode`], which handles both alphabets and the absent padding.
 pub fn encodeUrl(input: string): string {
     return encodeWith(input, URL, false);
 }
 
+/// Decodes Base64 text back into the original bytes, accepting either alphabet.
+///
+/// A thin public wrapper over [`decodeAny`]. It does not need to be told whether
+/// the input is standard or URL-safe, padded or unpadded: it recognises both
+/// `+`/`/` and `-`/`_`, ignores `=` padding, and skips any non-Base64 byte such
+/// as newlines in wrapped text.
 pub fn decode(input: string): string {
     return decodeAny(input);
 }
 
+/// Pins [`encode`] to the canonical RFC 4648 section 10 test vectors.
+///
+/// Covers the empty string and the "f", "fo", "foo", "foob", "fooba", "foobar"
+/// progression, which exercises both partial-group tails (one and two leftover
+/// bytes) and the full-group path.
 @test
 fn test_rfc4648_vectors(): void {
 
@@ -118,6 +218,11 @@ fn test_rfc4648_vectors(): void {
     assert.equalStr(encode("foobar"), "Zm9vYmFy");
 }
 
+/// Checks that [`decode`] inverts [`encode`] and reads known-good input.
+///
+/// Verifies the encode-then-decode round trip on sample strings and confirms
+/// that decoding fixed vectors ("Zm9vYmFy", "Zg==") returns the original bytes,
+/// including a padded single-byte case.
 @test
 fn test_roundtrip(): void {
     assert.equalStr(decode(encode("foobar")), "foobar");
@@ -126,6 +231,12 @@ fn test_roundtrip(): void {
     assert.equalStr(decode("Zg=="), "f");
 }
 
+/// Checks the URL-safe path: [`encodeUrl`] emits no padding, and [`decode`]
+/// still reads it.
+///
+/// "fooba" is a two-byte-remainder case, so standard encoding would end in a
+/// single `=`; this asserts the unpadded "Zm9vYmE" form and that it decodes
+/// back cleanly.
 @test
 fn test_url_safe(): void {
 

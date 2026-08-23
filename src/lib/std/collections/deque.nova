@@ -1,21 +1,97 @@
+//! A double-ended queue built from two growable lists.
+//!
+//! `Deque<T>` supports pushing and popping at BOTH ends in amortised O(1)
+//! time. It is the standard "two stacks back to back" construction: one
+//! [`List`] holds the front half and another holds the back half, each used as
+//! a stack (push and pop at its tail, which is the cheap end of a [`List`]).
+//! The logical order of the deque runs from the tail of `front`, down to the
+//! head of `front`, then the head of `back`, up to the tail of `back`. In other
+//! words `front` is stored reversed so that the deque's front element sits at
+//! the cheap end of the list.
+//!
+//! Why two lists rather than one shared buffer with head/tail indices: a plain
+//! [`List`] here is a tail-only stack (push and pop at the end), so a single
+//! list cannot pop from its head cheaply. Splitting into two lists gives a cheap
+//! end to each side of the deque. The catch is that when the side you want to
+//! pop from is empty, all the elements are sitting in the OTHER list, so they
+//! have to be moved across. That move is done by [`Deque.flip`], and because
+//! each element is flipped at most once before it is popped, the cost averages
+//! out to O(1) per operation even though a single flip is O(n).
+//!
+//! The invariant that makes this work: at any time an element lives in exactly
+//! one of the two lists, never both, and `size()` is simply the sum of the two
+//! sizes. A flip empties one list into the other, so it preserves that
+//! invariant and the total element count.
+//!
+//! The deque is a `class`, so it has reference semantics: passing a `Deque`
+//! around shares the same underlying lists rather than copying them. It fits
+//! alongside the other `collections` containers ([`List`], and the map and set
+//! types) as a general-purpose ordered container for queue and stack style
+//! workloads.
 
 import list;
 
+/// A double-ended queue over elements of type `T`, backed by two [`List`]s.
+///
+/// See the file header for the storage model. Briefly: [`Deque.front`] holds
+/// the front portion in reversed order and [`Deque.back`] holds the back
+/// portion in natural order, each used as a tail-only stack. Every element is
+/// in exactly one of the two lists. Construct with [`Deque.init`] or the free
+/// helper [`newDeque`].
 pub class Deque<T> {
+    /// The front portion of the deque, stored REVERSED.
+    ///
+    /// The deque's frontmost element is the tail of this list, so pushing and
+    /// popping the front is a cheap tail operation. When this list is empty but
+    /// the deque is not, the elements are all in [`Deque.back`] and get moved
+    /// here by [`Deque.flip`] on the next front access.
     pub front: List<T>,
+    /// The back portion of the deque, stored in NATURAL order.
+    ///
+    /// The deque's backmost element is the tail of this list, so pushing and
+    /// popping the back is a cheap tail operation. When this list is empty but
+    /// the deque is not, the elements are all in [`Deque.front`] and get moved
+    /// here by [`Deque.flip`] on the next back access.
     pub back: List<T>,
 
+    /// Creates an empty deque with two fresh, empty backing lists.
     init() {
         self.front = List<T>();
         self.back = List<T>();
     }
 
+    /// Total number of elements, counting both ends.
+    ///
+    /// Because every element lives in exactly one of the two lists, this is just
+    /// the sum of their sizes and needs no separate counter.
     pub fn size(self: Deque<T>): int { return self.front.size() + self.back.size(); }
+    /// Whether the deque holds no elements at all, i.e. [`Deque.size`] is zero.
     pub fn isEmpty(self: Deque<T>): bool { return self.size() == 0; }
 
+    /// Adds `v` at the front of the deque in O(1).
+    ///
+    /// This is a plain tail push on [`Deque.front`]; no flip is ever needed to
+    /// insert, only to pop or peek from an empty side.
     pub fn pushFront(self: Deque<T>, v: T): void { self.front.push(v); }
+    /// Adds `v` at the back of the deque in O(1).
+    ///
+    /// This is a plain tail push on [`Deque.back`]; see [`Deque.pushFront`].
     pub fn pushBack(self: Deque<T>, v: T): void { self.back.push(v); }
 
+    /// Moves every element of `src` into `dst`, reversing their order.
+    ///
+    /// This is the rebalancing step that lets both ends stay cheap. It repeatedly
+    /// pops the tail of `src` and pushes it onto the tail of `dst`, which reverses
+    /// the sequence: exactly what is needed to turn one side's storage order into
+    /// the other's. It is called only when the side being read is empty, so a
+    /// flip touches each element at most once between insertion and removal,
+    /// which is what keeps the pop and peek operations amortised O(1) despite a
+    /// single flip being O(n).
+    ///
+    /// The `v ?? src.get(0)` guards an unwrap that has already been proven safe:
+    /// the surrounding `if (v != undefined)` establishes that `v` is present, so
+    /// the `?? src.get(0)` fallback is never actually taken and exists only to
+    /// satisfy the optional-to-`T` conversion for [`List.push`].
     fn flip(self: Deque<T>, src: List<T>, dst: List<T>): void {
         while (src.size() > 0) {
             let v = src.pop();
@@ -23,6 +99,12 @@ pub class Deque<T> {
         }
     }
 
+    /// Removes and returns the frontmost element, or `undefined` if empty.
+    ///
+    /// If [`Deque.front`] has run empty, the elements are all in [`Deque.back`],
+    /// so it flips them across first (see [`Deque.flip`]) and then pops. When the
+    /// whole deque is empty both lists are empty, the flip does nothing, and the
+    /// final `pop` returns `undefined`.
     pub fn popFront(self: Deque<T>): T | undefined {
         if (self.front.size() == 0) {
             self.flip(self.back, self.front);
@@ -30,6 +112,10 @@ pub class Deque<T> {
         return self.front.pop();
     }
 
+    /// Removes and returns the backmost element, or `undefined` if empty.
+    ///
+    /// The mirror of [`Deque.popFront`]: it flips [`Deque.front`] into
+    /// [`Deque.back`] when the back has run empty, then pops the back.
     pub fn popBack(self: Deque<T>): T | undefined {
         if (self.back.size() == 0) {
             self.flip(self.front, self.back);
@@ -37,15 +123,29 @@ pub class Deque<T> {
         return self.back.pop();
     }
 
+    /// Returns the frontmost element without removing it, or `undefined` if empty.
+    ///
+    /// Like [`Deque.popFront`] it may trigger a flip to bring the front element
+    /// into [`Deque.front`], but it reads with [`List.last`] instead of popping,
+    /// so the element stays in place. Note that the flip is not free: a peek on an
+    /// empty front side still moves the whole back list across.
     pub fn peekFront(self: Deque<T>): T | undefined {
         if (self.front.size() == 0) { self.flip(self.back, self.front); }
         return self.front.last();
     }
 
+    /// Returns the backmost element without removing it, or `undefined` if empty.
+    ///
+    /// The mirror of [`Deque.peekFront`]: it may flip [`Deque.front`] into
+    /// [`Deque.back`] and then reads the tail without removing it.
     pub fn peekBack(self: Deque<T>): T | undefined {
         if (self.back.size() == 0) { self.flip(self.front, self.back); }
         return self.back.last();
     }
 }
 
+/// Constructs an empty [`Deque`] of element type `T`.
+///
+/// A convenience wrapper over [`Deque.init`] for call sites that prefer a free
+/// function to a constructor call.
 pub fn newDeque<T>(): Deque<T> { return Deque<T>(); }

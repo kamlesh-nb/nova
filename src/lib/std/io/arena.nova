@@ -1,6 +1,25 @@
+//! A bump-allocated memory arena for short-lived, high-churn allocations.
+//!
+//! `Arena` hands out `long` addresses from growable raw blocks (allocated via
+//! `bytes.alloc`) using a simple bump pointer: each `alloc` call rounds the
+//! request up to an 8-byte boundary and advances an offset within the current
+//! block, adding a new (doubled) block when the current one runs out. There is
+//! no per-allocation free: the whole arena is reclaimed at once with `reset`
+//! (which keeps the first block for reuse) or `delete`/`destroy` (which frees
+//! everything). This makes it useful where request-scoped or batch-scoped
+//! allocations would otherwise create heavy ARC retain/release traffic, for
+//! example parsing or building many small, short-lived objects that all die
+//! together at the end of a request.
+
 import bytes;
 import list;
 
+/// A bump allocator over growable raw blocks, reclaimed all at once rather
+/// than allocation by allocation.
+///
+/// Addresses returned by `alloc` are only valid until the next `reset` or
+/// `delete`: the arena does not track individual allocations, so nothing
+/// frees them independently.
 pub class Arena {
     blocks: list.List<long>,
     sizes: list.List<int>,
@@ -9,6 +28,8 @@ pub class Arena {
     total: int,
     freed: bool,
 
+    /// Creates an arena whose first block has capacity `cap` bytes.
+    /// A non-positive `cap` falls back to a default of 4096 bytes.
     init(cap: int) {
         let c = if (cap <= 0) 4096 else cap;
         self.blocks = list.List<long>();
@@ -21,6 +42,7 @@ pub class Arena {
         self.freed = false;
     }
 
+    // Appends a new block sized to at least double the previous one (or `need`, whichever is larger), and makes it current.
     fn addBlock(self: Arena, need: int): void {
         let last = self.sizes.at(self.sizes.size() - 1);
         let grown = last * 2;
@@ -31,6 +53,11 @@ pub class Arena {
         self.used = 0;
     }
 
+    /// Bump-allocates `n` bytes and returns the address of the first byte.
+    /// The size is rounded up to an 8-byte alignment boundary. If the current
+    /// block cannot fit the request, a new block is added first (see
+    /// `addBlock`), so the returned address may land in a different
+    /// underlying block than the previous call.
     pub fn alloc(self: Arena, n: int): long {
         let aligned = (n + 7) / 8 * 8;
         let cap = self.sizes.at(self.cur);
@@ -44,6 +71,12 @@ pub class Arena {
         return addr;
     }
 
+    /// Reclaims all allocations at once, invalidating every address returned
+    /// by `alloc` so far.
+    ///
+    /// Frees every block beyond the first and keeps the first block around
+    /// (with its usage counter zeroed) for reuse, so a `reset` arena does not
+    /// need to reallocate its initial block on the next `alloc`.
     pub fn reset(self: Arena): void {
         while (self.blocks.size() > 1) {
             bytes.free(self.blocks.at(self.blocks.size() - 1));
@@ -55,10 +88,15 @@ pub class Arena {
         self.total = 0;
     }
 
+    /// Total number of bytes handed out by `alloc` so far (aligned sizes,
+    /// summed across all blocks), reset to zero by `reset`.
     pub fn allocated(self: Arena): int { return self.total; }
 
+    /// Number of underlying raw blocks currently held by the arena.
     pub fn blockCount(self: Arena): int { return self.blocks.size(); }
 
+    /// Frees every underlying block and marks the arena as freed.
+    /// Safe to call more than once: subsequent calls are a no-op.
     pub fn delete(self: Arena): void {
         if (self.freed) { return; }
         self.freed = true;
@@ -69,7 +107,9 @@ pub class Arena {
         }
     }
 
+    /// Alias for `delete`, provided for callers that use a destroy-style name.
     pub fn destroy(self: Arena): void { self.delete(); }
 
+    /// Number of bytes still free in the current (most recently added) block.
     pub fn remaining(self: Arena): int { return self.sizes.at(self.cur) - self.used; }
 }

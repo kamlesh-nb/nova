@@ -1,3 +1,22 @@
+//! Memory-BIO driven TLS 1.3 state machines for `ClientBio` and `ServerBio`.
+//!
+//! A `MemBuf` is a pair of growable byte queues (`feed`/`nextRecord` on the
+//! input side, `appendOut`/`pull` on the output side) that stand in for the
+//! usual socket-backed BIO in OpenSSL-style TLS stacks: nothing in this file
+//! performs I/O. The caller owns the transport, feeds received bytes in with
+//! `feed`, calls `step` to advance the handshake, and pulls bytes to send out
+//! with `pull`. This keeps the TLS 1.3 protocol logic (`crypto.tls.13.*`)
+//! completely decoupled from sockets, so the same state machine drives a real
+//! reactor connection, a test harness, or any other transport.
+//!
+//! `ClientBio` and `ServerBio` both implement the `TlsBio` trait and wrap a
+//! `tlsClient.TlsClient` / `tlsServer.TlsServer` handshake engine around a
+//! `MemBuf`, adding session resumption (PSK tickets via `TicketCache`),
+//! 0-RTT early data, key updates, and application data framing. The file also
+//! carries small PEM/DER helpers (`pemBody`, `ecKeyScalar`) used to load
+//! certificates and EC private keys when constructing a `ServerBio` from PEM
+//! text rather than raw DER.
+
 import bytes;
 import crypto.tls.13.tlsClient;
 import crypto.tls.13.tlsServer;
@@ -10,19 +29,36 @@ import crypto.base64;
 import crypto.tls.truststore;
 import list;
 
+// Pointer arithmetic helper: offsets `b` by `off` bytes via a `long` cast so the address is not truncated.
 fn at(b: ptr, off: int): ptr { return (b as long + off) as ptr; }
 
+// Fills `buf` with `n` cryptographically random bytes, used for nonces, random fields, and ephemeral key material.
 fn fillRandom(buf: ptr, n: int): void {
     let s = random.randomBytes(n);
     let i = 0;
     while (i < n) { bytes.write_byte(buf, i, s[i] & 0xff); i = i + 1; }
 }
 
+/// A pair of growable byte queues that stand in for a socket in a TLS memory-BIO.
+///
+/// The input side (`ibuf`/`ilo`/`ihi`) is a byte queue fed by `feed` and drained
+/// record-by-record by `nextRecord`; the output side (`obuf`/`olen`) accumulates
+/// bytes written by `appendOut`/`appendRecord` and is drained by `pull`. Both
+/// sides grow (doubling capacity) as needed and are never shrunk until `freeBuffers`.
 pub struct MemBuf {
+    /// Input queue backing buffer.
+    /// Input queue capacity in bytes.
+    /// Read cursor into `ibuf` (bytes before this offset are already consumed).
+    /// Write cursor into `ibuf` (end of buffered, unconsumed input).
     pub ibuf: ptr, pub icap: int, pub ilo: int, pub ihi: int,
+    /// Output queue backing buffer.
+    /// Output queue capacity in bytes.
+    /// Number of valid bytes currently queued in `obuf`.
     pub obuf: ptr, pub ocap: int, pub olen: int,
+    /// Set once the peer has signalled (or is treated as having signalled) a closed connection.
     pub closed: bool,
 
+    /// Appends `n` bytes of raw input to the input queue, compacting and growing `ibuf` as needed.
     pub fn feed(self: MemBuf, data: ptr, n: int): void {
         if (self.ilo > 0) {
             let m = self.ihi - self.ilo;
@@ -46,6 +82,8 @@ pub struct MemBuf {
         self.ihi = self.ihi + n;
     }
 
+    /// Pops one complete TLS record from the input queue into `out` and returns its total length
+    /// (5-byte header plus body), or 0 if a full record is not yet buffered.
     pub fn nextRecord(self: MemBuf, out: ptr): int {
         if (self.ihi - self.ilo < 5) { return 0; }
         let len = (bytes.read_byte(self.ibuf, self.ilo + 3) << 8) | bytes.read_byte(self.ibuf, self.ilo + 4);
@@ -56,6 +94,7 @@ pub struct MemBuf {
         return 5 + len;
     }
 
+    /// Appends `n` raw bytes to the output queue, growing `obuf` as needed.
     pub fn appendOut(self: MemBuf, src: ptr, n: int): void {
         if (self.olen + n > self.ocap) {
             let ncap = self.ocap * 2;
@@ -72,6 +111,7 @@ pub struct MemBuf {
         self.olen = self.olen + n;
     }
 
+    /// Wraps `body` in a TLS record header (content type `ctype`, version `vMaj.vMin`) and queues it for output.
     pub fn appendRecord(self: MemBuf, ctype: int, vMaj: int, vMin: int, body: ptr, bodyLen: int): void {
         let rec = bytes.alloc(bodyLen + 5);
         bytes.write_byte(rec, 0, ctype);
@@ -85,6 +125,7 @@ pub struct MemBuf {
         bytes.free(rec);
     }
 
+    /// Copies up to `max` queued output bytes into `buf`, shifts the remainder down, and returns the count copied.
     pub fn pull(self: MemBuf, buf: ptr, max: int): int {
         let take = self.olen;
         if (take > max) { take = max; }
@@ -97,38 +138,71 @@ pub struct MemBuf {
         return take;
     }
 
+    /// Frees the `ibuf` and `obuf` heap allocations. Must be called once the `MemBuf` is no longer needed.
     pub fn freeBuffers(self: MemBuf): void {
         bytes.free(self.ibuf);
         bytes.free(self.obuf);
     }
 }
 
+/// Creates an empty `MemBuf` with 4096-byte input and output queues.
 pub fn newMemBuf(): MemBuf {
     return MemBuf { ibuf: bytes.alloc(4096), icap: 4096, ilo: 0, ihi: 0,
                     obuf: bytes.alloc(4096), ocap: 4096, olen: 0, closed: false };
 }
 
+/// Common transport-agnostic surface shared by `ClientBio` and `ServerBio`.
+///
+/// A caller drives a TLS connection purely through this trait: push received
+/// wire bytes with `feed`, advance the handshake with `step`, exchange
+/// application data with `writeApp`/`readApp`, and drain bytes to send with
+/// `pull`. Nothing in the trait touches a socket.
 pub trait TlsBio {
+    /// Queues raw bytes received from the peer for processing by `step`/`readApp`.
     fn feed(self, data: ptr, n: int): void;
+    /// Marks the connection as closed, so a subsequent `readApp` with no data returns an error rather than 0.
     fn markClosed(self): void;
+    /// Number of bytes currently queued and ready to be sent to the peer.
     fn pendingOut(self): int;
+    /// Drains up to `max` pending output bytes into `buf`.
     fn pull(self, buf: ptr, max: int): int;
+    /// Advances the handshake state machine as far as buffered input allows.
+    /// Returns 0 when the handshake completes, 1 when more input is needed, or -1 on protocol failure.
     fn step(self): int;
+    /// Encrypts and queues `n` bytes of application data for output. Returns the number of bytes accepted.
     fn writeApp(self, data: ptr, n: int): int;
+    /// Decrypts and copies up to `max` bytes of application data into `buf`.
+    /// Returns the byte count, 0 if none is available yet, or -1 on close/alert.
     fn readApp(self, buf: ptr, max: int): int;
+    /// Releases all resources owned by the BIO (buffers, handshake state).
     fn closeBio(self): void;
+    /// Returns the ALPN protocol negotiated during the handshake, or an empty string if none was.
     fn selectedAlpn(self): string;
 }
 
 
+/// Client-side TLS 1.3 connection driven over a `MemBuf`, implementing `TlsBio`.
+///
+/// Constructed via `newClientBio` (fresh handshake) or `newClientBioResume`
+/// (PSK/ticket resumption, optionally with 0-RTT early data). `step` runs the
+/// ClientHello / HelloRetryRequest / ServerHello / Finished exchange; once
+/// `step` returns 0 the connection is ready for `writeApp`/`readApp`.
 pub struct ClientBio impl TlsBio {
+    /// Underlying record queue.
     pub buf: MemBuf,
+    /// TLS 1.3 client handshake and record-protection engine.
     pub cl: tlsClient.TlsClient,
+    /// Handshake state: 1 = awaiting ServerHello, 2 = processing the server flight, 3 = established, negative = failed.
     pub state: int,
+    /// Scratch buffer used to hold one decoded record, and its capacity.
     pub scratch: ptr, pub scap: int,
+    /// Scratch buffer used to hold one decrypted plaintext record.
     pub plain: ptr,
+    /// Whether server certificate verification is enforced (see `newClientBioVerify`), the SNI/expected hostname, and the trust store used for verification.
     pub verify: bool, pub host: string, pub store: truststore.TrustStore,
+    /// Client random, session id, and ephemeral key-share material (X25519, P-256, P-384) generated for the handshake, plus the offered ALPN protocol.
     pub rnd: ptr, pub sid: ptr, pub ephPub: ptr, pub ephPubP: ptr, pub ephPubP384: ptr, pub alpn: string,
+    /// Set once a HelloRetryRequest has been processed, to reject a second one.
     pub hrrDone: bool,
 
     pub fn feed(self: ClientBio, data: ptr, n: int): void { self.buf.feed(data, n); }
@@ -136,6 +210,10 @@ pub struct ClientBio impl TlsBio {
     pub fn pendingOut(self: ClientBio): int { return self.buf.olen; }
     pub fn pull(self: ClientBio, buf: ptr, max: int): int { return self.buf.pull(buf, max); }
 
+    /// Drives the client handshake forward using whatever records are buffered in `self.buf`.
+    /// Handles HelloRetryRequest by re-sending a second ClientHello, verifies the server
+    /// certificate when `verify` is set, and sends the client Finished flight once done.
+    /// Returns 0 on completion, 1 if more input is needed, or -1 on a protocol failure (and sets `state` negative).
     pub fn step(self: ClientBio): int {
         if (self.state == 3) { return 0; }
         if (self.state < 0) { return 0 - 1; }
@@ -209,15 +287,21 @@ pub struct ClientBio impl TlsBio {
         return 1;
     }
 
+    /// Sets a client certificate and private key to present if the server requests client authentication.
     pub fn configureClientCert(self: ClientBio, certDer: ptr, certLen: int, key: ptr): void {
         self.cl.setClientCert(certDer, certLen, key);
     }
 
+    /// Pointer to the raw OCSP staple presented by the server, if any.
     pub fn stapledOcspPtr(self: ClientBio): ptr { return self.cl.ocspStaplePtr(); }
+    /// Size in bytes of the stapled OCSP response.
     pub fn stapledOcspSize(self: ClientBio): int { return self.cl.ocspStapleSize(); }
+    /// Pointer to the peer's raw DER certificate list as received in the handshake.
     pub fn peerCertListPtr(self: ClientBio): ptr { return self.cl.certListPtr(); }
+    /// Size in bytes of the peer's certificate list.
     pub fn peerCertListSize(self: ClientBio): int { return self.cl.certListSize(); }
 
+    /// Encrypts `n` bytes of application data, chunking to the negotiated record size limit, and queues it for output.
     pub fn writeApp(self: ClientBio, data: ptr, n: int): int {
         let cap = self.cl.sendLimit - 1;
         let off = 0;
@@ -233,6 +317,9 @@ pub struct ClientBio impl TlsBio {
         return n;
     }
 
+    /// Decrypts buffered records into `buf`, transparently handling post-handshake key updates
+    /// (0x18) and new session tickets (0x04). Returns the decrypted byte count, 0 if none is
+    /// available yet, or -1 once a close_notify alert or a closed connection is seen.
     pub fn readApp(self: ClientBio, buf: ptr, max: int): int {
         while (true) {
             let m = self.buf.nextRecord(self.scratch);
@@ -277,6 +364,7 @@ pub struct ClientBio impl TlsBio {
         return 0;
     }
 
+    /// Queues an encrypted close_notify alert for output, once the handshake has completed.
     pub fn closeNotify(self: ClientBio): void {
         if (self.state == 3) {
             let out = bytes.alloc(64);
@@ -287,18 +375,29 @@ pub struct ClientBio impl TlsBio {
     }
 
     pub fn selectedAlpn(self: ClientBio): string { return self.cl.selectedAlpn(); }
+    /// Negotiated cipher suite family (e.g. AES-GCM vs ChaCha20), as encoded by `tlsClient`.
     pub fn negotiatedKind(self: ClientBio): int { return self.cl.kind; }
+    /// Negotiated cipher suite identifier.
     pub fn negotiatedSuite(self: ClientBio): int { return self.cl.suite; }
 
+    /// Whether the server issued a session ticket usable for a future resumed connection.
     pub fn hasTicket(self: ClientBio): bool { return self.cl.hasTicket(); }
+    /// Pointer to the raw session ticket bytes to persist for resumption.
     pub fn ticketPtr(self: ClientBio): ptr { return self.cl.ticketPtr(); }
+    /// Size in bytes of the session ticket.
     pub fn ticketSize(self: ClientBio): int { return self.cl.ticketSize(); }
+    /// Pointer to the derived resumption PSK associated with the ticket.
     pub fn ticketPskPtr(self: ClientBio): ptr { return self.cl.ticketPskPtr(); }
+    /// Server-advertised ticket age, to pass back into `newClientBioResume` on the next connection.
     pub fn ticketAge(self: ClientBio): long { return self.cl.ticketAge(); }
+    /// Hash algorithm the ticket's PSK binder was computed with.
     pub fn ticketHashKind(self: ClientBio): int { return self.cl.ticketHashKind(); }
+    /// Whether the server accepted the offered PSK (i.e. this connection is a resumption).
     pub fn resumed(self: ClientBio): bool { return self.cl.pskWasAccepted(); }
+    /// Whether 0-RTT early data sent with the ClientHello was accepted by the server.
     pub fn earlyAccepted(self: ClientBio): bool { return self.cl.earlyWasAccepted(); }
 
+    /// Queues a KeyUpdate message, rotating the client's write key. `request` set to 1 also asks the peer to update its own key.
     pub fn requestKeyUpdate(self: ClientBio, request: int): void {
         if (self.state == 3) {
             let ku = bytes.alloc(64);
@@ -309,6 +408,7 @@ pub struct ClientBio impl TlsBio {
         }
     }
 
+    /// Frees the `MemBuf` and all scratch/key-material allocations owned by this client connection.
     pub fn closeBio(self: ClientBio): void {
         self.buf.freeBuffers();
         bytes.free(self.scratch);
@@ -321,14 +421,19 @@ pub struct ClientBio impl TlsBio {
     }
 }
 
+/// Starts a fresh (non-resumed) TLS 1.3 client handshake for `host`, with no ALPN offered and no certificate verification.
 pub fn newClientBio(host: string): ClientBio {
     return newClientBioAlpn(host, "");
 }
 
+/// Like `newClientBio`, offering `alpn` as the single ALPN protocol.
 pub fn newClientBioAlpn(host: string, alpn: string): ClientBio {
     return newClientBioGroups(host, alpn, 3);
 }
 
+/// Like `newClientBioAlpn`, restricting the offered key-share groups via `groupMask`
+/// (bit 1 = X25519, bit 2 = P-256, bit 4 = P-384). Generates fresh ephemeral keys,
+/// builds and queues the initial ClientHello plus a compatibility ChangeCipherSpec.
 pub fn newClientBioGroups(host: string, alpn: string, groupMask: int): ClientBio {
     let priv = bytes.alloc(32); fillRandom(priv, 32);
     let base = bytes.alloc(32); bytes.write_byte(base, 0, 9);
@@ -357,6 +462,8 @@ pub fn newClientBioGroups(host: string, alpn: string, groupMask: int): ClientBio
                        rnd: rnd, sid: sid, ephPub: ephPub, ephPubP: ephPubP, ephPubP384: ephPubP384, alpn: alpn, hrrDone: false };
 }
 
+/// Starts a resumed TLS 1.3 client handshake using a previously-issued PSK/ticket
+/// (see `ticketPtr`/`ticketPskPtr`/`ticketAge` on a prior `ClientBio`), with no early data sent.
 pub fn newClientBioResume(host: string, alpn: string, psk: ptr, pskLen: int, kind: int,
                           ticket: ptr, ticketLen: int, ageAdd: long): ClientBio {
     let empty = bytes.alloc(1);
@@ -365,11 +472,16 @@ pub fn newClientBioResume(host: string, alpn: string, psk: ptr, pskLen: int, kin
     return b;
 }
 
+/// Like `newClientBioResume`, additionally sending `earlyData` as 0-RTT application data
+/// with the ClientHello. Whether it was accepted is reported later via `earlyAccepted`.
 pub fn newClientBioResumeEarly(host: string, alpn: string, psk: ptr, pskLen: int, kind: int,
                                ticket: ptr, ticketLen: int, ageAdd: long, earlyData: ptr, earlyLen: int): ClientBio {
     return newClientBioResumeEx(host, alpn, psk, pskLen, kind, ticket, ticketLen, ageAdd, earlyData, earlyLen);
 }
 
+/// Shared implementation behind `newClientBioResume`/`newClientBioResumeEarly`: builds a
+/// PSK-binding ClientHello (with an optional 0-RTT early-data extension and encrypted payload)
+/// and queues it along with the compatibility ChangeCipherSpec.
 pub fn newClientBioResumeEx(host: string, alpn: string, psk: ptr, pskLen: int, kind: int,
                             ticket: ptr, ticketLen: int, ageAdd: long, earlyData: ptr, earlyLen: int): ClientBio {
     let priv = bytes.alloc(32); fillRandom(priv, 32);
@@ -409,6 +521,7 @@ pub fn newClientBioResumeEx(host: string, alpn: string, psk: ptr, pskLen: int, k
                        rnd: rnd, sid: sid, ephPub: ephPub, ephPubP: ephPubP, ephPubP384: ephPubP384, alpn: alpn, hrrDone: false };
 }
 
+/// Like `newClientBio`, but enables server certificate verification against `store` for `host`.
 pub fn newClientBioVerify(host: string, store: truststore.TrustStore): ClientBio {
     let b = newClientBio(host);
     b.verify = true;
@@ -417,12 +530,16 @@ pub fn newClientBioVerify(host: string, store: truststore.TrustStore): ClientBio
 }
 
 
-pub struct TicketCache { pub store: ptr }
+/// Single-entry server-side session ticket store: holds at most one issued ticket id and its PSK.
+pub struct TicketCache { /// Fixed-size backing buffer holding the cached ticket id, length, PSK and kind flags.
+    pub store: ptr }
+/// Allocates an empty `TicketCache` with no ticket cached yet.
 pub fn newTicketCache(): TicketCache {
     let s = bytes.alloc(1088);
     bytes.write_byte(s, 0, 0);
     return TicketCache { store: s };
 }
+// Records a newly-issued ticket id and its resumption PSK, overwriting any previous entry (single-slot cache).
 fn cachePut(c: TicketCache, id: ptr, idLen: int, psk: ptr, pskLen: int, kind: int): void {
     let s = c.store;
     bytes.write_byte(s, 0, 1);
@@ -433,6 +550,7 @@ fn cachePut(c: TicketCache, id: ptr, idLen: int, psk: ptr, pskLen: int, kind: in
     i = 0;
     while (i < pskLen) { bytes.write_byte(s, 1032 + i, bytes.read_byte(psk, i)); i = i + 1; }
 }
+// Checks whether the cache holds a valid entry whose ticket id matches `id`.
 fn cacheEq(c: TicketCache, id: ptr, idLen: int): bool {
     let s = c.store;
     if (bytes.read_byte(s, 0) != 1) { return false; }
@@ -446,37 +564,70 @@ fn cachePskLen(c: TicketCache): int { return bytes.read_byte(c.store, 3); }
 fn cacheKind(c: TicketCache): int { return bytes.read_byte(c.store, 4); }
 fn cachePskPtr(c: TicketCache): ptr { return (c.store as long + 1032) as ptr; }
 
+/// Server-side TLS 1.3 connection driven over a `MemBuf`, implementing `TlsBio`.
+///
+/// Constructed via `newServerBio` (raw DER cert/key) or `newServerBioPem` (PEM text).
+/// `step` processes the client's ClientHello (including optional early data and PSK
+/// resumption via `cache`), sends the ServerHello/certificate/Finished flight, and
+/// processes the client's Finished plus a NewSessionTicket for future resumption.
 pub struct ServerBio impl TlsBio {
+    /// Underlying record queue.
     pub buf: MemBuf,
+    /// TLS 1.3 server handshake and record-protection engine.
     pub srv: tlsServer.TlsServer,
+    /// Server random, generated fresh for this connection.
     pub sr: ptr,
+    /// Handshake state: 0 = awaiting ClientHello, 1 = awaiting client Finished (and possibly early data), 2 = established, negative = failed.
     pub state: int,
+    /// Scratch buffer used to hold one decoded record, and its capacity.
     pub scratch: ptr, pub scap: int,
+    /// Scratch buffer used to hold one decrypted plaintext record.
     pub plain: ptr,
+    /// Certificate DER and private key buffers, and whether this `ServerBio` owns (and must free) them.
     pub certOwned: ptr, pub keyOwned: ptr, pub owns: bool,
+    /// Session ticket cache consulted for PSK resumption; see `useTicketCache`.
     pub cache: TicketCache,
+    /// Whether 0-RTT early data is accepted; see `acceptEarlyData`.
     pub allowEarly: bool,
+    /// Buffer accumulating decrypted 0-RTT early application data, its length so far, how much of it `readApp` has consumed, and whether EndOfEarlyData has been seen.
     pub earlyData: ptr, pub earlyDataLen: int, pub earlyRead: int, pub earlyDone: bool,
 
     pub fn feed(self: ServerBio, data: ptr, n: int): void { self.buf.feed(data, n); }
     pub fn markClosed(self: ServerBio): void { self.buf.closed = true; }
+    /// Sets the list of ALPN protocols the server is willing to negotiate.
     pub fn offerAlpn(self: ServerBio, alpn: string): void { self.srv.alpnOffer = alpn; }
     pub fn selectedAlpn(self: ServerBio): string { return self.srv.alpnSel; }
+    /// Enables or disables requesting a client certificate during the handshake.
     pub fn requestClientCert(self: ServerBio, on: bool): void { self.srv.setRequestClientCert(on); }
+    /// Restricts the server to offering only the given cipher suite.
     pub fn restrictSuite(self: ServerBio, suite: int): void { self.srv.setRestrictSuite(suite); }
+    /// Negotiated cipher suite family, as encoded by `tlsServer`.
     pub fn negotiatedKind(self: ServerBio): int { return self.srv.kind; }
+    /// Negotiated cipher suite identifier.
     pub fn negotiatedSuite(self: ServerBio): int { return self.srv.suite; }
+    /// Sets the OCSP response to staple into the server's Certificate message.
     pub fn setStapledOcsp(self: ServerBio, der: ptr, len: int): void { self.srv.setStapleOcsp(der, len); }
+    /// Whether client certificate authentication succeeded (when requested).
     pub fn clientAuthOk(self: ServerBio): bool { return self.srv.clientAuthOk(); }
+    /// Whether the client presented a certificate at all.
     pub fn clientPresentedCert(self: ServerBio): bool { return self.srv.clientPresentedCert(); }
+    /// Sets the maximum plaintext record size the server is willing to receive.
     pub fn setRecordSizeLimit(self: ServerBio, limit: int): void { self.srv.recvLimit = limit; }
+    /// Installs the `TicketCache` this connection consults for PSK resumption and populates on completion.
     pub fn useTicketCache(self: ServerBio, c: TicketCache): void { self.cache = c; }
+    /// Enables or disables accepting 0-RTT early data offered by a resuming client.
     pub fn acceptEarlyData(self: ServerBio, on: bool): void { self.allowEarly = on; }
+    /// Whether this connection resumed from a PSK/ticket rather than a full handshake.
     pub fn resumed(self: ServerBio): bool { return self.srv.pskAccepted; }
+    /// Whether 0-RTT early data offered by the client was accepted.
     pub fn earlyAccepted(self: ServerBio): bool { return self.srv.earlyAccepted; }
     pub fn pendingOut(self: ServerBio): int { return self.buf.olen; }
     pub fn pull(self: ServerBio, buf: ptr, max: int): int { return self.buf.pull(buf, max); }
 
+    /// Drives the server handshake forward using whatever records are buffered in `self.buf`.
+    /// Validates any offered PSK against `cache`, sends the ServerHello/certificate/Finished
+    /// flight, processes early data and the client's Finished, and issues a fresh NewSessionTicket.
+    /// Returns 0 on completion, 1 while more input is expected, or -1 on a protocol failure.
     pub fn step(self: ServerBio): int {
         if (self.state == 2) { return 0; }
         if (self.state < 0) { return 0 - 1; }
@@ -551,6 +702,7 @@ pub struct ServerBio impl TlsBio {
         return 1;
     }
 
+    /// Encrypts `n` bytes of application data, chunking to the negotiated record size limit, and queues it for output.
     pub fn writeApp(self: ServerBio, data: ptr, n: int): int {
         let cap = self.srv.sendLimit - 1;
         let off = 0;
@@ -566,6 +718,9 @@ pub struct ServerBio impl TlsBio {
         return n;
     }
 
+    /// Returns any buffered 0-RTT early data first, then decrypts application records into `buf`.
+    /// Returns the byte count, 0 if none is available yet, or -1 once a close_notify alert or a
+    /// closed connection is seen.
     pub fn readApp(self: ServerBio, buf: ptr, max: int): int {
         if (self.earlyRead < self.earlyDataLen) {
             let take = self.earlyDataLen - self.earlyRead;
@@ -596,6 +751,7 @@ pub struct ServerBio impl TlsBio {
         return 0;
     }
 
+    /// Frees the `MemBuf`, scratch buffers, and the certificate/key buffers if this `ServerBio` owns them.
     pub fn closeBio(self: ServerBio): void {
         self.buf.freeBuffers();
         bytes.free(self.sr);
@@ -605,6 +761,8 @@ pub struct ServerBio impl TlsBio {
     }
 }
 
+/// Creates a `ServerBio` from a raw DER certificate and matching private key, ready to receive a ClientHello.
+/// The caller retains ownership of `certDer`/`signKey`; they are not freed by `closeBio`.
 pub fn newServerBio(certDer: ptr, certLen: int, signKey: ptr): ServerBio {
     let ephPriv = bytes.alloc(32); fillRandom(ephPriv, 32);
     let ephPrivP = bytes.alloc(32); fillRandom(ephPrivP, 32);
@@ -616,8 +774,10 @@ pub fn newServerBio(certDer: ptr, certLen: int, signKey: ptr): ServerBio {
 }
 
 
+// One decoded DER tag-length-value: `tag` byte, `start`/`len` of the value, and `next` offset following it.
 struct MbTlv { pub tag: int, pub start: int, pub len: int, pub next: int }
 
+// Decodes one DER TLV at `pos`, supporting both short-form and multi-byte long-form lengths.
 fn readTlv(buf: ptr, pos: int): MbTlv {
     let tag = bytes.read_byte(buf, pos);
     let p = pos + 1;
@@ -634,6 +794,7 @@ fn readTlv(buf: ptr, pos: int): MbTlv {
 }
 
 
+// Naive substring search for `needle` in `hay` starting at `from`; returns -1 if not found.
 fn indexOf(hay: string, needle: string, from: int): int {
     let n = hay.length; let m = needle.length;
     let i = from;
@@ -646,6 +807,8 @@ fn indexOf(hay: string, needle: string, from: int): int {
     return 0 - 1;
 }
 
+/// Extracts and base64-decodes the body of a PEM block delimited by `begin`/`end` markers, stripping whitespace.
+/// Returns an empty string if the markers are not found in `pem`.
 pub fn pemBody(pem: string, begin: string, end: string): string {
     let bs = indexOf(pem, begin, 0);
     if (bs < 0) { return ""; }
@@ -669,6 +832,8 @@ pub fn pemBody(pem: string, begin: string, end: string): string {
     return der;
 }
 
+// Copies a DER INTEGER's value into a fixed 32-byte big-endian buffer, left-padding with zeros
+// or dropping a leading sign/padding byte so the result is always exactly 32 bytes.
 fn copyScalar32(derp: ptr, start: int, len: int): ptr {
     let out = bytes.alloc(32);
     let i = 0;
@@ -681,6 +846,9 @@ fn copyScalar32(derp: ptr, start: int, len: int): ptr {
     return out;
 }
 
+/// Parses a PEM-encoded EC private key (either SEC1 "EC PRIVATE KEY" or PKCS#8 "PRIVATE KEY" format)
+/// and returns its 32-byte scalar value, decoding just enough DER structure to reach it.
+/// Returns 32 zero bytes if neither PEM form is present.
 pub fn ecKeyScalar(keyPem: string): ptr {
     let der = pemBody(keyPem, "-----BEGIN EC PRIVATE KEY-----", "-----END EC PRIVATE KEY-----");
     let pkcs8 = false;
@@ -701,6 +869,8 @@ pub fn ecKeyScalar(keyPem: string): ptr {
     return copyScalar32(dp, priv.start, priv.len);
 }
 
+/// Creates a `ServerBio` from PEM-encoded certificate and EC private key text, decoding both to DER
+/// first. Unlike `newServerBio`, the resulting cert/key buffers are owned and freed by `closeBio`.
 pub fn newServerBioPem(certPem: string, keyPem: string): ServerBio {
     let certDer = pemBody(certPem, "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----");
     let certLen = certDer.length;

@@ -1,16 +1,36 @@
+//! Generic memory-operation witnesses for a type parameter `T`.
+//!
+//! This module is the seam that generic, layout-aware containers (raw buffers,
+//! collections and similar low-level structures) call through instead of
+//! hardcoding pointer arithmetic and element size for every instantiation.
+//! Each function is a per-`T` witness: size, copy, drop, store and load,
+//! expressed as free generic functions rather than a trait, so a container
+//! can be generic over `T` without needing `T` to implement anything itself.
+//!
+//! The bodies here are placeholders (fixed size, no-op copy/drop, raw cast
+//! for load/move) rather than real per-`T` behaviour; callers should not
+//! assume these currently perform genuine memory operations.
 
+/// Reports the size, in bytes, of one element of `T`.
 pub fn sizeOf<T>(): int { return 8; }
 
+/// Copies one element of `T` from `src` to `dst`.
 pub fn copyElem<T>(dst: long, src: long): void { }
 
+/// Drops (releases/destructs) the element of `T` at `addr`.
 pub fn dropElem<T>(addr: long): void { }
 
+/// Writes `value` into a freshly allocated `slot`.
 pub fn store<T>(slot: long, value: T): void { }
 
+/// Overwrites an already-initialised `slot` with `value`, replacing its previous contents.
 pub fn storeOver<T>(slot: long, value: T): void { }
 
+/// Reads a `T` out of `slot` without consuming it.
 pub fn load<T>(slot: long): T { return slot as T; }
 
+/// Moves one element of `T` from `src` to `dst`, leaving `src` logically empty.
 pub fn moveElem<T>(dst: long, src: long): void { }
 
+/// Reads a `T` out of `slot` and takes ownership of it, as opposed to `load`'s borrowing read.
 pub fn moveOut<T>(slot: long): T { return slot as T; }

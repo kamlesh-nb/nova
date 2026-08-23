@@ -1,3 +1,16 @@
+//! Bindings for the embedded `webview` library, used by desktop apps built with Nova.
+//!
+//! A `Webview` wraps a native OS webview window (backed by WebKit, WebView2, or GTK
+//! WebKitGTK depending on platform) and lets a Nova program show HTML content, run
+//! JavaScript inside it, and bind Nova functions so page-side script can call back
+//! into Nova code. The `extern("webview")` declarations here are thin FFI wrappers over
+//! the C `webview.h` API; `nova_webview_bind` and `nova_webview_dispatch` are small
+//! shim functions (implemented in the runtime) that adapt Nova closures to the C
+//! callback signatures the library expects.
+//!
+//! This module is the desktop counterpart to the server-side `web` framework: `web`
+//! renders hypermedia for a browser over HTTP, while `webview` hosts that same kind of
+//! content inside a native window with no network hop required.
 
 extern("webview") fn webview_create(debug: int, window: ptr): ptr;
 extern("webview") fn webview_destroy(w: ptr): void;

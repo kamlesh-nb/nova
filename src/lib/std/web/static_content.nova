@@ -1,3 +1,10 @@
+//! Static file serving for the web framework: maps a URL prefix onto a
+//! directory on disk, resolves request paths to files, and caches the
+//! rendered `StaticAsset` (body plus content type) in memory so repeat
+//! requests skip the filesystem read and MIME lookup. Used by the web
+//! app scaffold to serve assets such as CSS, JS, and images alongside
+//! the dynamic routes handled elsewhere in `web`.
+
 import string;
 import map;
 import list;
@@ -6,14 +13,18 @@ import web.mime;
 import web.response;
 import web.status;
 
+// Extracts the extension of a path (the text after the last "."), or "" if there is none.
 fn fileExt(path: string): string {
     let dot = string.lastIndexOf(path, ".");
     if (dot == -1) { return ""; }
     return string.slice(path, dot + 1, path.length);
 }
 
+/// A cached static file: its full body and the Content-Type header to serve it with.
 pub struct StaticAsset {
+    /// The file's raw contents, read once and reused for every subsequent request.
     pub content: string,
+    /// The MIME type to send in the Content-Type header, derived from the file extension.
     pub contentType: string,
 
     init(content: string, contentType: string) {
@@ -22,9 +33,17 @@ pub struct StaticAsset {
     }
 }
 
+/// Binds a URL prefix to a directory on disk, and caches served files by their
+/// path relative to that directory.
+///
+/// `cacheCap` is accepted by `init` but not currently used to size or bound
+/// the underlying map; the cache grows unboundedly as distinct files are served.
 pub struct StaticMount {
+    /// The URL prefix this mount answers for, for example "/static/".
     pub prefix: string,
+    /// The filesystem directory that backs the prefix.
     pub dir: string,
+    /// In-memory cache of already-served files, keyed by path relative to `dir`.
     pub assets: map.Map<string, StaticAsset>,
 
     init(prefix: string, dir: string, cacheCap: int) {
@@ -33,6 +52,14 @@ pub struct StaticMount {
         self.assets = map.Map<string, StaticAsset>(256, string.hash);
     }
 
+    /// Serves `reqPath` if it falls under this mount's prefix.
+    ///
+    /// Returns `undefined` if `reqPath` does not start with `prefix`, or if the
+    /// resolved file does not exist on disk (letting the caller fall through to
+    /// another handler). Returns a 403 Forbidden response if the relative path
+    /// contains "..", to block path traversal outside `dir`. An empty or "/"
+    /// relative path is rewritten to "index.html". Cache hits skip the filesystem
+    /// entirely; misses read the file once, cache the rendered asset, then serve it.
     pub fn serve(self: StaticMount, reqPath: string): response.Response | undefined {
         if (!string.startsWith(reqPath, self.prefix)) {
             return undefined;

@@ -1,20 +1,92 @@
+//! A sorted key/value map (`OrderedMap`) backed by two parallel, key-ordered lists.
+//!
+//! Unlike a hash map, this container keeps its keys in a total order defined by
+//! a caller-supplied `less` comparator, so iteration and the `minKey`/`maxKey`
+//! queries return keys in sorted order rather than in insertion or hash order.
+//! It is the right choice when you need ordered traversal, range-style access,
+//! or a smallest/largest lookup, and the wrong choice for a large hot map where
+//! a hash table's O(1) average lookup would win.
+//!
+//! ## Representation
+//!
+//! The map holds two `List`s of equal length that move in lockstep: `ks` holds
+//! the keys in ascending order and `vs` holds each key's value at the same
+//! index. The pair at index `i` is the logical entry `(ks[i], vs[i])`. Keeping
+//! them sorted is what lets every lookup use binary search ([`OrderedMap.lowerBound`]),
+//! giving O(log n) probes; the cost is that an insert in the middle shifts the
+//! tail of both lists, so writes are O(n). That trade favours read-heavy or
+//! small maps, which is the intended use.
+//!
+//! ## Ordering and equality come only from `less`
+//!
+//! There is no separate equality function. Two keys are considered the SAME key
+//! when neither is less than the other, i.e. `!less(a, b) && !less(b, a)`
+//! (see [`OrderedMap.eqAt`]). The comparator must therefore be a strict weak
+//! ordering: irreflexive, asymmetric, and transitive. If it is not, the sorted
+//! invariant breaks and binary search may miss or duplicate keys. Because
+//! equality is derived this way, `K` needs no built-in comparability; the caller
+//! supplies whatever ordering is meaningful for the key type.
+//!
+//! ## A note on the `?? key` and `?? self.ks.get(0)` idioms
+//!
+//! `List.get` returns an optional (`V | undefined`) because an out-of-range
+//! index has no value. Inside this file the indices fed to `get` are always
+//! proven in range by a preceding bounds or `lowerBound` check, so the `??`
+//! fallbacks (`?? key`, `?? self.ks.get(0)`) can never actually be taken. They
+//! exist purely to unwrap the optional into a plain `K`/`V` for the comparator
+//! and the output list; treat them as "cannot happen" unwraps, not as real
+//! default values.
 
 import list;
 
+/// An associative map that keeps its keys sorted by a caller-supplied comparator.
+///
+/// Backed by two parallel key-ordered lists so that lookups are O(log n) binary
+/// searches and inserts/removals are O(n) shifts of the tail. Use it when you
+/// want ordered iteration or min/max access; prefer a hash map when you only
+/// need point lookups on a large, frequently-mutated map. Construct one with
+/// [`newOrderedMap`] or the `init` below, passing the strict-weak-ordering
+/// comparator described in the file header.
 pub class OrderedMap<K, V> {
+    /// The keys, held in ascending order under [`OrderedMap.less`]. Index `i`
+    /// here pairs with index `i` of [`OrderedMap.vs`]. The sorted invariant on
+    /// this list is what every binary search relies on.
     pub ks: List<K>,
+    /// The values, positionally aligned with [`OrderedMap.ks`]: `vs[i]` is the
+    /// value stored for key `ks[i]`. Always the same length as `ks`.
     pub vs: List<V>,
+    /// The strict weak ordering over keys. Returns true when its first argument
+    /// sorts before its second. Both the sort position and key equality are
+    /// derived from this single function (see the file header), so it must be
+    /// irreflexive, asymmetric, and transitive.
     pub less: (K, K) -> bool,
 
+    /// Creates an empty map ordered by `less`.
+    ///
+    /// Stores the comparator and starts with two empty lists. The comparator is
+    /// captured for the lifetime of the map; every later `set`/`has`/`get`/`remove`
+    /// call uses it, so it must remain a valid strict weak ordering throughout.
     init(less: (K, K) -> bool) {
         self.ks = List<K>();
         self.vs = List<V>();
         self.less = less;
     }
 
+    /// Number of entries currently in the map.
     pub fn size(self: OrderedMap<K, V>): int { return self.ks.size(); }
+    /// True when the map holds no entries.
     pub fn isEmpty(self: OrderedMap<K, V>): bool { return self.ks.size() == 0; }
 
+    /// Binary-searches for the first index whose key is NOT less than `key`.
+    ///
+    /// This is the classic lower-bound over the sorted [`OrderedMap.ks`]: it
+    /// returns the leftmost position `i` such that `!less(ks[i], key)`, which is
+    /// either the index of a key equal to `key` (if present) or the index where
+    /// `key` would be inserted to keep the list sorted. Every other method routes
+    /// its search through here, so it is the single point that depends on the
+    /// sorted invariant. Runs in O(log n) comparisons. The result is in the range
+    /// `0 ..= size()`; a returned value of `size()` means `key` sorts after every
+    /// existing key.
     fn lowerBound(self: OrderedMap<K, V>, key: K): int {
         let lo = 0;
         let hi = self.ks.size();
@@ -28,6 +100,14 @@ pub class OrderedMap<K, V> {
         return lo;
     }
 
+    /// True when the key stored at `idx` is equal to `key` under the comparator.
+    ///
+    /// Equality is defined as "neither is less than the other":
+    /// `!less(ks[idx], key) && !less(key, ks[idx])`. This is how the map decides
+    /// whether a lower-bound hit is an exact match or just an insertion point.
+    /// The index is bounds-checked, so passing an out-of-range `idx` (including
+    /// the `size()` returned by [`OrderedMap.lowerBound`] when the key sorts past
+    /// the end) safely returns false instead of reading out of range.
     fn eqAt(self: OrderedMap<K, V>, idx: int, key: K): bool {
         if (idx < 0 || idx >= self.ks.size()) { return false; }
         let mk = self.ks.get(idx) ?? key;
@@ -35,6 +115,13 @@ pub class OrderedMap<K, V> {
         return !f(mk ?? key, key) && !f(key, mk ?? key);
     }
 
+    /// Inserts `key` with `val`, or overwrites the value if `key` already exists.
+    ///
+    /// Finds the position with [`OrderedMap.lowerBound`]. If an equal key is
+    /// already there, only [`OrderedMap.vs`] at that index is replaced and the
+    /// order is untouched. Otherwise the key and value are inserted at that index
+    /// into both lists, which keeps them sorted and aligned but shifts the tail,
+    /// making this O(n) in the worst case.
     pub fn set(self: OrderedMap<K, V>, key: K, val: V): void {
         let idx = self.lowerBound(key);
         if (self.eqAt(idx, key)) {
@@ -45,16 +132,33 @@ pub class OrderedMap<K, V> {
         self.vs.insert(idx, val);
     }
 
+    /// True when `key` is present in the map. O(log n).
     pub fn has(self: OrderedMap<K, V>, key: K): bool {
         return self.eqAt(self.lowerBound(key), key);
     }
 
+    /// Returns the value stored for `key`, or `undefined` if the key is absent.
+    ///
+    /// O(log n): locates the lower bound and checks for an exact match. A present
+    /// key returns its value; a missing key returns `undefined`, so callers must
+    /// handle the optional. Note the value itself may legitimately be any `V`,
+    /// there is no way to distinguish "absent" from a stored value here except by
+    /// the `undefined` case.
     pub fn get(self: OrderedMap<K, V>, key: K): V | undefined {
         let idx = self.lowerBound(key);
         if (self.eqAt(idx, key)) { return self.vs.get(idx); }
         return undefined;
     }
 
+    /// Removes `key` and its value, returning true if it was present.
+    ///
+    /// If the key is absent this is a no-op that returns false. When present, the
+    /// entry at the found index is deleted by shifting every later entry of both
+    /// lists down by one and popping the now-duplicated last element, which keeps
+    /// the two lists aligned and sorted. The shift makes this O(n). The
+    /// `?? self.ks.get(i)` / `?? self.vs.get(i)` fallbacks are unreachable
+    /// "cannot happen" unwraps (index `i + 1` is always in range inside the loop),
+    /// as explained in the file header.
     pub fn remove(self: OrderedMap<K, V>, key: K): bool {
         let idx = self.lowerBound(key);
         if (!self.eqAt(idx, key)) { return false; }
@@ -70,6 +174,13 @@ pub class OrderedMap<K, V> {
         return true;
     }
 
+    /// Returns a fresh list of all keys in ascending sorted order.
+    ///
+    /// Builds and returns a new [`List`], so the caller owns the result and may
+    /// mutate it without disturbing the map. Because [`OrderedMap.ks`] is already
+    /// kept sorted, this is a straight O(n) copy; the `k != undefined` guard skips
+    /// the (unreachable, indices are in range) empty slot, and `?? self.ks.get(0)`
+    /// is a "cannot happen" unwrap into a plain `K`.
     pub fn keysInOrder(self: OrderedMap<K, V>): List<K> {
         let out = List<K>();
         let i = 0;
@@ -81,8 +192,20 @@ pub class OrderedMap<K, V> {
         return out;
     }
 
+    /// The smallest key under the ordering, or `undefined` when the map is empty.
+    ///
+    /// O(1): since [`OrderedMap.ks`] is sorted ascending, the minimum is simply
+    /// the first element.
     pub fn minKey(self: OrderedMap<K, V>): K | undefined { return self.ks.first(); }
+    /// The largest key under the ordering, or `undefined` when the map is empty.
+    ///
+    /// O(1): the maximum is the last element of the sorted [`OrderedMap.ks`].
     pub fn maxKey(self: OrderedMap<K, V>): K | undefined { return self.ks.last(); }
 }
 
+/// Convenience constructor for an empty [`OrderedMap`] ordered by `less`.
+///
+/// Equivalent to calling `OrderedMap<K, V>(less)` directly; provided as a
+/// free function for call sites that prefer a plain factory over a generic
+/// constructor invocation.
 pub fn newOrderedMap<K, V>(less: (K, K) -> bool): OrderedMap<K, V> { return OrderedMap<K, V>(less); }

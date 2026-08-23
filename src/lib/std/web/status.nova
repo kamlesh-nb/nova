@@ -1,6 +1,17 @@
+//! HTTP status codes and reason phrases for the web module.
+//!
+//! `Status` is the typed enum that route handlers and response builders use
+//! day to day, with `toCode`/`fromCode` to convert to and from the numeric
+//! wire value and `reasonPhrase` for the text that follows the code on the
+//! status line (for example, `"404 Not Found"`). `stringifyStatus` and
+//! `status_text` are lower-level helpers that work directly on a plain `int`
+//! code, for callers that render a response without going through `Status`.
 
 import bytes;
 
+/// HTTP response status codes, covering the common 2xx/3xx/4xx/5xx cases
+/// used across the web framework. Not exhaustive: codes outside this set
+/// have no `Status` member and must be handled as raw `int`s.
 pub enum Status {
     Ok = 200,
     Created = 201,
@@ -20,6 +31,7 @@ pub enum Status {
     PayloadTooLarge = 413,
     TooManyRequests = 429,
 
+    /// Converts a `Status` member to its numeric HTTP status code.
     pub fn toCode(self: Status): int {
         switch (self) {
             case Status.Ok: { return 200; }
@@ -43,6 +55,9 @@ pub enum Status {
         }
     }
 
+    /// Returns the standard HTTP reason phrase for this status (for example
+    /// `"Not Found"` for `Status.NotFound`), as used on the response status
+    /// line. Falls back to `"Unknown"` for any code not covered here.
     pub fn reasonPhrase(self: Status): string {
         switch (self) {
             case Status.Ok: { return "OK"; }
@@ -66,6 +81,10 @@ pub enum Status {
         }
     }
 
+    /// Maps a numeric HTTP status code back to its `Status` member.
+    /// Any code not covered by this enum silently falls back to
+    /// `Status.Ok` rather than erroring, so callers should not rely on it
+    /// to validate an arbitrary incoming code.
     pub fn fromCode(code: int): Status {
         if (code == 200) return Status.Ok;
         if (code == 201) return Status.Created;
@@ -88,6 +107,10 @@ pub enum Status {
     }
 }
 
+/// Renders a numeric HTTP status code as its decimal string form (for
+/// example, `404` becomes `"404"`), for writing directly into a response
+/// status line without going through `Status`. Allocates a fresh string
+/// via `bytes.alloc`. Only handles non-negative values; `0` returns `"0"`.
 pub fn stringifyStatus(status: int): string {
     if (status == 0) return "0";
     let temp = status;
@@ -108,6 +131,9 @@ pub fn stringifyStatus(status: int): string {
     return str_ptr as string;
 }
 
+/// Returns the reason phrase for a small set of common status codes, given
+/// the raw `int` rather than a `Status` value. Covers fewer codes than
+/// `Status.reasonPhrase`; unrecognised codes return `"Unknown"`.
 pub fn status_text(status: int): string {
     if (status == 200) return "OK";
     if (status == 201) return "Created";

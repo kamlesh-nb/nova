@@ -1,31 +1,112 @@
+//! LZ4 block and frame compression, plus the xxHash32 it needs.
+//!
+//! LZ4 is a byte-oriented LZ77 codec that trades ratio for raw speed: it finds
+//! repeated 4-byte sequences within a 64 KB window and emits (literal run,
+//! back-reference) pairs. This file implements both layers of the standard:
+//!
+//!   1. The raw BLOCK format ([`compressBlock`] / [`decompressBlock`]), which is
+//!      just the token stream with no header and no length framing. A block is
+//!      only self-describing up to its own end, so the caller must already know
+//!      how many bytes to feed the decoder.
+//!   2. The LZ4 FRAME format ([`compress`] / [`decompress`]), the interchange
+//!      container: a magic number, a frame descriptor (FLG/BD plus a header
+//!      checksum byte), a sequence of length-prefixed blocks, and a zero
+//!      end-mark. This is what other LZ4 tools read and write.
+//!
+//! Why xxHash32 lives here: the frame descriptor carries a one-byte checksum
+//! (the "HC" byte) computed as the second byte of xxHash32 over the FLG+BD
+//! pair. LZ4 and xxHash share an author and the frame spec mandates xxHash32
+//! for both the header check and the optional content/block checksums, so a
+//! self-contained xxHash32 ([`xxh32`]) is part of the codec, not a general
+//! hashing utility that happens to sit nearby.
+//!
+//! Buffers and 32-bit arithmetic. Output is accumulated into a
+//! [`deflate.ByteBuf`], the same growable byte buffer the sibling `deflate`
+//! module uses, so the two compressors share one buffer type. All the hashing
+//! and offset maths is 32-bit unsigned, but Nova's `int` is signed 32-bit, so
+//! every intermediate that must stay unsigned is carried in a `long` and masked
+//! back to 32 bits with [`M32`] after each step. This is deliberate: an `int`
+//! multiply here would overflow into the sign bit and diverge from the
+//! reference xxHash, and a heap address kept in an `int` would truncate.
+//!
+//! Fit with the rest of the standard library. This sits under `std/compress`
+//! alongside `deflate`, reuses that module's `ByteBuf`, and offers the same
+//! shape of `string`-in/`string`-out API so callers can pick a codec without
+//! changing how they move bytes.
 
 import bytes;
 import string;
 import compress.deflate;
 
+/// Bit mask for the low 32 bits (`0xFFFFFFFF`), used to fold a `long`
+/// intermediate back down to an unsigned 32-bit value after every arithmetic
+/// step. Every xxHash and LZ4 offset computation stays 32-bit unsigned, so
+/// masking with this after a multiply or add is what keeps the results
+/// bit-for-bit identical to the reference implementation despite `int` being
+/// signed. See the module header for why the maths runs in `long`.
 const M32: long = 4294967295;
 
+/// xxHash32 prime 1 (`0x9E3779B1`), the mixing multiplier for the main
+/// accumulator rounds and the final avalanche. Also reused as the LZ4 hash
+/// multiplier in [`hash4`].
 const XXP1: long = 2654435761;
+/// xxHash32 prime 2 (`0x85EBCA77`), applied to each input lane before it is
+/// folded into an accumulator and again in the avalanche tail.
 const XXP2: long = 2246822519;
+/// xxHash32 prime 3 (`0xC2B2AE3D`), mixing multiplier for the 4-byte tail loop
+/// and one avalanche stage.
 const XXP3: long = 3266489917;
+/// xxHash32 prime 4 (`0x27D4EB2F`), the rotate-and-multiply constant for the
+/// 4-byte tail loop.
 const XXP4: long = 668265263;
+/// xxHash32 prime 5 (`0x165667B1`), the seed for inputs shorter than 16 bytes
+/// and the per-byte multiplier in the final single-byte tail loop.
 const XXP5: long = 374761393;
 
+/// Rotate a 32-bit value left by `r` bits.
+///
+/// Both halves of the rotate are masked back into 32 bits via [`M32`]: the left
+/// shift can push bits above bit 31 and the right shift of a `long` would carry
+/// in nothing, so the mask is what makes this a true 32-bit rotate rather than a
+/// 64-bit one. `r` must be in `1..31`; the caller only ever passes fixed xxHash
+/// rotate amounts.
 fn rotl32(x: long, r: int): long {
     return ((x << r) | (x >> (32 - r))) & M32;
 }
+/// Read four bytes at offset `p` of `src` as a little-endian unsigned 32-bit
+/// value.
+///
+/// Little-endian is the byte order both xxHash32 and the LZ4 hash read the input
+/// in, so this is the single load primitive for both. The result is returned in
+/// a `long` so it stays unsigned; the caller must ensure `p + 3` is in range,
+/// since no bounds check happens here.
 fn rd32le(src: string, p: int): long {
     return (bytes.read_byte(src, p) as long)
         | ((bytes.read_byte(src, p + 1) as long) << 8)
         | ((bytes.read_byte(src, p + 2) as long) << 16)
         | ((bytes.read_byte(src, p + 3) as long) << 24);
 }
+/// One xxHash32 accumulator round: fold a 4-byte input lane into `acc`.
+///
+/// Mixes the lane with prime 2, adds it to the accumulator, rotates left by 13,
+/// then multiplies by prime 1, masking to 32 bits at each stage. This is the
+/// core mixing step run over the four parallel lanes in [`xxh32`]'s main loop.
 fn xxRound(acc: long, input: long): long {
     let a: long = (acc + ((input * XXP2) & M32)) & M32;
     let b: long = rotl32(a, 13);
     return (b * XXP1) & M32;
 }
 
+/// Compute the seed-0 xxHash32 of `len` bytes of `src` starting at `start`.
+///
+/// This is the standard xxHash32 with no user seed: for inputs of 16 bytes or
+/// more it runs four accumulators in parallel over 16-byte stripes and merges
+/// them with distinct rotates, then processes any 4-byte and single-byte tail,
+/// and finishes with the avalanche cascade. Inputs shorter than 16 bytes skip
+/// straight to seeding with prime 5. The returned value is a full 32-bit hash in
+/// a `long`; within this file only its second byte is used, for the frame header
+/// checksum in [`compress`], but the whole hash is computed so it also matches
+/// any external xxHash32. `start` and `len` must describe an in-range span.
 pub fn xxh32(src: string, start: int, len: int): long {
     let p = start;
     let end = start + len;
@@ -65,34 +146,90 @@ pub fn xxh32(src: string, start: int, len: int): long {
     return h & M32;
 }
 
+/// Store `v` as a little-endian 32-bit word into slot `i` of the raw buffer `p`.
+///
+/// Slot `i` means byte offset `i * 4`, so `p` is treated as an array of 32-bit
+/// integers. This is the writer half of the LZ4 match hash table used by
+/// [`compressBlockInto`], where each slot holds a candidate source position (or
+/// -1 for empty). Pairs with [`rd32`].
 fn wr32(p: ptr, i: int, v: int): void {
     bytes.write_byte(p, i * 4, v & 255);
     bytes.write_byte(p, i * 4 + 1, (v >> 8) & 255);
     bytes.write_byte(p, i * 4 + 2, (v >> 16) & 255);
     bytes.write_byte(p, i * 4 + 3, (v >> 24) & 255);
 }
+/// Read slot `i` (byte offset `i * 4`) of the raw buffer `p` as a little-endian
+/// 32-bit signed integer.
+///
+/// The reader half of the match hash table in [`compressBlockInto`]. It returns
+/// a signed `int` on purpose: an empty slot is stored as -1, and the compressor
+/// tests `cand >= 0` to tell "no candidate" apart from a real position. Pairs
+/// with [`wr32`].
 fn rd32(p: ptr, i: int): int {
     return bytes.read_byte(p, i * 4)
         | (bytes.read_byte(p, i * 4 + 1) << 8)
         | (bytes.read_byte(p, i * 4 + 2) << 16)
         | (bytes.read_byte(p, i * 4 + 3) << 24);
 }
+/// Hash the 4 bytes at `pos` into a 16-bit table index in `0..65535`.
+///
+/// Reads the 4-byte little-endian sequence, multiplies by prime 1, and keeps the
+/// top 16 bits of the low 32-bit product. This is the standard LZ4 "hash the next
+/// 4 bytes" step that indexes the 65536-entry candidate table in
+/// [`compressBlockInto`]; collisions are fine because every candidate is
+/// re-verified by [`match4`] before it is used.
 fn hash4(data: string, pos: int): int {
     let seq: long = rd32le(data, pos);
     return (((seq * XXP1) & M32) >> 16) as int;
 }
+/// Return whether the 4 bytes at `a` equal the 4 bytes at `b` in `data`.
+///
+/// Used to confirm a hash-table hit is a real 4-byte match and not just a hash
+/// collision before the compressor commits to encoding a back-reference.
+/// Comparison is byte by byte and short-circuits on the first mismatch.
 fn match4(data: string, a: int, b: int): bool {
     return bytes.read_byte(data, a) == bytes.read_byte(data, b)
         && bytes.read_byte(data, a + 1) == bytes.read_byte(data, b + 1)
         && bytes.read_byte(data, a + 2) == bytes.read_byte(data, b + 2)
         && bytes.read_byte(data, a + 3) == bytes.read_byte(data, b + 3);
 }
+/// Emit `v` in LZ4's linear small-integer code (LSIC) into `out`.
+///
+/// LZ4 stores lengths that overflow a 4-bit token field as a chain of bytes:
+/// every full 255 is written as a `255` byte and the remainder as a final byte
+/// below 255 (which is why an exact multiple of 255 still needs a trailing `0`).
+/// The caller has already written the 15 that signals "overflow follows", so
+/// `v` here is the amount BEYOND 15. Used for both literal-run and match lengths
+/// in [`compressBlockInto`]; the decoder mirror is inline in
+/// [`decompressBlockInto`].
 fn writeLSIC(out: deflate.ByteBuf, v: int): void {
     let x = v;
     while (x >= 255) { out.push(255); x = x - 255; }
     out.push(x);
 }
 
+/// Compress the `n` bytes of `data` at `begin` into LZ4 block tokens appended to
+/// `out`.
+///
+/// This is the LZ4 fast-compressor inner loop. It walks a single hash table of
+/// 65536 slots (allocated here, one 32-bit position per slot, initialised to -1)
+/// and for each position hashes the next 4 bytes, looks up the last position
+/// with that hash, and if the candidate is within the 65535-byte window, at or
+/// after `begin`, and confirmed by [`match4`], it extends the match greedily and
+/// emits a sequence: a token byte packing the literal-run length in the high
+/// nibble and the match length (minus the 4-byte minimum) in the low nibble,
+/// then any LSIC overflow for the literals, the literal bytes, a little-endian
+/// 2-byte offset, and any LSIC overflow for the match. Positions with no match
+/// advance by one.
+///
+/// Two guard zones enforce the format's end constraints and are the subtle part:
+/// `mflimit = end - 12` stops matching 12 bytes early and `last5 = end - 5`
+/// caps match extension, because LZ4 requires the last 5 bytes to be literals and
+/// the last match to start no closer than 12 bytes from the end so a decoder can
+/// copy without reading past its buffer. After the loop the trailing `anchor..end`
+/// run is flushed as a final literal-only sequence. The hash table is freed
+/// before return, so this function allocates and releases 256 KB per call and
+/// leaks nothing.
 fn compressBlockInto(out: deflate.ByteBuf, data: string, begin: int, n: int): void {
     let head = bytes.alloc(65536 * 4);
     let h = 0;
@@ -140,6 +277,23 @@ fn compressBlockInto(out: deflate.ByteBuf, data: string, begin: int, n: int): vo
     bytes.free(head);
 }
 
+/// Decode the LZ4 block of `n` token bytes at `begin` in `src`, appending the
+/// expanded output to `out`.
+///
+/// Reverses [`compressBlockInto`]. For each sequence it reads the token, expands
+/// the literal length (with the inline LSIC continuation when the high nibble is
+/// 15), copies that many literal bytes, then, unless the block ended on that
+/// literal run, reads the 2-byte little-endian offset and the match length (again
+/// with LSIC when the low nibble is 15, and adding back the 4-byte minimum) and
+/// copies the match.
+///
+/// The match copy is byte by byte from `out.len - offset` forward, and this is
+/// deliberate, not naive: LZ4 back-references may overlap the current write
+/// position (offset smaller than length is how run-length repeats are encoded),
+/// so each copied byte must be able to see bytes written earlier in the SAME
+/// copy. A bulk memmove would break that overlap. The `pos >= end` check after
+/// the literals handles a block that legitimately ends with a literal-only
+/// sequence and no trailing match.
 fn decompressBlockInto(out: deflate.ByteBuf, src: string, begin: int, n: int): void {
     let pos = begin;
     let end = begin + n;
@@ -172,19 +326,53 @@ fn decompressBlockInto(out: deflate.ByteBuf, src: string, begin: int, n: int): v
     }
 }
 
+/// Compress `data` into a single raw LZ4 block and return it as a `string`.
+///
+/// This is the block format with no framing: no magic, no header, no length
+/// prefix, and no checksum. It is only decodable by [`decompressBlock`] (or any
+/// LZ4 block decoder) that already knows the exact byte length, so use
+/// [`compress`] instead when the output has to be self-describing or interchanged
+/// with other tools.
 pub fn compressBlock(data: string): string {
     let out = deflate.ByteBuf();
     compressBlockInto(out, data, 0, data.length);
     return out.toString();
 }
+/// Decode a raw LZ4 block `src` (as produced by [`compressBlock`]) back to the
+/// original bytes.
+///
+/// Consumes the whole of `src` as one block, so `src` must be exactly the block
+/// and nothing more. There is no length or checksum to validate against, so a
+/// truncated or corrupt block yields wrong output rather than a reported error;
+/// for validated, framed data use [`decompress`].
 pub fn decompressBlock(src: string): string {
     let out = deflate.ByteBuf();
     decompressBlockInto(out, src, 0, src.length);
     return out.toString();
 }
 
+/// Maximum bytes per frame block (4 MiB), the "4 MB" block-size class that the
+/// BD byte value 112 (`0x70`) advertises.
+///
+/// [`compress`] splits the input into chunks of at most this size, one LZ4 block
+/// each, so the BD descriptor byte and this constant must stay in agreement for
+/// the frame to be well-formed.
 const BLOCK_MAX: int = 4194304;
 
+/// Compress `data` into a complete LZ4 FRAME and return it as a `string`.
+///
+/// The output is a self-describing, interchange-format frame: the 4-byte magic
+/// `04 22 4D 18`, a frame descriptor of FLG=96 and BD=112 (independent blocks,
+/// 4 MiB max block size, no content size, no checksums), the header-checksum byte
+/// (the second byte of [`xxh32`] over the FLG+BD pair), then the payload as a
+/// series of blocks, and finally a zero end-mark word.
+///
+/// Each block carries a 4-byte little-endian size prefix. The compressed form is
+/// used only when it is actually smaller than the raw chunk; otherwise the chunk
+/// is stored uncompressed and the size prefix has its top bit (`0x80000000`) set
+/// to flag "stored", exactly as the frame spec prescribes so a decoder never
+/// expands data that did not shrink. A scratch 2-byte buffer is allocated and
+/// freed just to checksum the descriptor. Decode with [`decompress`].
 pub fn compress(data: string): string {
     let out = deflate.ByteBuf();
     out.push(4); out.push(34); out.push(77); out.push(24);
@@ -228,6 +416,20 @@ pub fn compress(data: string): string {
     return out.toString();
 }
 
+/// Decode a complete LZ4 frame `src` (as produced by [`compress`]) back to the
+/// original bytes.
+///
+/// Reads the FLG byte to learn which optional fields are present, then skips the
+/// magic, descriptor, and header checksum to reach the first block. It honours
+/// the descriptor flags it needs: an 8-byte content-size field when FLG bit 3 is
+/// set, a 4-byte block checksum after each block when bit 4 is set (skipped, not
+/// verified), and a 4-byte content checksum at the end when bit 2 is set. Each
+/// block is read by its 4-byte size prefix; the top bit marks a stored
+/// (uncompressed) block, which is copied verbatim, otherwise it is expanded via
+/// [`decompressBlockInto`]. A zero size word is the end-mark and stops decoding.
+/// Inputs shorter than the 7-byte minimum frame preamble yield the empty string.
+/// Checksums present in the stream are stepped over but not validated, so this
+/// trusts the input to be intact.
 pub fn decompress(src: string): string {
     let out = deflate.ByteBuf();
     let n = src.length;
@@ -264,6 +466,12 @@ pub fn decompress(src: string): string {
 
 import assert;
 
+/// Round-trip a repetitive string through the frame codec and check the output
+/// matches the input.
+///
+/// The repeated "Hello, LZ4!" gives the matcher plenty to compress, so this also
+/// exercises the compressed (non-stored) block path in [`compress`] and confirms
+/// [`decompress`] reproduces it exactly.
 @test
 fn test_lz4_frame_roundtrip(): void {
     let original = "Hello, LZ4! Hello, LZ4! Hello, LZ4! Hello, LZ4! Hello, LZ4!";
@@ -272,12 +480,25 @@ fn test_lz4_frame_roundtrip(): void {
     assert.equalStr(decompress(packed), original);
 }
 
+/// Round-trip a string through the raw BLOCK codec, exercising overlapping
+/// back-references.
+///
+/// The "abc" repeat encodes as a short literal followed by a long overlapping
+/// match (offset 3, length far greater than 3), so this specifically checks that
+/// [`decompressBlockInto`]'s byte-by-byte overlapping copy is correct.
 @test
 fn test_lz4_block_roundtrip(): void {
     let s = "abcabcabcabcabcabcabcabcabcabc";
     assert.equalStr(decompressBlock(compressBlock(s)), s);
 }
 
+/// Round-trip the empty string and a short string of control and whitespace
+/// bytes through the frame codec.
+///
+/// Guards the edge cases: an empty input must still produce a valid frame that
+/// decodes back to empty, and non-alphabetic bytes (tabs, newlines, spaces) must
+/// survive unchanged, confirming the codec is byte-transparent and not
+/// text-specific.
 @test
 fn test_lz4_empty_and_binary(): void {
     assert.equalStr(decompress(compress("")), "");

@@ -1,7 +1,18 @@
+//! Zero-copy HTTP/1.1 request line parser.
+//!
+//! `HttpRequest` parses a raw request buffer (method, path, and headers) by
+//! recording offsets and lengths into the original buffer instead of copying
+//! substrings, which keeps the hot path allocation-free. Header name/value
+//! offsets are packed into a fixed-size scratch buffer (`hbuf`), so the
+//! caller must size `maxHeaders` up front and call `free()` once done with
+//! the request. This is the parser that sits underneath the web server's
+//! request handling and is one of the pieces the perf notes call out as
+//! shared across all reactor backends (epoll, io_uring, IOCP).
 
 import bytes;
 import os.sys;
 
+// Finds the first byte equal to `b` in buf[start, end); returns -1 if absent.
 fn indexOfByte(buf: long, start: int, end: int, b: int): int {
     if (start >= end) { return -1; }
     let p = sys.memchr(buf + (start as long), b, (end - start) as long);
@@ -9,11 +20,13 @@ fn indexOfByte(buf: long, start: int, end: int, b: int): int {
     return (p - buf) as int;
 }
 
+// ASCII lower-cases a single byte value; non-letters pass through unchanged.
 fn lower(c: int): int {
     if (c >= 65 && c <= 90) { return c + 32; }
     return c;
 }
 
+// Compares buf[off, off+len) against `s` for exact (case-sensitive) equality.
 fn sliceEqStr(buf: long, off: int, len: int, s: string): bool {
     if (len != s.length) { return false; }
     let i = 0;
@@ -24,6 +37,7 @@ fn sliceEqStr(buf: long, off: int, len: int, s: string): bool {
     return true;
 }
 
+// Case-insensitive counterpart of sliceEqStr, used for HTTP header name lookup.
 fn sliceEqStrCI(buf: long, off: int, len: int, s: string): bool {
     if (len != s.length) { return false; }
     let i = 0;
@@ -34,15 +48,30 @@ fn sliceEqStrCI(buf: long, off: int, len: int, s: string): bool {
     return true;
 }
 
+/// Parses one HTTP/1.1 request out of a raw byte buffer without copying.
+///
+/// All string data (method, path, header names and values) is exposed as
+/// offset/length pairs into the caller-supplied `buf`, so `buf` must stay
+/// alive for as long as the parsed fields are read. Call `free()` once the
+/// request is no longer needed to release the header scratch buffer.
 pub struct HttpRequest {
+    /// Address of the raw request buffer being parsed. Owned by the caller.
     pub buf: long,
+    /// Number of valid bytes in `buf`.
     pub len: int,
+    /// Offset of the HTTP method token (e.g. "GET") within `buf`.
     pub methodOff: int,
+    /// Length in bytes of the method token.
     pub methodLen: int,
+    /// Offset of the request path (e.g. "/users/1") within `buf`.
     pub pathOff: int,
+    /// Length in bytes of the request path.
     pub pathLen: int,
+    /// Number of headers actually parsed, up to `maxHeaders`.
     pub nheaders: int,
+    /// Capacity of the header table; headers beyond this count are dropped silently.
     pub maxHeaders: int,
+    /// Scratch buffer holding packed (nameOff, nameLen, valueOff, valueLen) i32 quads, one per header.
     pub hbuf: long,
 
     init(maxHeaders: int) {
@@ -53,6 +82,13 @@ pub struct HttpRequest {
         self.nheaders = 0;
     }
 
+    /// Parses the request line and headers out of `buf[0, len)`.
+    ///
+    /// Returns the byte offset immediately after the blank line that ends
+    /// the header block (where the body, if any, begins) on success, or `0`
+    /// if the buffer does not contain a complete, well-formed request line
+    /// and header block (the caller should read more data and retry).
+    /// Headers beyond `maxHeaders` are parsed for framing but not recorded.
     pub fn parse(self: HttpRequest, buf: long, len: int): int {
         self.buf = buf;
         self.len = len;
@@ -100,12 +136,15 @@ pub struct HttpRequest {
         return 0;
     }
 
+    /// Reports whether the parsed method exactly matches `s` (case-sensitive).
     pub fn methodEq(self: HttpRequest, s: string): bool {
         return sliceEqStr(self.buf, self.methodOff, self.methodLen, s);
     }
+    /// Reports whether the parsed path exactly matches `s` (case-sensitive).
     pub fn pathEq(self: HttpRequest, s: string): bool {
         return sliceEqStr(self.buf, self.pathOff, self.pathLen, s);
     }
+    /// Reports whether the parsed path begins with the literal prefix `s`.
     pub fn pathStartsWith(self: HttpRequest, s: string): bool {
         if (self.pathLen < s.length) { return false; }
         let i = 0;
@@ -116,6 +155,10 @@ pub struct HttpRequest {
         return true;
     }
 
+    /// Finds the index of the header named `name` (case-insensitive match).
+    ///
+    /// Returns -1 if no such header was parsed. If the same header name
+    /// appears more than once, returns the index of the first occurrence.
     pub fn header(self: HttpRequest, name: string): int {
         let i = 0;
         while (i < self.nheaders) {
@@ -127,19 +170,25 @@ pub struct HttpRequest {
         }
         return -1;
     }
+    /// Offset of header `i`'s value within `buf`. `i` must be a valid index
+    /// previously returned by `header()`, in range [0, nheaders).
     pub fn headerValueOff(self: HttpRequest, i: int): int {
         return bytes.read_i32(self.hbuf, (i * 16 + 8) as long) as int;
     }
+    /// Length in bytes of header `i`'s value.
     pub fn headerValueLen(self: HttpRequest, i: int): int {
         return bytes.read_i32(self.hbuf, (i * 16 + 12) as long) as int;
     }
+    /// Reports whether header `i`'s value exactly matches `s` (case-sensitive).
     pub fn headerValueEq(self: HttpRequest, i: int, s: string): bool {
         return sliceEqStr(self.buf, self.headerValueOff(i), self.headerValueLen(i), s);
     }
+    /// Reports whether a header named `name` was parsed (case-insensitive).
     pub fn hasHeader(self: HttpRequest, name: string): bool {
         return self.header(name) >= 0;
     }
 
+    /// Releases the header scratch buffer. Safe to call more than once.
     pub fn free(self: HttpRequest): void {
         if (self.hbuf != 0) { bytes.free(self.hbuf); self.hbuf = 0; }
     }

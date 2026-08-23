@@ -1,32 +1,87 @@
+//! Hash set of distinct elements (`Set<T>`).
+//!
+//! A `Set<T>` stores an unordered collection of unique values of type `T`. It
+//! is a thin wrapper over the standard library hash map: the set holds a
+//! [`map.Map`] keyed by the element with a dummy `bool` value, so membership is
+//! "does the map have this key". This means the set inherits the map's hashing,
+//! collision handling, growth policy, and ARC ownership for free, and the set's
+//! own code stays tiny and obviously correct.
+//!
+//! Because the backing store is a hash map, iteration order is NOT defined and
+//! must not be relied upon. Insertion is idempotent: adding an element that is
+//! already present is a no-op on membership, matching the mathematical notion
+//! of a set. Lookup, insert, and delete are amortised O(1); the set-algebra
+//! helpers ([`Set.unionWith`], [`Set.intersection`], [`Set.difference`]) are
+//! O(n) in the sizes of the operands they scan.
+//!
+//! `Set` is a `class`, so it has reference semantics and is ARC-managed. The
+//! elements it holds are owned through the backing map's keys, so the caller
+//! must call [`Set.delete`] when the set is a container of owned values that
+//! need their destructors run. The element type `T` needs a hash function
+//! supplied at construction; for plain `int` keys, [`i32Hash`] is provided as
+//! the identity hash.
 
 import map;
 import bytes;
 import list;
 import assert;
 
+/// An unordered collection of distinct elements of type `T`.
+///
+/// Membership is delegated to an inner [`map.Map`] keyed by the element, so a
+/// value is "in the set" exactly when it is a key of that map. Elements are
+/// unique: re-adding an existing element does not grow the set. Iteration order
+/// is unspecified because it follows the map's bucket layout.
 pub class Set<T> {
+    /// Backing hash map whose KEYS are the set's elements; the `bool` value is a
+    /// placeholder that is always `true` and carries no meaning. All membership,
+    /// hashing, and ownership decisions live in this map.
     pub map: map.Map<T, bool>,
 
+    /// Builds an empty set with room for roughly `initialCap` elements before
+    /// the backing map first has to grow, using `hashFn` to hash elements.
+    ///
+    /// `hashFn` must be a stable, deterministic hash of `T`: two values that
+    /// compare equal must hash equal, or lookups will miss. For `int` elements
+    /// pass [`i32Hash`].
     init(initialCap: int, hashFn: (T) -> int) {
         self.map = map.Map<T, bool>(initialCap, hashFn);
     }
 
+    /// Inserts `elem` into the set.
+    ///
+    /// Idempotent: if `elem` is already present this simply overwrites the
+    /// placeholder value and leaves the size unchanged, so callers never need to
+    /// guard the add with a [`Set.has`] check.
     pub fn add(self: Set<T>, elem: T): void {
         self.map.set(elem, true);
     }
 
+    /// Reports whether `elem` is a member of the set.
+    ///
+    /// Implemented as "the backing map has a value for this key". Correctness
+    /// depends on the `hashFn` given at construction agreeing with equality for
+    /// `T`.
     pub fn has(self: Set<T>, elem: T): bool {
         return self.map.get(elem) != undefined;
     }
 
+    /// Removes `elem` from the set if it is present; does nothing otherwise.
     pub fn remove(self: Set<T>, elem: T): void {
         self.map.delete_key(elem);
     }
 
+    /// Number of distinct elements currently in the set.
     pub fn size(self: Set<T>): int {
         return self.map.size();
     }
 
+    /// Calls `fn` once for each element, in unspecified order.
+    ///
+    /// It snapshots the current keys into a list first and iterates that, so the
+    /// callback sees the membership as it was at the moment of the call. Mutating
+    /// the set from inside `fn` therefore will not be reflected in this pass, and
+    /// is best avoided.
     pub fn forEach(self: Set<T>, fn: (T) => void): void {
         let keys = self.map.keys();
         let keysLen = keys.size();
@@ -37,10 +92,22 @@ pub class Set<T> {
         }
     }
 
+    /// Returns a fresh [`list.List`] of the set's elements in unspecified order.
+    ///
+    /// This is just the backing map's key list, so it is a new list the caller
+    /// owns; the elements inside it are still shared with the set.
     pub fn toList(self: Set<T>): list.List<T> {
         return self.map.keys();
     }
 
+    /// Returns a new set containing every element of `self` or `other` (the
+    /// union).
+    ///
+    /// The result is sized generously (both sizes plus one) so it does not need
+    /// to grow during the build, then every element of `self` and then every
+    /// element of `other` is added; duplicates collapse naturally because
+    /// [`Set.add`] is idempotent. Neither input set is modified. The new set
+    /// reuses `self`'s hash function.
     pub fn unionWith(self: Set<T>, other: Set<T>): Set<T> {
         let out = Set<T>(self.size() + other.size() + 1, self.map.hashFn);
         let a = self.map.keys();
@@ -52,6 +119,12 @@ pub class Set<T> {
         return out;
     }
 
+    /// Returns a new set of the elements present in BOTH `self` and `other` (the
+    /// intersection).
+    ///
+    /// It scans `self`'s elements and keeps only those that [`Set.has`] reports
+    /// present in `other`, so the cost is O(size of self) lookups. Neither input
+    /// is modified; the result reuses `self`'s hash function.
     pub fn intersection(self: Set<T>, other: Set<T>): Set<T> {
         let out = Set<T>(self.size() + 1, self.map.hashFn);
         let a = self.map.keys();
@@ -64,6 +137,12 @@ pub class Set<T> {
         return out;
     }
 
+    /// Returns a new set of the elements in `self` that are NOT in `other` (the
+    /// relative complement, `self` minus `other`).
+    ///
+    /// It scans `self`'s elements and keeps those `other` does not contain, so it
+    /// is asymmetric: `a.difference(b)` and `b.difference(a)` differ. Neither
+    /// input is modified; the result reuses `self`'s hash function.
     pub fn difference(self: Set<T>, other: Set<T>): Set<T> {
         let out = Set<T>(self.size() + 1, self.map.hashFn);
         let a = self.map.keys();
@@ -76,15 +155,28 @@ pub class Set<T> {
         return out;
     }
 
+    /// Releases the set's backing storage and runs destructors on owned
+    /// elements.
+    ///
+    /// Call this when the set held owned values whose lifetimes end with the
+    /// set. It forwards to the backing map's `delete`, so after this the set must
+    /// not be used again.
     pub fn delete(self: Set<T>): void {
         self.map.delete();
     }
 }
 
+/// Identity hash for `int` keys: returns the value itself.
+///
+/// This is the natural hash for integers, since the backing map already folds
+/// the raw hash into a bucket index. Pass it as the `hashFn` argument of
+/// [`Set`] when the element type is `int`.
 pub fn i32Hash(val: int): int {
     return val;
 }
 
+/// Exercises the core set contract: empty size, idempotent add, membership, and
+/// removal shrinking the size. Adding `10` twice must still leave size two.
 @test
 fn test_set(): void {
     let set = Set<int>(16, i32Hash);

@@ -1,60 +1,129 @@
 
+//! Raw FFI bindings to Windows Winsock2 (`ws2_32.dll`, plus `mswsock`'s
+//! `AcceptEx`) and a couple of small Nova-side helpers built on top.
+//!
+//! This is the Windows counterpart to the POSIX socket syscalls used on
+//! macOS/Linux: `os/windows/socket` and `os/windows/sys` sit on top of this
+//! module the same way their POSIX equivalents sit on top of `os/sys`, and
+//! the target-conditional file rule swaps the whole module in so shared
+//! callers do not need to know which platform they are on.
+//!
+//! Winsock needs an explicit `startup()`/`WSACleanup` init step that POSIX
+//! sockets do not, and its overlapped I/O model (`WSARecv`, `WSASend`,
+//! `AcceptEx`, `nova_wsa_connectex`) is completion-based rather than
+//! readiness-based, which is what lets the IOCP reactor treat a socket
+//! operation as "in flight" instead of "ready to read/write".
+
 import bytes;
 
+/// Address family: IPv4.
 pub const AF_INET: int = 2;
+/// Socket type: stream (TCP).
 pub const SOCK_STREAM: int = 1;
+/// Protocol: TCP.
 pub const IPPROTO_TCP: int = 6;
 
+/// `setsockopt`/`getsockopt` level for socket-level (as opposed to protocol-level) options.
 pub const SOL_SOCKET: int = 65535;
+/// Socket option: allow reuse of a local address in `bind`.
 pub const SO_REUSEADDR: int = 4;
+/// Socket option: fetch the pending per-socket error via `getsockopt`.
 pub const SO_ERROR: int = 4103;
+/// Maximum backlog length accepted by `listen`.
 pub const SOMAXCONN: int = 128;
 
+/// `ioctlsocket` command to toggle non-blocking mode (Winsock's `FIONBIO`).
 pub const FIONBIO: long = 2147772030;
 
+/// Sentinel returned by `socket`/`accept` on failure, in place of a real handle.
 pub const INVALID_SOCKET: long = -1;
+/// Generic failure return value used by most Winsock calls.
 pub const SOCKET_ERROR: int = -1;
+/// `WSAGetLastError` code meaning the non-blocking operation would have blocked.
 pub const WSAEWOULDBLOCK: int = 10035;
 
+/// Initialises the Winsock library for this process. Must be called before any other
+/// Winsock function; pair with `WSACleanup` when done. Prefer `startup()` below, which
+/// supplies the version and scratch buffer for you.
 pub extern("c") fn WSAStartup(wVersionRequested: int, lpWSAData: ptr): int;
+/// Tears down the Winsock library, releasing resources acquired by `WSAStartup`.
 pub extern("c") fn WSACleanup(): int;
+/// Returns the error code for the last failed Winsock call on this thread.
 pub extern("c") fn WSAGetLastError(): int;
 
+/// Creates a new socket and returns its handle, or `INVALID_SOCKET` on failure.
 pub extern("c") fn socket(af: int, type_: int, protocol: int): long;
+/// Closes a socket handle previously returned by `socket` or `accept`.
 pub extern("c") fn closesocket(s: long): int;
+/// Binds a socket to a local address.
 pub extern("c") fn bind(s: long, addr: ptr, namelen: int): int;
+/// Marks a bound socket as passive, ready to `accept` incoming connections.
 pub extern("c") fn listen(s: long, backlog: int): int;
+/// Accepts a pending connection, returning a new socket handle for it.
 pub extern("c") fn accept(s: long, addr: ptr, addrlen: ptr): long;
+/// Connects a socket to a remote address (blocking variant).
 pub extern("c") fn connect(s: long, name: ptr, namelen: int): int;
+/// Reads bytes from a connected socket into `buf`.
 pub extern("c") fn recv(s: long, buf: ptr, len: int, flags: int): int;
+/// Writes bytes from `buf` to a connected socket.
 pub extern("c") fn send(s: long, buf: ptr, len: int, flags: int): int;
+/// Sets a socket option, for example `SO_REUSEADDR` under `SOL_SOCKET`.
 pub extern("c") fn setsockopt(s: long, level: int, optname: int, optval: ptr, optlen: int): int;
+/// Reads a socket option, for example `SO_ERROR` under `SOL_SOCKET`.
 pub extern("c") fn getsockopt(s: long, level: int, optname: int, optval: ptr, optlen: ptr): int;
+/// Retrieves the local address a socket is bound to.
 pub extern("c") fn getsockname(s: long, addr: ptr, addrlen: ptr): int;
+/// Issues an I/O control command on a socket, for example toggling `FIONBIO`.
 pub extern("c") fn ioctlsocket(s: long, cmd: long, argp: ptr): int;
+/// Resolves a host/service name into one or more addresses (fills `res` with a linked list).
 pub extern("c") fn getaddrinfo(node: ptr, service: ptr, hints: ptr, res: ptr): int;
+/// Frees the address list allocated by `getaddrinfo`.
 pub extern("c") fn freeaddrinfo(res: ptr): void;
 
+/// Size in bytes of a Winsock `WSABUF` structure: a `{len: u32, buf: ptr}` pair.
 pub const WSABUF_SIZE: int = 16;
+/// Populates a `WSABUF` at `wb` with the given length and buffer pointer, for use with
+/// `WSARecv`/`WSASend`.
 pub fn setWsaBuf(wb: ptr, len: int, buf: long): void {
     bytes.write_i32(wb, 0, len as long);
     bytes.write_ptr(wb, 8, buf);
 }
+/// Issues an overlapped (or synchronous) scatter read into one or more `WSABUF`s.
+/// `lpOverlapped` drives completion-based delivery on the IOCP reactor; pass null for
+/// a synchronous call.
 pub extern("c") fn WSARecv(s: long, buffers: ptr, bufferCount: int, lpBytesRecvd: ptr, lpFlags: ptr, lpOverlapped: ptr, completionRoutine: long): int;
+/// Issues an overlapped (or synchronous) gather write from one or more `WSABUF`s.
 pub extern("c") fn WSASend(s: long, buffers: ptr, bufferCount: int, lpBytesSent: ptr, dwFlags: int, lpOverlapped: ptr, completionRoutine: long): int;
 
+/// `mswsock` overlapped accept: accepts a connection onto a pre-created socket and
+/// optionally receives the first bytes of data in the same operation. `outBuf` must be
+/// at least `2 * ACCEPTEX_ADDRLEN` bytes for the local/remote address output.
 pub extern("c") fn AcceptEx(listenSock: long, acceptSock: long, outBuf: ptr, recvDataLen: int,
                             localLen: int, remoteLen: int, received: ptr, overlapped: ptr): int;
+/// Per-address buffer size `AcceptEx` requires (must include 16 bytes of padding over
+/// a raw `sockaddr_in`).
 pub const ACCEPTEX_ADDRLEN: int = 32;
+/// Size of the scratch receive buffer used alongside `AcceptEx`.
 pub const ACCEPTEX_BUFLEN: int = 64;
 
+/// Overlapped connect. `ConnectEx` is not a named export like `AcceptEx`: it must be
+/// resolved at runtime via `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)`, so this
+/// wraps that resolution plus the indirect call in the C++ runtime (`io.cpp`).
 pub extern("c") fn nova_wsa_connectex(s: long, addr: ptr, addrlen: int, overlapped: ptr): int;
 
+/// Socket option that must be set on an `AcceptEx`-accepted socket before
+/// `getsockname`/`getpeername` and other operations that need the listening
+/// socket's context will work on it.
 pub const SO_UPDATE_ACCEPT_CONTEXT: int = 28683;
 
+/// Byte size of the `WSADATA` scratch buffer passed to `WSAStartup`.
 pub const WSADATA_SIZE: int = 512;
+/// Requested Winsock version (2.2, packed as major/minor bytes) passed to `WSAStartup`.
 pub const WINSOCK_VERSION: int = 514;
 
+/// Allocates a `WSADATA` buffer and calls `WSAStartup` with `WINSOCK_VERSION`, freeing
+/// the scratch buffer before returning. Call once per process before using any other
+/// socket function; returns 0 on success.
 pub fn startup(): int {
     let d = bytes.alloc(WSADATA_SIZE);
     let r = WSAStartup(WINSOCK_VERSION, d);

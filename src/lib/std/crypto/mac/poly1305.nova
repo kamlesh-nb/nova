@@ -1,21 +1,106 @@
+//! Poly1305 one-time message authentication code (RFC 8439).
+//!
+//! Poly1305 takes a 32-byte one-time key and a message of any length, and
+//! produces a 16-byte authentication tag. It is a polynomial evaluation MAC:
+//! the message is split into 16-byte blocks, each block is read as a little
+//! endian integer with a high bit appended, and the accumulator is updated as
+//! `h = (h + block) * r mod (2^130 - 5)`. After the last block the low 128 bits
+//! of `h` are added to a per-message pad `s` and the result is the tag. The key
+//! is the pair `(r, s)`: the first 16 bytes are `r` (with a fixed clamp applied)
+//! and the second 16 bytes are `s`.
+//!
+//! WHY it exists here: Poly1305 is the authenticator half of the
+//! ChaCha20-Poly1305 AEAD used by Nova's self-hosted TLS 1.3 stack, and it also
+//! backs the standalone MAC surface in the crypto library. The runtime retired
+//! wolfSSL, so all crypto is pure Nova with an optional hand-written assembly
+//! fast path, and this file is where the Poly1305 primitive lives.
+//!
+//! DESIGN: the accumulator `h` and the key `r` are held as five 26-bit limbs
+//! packed into `ulong` fields (`h0..h4`, `r0..r4`). Five 26-bit limbs cover the
+//! 130 bits of the field with room to spare, so the schoolbook multiply in
+//! [`Poly1305.absorb`] can accumulate partial products in 64-bit words without
+//! overflowing before the carry-propagation step folds them back down. The
+//! `s1..s4` fields hold `r1..r4` pre-multiplied by 5, which is the standard
+//! trick for reducing mod `2^130 - 5`: a limb that spills past bit 130 is worth
+//! 5 units in the bottom limb, so multiplying the wrapped terms by 5 and adding
+//! them back performs the reduction with plain multiplies.
+//!
+//! INVARIANTS the caller must uphold: the key buffer is exactly
+//! [`POLY1305_KEY_LEN`] (32) bytes, the output buffer is exactly
+//! [`POLY1305_TAG_LEN`] (16) bytes, and each [`Poly1305`] instance authenticates
+//! ONE message only. Poly1305 is a one-time MAC: reusing the same `(r, s)` key
+//! across two messages leaks `r` and breaks security, so the key must be fresh
+//! per message (in the AEAD this is the ChaCha20 keystream block for counter 0).
+//! Every [`Poly1305.create`] must be paired with a [`Poly1305.delete`] to free
+//! the two heap buffers it allocates.
+//!
+//! FAST PATH: when [`nova_has_asm_crypto`] reports a supported CPU, the state is
+//! carried in a 26-bit-free 44-bit-limb layout inside the `hw` scratch buffer and
+//! the block loop runs in assembly ([`nova_poly1305_blocks`] /
+//! [`nova_poly1305_finish`]). The pure-Nova limb path is the fallback and the
+//! reference for correctness. The two paths are never mixed within one instance;
+//! `useHw` records which one this instance chose at creation time.
+
 import bytes;
 import mem.allocator;
 
+/// Runtime probe for a CPU with the hand-written assembly crypto kernels.
+///
+/// Returns 1 when the assembly Poly1305 block and finish routines are available
+/// and safe to call on this machine, 0 otherwise. [`Poly1305.create`] calls this
+/// once and latches the answer into `useHw`, so the choice of code path is fixed
+/// for the lifetime of the instance.
 extern("c") fn nova_has_asm_crypto(): int;
+/// Assembly fast path: absorb `nblocks` whole 16-byte blocks into the state.
+///
+/// Consumes `nblocks * 16` bytes starting at `data` and folds them into the
+/// 44-bit-limb accumulator held in the `hw` scratch buffer. Only called when
+/// `useHw == 1`. The caller must pass complete blocks; a trailing partial block
+/// is handled by [`nova_poly1305_finish`] instead.
 extern("c") fn nova_poly1305_blocks(state: ptr, data: ptr, nblocks: int): void;
+/// Assembly fast path: absorb the final partial block, add the pad, and emit the tag.
+///
+/// `tail` points at the leftover `taillen` bytes (0..15) that did not fill a
+/// whole block, `padLo`/`padHi` carry the 128-bit pad `s` as two 64-bit halves,
+/// and the 16-byte tag is written to `out`. This finishes the assembly path and
+/// mirrors the tail-padding plus final addition that [`Poly1305.final`] performs
+/// by hand in the pure-Nova path.
 extern("c") fn nova_poly1305_finish(state: ptr, tail: ptr, taillen: int, out: ptr, padLo: ulong, padHi: ulong): void;
 
+/// Mask that keeps the low 26 bits, i.e. the width of one limb in the packed
+/// five-limb representation of a field element.
 const M26: ulong = 0x3ffffff;
+/// The `2^128` high bit appended to each full 16-byte message block.
+///
+/// Each block is read as a 128-bit little endian integer and then bit 128 is
+/// set before it enters the accumulator, which is Poly1305's way of encoding the
+/// block length so that blocks of different content never collide. Bit 128 lands
+/// in the fifth limb `h4` at bit `128 - 4*26 = 24`, hence the value `0x1000000`.
+/// The final short block sets this bit explicitly at the pad byte instead (see
+/// [`Poly1305.final`]), so it passes `0` here.
 const HIBIT: ulong = 0x1000000;
 
+/// Length in bytes of a Poly1305 key: 16 bytes of `r` followed by 16 bytes of `s`.
 pub const POLY1305_KEY_LEN: int = 32;
+/// Length in bytes of a Poly1305 authentication tag.
 pub const POLY1305_TAG_LEN: int = 16;
 
+/// Writes a 64-bit word `w` little endian at byte offset `off` in `buf`.
+///
+/// Used only to lay out the 44-bit-limb state that the assembly kernels read
+/// from the `hw` scratch buffer, so it emits full 8-byte words. Compare
+/// [`putLe`], which writes the 32-bit words of the final tag.
 fn putU64(buf: ptr, off: int, w: ulong): void {
     let i = 0;
     while (i < 8) { bytes.write_byte(buf, off + i, ((w >> (i * 8)) & 0xff) as int); i = i + 1; }
 }
 
+/// Reads four bytes at offset `off` in `buf` as a 32-bit little endian word.
+///
+/// Poly1305 is defined entirely over little endian integers, so both the key
+/// and the message are decoded through this helper. The result is widened to
+/// `ulong` so callers can shift and OR adjacent words together to reassemble the
+/// 26-bit or 44-bit limbs without a narrowing intermediate.
 fn leWord(buf: ptr, off: int): ulong {
     return (bytes.read_byte(buf, off) as ulong)
         | ((bytes.read_byte(buf, off + 1) as ulong) << 8)
@@ -23,6 +108,11 @@ fn leWord(buf: ptr, off: int): ulong {
         | ((bytes.read_byte(buf, off + 3) as ulong) << 24);
 }
 
+/// Writes the low 32 bits of `w` little endian at offset `off` in `buf`.
+///
+/// Used by [`Poly1305.final`] to serialise the four 32-bit words of the tag.
+/// Only the bottom 32 bits are emitted; callers pass words already masked to
+/// `0xffffffff`.
 fn putLe(buf: ptr, off: int, w: ulong): void {
     bytes.write_byte(buf, off, (w & 0xff) as int);
     bytes.write_byte(buf, off + 1, ((w >> 8) & 0xff) as int);
@@ -30,16 +120,58 @@ fn putLe(buf: ptr, off: int, w: ulong): void {
     bytes.write_byte(buf, off + 3, ((w >> 24) & 0xff) as int);
 }
 
+/// A running Poly1305 computation over one message.
+///
+/// Holds the clamped key `r` and its pre-multiplied `s`-form, the polynomial
+/// accumulator `h`, the pad, and a 16-byte staging buffer for a partial trailing
+/// block. Build one with [`Poly1305.create`], feed message bytes with
+/// [`Poly1305.update`] (any number of calls, any sizes), read the tag with
+/// [`Poly1305.final`], then release the heap buffers with [`Poly1305.delete`].
+/// The instance is single-use: it authenticates exactly one message and must not
+/// be reset and reused, because the key is a one-time key.
 pub struct Poly1305 {
+    /// The clamped key `r` as five 26-bit limbs, low limb first. Set once in
+    /// [`Poly1305.create`] and never mutated thereafter.
     pub r0: ulong, pub r1: ulong, pub r2: ulong, pub r3: ulong, pub r4: ulong,
+    /// The upper `r` limbs each pre-multiplied by 5. These feed the mod
+    /// `2^130 - 5` reduction inside [`Poly1305.absorb`]: a term that wraps past
+    /// bit 130 is folded back into the low limbs as `5 *` its value.
     pub s1: ulong, pub s2: ulong, pub s3: ulong, pub s4: ulong,
+    /// The polynomial accumulator `h` as five 26-bit limbs, starting at zero and
+    /// updated per block. After the final carry chain in [`Poly1305.final`] its
+    /// low 128 bits become the pre-pad tag.
     pub h0: ulong, pub h1: ulong, pub h2: ulong, pub h3: ulong, pub h4: ulong,
+    /// The per-message pad `s` (second half of the key) as four 32-bit little
+    /// endian words. Added to the reduced accumulator at the very end to produce
+    /// the tag.
     pub pad0: ulong, pub pad1: ulong, pub pad2: ulong, pub pad3: ulong,
+    /// A 16-byte heap buffer that stages a not-yet-complete block across
+    /// [`Poly1305.update`] calls. Its valid prefix length is `bufLen`.
     pub buf: ptr,
+    /// Number of bytes currently held in `buf`, in the range 0..15. When it
+    /// reaches 16 the block is absorbed and this resets to 0.
     pub bufLen: int,
+    /// Scratch buffer for the assembly path's 44-bit-limb state, or 0 when the
+    /// pure-Nova path is in use. Allocated (64 bytes) only when `useHw == 1`.
     pub hw: ptr,
+    /// 1 when this instance runs the assembly fast path, 0 for the pure-Nova
+    /// limb path. Latched at creation from [`nova_has_asm_crypto`] and fixed for
+    /// the instance's lifetime; the two paths are never interleaved.
     pub useHw: int,
 
+    /// Initialises a fresh Poly1305 state from a 32-byte key buffer.
+    ///
+    /// Decodes and clamps `r` from the first 16 bytes into the 26-bit limbs
+    /// (`r0..r4`), the clamp masks (`0x3ffffff`, `0x3ffff03`, ...) are the
+    /// canonical Poly1305 clamp that clears the bits the specification requires,
+    /// then derives the `s1..s4` reduction constants. The pad `s` is read from
+    /// the second 16 bytes, `h` is zeroed, and the staging buffer is allocated.
+    /// When [`nova_has_asm_crypto`] returns 1 it additionally lays out the key in
+    /// the 44-bit-limb form the assembly kernels expect (with the `r1`/`r2`
+    /// halves pre-multiplied by 20 for that path's reduction) into a 64-byte `hw`
+    /// buffer and sets `useHw`. The returned value owns two heap buffers, so it
+    /// must be released with [`Poly1305.delete`]. `key` must point at exactly
+    /// [`POLY1305_KEY_LEN`] readable bytes.
     pub fn create(key: ptr): Poly1305 {
         let p = bytes.new_with_allocator<Poly1305>(allocator.globalAllocator());
         let t0 = leWord(key, 0);
@@ -84,6 +216,18 @@ pub struct Poly1305 {
         return p;
     }
 
+    /// Absorbs one 16-byte block at offset `off` in `m` into the accumulator (pure-Nova path).
+    ///
+    /// Computes `h = (h + block) * r mod (2^130 - 5)` for a single block. The
+    /// block is decoded into 26-bit limbs and added to `h`, `hibit` supplies the
+    /// high `2^128` bit ([`HIBIT`] for a full block, 0 when [`Poly1305.final`]
+    /// pads a short tail that carries its own length byte), the schoolbook
+    /// multiply `d0..d4` mixes each `h` limb against `r` and the pre-multiplied
+    /// `s` limbs (the `s` terms are the wrapped high products folded back for the
+    /// mod `2^130 - 5` reduction), and a carry chain repacks the result into
+    /// five 26-bit limbs. This is the only path that reduces `h` per block; the
+    /// assembly kernels do the equivalent in the `hw` state. Only called when
+    /// `useHw == 0`.
     fn absorb(self: Poly1305, m: ptr, off: int, hibit: ulong): void {
         let t0 = leWord(m, off);
         let t1 = leWord(m, off + 4);
@@ -117,6 +261,18 @@ pub struct Poly1305 {
         self.h4 = nh4;
     }
 
+    /// Feeds `len` bytes at `data` into the running MAC.
+    ///
+    /// May be called any number of times with any chunk sizes; the result
+    /// depends only on the concatenation of all the bytes fed, not on how they
+    /// were split across calls. First it tops up any partial block left in `buf`
+    /// from a previous call and absorbs it once full, then it absorbs whole
+    /// 16-byte blocks straight from `data` (in a single batched
+    /// [`nova_poly1305_blocks`] call on the assembly path, or block by block via
+    /// [`Poly1305.absorb`] otherwise), and finally it stashes the trailing 0..15
+    /// bytes back into `buf` for next time. The trailing remainder is completed
+    /// and padded by [`Poly1305.final`]. `data` must point at `len` readable
+    /// bytes.
     pub fn update(self: Poly1305, data: ptr, len: int): void {
         let i = 0;
         if (self.bufLen > 0) {
@@ -150,6 +306,21 @@ pub struct Poly1305 {
         }
     }
 
+    /// Finishes the MAC and writes the 16-byte tag to `out`.
+    ///
+    /// Absorbs any trailing partial block held in `buf`: a `1` byte is appended
+    /// right after the data (the length marker for a short block), the rest is
+    /// zero-filled, and it is absorbed with `hibit = 0` since the marker byte
+    /// already stands in for the high bit. Then `h` is fully carry-reduced, a
+    /// constant-time conditional subtraction of the prime brings it into the
+    /// range `[0, 2^130 - 5)` (the `mask`/`notMask` select avoids a
+    /// data-dependent branch, so the reduction does not leak timing), the low 128
+    /// bits are added to the pad `s` with carry propagation, and the four result
+    /// words are serialised little endian via [`putLe`]. On the assembly path it
+    /// delegates the tail, pad, and serialisation to [`nova_poly1305_finish`].
+    /// After this call the accumulator state is spent; do not call
+    /// [`Poly1305.update`] again. `out` must point at [`POLY1305_TAG_LEN`]
+    /// writable bytes.
     pub fn final(self: Poly1305, out: ptr): void {
         if (self.useHw == 1) {
             let padLo = self.pad0 | (self.pad1 << 32);
@@ -204,6 +375,13 @@ pub struct Poly1305 {
         putLe(out, 12, a3);
     }
 
+    /// Frees the heap buffers this instance owns and null-guards against a double free.
+    ///
+    /// Releases the staging buffer `buf` and, on the assembly path, the `hw`
+    /// scratch buffer, setting each pointer to 0 so a second call is a no-op.
+    /// Every [`Poly1305.create`] must be matched with exactly one
+    /// [`Poly1305.delete`]. It does NOT zero the secret key material in `r`/`s`;
+    /// those live in the value struct's own storage, not on the heap.
     pub fn delete(self: Poly1305): void {
         if (self.buf != 0) {
             bytes.free(self.buf);
@@ -216,6 +394,14 @@ pub struct Poly1305 {
     }
 }
 
+/// One-shot Poly1305: authenticate a whole message under `key`, writing the tag to `out`.
+///
+/// Convenience wrapper that creates a [`Poly1305`], feeds the entire message in
+/// a single [`Poly1305.update`], finalises, and deletes the state, so the caller
+/// never touches the incremental API. Use this when the whole message is already
+/// in one buffer. `key` is 32 bytes ([`POLY1305_KEY_LEN`]), `msg` is `msgLen`
+/// bytes, and `out` receives 16 bytes ([`POLY1305_TAG_LEN`]). As with any
+/// Poly1305 use, `key` must be a fresh one-time key for this message.
 pub fn authInto(key: ptr, msg: ptr, msgLen: int, out: ptr): void {
     let p = Poly1305.create(key);
     p.update(msg, msgLen);

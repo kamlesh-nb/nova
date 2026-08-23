@@ -1,18 +1,78 @@
+//! A generic binary heap (priority queue) over `List<T>`.
+//!
+//! `Heap<T>` is a classic array-backed binary heap. The tree lives inside a
+//! flat [`List`], with the children of the node at index `i` sitting at
+//! `2*i + 1` and `2*i + 2`, and its parent at `(i - 1) / 2`. There is no
+//! separate node allocation and no pointers between elements: the parent and
+//! child relationships are purely arithmetic on the index, which is what keeps
+//! the structure cache friendly and cheap to grow.
+//!
+//! The ordering is supplied by the caller as a `less` comparator rather than
+//! being fixed by the type. The element that `less` reports as smallest is the
+//! one kept at the root and handed back first by [`Heap.pop`] and
+//! [`Heap.peek`]. So a comparator that returns `a < b` gives a min heap, and
+//! one that returns `a > b` gives a max heap. This is why the type carries the
+//! comparator as a field: it lets a single implementation serve both
+//! priorities and any custom key without special casing.
+//!
+//! The heap invariant maintained after every operation is that each node
+//! compares as not greater than either of its children under `less`. Both
+//! mutating operations restore it in O(log n): [`Heap.push`] appends then
+//! sift ups, [`Heap.pop`] swaps the root with the last element, shrinks, then
+//! sift downs. Reads ([`Heap.size`], [`Heap.isEmpty`], [`Heap.peek`]) are O(1).
+//!
+//! One subtlety worth calling out: `List.get` returns an optional, so the code
+//! below is peppered with `?? fallback` guards. Those fallbacks only exist to
+//! satisfy the optional unwrap on indices that the algorithm has already proven
+//! to be in range; they are never expected to be taken at run time. This is a
+//! deliberate trade to keep the heap free of a separate bounds-checking layer.
+//!
+//! It sits alongside the other containers in `std/collections` and depends only
+//! on [`List`], so it is safe to use anywhere in the standard library and in
+//! user code without pulling in the wider runtime.
 
 import list;
 
+/// An array-backed binary heap ordered by a caller-supplied comparator.
+///
+/// `Heap<T>` keeps the smallest element (as judged by [`Heap.less`]) at the
+/// root, so [`Heap.peek`] and [`Heap.pop`] always yield the current minimum
+/// under that ordering. Supply `a < b` for a min heap or `a > b` for a max
+/// heap. The backing store is a single [`List`]; see the file header for the
+/// index arithmetic and the heap invariant.
 pub class Heap<T> {
+    /// The flat array that stores the heap in level order (breadth first).
+    ///
+    /// The node at index `i` has children at `2*i + 1` and `2*i + 2` and parent
+    /// at `(i - 1) / 2`. Element 0, when present, is the current minimum.
     pub data: List<T>,
+    /// The strict ordering used to compare two elements.
+    ///
+    /// It must behave like a real "less than": return `true` when the first
+    /// argument should rank ahead of (come out before) the second. The element
+    /// for which this returns `false` against all others ends up at the root.
     pub less: (T, T) -> bool,
 
+    /// Creates an empty heap that will order its elements by `less`.
+    ///
+    /// The backing [`List`] starts empty; the comparator is captured for the
+    /// lifetime of the heap and used by every [`Heap.push`] and [`Heap.pop`].
     init(less: (T, T) -> bool) {
         self.data = List<T>();
         self.less = less;
     }
 
+    /// Number of elements currently in the heap. O(1).
     pub fn size(self: Heap<T>): int { return self.data.size(); }
+    /// Whether the heap holds no elements. O(1).
     pub fn isEmpty(self: Heap<T>): bool { return self.data.size() == 0; }
 
+    /// Exchanges the elements at indices `i` and `j` in the backing array.
+    ///
+    /// This is the primitive used by the sift up and sift down loops to move an
+    /// element one level towards its correct position. Both indices are assumed
+    /// in range; the `?? self.data.get(0)` guards only satisfy the optional
+    /// unwrap on `List.get` and are never expected to fire for valid indices.
     fn swap(self: Heap<T>, i: int, j: int): void {
         let a = self.data.get(i) ?? self.data.get(0);
         let b = self.data.get(j) ?? self.data.get(0);
@@ -20,6 +80,14 @@ pub class Heap<T> {
         self.data.set(j, a ?? b);
     }
 
+    /// Inserts `v` and restores the heap ordering. O(log n).
+    ///
+    /// The value is appended at the end of the array (the next leaf slot) and
+    /// then sift up: while it compares smaller than its parent under
+    /// [`Heap.less`], it is swapped upward, stopping as soon as the parent is
+    /// not greater or the root is reached. On return, `v` sits at the deepest
+    /// position consistent with the heap invariant. The `?? v` guards cover the
+    /// optional unwrap on indices already known to be valid.
     pub fn push(self: Heap<T>, v: T): void {
         self.data.push(v);
         let i = self.data.size() - 1;
@@ -33,6 +101,16 @@ pub class Heap<T> {
         }
     }
 
+    /// Removes and returns the smallest element, or `undefined` if empty. O(log n).
+    ///
+    /// The root (the minimum under [`Heap.less`]) is captured to return. The
+    /// last element is moved into the root slot, the array is shrunk by one, and
+    /// the new root is sift down: at each step it is compared against its two
+    /// children and swapped with the smaller child until neither child ranks
+    /// ahead of it, which re-establishes the heap invariant. The many
+    /// `?? fallback` expressions only satisfy optional unwraps on indices the
+    /// loop bounds have already validated. Returns `undefined` on an empty heap
+    /// rather than trapping. See [`Heap.peek`] for a non-removing read.
     pub fn pop(self: Heap<T>): T | undefined {
         let n = self.data.size();
         if (n == 0) { return undefined; }
@@ -65,7 +143,16 @@ pub class Heap<T> {
         return root;
     }
 
+    /// Returns the smallest element without removing it, or `undefined` if empty. O(1).
+    ///
+    /// This is just a read of index 0, which the heap invariant guarantees holds
+    /// the current minimum. Unlike [`Heap.pop`] it leaves the heap unchanged.
     pub fn peek(self: Heap<T>): T | undefined { return self.data.get(0); }
 }
 
+/// Convenience constructor for a [`Heap`] ordered by `less`.
+///
+/// Equivalent to calling `Heap<T>(less)` directly; it exists as a free function
+/// for callers who prefer a factory style or need to pass the constructor
+/// around. See [`Heap.less`] for how `less` picks between a min and max heap.
 pub fn newHeap<T>(less: (T, T) -> bool): Heap<T> { return Heap<T>(less); }

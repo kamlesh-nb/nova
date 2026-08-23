@@ -1,17 +1,30 @@
+//! Owned `string` manipulation utilities.
+//!
+//! Where `str.nova` defines `Str`, a borrowed zero-copy view, this module works
+//! on owned `string` values: each function that produces new text (`concat`,
+//! `slice`, `trim`, case conversion, `replace`, and so on) allocates a fresh
+//! heap string and returns it, leaving the input untouched. It also carries
+//! the numeric parsers (`parseInt`, `parseLong`, `parseDouble`, ...) and the
+//! byte-wise comparison helpers (`eql`, `compare`, `hash`) used throughout the
+//! standard library wherever text needs to be split, joined, searched, or
+//! converted to and from numbers.
 
 import list;
 import bytes;
 
 extern("c") fn nova_str_alloc(len: int): long;
 
+/// Returns the number of bytes in `s`.
 pub fn len(s: string): int {
     return s.length;
 }
 
+// Allocates an uninitialised owned string buffer of the given byte length.
 fn allocString(len: int): string {
     return nova_str_alloc(len) as string;
 }
 
+/// Concatenates `a` and `b` into a newly allocated string.
 pub fn concat(a: string, b: string): string {
     let len_a = a.length;
     let len_b = b.length;
@@ -23,6 +36,10 @@ pub fn concat(a: string, b: string): string {
     return ptr;
 }
 
+/// Splits `s` on every occurrence of `sep`, returning the parts in order.
+///
+/// An empty `sep` splits into individual one-byte strings rather than
+/// returning `s` unchanged.
 pub fn split(s: string, sep: string): List<string> {
     let result = List<string>();
     let s_len = s.length;
@@ -58,6 +75,9 @@ pub fn split(s: string, sep: string): List<string> {
     return result;
 }
 
+/// Joins the strings in `list` into one string, inserting `sep` between
+/// consecutive elements. Returns `""` for an empty list. `undefined` entries
+/// contribute no bytes but still get a separator on either side.
 pub fn join(list: List<string>, sep: string): string {
     if (list.size() == 0) {
         return "";
@@ -104,6 +124,10 @@ pub fn join(list: List<string>, sep: string): string {
     return ptr;
 }
 
+/// Returns the substring from `start` (inclusive) to `end` (exclusive).
+///
+/// Both bounds are clamped into `[0, s.length]`, and a range that ends up
+/// empty or inverted yields `""` rather than erroring.
 pub fn slice(s: string, start: int, end: int): string {
     let s_len = s.length;
     let start_clamped = if (start < 0) 0 else if (start > s_len) s_len else start;
@@ -117,6 +141,7 @@ pub fn slice(s: string, start: int, end: int): string {
     return ptr;
 }
 
+/// Removes leading and trailing ASCII whitespace (space, tab, LF, CR).
 pub fn trim(s: string): string {
     let len = s.length;
     let start = 0;
@@ -138,6 +163,7 @@ pub fn trim(s: string): string {
     return slice(s, start, end);
 }
 
+/// Removes leading ASCII whitespace only.
 pub fn trimStart(s: string): string {
     let len = s.length;
     let start = 0;
@@ -149,6 +175,7 @@ pub fn trimStart(s: string): string {
     return slice(s, start, len);
 }
 
+/// Removes trailing ASCII whitespace only.
 pub fn trimEnd(s: string): string {
     let len = s.length;
     let end = len;
@@ -160,15 +187,18 @@ pub fn trimEnd(s: string): string {
     return slice(s, 0, end);
 }
 
+/// Alias for `slice`: returns the substring from `start` to `end`.
 pub fn substring(s: string, start: int, end: int): string {
     return slice(s, start, end);
 }
 
+/// Returns the single-byte string at index `i`, or `""` if `i` is out of range.
 pub fn charAt(s: string, i: int): string {
     if (i < 0 || i >= s.length) { return ""; }
     return slice(s, i, i + 1);
 }
 
+/// Returns `s` repeated `n` times, concatenated with no separator.
 pub fn repeat(s: string, n: int): string {
     let out = "";
     let i = 0;
@@ -176,6 +206,8 @@ pub fn repeat(s: string, n: int): string {
     return out;
 }
 
+/// Pads `s` on the left with repetitions of `pad` until it reaches `targetLen`
+/// bytes. Returns `s` unchanged if `pad` is empty or `s` is already long enough.
 pub fn padStart(s: string, targetLen: int, pad: string): string {
     if (pad.length == 0) { return s; }
     let deficit = targetLen - s.length;
@@ -185,6 +217,9 @@ pub fn padStart(s: string, targetLen: int, pad: string): string {
     return concat(slice(prefix, 0, deficit), s);
 }
 
+/// Pads `s` on the right with repetitions of `pad` until it reaches
+/// `targetLen` bytes. Returns `s` unchanged if `pad` is empty or `s` is
+/// already long enough.
 pub fn padEnd(s: string, targetLen: int, pad: string): string {
     if (pad.length == 0) { return s; }
     let deficit = targetLen - s.length;
@@ -194,6 +229,11 @@ pub fn padEnd(s: string, targetLen: int, pad: string): string {
     return concat(s, slice(suffix, 0, deficit));
 }
 
+/// Replaces every non-overlapping occurrence of `old` in `s` with `new`.
+///
+/// When `old` is `""`, `new` is inserted between every byte of `s`, including
+/// before the first byte and after the last. Returns `s` unchanged (no new
+/// allocation) when there are no matches.
 pub fn replace(s: string, old: string, new: string): string {
     let s_len = s.length;
     let old_len = old.length;
@@ -278,6 +318,8 @@ pub fn replace(s: string, old: string, new: string): string {
     return result;
 }
 
+/// Returns a copy of `s` with ASCII uppercase letters lowercased. Non-ASCII
+/// bytes pass through unchanged.
 pub fn toLowerCase(s: string): string {
     let len = s.length;
     let ptr = allocString(len);
@@ -294,6 +336,8 @@ pub fn toLowerCase(s: string): string {
     return ptr;
 }
 
+/// Returns a copy of `s` with ASCII lowercase letters uppercased. Non-ASCII
+/// bytes pass through unchanged.
 pub fn toUpperCase(s: string): string {
     let len = s.length;
     let ptr = allocString(len);
@@ -310,6 +354,7 @@ pub fn toUpperCase(s: string): string {
     return ptr;
 }
 
+/// Reports whether `s` begins with `prefix`.
 pub fn startsWith(s: string, prefix: string): bool {
     let s_len = s.length;
     let p_len = prefix.length;
@@ -326,6 +371,7 @@ pub fn startsWith(s: string, prefix: string): bool {
     return true;
 }
 
+/// Reports whether `s` ends with `suffix`.
 pub fn endsWith(s: string, suffix: string): bool {
     let s_len = s.length;
     let suf_len = suffix.length;
@@ -342,6 +388,8 @@ pub fn endsWith(s: string, suffix: string): bool {
     return true;
 }
 
+/// Reports whether `substr` occurs anywhere in `s`. An empty `substr` always
+/// matches.
 pub fn contains(s: string, substr: string): bool {
     let s_len = s.length;
     let sub_len = substr.length;
@@ -370,10 +418,14 @@ pub fn contains(s: string, substr: string): bool {
     return false;
 }
 
+/// Returns the byte index of the first occurrence of `substr` in `s`, or -1
+/// if it does not occur.
 pub fn indexOf(s: string, substr: string): int {
     return indexOfFrom(s, substr, 0);
 }
 
+/// Returns the byte index of the last occurrence of `substr` in `s`, or -1 if
+/// it does not occur. An empty `substr` matches at `s.length`.
 pub fn lastIndexOf(s: string, substr: string): int {
     let s_len = s.length;
     let sub_len = substr.length;
@@ -393,6 +445,7 @@ pub fn lastIndexOf(s: string, substr: string): int {
     return -1;
 }
 
+// Finds the first occurrence of substr at or after byte index start, or -1.
 fn indexOfFrom(s: string, substr: string, start: int): int {
     let s_len = s.length;
     let sub_len = substr.length;
@@ -421,6 +474,8 @@ fn indexOfFrom(s: string, substr: string, start: int): int {
     return -1;
 }
 
+/// Reports whether `a` and `b` have identical bytes. Two `undefined` strings
+/// are considered equal; `undefined` never equals a defined string.
 pub fn eql(a: string, b: string): bool {
     if (a == undefined || b == undefined) {
         return a == undefined && b == undefined;
@@ -440,6 +495,8 @@ pub fn eql(a: string, b: string): bool {
     return true;
 }
 
+/// Lexicographically compares `a` and `b` byte by byte, returning -1, 0, or 1
+/// (a shorter string that is a prefix of the other compares as smaller).
 pub fn compare(a: string, b: string): int {
     let len_a = a.length;
     let len_b = b.length;
@@ -468,6 +525,7 @@ pub fn compare(a: string, b: string): int {
     return 0;
 }
 
+/// Computes a djb2-style hash of `s`, suitable for use as a map/set key hash.
 pub fn hash(s: string): int {
     let len = s.length;
     let h = 5381;
@@ -480,6 +538,11 @@ pub fn hash(s: string): int {
     return h;
 }
 
+/// Parses a signed decimal integer from `s`, saturating to `long`'s min/max on
+/// overflow and stopping at the first non-digit rather than failing.
+///
+/// Unlike `parseLong`, this never returns `undefined`: an empty string or a
+/// string with no leading digits parses as `0`.
 pub fn parseI64(s: string): long {
 
     let len = s.length;
@@ -536,6 +599,11 @@ pub fn parseI64(s: string): long {
     return 0 - acc;
 }
 
+/// Parses a decimal (optionally exponent-bearing) number from `s`.
+///
+/// Delegates to `parseDouble` first and only falls back to a lenient
+/// digit-by-digit scan (which never fails and simply ignores invalid
+/// characters) when `parseDouble` reports `undefined`.
 pub fn parseFloat(s: string): double {
     let parsed = parseDouble(s);
     if (parsed != undefined) { return parsed; }
@@ -573,6 +641,11 @@ pub fn parseFloat(s: string): double {
 }
 
 
+/// Strictly parses a signed decimal integer from `s` into a `long`.
+///
+/// Returns `undefined` for an empty string, a lone sign, trailing
+/// non-numeric characters, or overflow of `long`'s range: the whole string
+/// must be a valid integer.
 pub fn parseLong(s: string): long | undefined {
     let len = s.length;
     if (len == 0) { return undefined; }
@@ -608,6 +681,10 @@ pub fn parseLong(s: string): long | undefined {
     return 0 - acc;
 }
 
+/// Strictly parses a signed decimal integer from `s` into an `int`.
+///
+/// Uses `parseLong` and returns `undefined` if parsing fails or the value
+/// falls outside `int`'s 32-bit range.
 pub fn parseInt(s: string): int | undefined {
     let v = parseLong(s);
     if (v == undefined) { return undefined; }
@@ -617,6 +694,12 @@ pub fn parseInt(s: string): int | undefined {
     return v as int;
 }
 
+/// Strictly parses a decimal number from `s` into a `double`, with optional
+/// sign, fractional part, and `e`/`E` exponent (e.g. `-1.5e2`).
+///
+/// Returns `undefined` unless the entire string is consumed as a valid
+/// number: no digits, a dangling exponent marker, or trailing garbage all
+/// fail rather than returning a partial result.
 pub fn parseDouble(s: string): double | undefined {
     let len = s.length;
     if (len == 0) { return undefined; }
@@ -676,6 +759,8 @@ pub fn parseDouble(s: string): double | undefined {
     return mant;
 }
 
+/// Destructor hook for `string`. Owned strings are plain heap buffers with no
+/// nested owned fields, so there is nothing extra to release here.
 pub fn delete(self: string): void {
 }
 

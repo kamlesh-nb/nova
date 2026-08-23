@@ -1,12 +1,28 @@
+//! Child process management: spawning, piping stdin/stdout, and reaping.
+//!
+//! `Process` wraps a native OS child process handle (an opaque `ctx` pointer
+//! managed by the runtime) and gives Nova code a way to launch a command,
+//! write to its standard input, read from its standard output, and wait for
+//! or signal it. `spawnIsolated` extends this with Linux namespace and
+//! seccomp based sandboxing (rootfs, hostname, dropped capabilities, no new
+//! privileges) for running untrusted or lower-trust workloads. This is the
+//! stdlib seam for shelling out; the actual OS work happens in the native
+//! `nova_process_*` runtime functions this module calls into.
 
 import list;
 import bytes;
 
 import assert;
 
+/// A handle to a spawned child process, with pipes for its stdin/stdout.
 pub struct Process {
+    /// Opaque native handle for the underlying OS process. Zero once the
+    /// process has been closed; do not use directly, it is runtime-owned.
     pub ctx: ptr,
 
+    /// Spawns `cmd` with the given argument list and returns a handle to it.
+    /// Arguments are joined with newlines before crossing into the native
+    /// runtime, so no argument may itself contain a newline.
     pub fn spawn(cmd: string, args: list.List<string>): Process {
         let args_str = "";
         let i = 0;
@@ -25,6 +41,11 @@ pub struct Process {
         };
     }
 
+    /// Spawns `cmd` inside a sandboxed Linux namespace: `nsFlags` selects
+    /// which namespaces to unshare, `rootfs` chroots the child, `hostname`
+    /// sets its UTS namespace name, `dropCaps` and `noNewPrivs` restrict its
+    /// privileges, and `seccomp` applies a syscall filter. Same newline
+    /// joining rule for `args` as `spawn`.
     pub fn spawnIsolated(cmd: string, args: list.List<string>, nsFlags: int, rootfs: string,
                          hostname: string, dropCaps: int, noNewPrivs: int, seccomp: int): Process {
         let args_str = "";
@@ -40,10 +61,17 @@ pub struct Process {
         return Process{ ctx: ctx };
     }
 
+    /// Writes `data` to the child's standard input. Returns the number of
+    /// bytes actually written (may be less than `data`'s length on a
+    /// partial write), or a negative value on error.
     pub fn write(self: Process, data: string): int {
         return nova_process_write_stdin(self.ctx, data);
     }
 
+    /// Reads up to `max_len` bytes from the child's standard output.
+    /// Returns an empty string if nothing was read (EOF or an error), not
+    /// a distinguishable failure signal, so callers cannot tell EOF apart
+    /// from a zero-byte read from this return value alone.
     pub fn read(self: Process, max_len: int): string {
         let buf = bytes.alloc(max_len);
         let n = nova_process_read_stdout(self.ctx, buf, max_len);
@@ -62,34 +90,45 @@ pub struct Process {
         return str_ptr as string;
     }
 
+    /// Blocks until the child process exits, and returns its exit code.
     pub fn wait(self: Process): int {
         return nova_process_wait(self.ctx);
     }
 
+    /// Checks the child's status without blocking. Returns the exit code if
+    /// it has already exited, or `-2` if it is still running.
     pub fn tryWait(self: Process): int {
         return nova_process_try_wait(self.ctx);
     }
 
+    /// True if the child process has not yet exited.
     pub fn isRunning(self: Process): bool {
         return nova_process_try_wait(self.ctx) == -2;
     }
 
+    /// The OS process ID of the child.
     pub fn pid(self: Process): long {
         return nova_process_pid(self.ctx);
     }
 
+    /// Sends the given signal number to the child process.
     pub fn kill(self: Process, sig: int): int {
         return nova_process_kill(self.ctx, sig);
     }
 
+    /// Sends SIGTERM (15), requesting the child to exit gracefully.
     pub fn terminate(self: Process): int {
         return nova_process_kill(self.ctx, 15);
     }
 
+    /// Sends SIGKILL (9), terminating the child immediately and unconditionally.
     pub fn forceKill(self: Process): int {
         return nova_process_kill(self.ctx, 9);
     }
 
+    /// Releases the native process handle. Safe to call more than once:
+    /// it is a no-op once `ctx` has already been zeroed. Does not wait for
+    /// or kill the child; call `wait`/`kill` first if that is needed.
     pub fn close(self: Process): void {
         if (self.ctx != 0) {
             nova_process_free(self.ctx);
@@ -97,6 +136,7 @@ pub struct Process {
         }
     }
 
+    /// Destructor hook, forwards to `close`.
     pub fn delete(self: Process): void {
         self.close();
     }

@@ -1,16 +1,77 @@
+//! SQL helpers for loading related rows in bulk (the ORM relations seam).
+//!
+//! This file is the small, self-contained piece of the ORM that turns a set of
+//! parent keys into ONE batched `IN (...)` query, and then buckets the returned
+//! rows back by their foreign key. It exists to solve the classic N+1 query
+//! problem: instead of firing one child query per parent row, the caller
+//! collects every parent key it needs, runs a single query built here, and
+//! stitches the children back onto their parents in memory.
+//!
+//! The design is deliberately thin. These functions build SQL strings and
+//! parameter lists; they do NOT open connections, execute anything, or know
+//! about the driver in use. The query text uses positional `$1`, `$2`, ...
+//! placeholders and hands the actual key values back as a parallel
+//! `list.List<db.DbValue>`, so the values travel over the binary wire protocol
+//! as bound parameters rather than being interpolated into the SQL. That keeps
+//! the seam injection-safe and driver-neutral: whichever `db.Connection`
+//! ultimately runs the string is responsible for binding the params.
+//!
+//! Two shapes are supported, and they are the same query under the hood:
+//!   - `hasMany`  : one parent has many children; select children whose foreign
+//!                  key column is IN the set of parent primary keys.
+//!   - `belongsTo`: many children belong to one parent; select parents whose
+//!                  primary key is IN the set of child foreign keys.
+//!
+//! Both delegate to [`inClause`], which owns the one subtlety worth knowing:
+//! an empty key set. `IN ()` is not valid SQL, so an empty input produces a
+//! query that provably returns no rows (`WHERE 1 = 0`) rather than a malformed
+//! statement. That lets callers pass whatever they gathered without a special
+//! case for "no parents".
+//!
+//! After the child rows come back, [`groupByColumn`] indexes them by the
+//! foreign key column (compared as text) and [`childrenOf`] looks a bucket up,
+//! so the caller can walk parents and attach each one's children in O(1). Keys
+//! are grouped by their textual form via [`db.Row.getText`], which matches how
+//! the placeholder values were sourced.
+//!
+//! This sits on top of the `data.db` seam (`ResultSet`, `Row`, `Column`,
+//! `DbValue`) and under the higher-level ORM; it holds no state and allocates
+//! only the strings, lists, and maps it returns.
+
 import string;
 import list;
 import map;
 import data.db;
 
+/// Builds the batched query for a "has many" relation: fetch the child rows
+/// whose foreign key column falls IN the given set of parent keys.
+///
+/// `childTable` is the table to select from, `fkCol` is the child's foreign key
+/// column, `cols` is the projection (empty means `*`, see [`colList`]), and
+/// `parentKeys` are the parent primary keys to match. Returns the SQL text with
+/// `$1..$n` placeholders alongside the parallel parameter list to bind. An empty
+/// `parentKeys` yields a query that returns no rows, per [`inClause`].
 pub fn hasManyQuery(childTable: string, fkCol: string, cols: list.List<string>, parentKeys: list.List<db.DbValue>): (string, list.List<db.DbValue>) {
     return inClause("SELECT " + colList(cols) + " FROM " + childTable + " WHERE " + fkCol + " IN (", parentKeys);
 }
 
+/// Builds the batched query for a "belongs to" relation: fetch the parent rows
+/// whose primary key falls IN the given set of child foreign keys.
+///
+/// The mirror image of [`hasManyQuery`]. `parentTable` is the table to select
+/// from, `pkCol` is the parent's primary key column, `cols` is the projection
+/// (empty means `*`), and `fkKeys` are the foreign key values taken from the
+/// child rows. Returns the SQL text plus its parallel parameter list, and
+/// returns a no-rows query for an empty `fkKeys` via [`inClause`].
 pub fn belongsToQuery(parentTable: string, pkCol: string, cols: list.List<string>, fkKeys: list.List<db.DbValue>): (string, list.List<db.DbValue>) {
     return inClause("SELECT " + colList(cols) + " FROM " + parentTable + " WHERE " + pkCol + " IN (", fkKeys);
 }
 
+/// Renders a projection column list into the text between `SELECT` and `FROM`.
+///
+/// An empty `cols` becomes `*` (select everything); otherwise the column names
+/// are joined with `, ` in order. The names are emitted verbatim, so the caller
+/// is responsible for supplying already-valid column identifiers.
 fn colList(cols: list.List<string>): string {
     if (cols.size() == 0) { return "*"; }
     let out = "";
@@ -19,6 +80,16 @@ fn colList(cols: list.List<string>): string {
     return out;
 }
 
+/// Completes an `IN (...)` query from a prefix and a list of key values.
+///
+/// Given `prefix` already ending in `IN (`, this appends one positional
+/// placeholder per key (`$1, $2, ...`), a closing `)`, and collects the keys
+/// into the returned parameter list in the same order. It is shared by
+/// [`hasManyQuery`] and [`belongsToQuery`] and holds their one edge case:
+/// `IN ()` is illegal SQL, so an EMPTY `keys` short-circuits to
+/// `SELECT * FROM (SELECT 1) t WHERE 1 = 0`, a valid statement that matches no
+/// rows, and returns it with an empty parameter list. The placeholders are
+/// 1-based to match the wire protocol's parameter numbering.
 fn inClause(prefix: string, keys: list.List<db.DbValue>): (string, list.List<db.DbValue>) {
     let params = list.List<db.DbValue>();
     let sql = prefix;
@@ -36,6 +107,14 @@ fn inClause(prefix: string, keys: list.List<db.DbValue>): (string, list.List<db.
     return (sql, params);
 }
 
+/// Finds the position of a named column in a result set, or -1 if absent.
+///
+/// Scans `rs.columns` left to right and returns the first index whose column
+/// name equals `name` (exact byte comparison via [`string.eql`]). Returns
+/// `0 - 1`, that is -1, when no column matches, which callers such as
+/// [`groupByColumn`] treat as "column not present" and bail out on. A missing
+/// column during the scan is defaulted to a null placeholder so the loop stays
+/// total.
 pub fn columnIndex(rs: db.ResultSet, name: string): int {
     let i = 0;
     while (i < rs.columns.size()) {
@@ -46,6 +125,18 @@ pub fn columnIndex(rs: db.ResultSet, name: string): int {
     return 0 - 1;
 }
 
+/// Buckets the rows of a result set by the textual value of one column.
+///
+/// This is the "stitch back" half of the batched load: after the child rows
+/// arrive in a single [`db.ResultSet`], grouping them by `fkCol` lets the caller
+/// attach each bucket to its parent in O(1) via [`childrenOf`]. The key is the
+/// column's text form ([`db.Row.getText`]), which is how the placeholder values
+/// were sourced, so parent keys and bucket keys line up.
+///
+/// Returns an empty map (16-bucket, [`string.hash`]) when `fkCol` is not a
+/// column of `rs`, since [`columnIndex`] reports -1 and there is nothing to
+/// group by. Rows that fail to read are defaulted to an empty [`db.Row`] so the
+/// scan never aborts. Buckets are created lazily on first insertion.
 pub fn groupByColumn(rs: db.ResultSet, fkCol: string): map.Map<string, list.List<db.Row>> {
     let groups = map.Map<string, list.List<db.Row>>(16, string.hash);
     let ci = columnIndex(rs, fkCol);
@@ -62,6 +153,12 @@ pub fn groupByColumn(rs: db.ResultSet, fkCol: string): map.Map<string, list.List
     return groups;
 }
 
+/// Looks up the rows grouped under a given key, returning an empty list if none.
+///
+/// The read side of [`groupByColumn`]: `parentKey` is a parent's key in its
+/// text form, and the result is that parent's children. A parent with no
+/// matching children yields a fresh empty [`list.List`] rather than a missing
+/// value, so the caller can iterate unconditionally without a presence check.
 pub fn childrenOf(groups: map.Map<string, list.List<db.Row>>, parentKey: string): list.List<db.Row> {
     return groups.get(parentKey) ?? list.List<db.Row>();
 }

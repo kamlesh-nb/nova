@@ -1,22 +1,109 @@
+//! Growable, generic, contiguous list (`List<T>`).
+//!
+//! `List<T>` is Nova's dynamic array: the everyday "resizable vector" that most
+//! standard-library and application code reaches for. It stores its elements in
+//! one contiguous run so that indexing is O(1) and iteration is cache-friendly,
+//! and it grows automatically as elements are pushed. The type is generic and
+//! monomorphised, so `List<int>` and `List<string>` compile to distinct,
+//! specialised code with no boxing or type erasure.
+//!
+//! All the real storage work lives one layer down in [`RawBuffer`], imported
+//! from `mem.rawbuffer`. `List<T>` is deliberately a THIN wrapper over that
+//! buffer: `RawBuffer` owns the allocation, the element slots, the growth
+//! policy (capacity doubling), and the per-element ARC retain and release when
+//! `T` is a heap type. This split keeps the low-level, unsafe pointer
+//! arithmetic in one audited place and lets `List` be a small, readable set of
+//! ergonomic operations (map, filter, reduce, sort, and friends) written on top
+//! of a handful of primitives (`push`, `at`, `set`, `count`, `swap`).
+//!
+//! Ownership and value semantics: a `List<T>` OWNS its elements. When the list
+//! is destroyed the backing buffer releases each element, and when the buffer
+//! reallocates on growth the existing elements are moved, not copied and
+//! retained twice. Because `List` is a struct with a container field, copying a
+//! list value performs a genuine element-by-element copy via [`List.copy`] and
+//! [`List.slice`] rather than aliasing the same buffer, which keeps the value
+//! semantics that the rest of the language expects from a struct.
+//!
+//! Two error conventions live side by side here, and the choice is intentional.
+//! The lookups that a caller is expected to probe speculatively return an
+//! optional (`T | undefined`): [`List.get`], [`List.first`], [`List.last`], and
+//! [`List.pop`] hand back `undefined` for an out-of-range index or an empty
+//! list. The lookups that assert a precondition instead panic on violation:
+//! [`List.at`] calls `nova_panic` when the index is out of bounds, because
+//! reaching it with a bad index is a program bug, not a data condition. A few
+//! mutators ([`List.set`]) simply no-op on an out-of-range index rather than
+//! panic, so a stray write cannot corrupt the buffer.
+//!
+//! Sorting is an in-place heapsort ([`List.sort`] and [`List.sortBy`]), driven
+//! by the private sift-down helpers [`List.heapSiftDown`] and
+//! [`List.heapSiftDownBy`]. Heapsort is chosen for its O(n log n) worst case and
+//! its lack of extra allocation: it rearranges the existing buffer through
+//! `swap` alone. It is not a stable sort, so callers that need stability must
+//! encode a tiebreak into their comparator or key.
+
 import mem.rawbuffer;
 
+/// A growable, contiguous, owning sequence of `T` backed by a [`RawBuffer`].
+///
+/// The element storage, capacity growth, and per-element ARC are all delegated
+/// to the [`List.data`] buffer; the struct itself only adds the higher-level
+/// list operations and two cached counters. Prefer the constructor `List<T>()`
+/// (the `init` below) which starts with a small non-zero capacity so the first
+/// few pushes do not reallocate.
 pub struct List<T> {
+    /// The backing store that actually owns the elements and the allocation.
+    ///
+    /// Every element access, mutation, growth, and destruction routes through
+    /// this buffer. It is the single source of truth for the real element
+    /// count: the [`List.len`] and [`List.cap`] fields are only cached mirrors
+    /// of `data.count()` and `data.capacity()`, and the methods here read
+    /// `data.count()` directly rather than trusting the cached `len`.
     pub data: RawBuffer<T>,
+    /// Cached copy of the element count, refreshed after size-changing calls.
+    ///
+    /// This mirrors `data.count()` for cheap external inspection, but it is NOT
+    /// the authoritative length: the read-only operations below query
+    /// `self.data.count()` directly, and only the mutators ([`List.push`],
+    /// [`List.insert`], [`List.remove`], [`List.pop`], [`List.clear`]) write
+    /// this field back. Do not rely on it inside a method that has mutated the
+    /// buffer without also refreshing it.
     pub len: int,
+    /// Cached copy of the backing buffer's allocated capacity.
+    ///
+    /// Mirrors `data.capacity()` and is updated by the same mutators that touch
+    /// [`List.len`]. It reflects how many elements can be held before the next
+    /// reallocation, not the current element count.
     pub cap: int,
 
+    /// Creates an empty list with a small initial capacity of four slots.
+    ///
+    /// Starting non-empty avoids a reallocation on each of the first few
+    /// pushes. The buffer is allocated eagerly, so a freshly constructed list
+    /// already owns storage even though [`List.len`] is zero.
     init() {
         self.data = rawbuffer.RawBuffer<T>(4);
         self.len = 0;
         self.cap = 4;
     }
 
+    /// Appends `value` to the end of the list, growing the buffer if needed.
+    ///
+    /// The append itself is delegated to [`List.data`]; the buffer may reallocate
+    /// (typically doubling capacity) when it is full, which is why the cached
+    /// [`List.len`] and [`List.cap`] are re-read from the buffer afterwards.
+    /// Amortised O(1).
     pub fn push(self: List<T>, value: T): void {
         self.data.push(value);
         self.len = self.data.count();
         self.cap = self.data.capacity();
     }
 
+    /// Returns the element at `index`, or `undefined` if the index is out of range.
+    ///
+    /// This is the safe, probe-friendly lookup: a negative index or one at or
+    /// beyond the element count yields `undefined` rather than panicking. Use
+    /// this when an out-of-range index is an ordinary, expected outcome; use
+    /// [`List.at`] when a bad index would be a program bug.
     pub fn get(self: List<T>, index: int): T | undefined {
         if (index < 0 || index >= self.data.count()) {
             return undefined;
@@ -24,6 +111,13 @@ pub struct List<T> {
         return self.data.at(index);
     }
 
+    /// Returns the element at `index`, panicking if the index is out of range.
+    ///
+    /// This is the assertive lookup: it calls `nova_panic` on a negative index
+    /// or one at or beyond the count, on the understanding that reaching it with
+    /// a bad index means the caller's own invariant is broken. When an
+    /// out-of-range index is a normal data condition, prefer [`List.get`], which
+    /// returns `undefined` instead.
     pub fn at(self: List<T>, index: int): T {
         if (index < 0 || index >= self.data.count()) {
             nova_panic("List.at: index out of bounds");
@@ -31,6 +125,12 @@ pub struct List<T> {
         return self.data.at(index);
     }
 
+    /// Overwrites the element at `index` with `value`, ignoring out-of-range indices.
+    ///
+    /// Unlike [`List.at`] this neither panics nor grows the list: a negative or
+    /// past-the-end index is silently a no-op, so a stray write cannot corrupt
+    /// the buffer or extend it. It replaces an existing slot only, and the
+    /// buffer releases the old occupant as part of the set.
     pub fn set(self: List<T>, index: int, value: T): void {
         if (index < 0 || index >= self.data.count()) {
             return;
@@ -38,22 +138,44 @@ pub struct List<T> {
         self.data.set(index, value);
     }
 
+    /// Inserts `value` at `index`, shifting later elements one slot to the right.
+    ///
+    /// Delegates the shift and any growth to [`List.data`], then refreshes the
+    /// cached [`List.len`] and [`List.cap`]. Because every element from `index`
+    /// onwards moves up by one, this is O(n) in the number of trailing
+    /// elements. Bounds handling follows the buffer's `insertAt` contract.
     pub fn insert(self: List<T>, index: int, value: T): void {
         self.data.insertAt(index, value);
         self.len = self.data.count();
         self.cap = self.data.capacity();
     }
 
+    /// Removes the element at `index`, shifting later elements one slot to the left.
+    ///
+    /// The removed element is released by the buffer and the gap is closed, so
+    /// this is O(n) in the number of trailing elements. The cached [`List.len`]
+    /// and [`List.cap`] are refreshed from the buffer afterwards. Out-of-range
+    /// handling follows the buffer's `removeAt` contract.
     pub fn remove(self: List<T>, index: int): void {
         self.data.removeAt(index);
         self.len = self.data.count();
         self.cap = self.data.capacity();
     }
 
+    /// Returns the current number of elements.
+    ///
+    /// Reads the authoritative count straight from [`List.data`] rather than the
+    /// cached [`List.len`], so it is always correct even immediately after a
+    /// buffer mutation.
     pub fn size(self: List<T>): int {
         return self.data.count();
     }
 
+    /// Applies `fn` to each element in order, front to back, for its side effects.
+    ///
+    /// The count is re-read each iteration, so this walks the list as it stands.
+    /// It does not build or return anything; for a transforming pass that yields
+    /// a new list use [`List.map`] instead.
     pub fn forEach(self: List<T>, fn: (T) -> void): void {
         let i = 0;
         while (i < self.data.count()) {
@@ -63,6 +185,11 @@ pub struct List<T> {
         }
     }
 
+    /// Builds a new `List<U>` by applying `fn` to every element in order.
+    ///
+    /// The source list is left unchanged. The result is a freshly owned list of
+    /// the same length, in the same order. This is the transforming counterpart
+    /// to [`List.forEach`].
     pub fn map<U>(self: List<T>, fn: (T) -> U): List<U> {
         let result = List<U>();
         let i = 0;
@@ -75,6 +202,10 @@ pub struct List<T> {
         return result;
     }
 
+    /// Builds a new list holding only the elements for which `pred` returns true.
+    ///
+    /// Order is preserved and the source list is untouched. The result may be
+    /// empty (if nothing matches) or as long as the source (if everything does).
     pub fn filter(self: List<T>, pred: (T) -> bool): List<T> {
         let result = List<T>();
         let i = 0;
@@ -88,6 +219,12 @@ pub struct List<T> {
         return result;
     }
 
+    /// Folds the list into a single value of type `U`, left to right.
+    ///
+    /// Starts from the seed `acc` and threads it through `fn(accumulator,
+    /// element)` for each element in order, returning the final accumulator. On
+    /// an empty list the seed is returned unchanged. This is a left fold; the
+    /// combining function receives the running accumulator first.
     pub fn reduce<U>(self: List<T>, acc: U, fn: (U, T) -> U): U {
         let result = acc;
         let i = 0;
@@ -99,6 +236,11 @@ pub struct List<T> {
         return result;
     }
 
+    /// Reverses the elements in place using a two-pointer swap from both ends.
+    ///
+    /// Walks one index up from the front and one down from the back, swapping
+    /// until they meet, so it does O(n/2) swaps and allocates nothing. Mutates
+    /// the list directly rather than returning a new one.
     pub fn reverse(self: List<T>): void {
         let i = 0;
         let j = self.data.count() - 1;
@@ -109,11 +251,20 @@ pub struct List<T> {
         }
     }
 
+    /// Empties the list, releasing all elements but keeping the allocation.
+    ///
+    /// The backing buffer drops its elements and resets its count, so the
+    /// capacity is retained for reuse and [`List.cap`] is deliberately not
+    /// changed here. Only [`List.len`] is reset to zero.
     pub fn clear(self: List<T>): void {
         self.data.clear();
         self.len = 0;
     }
 
+    /// Returns the first element, or `undefined` if the list is empty.
+    ///
+    /// A safe peek that never panics. See [`List.last`] for the other end and
+    /// [`List.get`] for arbitrary indices.
     pub fn first(self: List<T>): T | undefined {
         if (self.data.count() == 0) {
             return undefined;
@@ -121,6 +272,10 @@ pub struct List<T> {
         return self.data.at(0);
     }
 
+    /// Returns the last element, or `undefined` if the list is empty.
+    ///
+    /// A safe peek that never panics. Reads the element at `count - 1`. See
+    /// [`List.first`] for the other end.
     pub fn last(self: List<T>): T | undefined {
         if (self.data.count() == 0) {
             return undefined;
@@ -128,6 +283,12 @@ pub struct List<T> {
         return self.data.at(self.data.count() - 1);
     }
 
+    /// Removes and returns the last element, or `undefined` if the list is empty.
+    ///
+    /// This is the pairing for [`List.push`]: together they make the list usable
+    /// as a stack, both operating at the back in amortised O(1). The cached
+    /// [`List.len`] and [`List.cap`] are refreshed from the buffer after the
+    /// removal.
     pub fn pop(self: List<T>): T | undefined {
         let v = self.data.pop();
         self.len = self.data.count();
@@ -135,6 +296,11 @@ pub struct List<T> {
         return v;
     }
 
+    /// Returns the index of the first element satisfying `pred`, or -1 if none do.
+    ///
+    /// Scans front to back and stops at the first match. The `-1` sentinel is
+    /// the "not found" signal shared with [`List.indexOf`]; callers test against
+    /// it (as [`List.any`] does) rather than receiving an optional.
     pub fn findIndex(self: List<T>, pred: (T) -> bool): int {
         let i = 0;
         while (i < self.data.count()) {
@@ -146,10 +312,20 @@ pub struct List<T> {
         return -1;
     }
 
+    /// Returns true if at least one element satisfies `pred`.
+    ///
+    /// Implemented on top of [`List.findIndex`], so it short-circuits at the
+    /// first match. On an empty list it returns false. This is the existential
+    /// counterpart to [`List.all`].
     pub fn any(self: List<T>, pred: (T) -> bool): bool {
         return self.findIndex(pred) != -1;
     }
 
+    /// Returns true if every element satisfies `pred`.
+    ///
+    /// Short-circuits and returns false at the first element that fails. On an
+    /// empty list it returns true (vacuous truth), which is the standard
+    /// convention and the mirror of [`List.any`] returning false when empty.
     pub fn all(self: List<T>, pred: (T) -> bool): bool {
         let i = 0;
         while (i < self.data.count()) {
@@ -161,6 +337,11 @@ pub struct List<T> {
         return true;
     }
 
+    /// Returns the index of the first element equal to `value`, or -1 if absent.
+    ///
+    /// Uses `==` for the comparison, so `T` must support equality. This is the
+    /// value-based sibling of [`List.findIndex`] (which takes a predicate) and
+    /// backs [`List.contains`].
     pub fn indexOf(self: List<T>, value: T): int {
         let i = 0;
         while (i < self.data.count()) {
@@ -172,14 +353,32 @@ pub struct List<T> {
         return -1;
     }
 
+    /// Returns true if any element equals `value`.
+    ///
+    /// A membership test built on [`List.indexOf`], so it short-circuits at the
+    /// first equal element and relies on `==` for `T`.
     pub fn contains(self: List<T>, value: T): bool {
         return self.indexOf(value) != -1;
     }
 
+    /// Returns an independent shallow copy of the whole list.
+    ///
+    /// Implemented as a full-range [`List.slice`], so it produces a new list
+    /// with its own buffer holding the same elements (each retained as it is
+    /// pushed into the copy). Mutating either list afterwards does not affect
+    /// the other; the elements themselves are shared by reference when `T` is a
+    /// heap type, as usual for a shallow copy.
     pub fn copy(self: List<T>): List<T> {
         return self.slice(0, self.data.count());
     }
 
+    /// Returns a new list holding the half-open range `[start, end)`.
+    ///
+    /// Both bounds are clamped into `0 .. count` before use, so out-of-range or
+    /// inverted arguments cannot panic or read past the buffer: a `start` past
+    /// the end, or an `end` below `start`, simply yields an empty list. The
+    /// source is left unchanged and the result owns a fresh buffer. This is the
+    /// building block for [`List.copy`].
     pub fn slice(self: List<T>, start: int, end: int): List<T> {
         let n = self.data.count();
         let s = if (start < 0) 0 else if (start > n) n else start;
@@ -193,6 +392,11 @@ pub struct List<T> {
         return out;
     }
 
+    /// Returns a new list containing this list's elements followed by `other`'s.
+    ///
+    /// Neither input is mutated; the result is a fresh list of length
+    /// `self.size() + other.size()`, in order. Elements are copied in by
+    /// pushing, so heap elements are retained into the new buffer.
     pub fn concat(self: List<T>, other: List<T>): List<T> {
         let out = List<T>();
         let i = 0;
@@ -208,6 +412,16 @@ pub struct List<T> {
         return out;
     }
 
+    /// Restores the max-heap property at subtree `root` within the prefix `[0, n)`.
+    ///
+    /// This is the private engine of [`List.sort`]. It treats the buffer as a
+    /// binary heap (children of `i` at `2i+1` and `2i+2`), finds the largest of
+    /// the node and its two in-range children according to `cmp`, and if a child
+    /// is larger it swaps and descends into that child, repeating until the node
+    /// dominates its children. `cmp(a, b) > 0` means `a` sorts after `b`, so the
+    /// element that compares greatest bubbles to the top. Only the first `n`
+    /// slots are considered, which is how the sort shrinks the heap region as it
+    /// extracts the maximum to the tail.
     fn heapSiftDown(self: List<T>, root: int, n: int, cmp: (T, T) -> int): void {
         let i = root;
         while (true) {
@@ -230,6 +444,19 @@ pub struct List<T> {
         }
     }
 
+    /// Sorts the list in place into ascending order according to `cmp`.
+    ///
+    /// The comparator returns a negative number when its first argument sorts
+    /// before its second, zero when they are equivalent, and a positive number
+    /// when it sorts after, the usual three-way convention. This is an in-place
+    /// heapsort: it first builds a max-heap by sifting down from the last
+    /// internal node, then repeatedly swaps the maximum at index 0 to the end of
+    /// the shrinking heap region and re-sifts. Worst and average case are both
+    /// O(n log n) and no extra buffer is allocated. Lists of length below two
+    /// are already sorted and return immediately. Note this sort is NOT stable:
+    /// equal elements may be reordered, so encode a tiebreak into `cmp` if order
+    /// among equals matters. See [`List.sortBy`] for a key-function variant and
+    /// [`List.heapSiftDown`] for the underlying step.
     pub fn sort(self: List<T>, cmp: (T, T) -> int): void {
         let n = self.data.count();
         if (n < 2) { return; }
@@ -243,6 +470,12 @@ pub struct List<T> {
         }
     }
 
+    /// Returns a new list with the first `n` elements (fewer if the list is shorter).
+    ///
+    /// The count is clamped into `0 .. size()`, so a negative `n` yields an empty
+    /// list and an `n` larger than the list yields a full copy. The source is
+    /// unchanged. This is the complement of [`List.drop`]: `take(n)` ++
+    /// `drop(n)` reconstructs the original order.
     pub fn take(self: List<T>, n: int): List<T> {
         let out = List<T>();
         let count = self.data.count();
@@ -261,6 +494,11 @@ pub struct List<T> {
         return out;
     }
 
+    /// Returns a new list with the first `n` elements removed.
+    ///
+    /// The skip count is clamped into `0 .. size()`, so a negative `n` keeps
+    /// everything and an `n` past the end yields an empty list. The source is
+    /// unchanged. Complement of [`List.take`].
     pub fn drop(self: List<T>, n: int): List<T> {
         let out = List<T>();
         let count = self.data.count();
@@ -279,6 +517,12 @@ pub struct List<T> {
         return out;
     }
 
+    /// Returns how many elements satisfy `pred`.
+    ///
+    /// Walks the whole list and tallies the matches, so it does not
+    /// short-circuit the way [`List.any`] does. Note the name is overloaded in
+    /// spirit with the buffer's element count, but this method takes a predicate
+    /// and counts matches, whereas plain size comes from [`List.size`].
     pub fn count(self: List<T>, pred: (T) -> bool): int {
         let c = 0;
         let i = 0;
@@ -291,6 +535,12 @@ pub struct List<T> {
         return c;
     }
 
+    /// Maps each element to a `List<U>` and concatenates the results in order.
+    ///
+    /// For every element `fn` produces a sublist, and each sublist's elements
+    /// are appended, front to back, into one flat result. This is [`List.map`]
+    /// followed by a flatten in a single pass; an element mapping to an empty
+    /// list contributes nothing.
     pub fn flatMap<U>(self: List<T>, fn: (T) -> List<U>): List<U> {
         let out = List<U>();
         let i = 0;
@@ -306,6 +556,12 @@ pub struct List<T> {
         return out;
     }
 
+    /// Splits the list into consecutive sublists of at most `size` elements each.
+    ///
+    /// Elements are taken in order, so the result reads left to right and only
+    /// the final chunk may be shorter than `size`. A `size` of zero or less is
+    /// treated as invalid and yields an empty result rather than looping, which
+    /// also avoids a division or non-terminating step. The source is unchanged.
     pub fn chunk(self: List<T>, size: int): List<List<T>> {
         let out = List<List<T>>();
         if (size <= 0) {
@@ -326,6 +582,11 @@ pub struct List<T> {
         return out;
     }
 
+    /// Pairs elements of this list with `other` positionally into a list of tuples.
+    ///
+    /// The result has length equal to the SHORTER of the two lists; any trailing
+    /// elements of the longer list are dropped. Element `i` of the result is the
+    /// tuple `(self[i], other[i])`. Neither input is mutated.
     pub fn zip<U>(self: List<T>, other: List<U>): List<(T, U)> {
         let out = List<(T, U)>();
         let n = self.data.count();
@@ -342,6 +603,13 @@ pub struct List<T> {
         return out;
     }
 
+    /// Sift-down step of [`List.sortBy`], ordering by an integer key rather than a comparator.
+    ///
+    /// Identical in structure to [`List.heapSiftDown`] but it compares
+    /// `key(child) > key(parent)` instead of calling a three-way comparator, so
+    /// the element with the greatest key bubbles up. Restores the max-heap
+    /// property at `root` within the prefix `[0, n)`. Note it recomputes `key`
+    /// on each comparison, so an expensive key function is evaluated repeatedly.
     fn heapSiftDownBy(self: List<T>, root: int, n: int, key: (T) -> int): void {
         let i = root;
         while (true) {
@@ -364,6 +632,15 @@ pub struct List<T> {
         }
     }
 
+    /// Sorts the list in place into ascending order of the integer `key`.
+    ///
+    /// A convenience over [`List.sort`] for the common case of ordering by a
+    /// numeric field: instead of writing a three-way comparator you supply a
+    /// function that projects each element to an `int`, and elements are ordered
+    /// by that projection ascending. Same in-place heapsort characteristics as
+    /// [`List.sort`]: O(n log n), no extra allocation, and NOT stable. The key
+    /// is recomputed during sifting via [`List.heapSiftDownBy`], so keep it
+    /// cheap. Lists shorter than two elements return immediately.
     pub fn sortBy(self: List<T>, key: (T) -> int): void {
         let n = self.data.count();
         if (n < 2) { return; }
@@ -378,6 +655,12 @@ pub struct List<T> {
     }
 }
 
+/// Smoke test for the core list lifecycle: construct, push, size, and index.
+///
+/// Run by `nova test`, it checks that a new list starts empty, that pushes grow
+/// the reported size, and that positional [`List.get`] returns the pushed
+/// values. It is a minimal guard on the buffer wiring rather than a full
+/// coverage suite, and it reports failures through `nova_test_fail`.
 @test
 fn test_list(): void {
     let list = List<int>();

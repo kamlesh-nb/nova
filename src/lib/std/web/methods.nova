@@ -1,7 +1,20 @@
+//! HTTP request methods.
+//!
+//! This file defines the `Method` enum used across the web framework and
+//! HTTP client/server code to represent a request's verb, along with
+//! conversions to and from its wire form. Route matching, request parsing,
+//! and outgoing client requests all share this one enum rather than passing
+//! raw strings around.
 
 import bytes;
 import string;
 
+/// The HTTP request method (verb).
+///
+/// Covers the common verbs used by the web framework's router and HTTP
+/// client. There is no `Head`, `Connect`, or `Trace` variant, and no
+/// catch-all for extension methods: `fromString` folds any unrecognised
+/// input to `Method.Get`.
 pub enum Method {
     Get,
     Post,
@@ -10,6 +23,11 @@ pub enum Method {
     Options,
     Patch,
 
+    /// Renders the method as its upper-case wire form (e.g. "GET", "POST").
+    ///
+    /// Any variant not explicitly matched falls through the `default` case
+    /// and returns "GET"; with the current variant set this path is dead,
+    /// but it guards against a future enum addition being forgotten here.
     pub fn toString(self: Method): string {
         switch (self) {
             case Method.Get: { return "GET"; }
@@ -22,6 +40,11 @@ pub enum Method {
         }
     }
 
+    /// Parses a method name into a `Method`, matching case-insensitively.
+    ///
+    /// Any string that is not one of the six recognised verbs (including an
+    /// empty string or a typo) silently resolves to `Method.Get` rather than
+    /// failing, so callers must not rely on this to validate input.
     pub fn fromString(s: string): Method {
         let upper = string.toUpperCase(s);
         if (upper == "GET") return Method.Get;

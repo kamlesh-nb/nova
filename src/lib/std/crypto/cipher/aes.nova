@@ -1,12 +1,73 @@
+//! Constant-time AES block cipher (bitsliced, BearSSL-style).
+//!
+//! This file implements the raw AES block primitive: it turns a key into an
+//! expanded key schedule and encrypts one 16-byte block at a time. It is the
+//! low-level engine that higher constructions build on, for example a mode of
+//! operation (CTR, GCM) or a KDF. It deliberately does NOT do any chaining,
+//! padding, authentication, or IV handling; those belong to the mode layer
+//! that wraps [`Aes.encryptBlock`].
+//!
+//! The one design decision that shapes every line here is that the S-box is
+//! computed, never looked up. A classic AES uses a 256-entry substitution
+//! table, but a table lookup indexed by secret data leaks the key through the
+//! cache: the access pattern depends on the byte being substituted, and a
+//! co-resident attacker can recover it by timing cache hits and misses. To be
+//! constant-time we instead evaluate the S-box as a fixed circuit of AND and
+//! XOR gates (Boyar and Peralta's minimal-depth formulation, seen in
+//! [`subBytes`]), whose runtime and memory access are independent of the data.
+//!
+//! To make that circuit efficient we work "bitsliced". The 128-bit AES state
+//! is 16 bytes, and each byte is 8 bits; we lay the state out as eight 32-bit
+//! words `q[0..8]`, where word `k` holds bit `k` of all sixteen state bytes
+//! (bit-plane `k`). One bitwise operation on a word therefore applies the same
+//! Boolean gate to all sixteen bytes at once, so the whole block is substituted
+//! in parallel with no branches and no lookups. [`ortho`] is the transpose that
+//! moves between the natural byte layout and this bit-plane layout, and it has
+//! to be applied on the way in and on the way out of the sliced section.
+//!
+//! Everything operates on raw memory through the `bytes` intrinsics rather than
+//! Nova containers, because this is a hot inner loop and each round touches the
+//! 32-byte working buffer repeatedly. Buffers are held as `ptr`/`long`
+//! addresses; note the CLAUDE.md rule that addresses must never be narrowed to
+//! `int`. Words are read and written little-endian on the wire via [`le32`] and
+//! [`putLe32`] so the byte order is fixed regardless of host endianness.
+//!
+//! Only the forward (encrypt) direction is provided here. It fits into the
+//! wider `crypto` tree as the block cipher that CTR-based AEAD and other
+//! symmetric constructions call into.
+
 import bytes;
 import mem.allocator;
 
+/// Bit mask for the low 32 bits, used to fold every intermediate word back into
+/// the 32-bit range after shifts and rotates.
+///
+/// The arithmetic here is done in `ulong` (64-bit) so that a left shift does
+/// not lose the high bits mid-expression, then masked with `M32` to model a
+/// true 32-bit word. It doubles as the all-ones constant that XOR-inverts a
+/// word, which is how [`subBytes`] realises the S-box's affine NOT terms.
 const M32: ulong = 0xffffffff;
 
+/// AES block size in bytes: always 16, for every key length.
+///
+/// AES-128, AES-192 and AES-256 differ only in key length and round count, not
+/// block size. [`Aes.encryptBlock`] reads and writes exactly this many bytes.
 pub const AES_BLOCK_LEN: int = 16;
 
+/// Round constants for key expansion, one per key-schedule "column group".
+///
+/// Each value is `x^(i-1)` in GF(2^8) with the AES reduction polynomial: the
+/// sequence doubles (0x01, 0x02, 0x04 ...) and 0x80 doubled reduces to 0x1b,
+/// then 0x36. It is XORed into the first byte of the rotated-and-substituted
+/// word during expansion in [`Aes.create`]. Ten entries suffice: AES-256, the
+/// largest, needs the constant only for its first ten expansion steps.
 const RCON: int[10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
+/// Reads four bytes at `off` from `buf` as a little-endian 32-bit word.
+///
+/// The result is widened to `ulong` so the caller can shift and combine it
+/// without losing the top bit. This fixes the on-wire byte order to
+/// little-endian independent of the host, and pairs with [`putLe32`].
 fn le32(buf: ptr, off: int): ulong {
     return (bytes.read_byte(buf, off) as ulong)
         | ((bytes.read_byte(buf, off + 1) as ulong) << 8)
@@ -14,6 +75,10 @@ fn le32(buf: ptr, off: int): ulong {
         | ((bytes.read_byte(buf, off + 3) as ulong) << 24);
 }
 
+/// Writes the low 32 bits of `w` to `buf` at `off` in little-endian order.
+///
+/// The inverse of [`le32`]. Only the bottom four bytes of `w` are stored; any
+/// higher bits are ignored, so callers do not need to pre-mask with [`M32`].
 fn putLe32(buf: ptr, off: int, w: ulong): void {
     bytes.write_byte(buf, off, (w & 0xff) as int);
     bytes.write_byte(buf, off + 1, ((w >> 8) & 0xff) as int);
@@ -21,9 +86,30 @@ fn putLe32(buf: ptr, off: int, w: ulong): void {
     bytes.write_byte(buf, off + 3, ((w >> 24) & 0xff) as int);
 }
 
+/// Reads bit-plane word `i` (0..7) from the sliced state buffer `q`.
+///
+/// The eight planes are packed as consecutive little-endian words, so plane `i`
+/// lives at byte offset `i * 4`. This is the accessor the round functions use
+/// instead of indexing raw memory, keeping the layout in one place.
 fn getq(q: ptr, i: int): ulong { return le32(q, i * 4); }
+/// Writes bit-plane word `i` (0..7) into the sliced state buffer `q`.
+///
+/// The value is masked to 32 bits before storing, since intermediates are
+/// computed in `ulong` and may carry stray high bits. Counterpart to [`getq`].
 fn setq(q: ptr, i: int, v: ulong): void { putLe32(q, i * 4, v & M32); }
 
+/// Applies the AES S-box to all sixteen state bytes at once, in bitsliced form.
+///
+/// This is Boyar and Peralta's low-depth Boolean circuit for the AES S-box:
+/// the byte substitution expressed purely as AND/XOR gates over the eight
+/// bit-planes in `q`, with no table and no data-dependent branch, which is what
+/// makes it constant-time and immune to cache-timing key recovery. The three
+/// blocks mirror the published circuit: the linear "top" that derives the `y`
+/// signals, the non-linear "middle" of ANDs producing the `z` signals, and the
+/// linear "bottom" that recombines them into the output bits `s0..s7`. The XORs
+/// with [`M32`] at `s1`, `s2`, `s6` and `s7` fold in the S-box's affine
+/// constant (the bit inversions). The state must already be in bit-plane layout
+/// (see [`ortho`]) before this runs.
 fn subBytes(q: ptr): void {
     let x0 = getq(q, 7); let x1 = getq(q, 6); let x2 = getq(q, 5); let x3 = getq(q, 4);
     let x4 = getq(q, 3); let x5 = getq(q, 2); let x6 = getq(q, 1); let x7 = getq(q, 0);
@@ -72,6 +158,13 @@ fn subBytes(q: ptr): void {
     setq(q, 3, s4); setq(q, 2, s5); setq(q, 1, s6); setq(q, 0, s7);
 }
 
+/// One butterfly step of the bit-plane transpose between words `ia` and `ib`.
+///
+/// It exchanges interleaved bit groups across the two words: bits selected by
+/// the low mask `cl` in word `ib` are shifted left by `s` into word `ia`, and
+/// bits selected by the high mask `ch` in word `ia` are shifted right by `s`
+/// into word `ib`. Called repeatedly by [`ortho`] with masks 0x55/0xaa,
+/// 0x33/0xcc, 0x0f/0xf0 and shifts 1, 2, 4 to realise the full transpose.
 fn orthoSwap(q: ptr, ia: int, ib: int, cl: ulong, ch: ulong, s: int): void {
     let a = getq(q, ia);
     let b = getq(q, ib);
@@ -79,6 +172,14 @@ fn orthoSwap(q: ptr, ia: int, ib: int, cl: ulong, ch: ulong, s: int): void {
     setq(q, ib, ((a & ch) >> s) | (b & ch));
 }
 
+/// Transposes the eight words of `q` between byte layout and bit-plane layout.
+///
+/// AES arithmetic on bytes and the bitsliced S-box need opposite arrangements
+/// of the same bits, so the state is "orthogonalised" on entry to the sliced
+/// section and again on exit. The operation is its own inverse: applying it a
+/// second time restores the original layout, which is why [`Aes.encryptBlock`]
+/// and [`Aes.create`] call it in matched pairs. It is a fixed sequence of
+/// [`orthoSwap`] butterflies at stride 1, 2 and 4.
 fn ortho(q: ptr): void {
     orthoSwap(q, 0, 1, 0x55555555, 0xaaaaaaaa, 1);
     orthoSwap(q, 2, 3, 0x55555555, 0xaaaaaaaa, 1);
@@ -94,6 +195,14 @@ fn ortho(q: ptr): void {
     orthoSwap(q, 3, 7, 0x0f0f0f0f, 0xf0f0f0f0, 4);
 }
 
+/// Applies the AES S-box to the four bytes of a single 32-bit word.
+///
+/// Used only during key expansion in [`Aes.create`], where `SubWord` acts on
+/// one column rather than the whole state. It reuses the full machinery by
+/// staging `x` into a fresh 32-byte sliced buffer with the other planes zeroed,
+/// running [`ortho`], [`subBytes`], [`ortho`], then extracting the result. The
+/// buffer is heap-allocated per call and freed before return, so this is not on
+/// the per-block hot path; it runs a handful of times at key setup only.
 fn subWord(x: ulong): ulong {
     let q = bytes.alloc(32);
     let i = 0;
@@ -107,6 +216,14 @@ fn subWord(x: ulong): ulong {
     return r;
 }
 
+/// Performs the AES ShiftRows step on the bitsliced state.
+///
+/// ShiftRows cyclically rotates the rows of the 4x4 state matrix (row `r` by
+/// `r` bytes). In the bit-plane layout each of the eight words holds one bit of
+/// all sixteen bytes, so the same permutation is applied identically to every
+/// plane: the masks and shifts here move each row's bits to their rotated column
+/// positions within the 32-bit word. Runs once per round in
+/// [`Aes.encryptBlock`], after [`subBytes`] and before [`mixColumns`].
 fn shiftRows(q: ptr): void {
     let i = 0;
     while (i < 8) {
@@ -119,9 +236,29 @@ fn shiftRows(q: ptr): void {
     }
 }
 
+/// Rotates a 32-bit word right by 16 bits (equivalently, swaps its halves).
+///
+/// A helper for [`mixColumns`], where the four bytes of each column live in one
+/// word and the MixColumns matrix needs bytes brought into alignment. Masked to
+/// 32 bits so the wrap-around behaves as a true 32-bit rotate.
 fn rotr16(x: ulong): ulong { return ((x << 16) | (x >> 16)) & M32; }
+/// Rotates a 32-bit word right by 8 bits.
+///
+/// Companion to [`rotr16`] used by [`mixColumns`] to line up the neighbouring
+/// bytes that the MixColumns linear combination XORs together. Masked to 32
+/// bits for correct wrap-around.
 fn rotr8(x: ulong): ulong { return ((x >> 8) | (x << 24)) & M32; }
 
+/// Performs the AES MixColumns step on the bitsliced state.
+///
+/// MixColumns multiplies each column of the state by a fixed matrix over
+/// GF(2^8). In this bitsliced formulation the xtime (multiply-by-2) and the
+/// byte rotations that the matrix implies are expressed directly as XORs of
+/// rotated words: [`rotr8`] and [`rotr16`] supply the shifted neighbours, and
+/// each output plane is the XOR of the appropriate rotated planes. The
+/// per-plane formulas encode the {02, 03, 01, 01} column multiplication once
+/// for all sixteen bytes. Applied every round except the last in
+/// [`Aes.encryptBlock`].
 fn mixColumns(q: ptr): void {
     let q0 = getq(q, 0); let q1 = getq(q, 1); let q2 = getq(q, 2); let q3 = getq(q, 3);
     let q4 = getq(q, 4); let q5 = getq(q, 5); let q6 = getq(q, 6); let q7 = getq(q, 7);
@@ -137,6 +274,14 @@ fn mixColumns(q: ptr): void {
     setq(q, 7, q6 ^ r6 ^ r7 ^ rotr16(q7 ^ r7));
 }
 
+/// XORs one round's subkey into the bitsliced state (the AddRoundKey step).
+///
+/// The expanded schedule `sk` is stored already bitsliced, eight planes per
+/// round, so `skOff` is the plane index at which this round's key begins (a
+/// caller passes `round * 8`). Each of the eight state planes is XORed with the
+/// matching key plane. This is the only place the key material meets the state,
+/// and it runs once before the round loop, once per middle round, and once
+/// after the final round in [`Aes.encryptBlock`].
 fn addRoundKey(q: ptr, sk: ptr, skOff: int): void {
     let i = 0;
     while (i < 8) {
@@ -145,10 +290,42 @@ fn addRoundKey(q: ptr, sk: ptr, skOff: int): void {
     }
 }
 
+/// An initialised AES cipher: an expanded, bitsliced key schedule ready to
+/// encrypt blocks.
+///
+/// Construct one with [`Aes.create`] from a 16, 24 or 32-byte key, call
+/// [`Aes.encryptBlock`] as many times as needed, then release the schedule with
+/// [`Aes.delete`]. The instance owns a single heap allocation, [`Aes.skey`],
+/// which is NOT reference counted, so [`Aes.delete`] must be called exactly once
+/// to avoid a leak. The struct is reusable across many blocks and holds no
+/// per-block or per-message state (no IV, no counter); chaining and nonces are
+/// the mode layer's job.
 pub struct Aes {
+    /// Heap pointer to the expanded key schedule, stored in bit-plane layout,
+    /// `(numRounds + 1) * 8` words of 4 bytes each.
+    ///
+    /// Owned by this instance and freed by [`Aes.delete`], which also zeroes
+    /// this field so a second delete is a no-op. A value of 0 means the schedule
+    /// has already been released.
     pub skey: ptr,
+    /// Number of AES rounds for the configured key length: 10, 12 or 14.
+    ///
+    /// Set by [`Aes.create`] from the key length (AES-128/192/256) and read by
+    /// [`Aes.encryptBlock`] to bound its round loop.
     pub numRounds: int,
 
+    /// Builds an [`Aes`] from a raw key of `keyLen` bytes (16, 24 or 32).
+    ///
+    /// Performs the full AES key expansion and then pre-transposes every round
+    /// key into the bitsliced layout that [`Aes.encryptBlock`] expects, so the
+    /// per-block path never re-slices the key. The round count is chosen from
+    /// `keyLen`: 32 gives 14 rounds (AES-256), 24 gives 12 (AES-192), and any
+    /// other length falls through to 10 (AES-128), so callers must pass a valid
+    /// length. Expansion uses [`subWord`] and [`RCON`], with the extra
+    /// [`subWord`] at `j == 4` that AES-256 (`nk > 6`) requires. `key` must
+    /// point to at least `keyLen` readable bytes; it is not retained after this
+    /// returns. The returned instance owns [`Aes.skey`] and must be freed with
+    /// [`Aes.delete`].
     pub fn create(key: ptr, keyLen: int): Aes {
         let ctx = bytes.new_with_allocator<Aes>(allocator.globalAllocator());
         let nr = if (keyLen == 32) 14 else if (keyLen == 24) 12 else 10;
@@ -199,6 +376,19 @@ pub struct Aes {
         return ctx;
     }
 
+    /// Encrypts one 16-byte block from `dataIn` into `out`.
+    ///
+    /// This is the raw ECB block transform: no chaining, no padding, no
+    /// authentication. `dataIn` and `out` must each address at least
+    /// [`AES_BLOCK_LEN`] bytes; using the same buffer for both is fine. The
+    /// block is loaded into a sliced buffer, [`ortho`]-transposed once, then run
+    /// through the standard schedule (initial [`addRoundKey`], then
+    /// `numRounds - 1` full rounds of [`subBytes`], [`shiftRows`],
+    /// [`mixColumns`], [`addRoundKey`], and a final round that omits
+    /// [`mixColumns`]), transposed back, and written out little-endian. The
+    /// whole path is data-independent and constant-time. Because a real mode
+    /// uses this as a keystream or chaining primitive, callers should not use
+    /// ECB directly for confidentiality of multi-block messages.
     pub fn encryptBlock(self: Aes, dataIn: ptr, out: ptr): void {
         let q = bytes.alloc(32);
         setq(q, 0, le32(dataIn, 0));
@@ -229,6 +419,13 @@ pub struct Aes {
         bytes.free(q);
     }
 
+    /// Frees the expanded key schedule and marks the instance released.
+    ///
+    /// [`Aes.skey`] is a plain heap allocation outside ARC, so this must be
+    /// called exactly once when the cipher is no longer needed. It is guarded
+    /// against a double free: if [`Aes.skey`] is already 0 it does nothing, and
+    /// after freeing it resets the field to 0. Note this does NOT wipe the key
+    /// bytes before freeing, so it is not a zeroise-on-drop.
     pub fn delete(self: Aes): void {
         if (self.skey != 0) {
             bytes.free(self.skey);

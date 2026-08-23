@@ -1,8 +1,16 @@
 
+//! DNS and socket-address support: IPv6 literal parsing, a simple host-to-address
+//! cache, and construction of a raw `sockaddr_in6` byte buffer for the sockets
+//! layer. This file does not itself perform name resolution over the network;
+//! it provides the low-level parsing and buffer-building blocks that the
+//! networking stack (`os/*/socket`) and higher-level connect/listen code build on,
+//! plus a cache so repeated lookups of the same host can be avoided.
+
 import bytes;
 import string;
 import map;
 
+// Maps one hex digit character code to its numeric value, or -1 if not a hex digit.
 fn hexVal(c: int): int {
     if (c >= 48 && c <= 57) { return c - 48; }
     if (c >= 97 && c <= 102) { return c - 87; }
@@ -10,6 +18,13 @@ fn hexVal(c: int): int {
     return 0 - 1;
 }
 
+/// Parses a textual IPv6 address (including the `::` zero-run shorthand) into
+/// 16 raw address bytes written to `out16`.
+///
+/// `out16` must point to at least 16 bytes; it is zero-filled first. Returns
+/// `false` on a malformed address (bad hex digit, a group with more than 4
+/// hex digits, or a total byte count that does not fit in 16 bytes), in which
+/// case `out16` may still have been partially written.
 pub fn parseIPv6(addr: string, out16: ptr): bool {
     let i = 0;
     while (i < 16) { bytes.write_byte(out16, i, 0); i = i + 1; }
@@ -32,6 +47,8 @@ pub fn parseIPv6(addr: string, out16: ptr): bool {
     return true;
 }
 
+// Parses a colon-separated run of hex groups (one half of an IPv6 address split
+// at "::") into buf starting at off; returns bytes written, or -1 on a parse error.
 fn writeGroups(s: string, buf: ptr, off: int): int {
     if (s.length == 0) { return 0; }
     let p = off;
@@ -57,17 +74,35 @@ fn writeGroups(s: string, buf: ptr, off: int): int {
     return p - off;
 }
 
+/// A simple in-memory cache mapping hostnames to resolved addresses, so callers
+/// can avoid repeating a resolution for a host they have already looked up.
+/// Not thread-safe and not automatically invalidated: entries live for as long
+/// as the cache instance does, so callers own eviction if addresses can change.
 pub struct DnsCache {
+    /// Underlying host-to-address map, keyed by hostname string and hashed with `string.hash`.
     pub m: Map<string, long>,
     init() { self.m = Map<string, long>(64, string.hash); }
 
+    /// Looks up a cached address for `host`, or `undefined` if it has not been cached.
     pub fn get(self: DnsCache, host: string): long | undefined { return self.m.get(host); }
+    /// Stores (or overwrites) the resolved address for `host`.
     pub fn put(self: DnsCache, host: string, addr: long): void { self.m.set(host, addr); }
+    /// Returns `true` if `host` currently has a cached entry.
     pub fn has(self: DnsCache, host: string): bool { return self.m.get(host) != undefined; }
 }
 
+/// Creates an empty `DnsCache`.
 pub fn newDnsCache(): DnsCache { return DnsCache(); }
 
+/// Builds a raw `sockaddr_in6` structure as a 28-byte buffer ready to hand to
+/// the sockets layer.
+///
+/// `addr16` must point to 16 bytes of IPv6 address (as produced by `parseIPv6`).
+/// `bsdLen` selects the struct layout: when true, byte 0 carries the BSD-style
+/// `sin6_len` and byte 1 the family (macOS/BSD sockaddr convention); when false,
+/// the family is written as a little-endian 16-bit value at bytes 0-1 (Linux
+/// convention). Port is written big-endian (network byte order) at bytes 2-3;
+/// flowinfo, scope id, and any padding are left zeroed.
 pub fn makeSockaddrIn6(family: int, port: int, addr16: ptr, bsdLen: bool): ptr {
     let sa = bytes.alloc(28);
     let i = 0;

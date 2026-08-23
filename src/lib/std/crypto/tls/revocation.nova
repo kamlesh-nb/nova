@@ -1,13 +1,98 @@
+//! Certificate revocation checking for the TLS client handshake.
+//!
+//! During a TLS handshake a peer presents a certificate that was valid when it
+//! was issued, but the certificate authority may have revoked it since (a
+//! compromised private key, a mis-issuance, an operator who quit). Validating
+//! the signature chain in `crypto.x509` proves a certificate is authentic; it
+//! says nothing about whether it has since been revoked. This module answers
+//! that second question, giving the handshake a single verdict for a leaf
+//! certificate: good, revoked, or unknown.
+//!
+//! Two industry mechanisms carry revocation state, and this file wraps both
+//! behind one uniform tri-state return:
+//!
+//!   1. OCSP (RFC 6960), via [`checkOcspStapled`]. The Online Certificate
+//!      Status Protocol asks the issuer's responder about ONE certificate. In a
+//!      TLS handshake the server usually STAPLES a pre-fetched, signed OCSP
+//!      response into the handshake (the `status_request` extension), so the
+//!      client does not contact the responder itself. That stapled DER is what
+//!      this function verifies.
+//!   2. CRL (RFC 5280), via [`checkCrl`]. A Certificate Revocation List is a
+//!      signed, periodically published list of revoked serial numbers. The
+//!      caller supplies the DER of the relevant CRL and we search it.
+//!
+//! Both paths follow the same defence-in-depth shape, and the ORDER of checks
+//! is the security-critical part. Before believing any status byte we FIRST
+//! verify the signature over the response or list using the issuer's public
+//! key, and we confirm the response actually talks about THIS leaf's serial
+//! number. An attacker who can inject a stapled response or a stale CRL must not
+//! be able to forge a `good` verdict for a certificate the authority revoked,
+//! nor replay a `good` response minted for a different certificate. So a failed
+//! signature, a serial-number mismatch, a parse surprise, or a non-EC issuer key
+//! all collapse to [`REV_UNKNOWN`] rather than to [`REV_GOOD`]: when we cannot
+//! prove the status we refuse to assert the certificate is fine, and the caller
+//! decides its own policy (typically soft-fail for OCSP, and hard-fail if it has
+//! required stapling).
+//!
+//! Scope note: both entry points only handle issuers whose key is EC P-256
+//! (`x509.isEcKey`), because the underlying verifiers `ocsp.verifyOcspSignatureEc`
+//! and `crl.verifyCrlSignatureEc` are ECDSA-only. An RSA issuer therefore yields
+//! [`REV_UNKNOWN`] here rather than a checked result. All the actual DER parsing
+//! and signature maths live in [`crypto.ocsp`] and [`crypto.crl`]; this file is
+//! the thin, order-enforcing policy layer over them.
 
 import bytes;
 import crypto.x509;
 import crypto.ocsp;
 import crypto.crl;
 
+/// Verdict: the certificate is NOT revoked, and that status is signature-verified.
+///
+/// Only returned by [`checkOcspStapled`] / [`checkCrl`] after the response or
+/// list has been authenticated against the issuer key and matched to the leaf's
+/// serial number, so it is a positive assertion the caller can trust, not a
+/// mere absence of evidence.
 pub const REV_GOOD: int = 0;
+/// Verdict: the certificate HAS been revoked by its issuer.
+///
+/// A terminal, signature-verified result. The caller should reject the peer
+/// regardless of its soft-fail policy, since revocation was proven, not merely
+/// suspected.
 pub const REV_REVOKED: int = 1;
+/// Verdict: revocation status could not be established.
+///
+/// This is the fail-safe sink for every case where we cannot prove the status:
+/// a bad or absent signature, a serial-number mismatch, a parse failure, a
+/// responder error status, or an issuer key we cannot verify (non-EC). It is
+/// deliberately distinct from [`REV_GOOD`] so an attacker cannot turn "I could
+/// not check" into "it is fine". The caller applies its own soft-fail or
+/// hard-fail policy to this value.
 pub const REV_UNKNOWN: int = 2;
 
+/// Verifies a stapled OCSP response and returns the leaf's revocation verdict.
+///
+/// `der`/`len` point at the raw OCSP response DER the server stapled into the
+/// handshake. The checks run in this order, and every failure short-circuits to
+/// [`REV_UNKNOWN`] so that an unverifiable response can never masquerade as
+/// [`REV_GOOD`]:
+///
+///   1. Both certificates parsed cleanly (`leaf.ok`, `issuer.ok`) and the
+///      issuer key is EC P-256 (`x509.isEcKey`), the only key type the ECDSA
+///      verifier below supports.
+///   2. The response parses and its top-level `responseStatus` is `successful`
+///      (0). A responder error status leaves `res.ok` set but non-zero status,
+///      which is treated as unknown.
+///   3. The ECDSA signature over the response verifies against the issuer's
+///      public key, read at `issuer.ecStart` inside `issuer.buf`. Without this
+///      the status byte is attacker-controlled.
+///   4. The serial number the response is ABOUT matches the leaf's serial
+///      (`leaf.serialStart`/`leaf.serialLen`), which stops a valid response
+///      minted for a different certificate from being replayed here.
+///
+/// Only once all four hold do we trust `res.certStatus`: `CERT_REVOKED` maps to
+/// [`REV_REVOKED`], `CERT_GOOD` to [`REV_GOOD`], and anything else (including
+/// `unknown`) to [`REV_UNKNOWN`]. See [`crypto.ocsp.parseOcspResponse`],
+/// [`crypto.ocsp.verifyOcspSignatureEc`], and [`crypto.ocsp.serialMatches`].
 pub fn checkOcspStapled(leaf: x509.Cert, issuer: x509.Cert, der: ptr, len: int): int {
     if (!leaf.ok || !issuer.ok || !x509.isEcKey(issuer)) { return REV_UNKNOWN; }
     let res = ocsp.parseOcspResponse(der, len);
@@ -21,6 +106,26 @@ pub fn checkOcspStapled(leaf: x509.Cert, issuer: x509.Cert, der: ptr, len: int):
     return REV_UNKNOWN;
 }
 
+/// Verifies a CRL and returns whether the leaf's serial appears on it.
+///
+/// `der`/`len` point at the raw DER of a Certificate Revocation List. The flow
+/// mirrors [`checkOcspStapled`] and enforces the same order so an unverifiable
+/// list cannot yield a trusted verdict:
+///
+///   1. Both certificates parsed and the issuer key is EC P-256, as above.
+///   2. The CRL parses (`crl.parseCrl`).
+///   3. The ECDSA signature over the CRL verifies against the issuer's public
+///      key at `issuer.ecStart`, proving the list was published by the issuer
+///      and not substituted by an attacker.
+///   4. The leaf's serial (`leaf.serialStart`/`leaf.serialLen`) is looked up in
+///      the list. Present means [`REV_REVOKED`].
+///
+/// A signature-verified CRL that does NOT list the serial returns [`REV_GOOD`],
+/// since a valid CRL is a complete enumeration of what the issuer has revoked.
+/// This is the one place the two mechanisms differ in spirit: OCSP asserts a
+/// per-certificate status byte, whereas a CRL's silence about a serial is itself
+/// the positive "not revoked" signal. See [`crypto.crl.parseCrl`],
+/// [`crypto.crl.verifyCrlSignatureEc`], and [`crypto.crl.isRevoked`].
 pub fn checkCrl(leaf: x509.Cert, issuer: x509.Cert, der: ptr, len: int): int {
     if (!leaf.ok || !issuer.ok || !x509.isEcKey(issuer)) { return REV_UNKNOWN; }
     let v = crl.parseCrl(der, len);

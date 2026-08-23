@@ -1,14 +1,39 @@
+//! Linux reactor backend: epoll (readiness) plus an optional io_uring (completion) path.
+//!
+//! This module is the Linux half of the reactor abstraction that `net/ev` exposes to the rest of
+//! the standard library. It defines the fixed-layout "op" record that carries a pending I/O request
+//! (kind, fd, buffer, length, token, result) between the coroutine that issued it and the poller
+//! that completes it, plus two ways of driving that record to completion: classic `epoll_wait`
+//! readiness notification, or io_uring submission queue entries when the runtime has selected the
+//! completion-based backend (`usingUring()`). Callers generally use the free functions
+//! (`submit`, `armRead`/`armWrite`, `waitReady`, `evFd`/`evToken`/`evEof`) or the `Poller` class,
+//! which wraps an epoll or io_uring instance behind the shared `EventLoop` trait so the rest of the
+//! runtime does not need to know which backend is active.
+//!
+//! On io_uring, readiness is emulated with one-shot `POLL_ADD` submissions tracked per fd
+//! (`nova_reactor_arm_*`), because a completion engine has no "tell me when readable" primitive of
+//! its own. Abandoned operations are never freed directly here: the kernel still holds a reference
+//! to the op record until the operation completes or is cancelled, so `abandonOp` marks the record
+//! and lets the drain path free it once the completion lands (see the io_uring notes in
+//! `lang/CLAUDE.md` for the full rationale).
 
 import bytes;
 import os.socket;
 import os.linux.epoll;
 
+/// Op kind: a pending non-blocking `recv`.
 pub const OP_RECV: int = 0;
+/// Op kind: a pending non-blocking `send`.
 pub const OP_SEND: int = 1;
+/// Op kind: a pending non-blocking `accept`.
 pub const OP_ACCEPT: int = 2;
+/// Op kind: a pending non-blocking `connect` (readiness signalled via writability).
 pub const OP_CONNECT: int = 3;
+/// Op kind: a readiness-only wait for POLLIN (used to emulate readiness on io_uring).
 pub const OP_POLL_IN: int = 4;
+/// Op kind: a readiness-only wait for POLLOUT (used to emulate readiness on io_uring).
 pub const OP_POLL_OUT: int = 5;
+/// Op kind: a pending fd-passing `recvmsg` (SCM_RIGHTS).
 pub const OP_RECVFD: int = 6;
 
 const POLLIN_BIT: int = 1;
@@ -17,8 +42,12 @@ const POLLERR_BIT: int = 8;
 const POLLHUP_BIT: int = 16;
 const POLLRDHUP_BIT: int = 8192;
 
+/// Size in bytes of one op record, as laid out by `makeOp` (kind, fd, buf ptr, len, done flag,
+/// token ptr, result ptr).
 pub const OP_SIZE: int = 40;
 
+/// Initialises an op record at `op` (a buffer of at least `OP_SIZE` bytes) with the given kind,
+/// file descriptor, buffer address, length, and caller token. Clears the done flag and result slot.
 pub fn makeOp(op: long, kind: int, fd: int, buf: long, len: int, token: long): void {
     bytes.write_i32(op, 0, kind as long);
     bytes.write_i32(op, 4, fd as long);
@@ -28,15 +57,25 @@ pub fn makeOp(op: long, kind: int, fd: int, buf: long, len: int, token: long): v
     bytes.write_ptr(op, 24, token);
     bytes.write_ptr(op, 32, 0);
 }
+/// Reads the op kind (one of the `OP_*` constants) from an op record.
 pub fn opKind(op: long): int { return bytes.read_i32(op, 0) as int; }
+/// Reads the file descriptor an op record targets.
 pub fn opFd(op: long): int { return bytes.read_i32(op, 4) as int; }
+/// Reads the buffer address an op record reads into or writes from.
 pub fn opBuf(op: long): long { return bytes.read_ptr(op, 8); }
+/// Reads the requested buffer length for an op record.
 pub fn opLen(op: long): int { return bytes.read_i32(op, 16) as int; }
+/// Reads the done/status flag: 0 while pending, 1 once `setOpResult` has run, or `OP_ABANDONED`
+/// if the caller gave up on the op while the kernel still held it.
 pub fn opDone(op: long): int { return bytes.read_i32(op, 20) as int; }
+/// Reads the caller-supplied token that identifies which coroutine/waiter owns this op.
 pub fn opToken(op: long): long { return bytes.read_ptr(op, 24); }
+/// Reads the completed op's result (bytes transferred, accepted fd, or a negative error code).
 pub fn opResult(op: long): int { return bytes.read_ptr(op, 32) as int; }
+/// Stores the completion result into an op record and marks it done.
 pub fn setOpResult(op: long, r: int): void { bytes.write_ptr(op, 32, r as long); bytes.write_i32(op, 20, 1); }
 
+// Chooses the epoll interest mask for an op kind: EPOLLOUT for send/connect, EPOLLIN otherwise, both one-shot.
 fn eventsFor(kind: int): int {
     if (kind == OP_SEND || kind == OP_CONNECT) { return epoll.EPOLLOUT | epoll.EPOLLONESHOT; }
     return epoll.EPOLLIN | epoll.EPOLLONESHOT;
@@ -45,11 +84,16 @@ fn eventsFor(kind: int): int {
 extern("c") fn nova_epoll_mark_registered(fd: int): int;
 extern("c") fn nova_epoll_clear_registered(fd: int): void;
 
+// Registers or re-arms a fd's epoll interest: ADD on first use, MOD thereafter (avoids a redundant
+// ADD/DEL pair per keep-alive request; see the persistent-registration note in lang/CLAUDE.md).
 fn arm(kq: int, fd: int, events: int, data: long): int {
     if (nova_epoll_mark_registered(fd) != 0) { return epoll.ctlAdd(kq, fd, events, data); }
     return epoll.ctlMod(kq, fd, events, data);
 }
 
+/// Submits an op for the given epoll instance `kq`. On io_uring, stages (and, if the submission
+/// queue is full, flushes) an SQE instead; on epoll, arms the fd for the interest matching the
+/// op's kind. Returns 0 on success, -1 on failure.
 pub fn submit(kq: int, op: long): int {
     let ring = if (usingUring()) nova_uring_current() else (0 as long);
     if (ring != (0 as long)) {
@@ -59,8 +103,14 @@ pub fn submit(kq: int, op: long): int {
     return arm(kq, opFd(op), eventsFor(opKind(op)), op);
 }
 
+/// Done-flag value marking an op record that the caller has given up on while the kernel may still
+/// hold a reference to it; the drain path frees it once the completion actually arrives.
 pub const OP_ABANDONED: int = 2;
 
+/// Gives up on a pending op without freeing it out from under the kernel. Returns `true` when the
+/// caller must NOT free `op` yet (io_uring: the record is marked `OP_ABANDONED` and cancellation is
+/// requested; the drain path frees it on completion). Returns `false` on epoll, where deregistering
+/// the interest is enough and the caller may free the record immediately.
 pub fn abandonOp(kq: int, op: long): bool {
     if (op == (0 as long)) { return false; }
     if (!usingUring()) {
@@ -76,14 +126,18 @@ pub fn abandonOp(kq: int, op: long): bool {
     return true;
 }
 
+/// Cancels a pending read/poll interest on `fd` and clears its registration state.
 pub fn cancelRead(kq: int, fd: int): void {
     if (usingUring()) { dropArm(fd); return; }
     epoll.ctlDel(kq, fd);
     nova_epoll_clear_registered(fd);
 }
 
+/// True when a `connect` op is submitted to the kernel as part of `submit` itself (io_uring); false
+/// when it is only armed for a later writability notification (epoll).
 pub fn connectIsSubmitted(): bool { return usingUring(); }
 
+/// Size in bytes of one entry in the io_uring completion event buffer (user_data + result word).
 pub const EVENT_SIZE: int = 12;
 
 extern("c") fn nova_reactor_arm_get(fd: int): long;
@@ -93,9 +147,12 @@ extern("c") fn nova_reactor_rearm_pop(): long;
 extern("c") fn nova_op_alloc(size: long): long;
 extern("c") fn nova_op_free(op: long): void;
 
+// Reads whether a poll-emulation op record currently has an outstanding SQE (io_uring only).
 fn opArmed(op: long): int { return bytes.read_i32(op, 20) as int; }
 fn setArmed(op: long, v: int): void { bytes.write_i32(op, 20, v as long); }
 
+// Arms (or re-arms) io_uring poll-emulated readiness for `fd`: reuses the per-fd op record if one
+// already exists, and only submits a fresh SQE if the previous one is not still outstanding.
 fn armPoll(fd: int, token: long, kind: int): int {
     if (fd < 0) { return -1; }
     let op = nova_reactor_arm_get(fd);
@@ -113,6 +170,7 @@ fn armPoll(fd: int, token: long, kind: int): int {
     return stageUring(nova_uring_current(), op);
 }
 
+// Cancels the outstanding io_uring poll-emulation SQE for `fd`, if any, and marks it not-armed.
 fn dropArm(fd: int): void {
     let op = nova_reactor_arm_get(fd);
     if (op == (0 as long)) { return; }
@@ -123,14 +181,18 @@ fn dropArm(fd: int): void {
     setArmed(op, 0);
 }
 
+/// Arms readiness notification for readability on `fd`, tagged with `token`. On epoll this is a
+/// plain `EPOLL_CTL_ADD`; on io_uring it emulates readiness with a poll-add SQE.
 pub fn armRead(kq: int, fd: int, token: long): int {
     if (usingUring()) { return armPoll(fd, token, OP_POLL_IN); }
     return epoll.ctlAdd(kq, fd, epoll.EPOLLIN, token);
 }
+/// Arms readiness notification for writability on `fd`, tagged with `token`, one-shot on epoll.
 pub fn armWrite(kq: int, fd: int, token: long): int {
     if (usingUring()) { return armPoll(fd, token, OP_POLL_OUT); }
     return epoll.ctlAdd(kq, fd, epoll.EPOLLOUT | epoll.EPOLLONESHOT, token);
 }
+/// Cancels a previously armed write-readiness notification on `fd`.
 pub fn cancelWrite(kq: int, fd: int): void {
     if (usingUring()) { dropArm(fd); return; }
     epoll.ctlDel(kq, fd);
@@ -139,6 +201,8 @@ pub fn cancelWrite(kq: int, fd: int): void {
 const URING_EV_DATA_OFF: int = 0;
 const URING_EV_RES_OFF: int = 8;
 
+// Checks whether `raw` (a user_data word) was already written into this batch's event buffer, so a
+// completion is not reported twice within the same drain.
 fn slotSeen(eventBuf: long, written: int, raw: long): bool {
     let j = 0;
     while (j < written) {
@@ -150,6 +214,10 @@ fn slotSeen(eventBuf: long, written: int, raw: long): bool {
     return false;
 }
 
+// io_uring implementation of waitReady: flushes any pending re-arms, submits and waits for at least
+// one completion, then drains the completion queue into eventBuf. Filters out poll-emulation
+// completions that were re-armed rather than surfaced (a POLLIN wait with none of the interesting
+// bits set gets pushed back onto the pending queue instead of being reported).
 fn uringWaitReady(eventBuf: long, maxEvents: int): int {
     let ring = nova_uring_current();
     if (ring == (0 as long)) { return 0; }
@@ -212,11 +280,15 @@ fn uringWaitReady(eventBuf: long, maxEvents: int): int {
     return written;
 }
 
+/// Blocks (up to `timeoutMs`, or indefinitely under io_uring's own wait-for-one semantics) until at
+/// least one event is ready, writes up to `maxEvents` entries into `eventBuf`, and returns the count
+/// written. Dispatches to `epoll_wait` or the io_uring drain depending on the active backend.
 pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
     if (usingUring()) { return uringWaitReady(eventBuf, maxEvents); }
     return epoll.epoll_wait(kq, eventBuf, maxEvents, timeoutMs);
 }
 
+// Reads the raw user_data/epoll-data word for event slot `i`, backend-appropriate.
 fn evRaw(eventBuf: long, i: int): long {
     if (usingUring()) {
         return bytes.read_ptr(eventBuf + ((i * epoll.EPOLL_EVENT_SIZE) as long), URING_EV_DATA_OFF);
@@ -224,50 +296,84 @@ fn evRaw(eventBuf: long, i: int): long {
     return epoll.evData(eventBuf, i);
 }
 
+// True when a raw event word `d` is itself an op record pointer (its token maps back to itself),
+// as opposed to a plain token value or the reserved wake sentinel.
 fn isOpRecordWord(d: long): bool {
     return d != (0 as long) && d != WAKE_DATA && nova_reactor_event_token(d) == d;
 }
 
+/// Returns the file descriptor associated with event slot `i`, or -1 on io_uring when the slot is
+/// not an op record (e.g. a plain wake or token-only completion).
 pub fn evFd(eventBuf: long, i: int): int {
     let d = evRaw(eventBuf, i);
     if (usingUring()) { return if (isOpRecordWord(d)) opFd(d) else -1; }
     return d as int;
 }
 
+/// Resolves a raw epoll/io_uring data word to the caller token it represents (identity for plain
+/// tokens, or the token stored inside an op record when the word is an op pointer).
 pub extern("c") fn nova_reactor_event_token(data: long): long;
 
+/// Returns which reactor backend is active for this process (see `BACKEND_URING`).
 pub extern("c") fn nova_reactor_backend(): int;
+/// Creates an io_uring instance with the given submission queue depth. Returns 0 on failure.
 pub extern("c") fn nova_uring_create(entries: int): long;
+/// Tears down an io_uring instance created by `nova_uring_create`.
 pub extern("c") fn nova_uring_destroy(ring: long): void;
+/// Sets the thread-local "current" io_uring instance that free functions like `submit` target.
 pub extern("c") fn nova_uring_set_current(ring: long): void;
+/// Returns the thread-local "current" io_uring instance, or 0 if none is set.
 pub extern("c") fn nova_uring_current(): long;
+/// Returns the raw file descriptor backing an io_uring instance.
 pub extern("c") fn nova_uring_fd(ring: long): int;
+/// Prepares (stages, without submitting) one submission queue entry. Returns 0 on success.
 pub extern("c") fn nova_uring_prep(ring: long, op: int, fd: int, addr: long, len: int, off: long, userData: long): int;
+/// Submits all staged SQEs and waits for at least `waitNr` completions.
 pub extern("c") fn nova_uring_submit_and_wait(ring: long, waitNr: int): int;
+/// Returns how many completions are currently ready on the completion queue.
 pub extern("c") fn nova_uring_cq_ready(ring: long): int;
+/// Reads the user_data and result of completion queue entry `i` without consuming it.
 pub extern("c") fn nova_uring_peek(ring: long, i: int, userData: ptr, res: ptr): int;
+/// Marks the first `n` completion queue entries as consumed.
 pub extern("c") fn nova_uring_advance(ring: long, n: int): void;
+/// Drains the cross-reactor wake eventfd after a wake completion fires.
 pub extern("c") fn nova_uring_wake_drain(): void;
+/// io_uring opcode constant for `IORING_OP_RECV`.
 pub extern("c") fn nova_uring_op_recv(): int;
+/// io_uring opcode constant for `IORING_OP_SEND`.
 pub extern("c") fn nova_uring_op_send(): int;
+/// io_uring opcode constant for `IORING_OP_ACCEPT`.
 pub extern("c") fn nova_uring_op_accept(): int;
+/// io_uring opcode constant for `IORING_OP_CONNECT`.
 pub extern("c") fn nova_uring_op_connect(): int;
+/// io_uring opcode constant for `IORING_OP_POLL_ADD`.
 pub extern("c") fn nova_uring_op_poll_add(): int;
+/// io_uring opcode constant for `IORING_OP_POLL_REMOVE`.
 pub extern("c") fn nova_uring_op_poll_remove(): int;
+/// io_uring opcode constant for `IORING_OP_ASYNC_CANCEL`.
 pub extern("c") fn nova_uring_op_async_cancel(): int;
+/// io_uring poll-add flag requesting multishot (repeating) notification.
 pub extern("c") fn nova_uring_poll_add_multi(): int;
+/// Completion queue entry flag indicating more completions will follow for a multishot request.
 pub extern("c") fn nova_uring_cqe_f_more(): int;
+/// Reads the flags word of completion queue entry `i` without consuming it.
 pub extern("c") fn nova_uring_peek_flags(ring: long, i: int): int;
 
+/// `nova_reactor_backend()` value meaning io_uring is the active backend (readiness-based epoll is
+/// the implicit alternative).
 pub const BACKEND_URING: int = 1;
+/// True when the process is using the io_uring (completion) backend rather than epoll (readiness).
 pub fn usingUring(): bool { return nova_reactor_backend() == BACKEND_URING; }
 
+// Stages an op's SQE; if the submission queue is full, flushes the batch and retries once.
 fn stageUring(ring: long, op: long): int {
     if (uringPrep(ring, op) == 0) { return 0; }
     if (nova_uring_submit_and_wait(ring, 0) < 0) { return -1; }
     return uringPrep(ring, op);
 }
 
+// Translates an op record's kind into the matching io_uring SQE, using the op pointer itself as
+// user_data so the completion can be traced back to it.
 fn uringPrep(ring: long, op: long): int {
     let kind = opKind(op);
     let fd = opFd(op);
@@ -286,16 +392,23 @@ fn uringPrep(ring: long, op: long): int {
     }
     return -1;
 }
+/// Returns the caller token for event slot `i`: resolved via `nova_reactor_event_token` for plain
+/// tokens, or read out of the op record itself when the raw word is an op pointer under io_uring.
 pub fn evToken(eventBuf: long, i: int): long {
     let d = evRaw(eventBuf, i);
     let tok = nova_reactor_event_token(d);
     if (usingUring() && d == tok && d != (0 as long)) { return opToken(d); }
     return tok;
 }
+// Wraps FIONREAD, used to size a read after a zero-byte readiness completion reports no count.
 extern("c") fn nova_fionread(fd: int): long;
+/// Returns the number of bytes currently available to read on the fd behind event slot `i`, via
+/// `FIONREAD`. Needed on io_uring, where a readiness completion carries no byte count of its own.
 pub fn evBytes(eventBuf: long, i: int): long {
     return nova_fionread(evFd(eventBuf, i));
 }
+/// True when event slot `i` indicates the peer closed or the connection errored (HUP/RDHUP/ERR on
+/// epoll, or a negative/HUP-equivalent result on io_uring).
 pub fn evEof(eventBuf: long, i: int): bool {
     if (usingUring()) {
         let res = bytes.read_i32(eventBuf + ((i * EVENT_SIZE) as long), URING_EV_RES_OFF) as int;
@@ -304,32 +417,56 @@ pub fn evEof(eventBuf: long, i: int): bool {
     }
     return (epoll.evEvents(eventBuf, i) & (epoll.EPOLLHUP | epoll.EPOLLRDHUP)) != 0;
 }
+// Reserved user_data value used by the cross-reactor wake eventfd.
 const WAKE_DATA: long = -1;
+// Synthetic filter value returned by evFilterAt for a user-initiated wake, not a real epoll event mask.
 const USER_FILTER: int = -2;
+/// Returns the epoll event mask for slot `i` (or `USER_FILTER` for a cross-reactor wake, or 0 on
+/// io_uring where there is no equivalent mask).
 pub fn evFilterAt(eventBuf: long, i: int): int {
     if (evRaw(eventBuf, i) == WAKE_DATA) { return USER_FILTER; }
     if (usingUring()) { return 0; }
     return epoll.evEvents(eventBuf, i);
 }
 
+/// Backend-agnostic reactor interface: submit an op, poll for completions, and read back the
+/// tokens that completed in the last poll. `Poller` is the only implementation in this module.
 pub trait EventLoop {
+    /// Submits an op for later completion. Returns 0 on success, -1 on failure.
     fn submit(self, op: long): int;
+    /// Polls for completions (blocking up to `timeoutMs` on epoll), returning the completed count.
     fn poll(self, timeoutMs: int): int;
+    /// Returns the token of the `i`-th completion from the most recent `poll` call.
     fn completedToken(self, i: int): long;
+    /// True when the underlying epoll/io_uring instance was created successfully.
     fn ok(self): bool;
+    /// Releases the poller's buffers and closes its epoll fd or destroys its io_uring instance.
     fn destroy(self): void;
 }
 
+/// Reactor driving either epoll (readiness) or io_uring (completion), chosen once at construction
+/// via `usingUring()`. Owns the kernel instance, the raw event buffer the kernel writes into, and a
+/// separate `compBuf` of resolved caller tokens that `completedToken` reads from after each `poll`.
 pub class Poller impl EventLoop {
+    /// The epoll instance fd, or (when io_uring is active) the io_uring instance's own fd.
     pub kq: int,
+    /// The io_uring instance handle, or 0 when running on epoll.
     pub ring: long,
+    /// Raw kernel event buffer: epoll events, or io_uring completion queue entries.
     pub eventBuf: long,
+    /// Resolved caller tokens for the completions produced by the most recent `poll` call.
     pub compBuf: long,
+    /// Scratch buffer for reading one io_uring completion's user_data (io_uring only).
     pub udBuf: long,
+    /// Scratch buffer for reading one io_uring completion's result (io_uring only).
     pub resBuf: long,
+    /// Capacity, in events, of `eventBuf` and `compBuf`.
     pub maxEvents: int,
+    /// Number of completions produced by the most recent `poll` call.
     pub nComp: int,
 
+    /// Creates a poller sized for up to `maxEvents` events per `poll` call, selecting epoll or
+    /// io_uring per `usingUring()` and allocating the buffers each backend needs.
     init(maxEvents: int) {
         self.maxEvents = maxEvents;
         self.compBuf = bytes.alloc(maxEvents * 8);
@@ -350,16 +487,21 @@ pub class Poller impl EventLoop {
         }
     }
 
+    /// True when the epoll fd (or io_uring instance) was created successfully.
     fn ok(self: Poller): bool {
         if (self.ring != (0 as long)) { return true; }
         return self.kq >= 0;
     }
 
+    /// Submits an op via io_uring staging or epoll arming, depending on the active backend.
     fn submit(self: Poller, op: long): int {
         if (self.ring != (0 as long)) { return stageUring(self.ring, op); }
         return arm(self.kq, opFd(op), eventsFor(opKind(op)), op);
     }
 
+    /// Waits up to `timeoutMs` for epoll events, then drives each ready op to completion in place
+    /// (issuing the actual `recv`/`send`/`accept`/`connect` syscall for it) before recording its
+    /// token in `compBuf`. On io_uring, delegates to `pollUring` instead. Returns `nComp`.
     fn poll(self: Poller, timeoutMs: int): int {
         if (self.ring != (0 as long)) { return self.pollUring(); }
         let n = epoll.epoll_wait(self.kq, self.eventBuf, self.maxEvents, timeoutMs);
@@ -422,6 +564,9 @@ pub class Poller impl EventLoop {
         return self.nComp;
     }
 
+    /// io_uring backend for `poll`: submits and waits for at least one completion, then drains the
+    /// completion queue into `compBuf`, freeing any `OP_ABANDONED` record it encounters instead of
+    /// reporting it. Returns `nComp`.
     fn pollUring(self: Poller): int {
         self.nComp = 0;
         nova_uring_submit_and_wait(self.ring, 1);
@@ -452,10 +597,13 @@ pub class Poller impl EventLoop {
         return self.nComp;
     }
 
+    /// Returns the token of the `i`-th completion recorded by the most recent `poll` call.
     fn completedToken(self: Poller, i: int): long {
         return bytes.read_ptr(self.compBuf, (i * 8) as long);
     }
 
+    /// Frees all buffers, tears down the io_uring instance (if any) and unsets it as current, and
+    /// closes the epoll fd. Safe to call more than once; each field is reset after freeing.
     fn destroy(self: Poller): void {
         if (self.eventBuf != 0) { bytes.free(self.eventBuf); self.eventBuf = 0; }
         if (self.compBuf != 0) { bytes.free(self.compBuf); self.compBuf = 0; }

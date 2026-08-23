@@ -1,8 +1,21 @@
+//! TCP client connection helper.
+//!
+//! `TcpClient` is a thin, static entry point for opening outbound TCP
+//! connections and wrapping the resulting file descriptor in a
+//! `net.tcp.stream.TcpStream` for reading and writing. It builds on the
+//! low-level `stream.connect` syscall wrapper, so it does not itself own
+//! any socket state; the returned `TcpStream` does.
 
 import bytes;
 import net.tcp.stream;
 
+/// Static helper for establishing outbound TCP connections.
 pub class TcpClient {
+    /// Connects to `host:port` and returns a `TcpStream` wrapping the new socket.
+    ///
+    /// If the underlying connect fails (fd < 0), returns an `undefined`
+    /// `TcpStream` rather than an error, so callers must check the stream
+    /// before use.
     pub fn connect(host: string, port: int): stream.TcpStream {
         let fd = stream.connect(host, port);
         if (fd < 0) {
@@ -12,6 +25,12 @@ pub class TcpClient {
         return stream.TcpStream(fd);
     }
 
+    /// Connects to `host:port` and applies a read/write timeout in milliseconds
+    /// to the resulting stream before returning it.
+    ///
+    /// A `timeoutMs` of 0 or less leaves the stream on its default timeout
+    /// behaviour. As with `connect`, a failed connect yields an `undefined`
+    /// `TcpStream`.
     pub fn connectTimeout(host: string, port: int, timeoutMs: int): stream.TcpStream {
         let fd = stream.connect(host, port);
         if (fd < 0) {

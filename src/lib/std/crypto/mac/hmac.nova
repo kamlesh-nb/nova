@@ -1,16 +1,83 @@
+//! Keyed-hash message authentication (HMAC), per RFC 2104 and FIPS 198-1.
+//!
+//! HMAC turns any of Nova's plain hash functions into a keyed authenticator: it
+//! proves that a message was produced by someone holding the secret key, and
+//! that the message was not altered in transit. This file wires the shared HMAC
+//! construction onto the four SHA variants the standard library ships (SHA-1,
+//! SHA-256, SHA-384, SHA-512), one entry point per digest.
+//!
+//! The construction is the classic double-hash. Given a key `K`, a block size
+//! `B` (the hash's internal block, NOT its digest length), and a message `m`:
+//!
+//!   1. Derive a block-sized key `K0`. If `K` is longer than `B`, it is first
+//!      hashed down to a digest and that digest becomes the key material; either
+//!      way `K0` is zero-padded on the right out to `B` bytes.
+//!   2. Compute two `B`-byte pads by XOR-ing every byte of `K0` with the fixed
+//!      constants `0x36` (the inner pad, [`IPAD`]) and `0x5c` (the outer pad,
+//!      [`OPAD`]).
+//!   3. The result is `H((K0 ^ opad) || H((K0 ^ ipad) || m))`. The inner hash
+//!      binds the key and the message; the outer hash binds the key again and
+//!      defends against length-extension on the inner digest.
+//!
+//! Two design points are worth calling out. First, the key is padded to the
+//! HASH BLOCK LENGTH, not the digest length: for SHA-256 that is 64 bytes, and
+//! for SHA-512/SHA-384 it is 128 bytes. Reading the block-length constant from
+//! the corresponding hash module (rather than hardcoding it here) keeps the two
+//! in step. Second, every function writes its tag into a caller-provided output
+//! buffer rather than allocating and returning one, matching the pointer-and-
+//! length calling convention used across [`bytes`] and the hash modules; the
+//! caller must size that buffer to the matching `HMAC_*_LEN` constant.
+//!
+//! All intermediate buffers (the padded key, the two pads, the inner digest)
+//! are heap-allocated through [`bytes`] and freed before return, so a call
+//! leaves nothing behind. The functions are pure and hold no state between
+//! calls, so they are safe to invoke concurrently on distinct buffers.
+//!
+//! These primitives sit under the wider crypto tree and back higher-level users
+//! such as HKDF, PBKDF2, JWT signing, and the TLS record layer.
+
 import bytes;
 import crypto.hash.sha1;
 import crypto.hash.sha256;
 import crypto.hash.sha512;
 
+/// Inner-pad constant, XOR-ed byte-wise into the padded key for the inner hash.
+///
+/// The value `0x36` and its outer counterpart [`OPAD`] are fixed by RFC 2104.
+/// What matters is only that the two constants differ in enough bits (here in
+/// every nibble), so the inner and outer keys derived from the same `K0` are
+/// distinct; the specific bytes are a convention every HMAC implementation
+/// shares so that tags interoperate.
 const IPAD: int = 0x36;
+/// Outer-pad constant, XOR-ed byte-wise into the padded key for the outer hash.
+///
+/// The fixed RFC 2104 companion to [`IPAD`]; see that constant for why the pair
+/// is chosen to differ.
 const OPAD: int = 0x5c;
 
+/// Byte length of an HMAC-SHA-1 tag (the SHA-1 digest length, 20 bytes).
+///
+/// Callers must size the `out` buffer passed to [`hmacSha1`] to at least this
+/// many bytes.
 pub const HMAC_SHA1_LEN: int = 20;
+/// Byte length of an HMAC-SHA-256 tag (32 bytes); size `out` for [`hmacSha256`]
+/// to this.
 pub const HMAC_SHA256_LEN: int = 32;
+/// Byte length of an HMAC-SHA-384 tag (48 bytes); size `out` for [`hmacSha384`]
+/// to this.
 pub const HMAC_SHA384_LEN: int = 48;
+/// Byte length of an HMAC-SHA-512 tag (64 bytes); size `out` for [`hmacSha512`]
+/// to this.
 pub const HMAC_SHA512_LEN: int = 64;
 
+/// Computes HMAC-SHA-1 over `msg` under `key`, writing 20 bytes to `out`.
+///
+/// The key is normalised to the SHA-1 block length (64 bytes): a key longer
+/// than a block is hashed down first, otherwise it is zero-padded. The `out`
+/// buffer must hold at least [`HMAC_SHA1_LEN`] bytes; `key` and `msg` are read
+/// but not modified. Note that SHA-1 is retained only for legacy protocols; new
+/// code should prefer [`hmacSha256`] or stronger. All scratch buffers are freed
+/// before return, so the call leaks nothing.
 pub fn hmacSha1(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     let bs = sha1.SHA1_BLOCK_LEN;
     let dl = sha1.SHA1_DIGEST_LEN;
@@ -47,6 +114,13 @@ pub fn hmacSha1(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     bytes.free(ih);
 }
 
+/// Computes HMAC-SHA-256 over `msg` under `key`, writing 32 bytes to `out`.
+///
+/// The key is normalised to the SHA-256 block length (64 bytes), hashing a
+/// longer key down first and zero-padding otherwise. The `out` buffer must hold
+/// at least [`HMAC_SHA256_LEN`] bytes. This is the default choice for new code
+/// that needs a keyed authenticator. The structure mirrors [`hmacSha1`] exactly,
+/// differing only in the underlying hash. All scratch buffers are freed on exit.
 pub fn hmacSha256(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     let bs = sha256.SHA256_BLOCK_LEN;
     let dl = sha256.SHA256_DIGEST_LEN;
@@ -83,6 +157,21 @@ pub fn hmacSha256(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void 
     bytes.free(ih);
 }
 
+/// Shared core for the SHA-512 family, factored out because SHA-384 and SHA-512
+/// differ only by two run-time parameters rather than by algorithm.
+///
+/// Both variants use the same 128-byte block ([`sha512.SHA512_BLOCK_LEN`]) and
+/// the same round function; SHA-384 is SHA-512 with a different initial state
+/// and a truncated output. That distinction is carried entirely by `is384`,
+/// which selects the correct key-hashing routine ([`sha512.hash384Into`] versus
+/// [`sha512.hashInto`]) and is threaded into the streaming hash constructor, and
+/// by `dl`, the digest length to emit (48 for SHA-384, 64 for SHA-512). Keeping
+/// one body avoids two near-identical copies drifting apart.
+///
+/// `dl` must match `is384` (the caller passes the matching `HMAC_*_LEN`), and
+/// `out` must hold at least `dl` bytes. Every scratch buffer is freed before
+/// return. Callers should use the [`hmacSha384`] / [`hmacSha512`] wrappers
+/// rather than calling this directly.
 fn hmac512Core(is384: bool, dl: int, key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     let bs = sha512.SHA512_BLOCK_LEN;
     let k0 = bytes.alloc(bs);
@@ -118,10 +207,20 @@ fn hmac512Core(is384: bool, dl: int, key: ptr, keyLen: int, msg: ptr, msgLen: in
     bytes.free(ih);
 }
 
+/// Computes HMAC-SHA-384 over `msg` under `key`, writing 48 bytes to `out`.
+///
+/// A thin wrapper over [`hmac512Core`] with `is384` set and the digest length
+/// fixed to [`HMAC_SHA384_LEN`]. The `out` buffer must hold at least that many
+/// bytes.
 pub fn hmacSha384(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     hmac512Core(true, HMAC_SHA384_LEN, key, keyLen, msg, msgLen, out);
 }
 
+/// Computes HMAC-SHA-512 over `msg` under `key`, writing 64 bytes to `out`.
+///
+/// A thin wrapper over [`hmac512Core`] with `is384` cleared and the digest
+/// length fixed to [`HMAC_SHA512_LEN`]. The `out` buffer must hold at least that
+/// many bytes.
 pub fn hmacSha512(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     hmac512Core(false, HMAC_SHA512_LEN, key, keyLen, msg, msgLen, out);
 }
