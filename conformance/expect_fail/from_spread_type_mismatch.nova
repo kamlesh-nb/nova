@@ -1,5 +1,5 @@
 // EXPECT-FAIL: typecheck
-// A `..from` convention match requires name AND type to agree. Here `count`
+// A `...from` convention match requires name AND type to agree. Here `count`
 // matches by name but the source type (string) differs from the target (int),
 // so the spread must NOT fill it silently: it is a compile error, and the field
 // must be given explicitly. Guards against a silent string->int miscompile and,
@@ -12,6 +12,6 @@ struct Dst { count: int, name: string }
 @test
 fn t_type_mismatch(): void {
     let s = Src{ count: "hello", name: "x" };
-    let d = Dst{ ..from(s) };
+    let d = Dst{ ...from(s) };
     assert.equalInt(d.count, 0);
 }

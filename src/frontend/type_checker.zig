@@ -212,7 +212,7 @@ fn identOf(tr: ast.TypeRef) ?[]const u8 {
     };
 }
 
-/// Whether two field types are compatible for a `..from` convention copy. The
+/// Whether two field types are compatible for a `...from` convention copy. The
 /// rule is deliberately strict: both must be the same named type. A spread copies
 /// the value as-is (no conversion), so a name match whose types differ (e.g.
 /// `string` vs `int`, or owned `string` vs a zero-copy `str.Str` view) is NOT a
@@ -253,7 +253,7 @@ pub fn flattenNameMatch(tgt: []const u8, prefix: []const u8, leaf: []const u8) b
     return std.mem.startsWith(u8, nt, np) and std.mem.eql(u8, nt[np.len..], nl);
 }
 
-/// Convention-equality of two field names for the `..from` mapper spread:
+/// Convention-equality of two field names for the `...from` mapper spread:
 /// case-insensitive and ignoring underscores, so `image_url` matches `imageUrl`
 /// and `full_name` matches `fullName`. Shared conceptually with the codegen
 /// matcher in `expressions.zig` (kept in sync by hand).
@@ -1238,7 +1238,7 @@ pub const TypeChecker = struct {
         return null;
     }
 
-    /// Whether a `..from` spread of source struct `src_name` can fully fill target
+    /// Whether a `...from` spread of source struct `src_name` can fully fill target
     /// struct `dst_name` by convention, allowing NESTED spreads: a target field
     /// whose type differs from its convention-matched source field is covered if
     /// both are structs and the nested source likewise covers the nested target.
@@ -1494,7 +1494,7 @@ pub const TypeChecker = struct {
             .struct_init => |si| {
                 for (si.fields) |field| try self.checkExpr(field.value);
 
-                // A `..from(expr)` spread fills every target field not named
+                // A `...from(expr)` spread fills every target field not named
                 // explicitly, by convention, from a same-named field of the
                 // source struct. Resolve the source struct so the missing-field
                 // check below treats convention-covered fields as satisfied.
@@ -1565,7 +1565,7 @@ pub const TypeChecker = struct {
                         }
                         if (!found) {
                             if (name_only_src_type) |src_ty| {
-                                self.addError(si.span, "spread '..from' cannot fill field '{s}': the source has a matching '{s}' but its type '{s}' differs from the target type '{s}', give this field explicitly", .{ df.name, df.name, src_ty, identOf(df.type_name) orelse "?" });
+                                self.addError(si.span, "spread '...from' cannot fill field '{s}': the source has a matching '{s}' but its type '{s}' differs from the target type '{s}', give this field explicitly", .{ df.name, df.name, src_ty, identOf(df.type_name) orelse "?" });
                             } else if (self.structInitParamCount(si.type_name) != null) {
                                 self.addError(si.span, "struct literal '{s}{{ ... }}' is missing field '{s}', initialize every field, or use the constructor '{s}(...)'", .{ si.type_name, df.name, si.type_name });
                             } else {

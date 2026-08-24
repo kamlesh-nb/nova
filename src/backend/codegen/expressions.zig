@@ -4495,7 +4495,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             else
                 try self.compileAlloc(size_val);
 
-            // Effective field list. With a `..from(expr)` spread, every target
+            // Effective field list. With a `...from(expr)` spread, every target
             // field not named explicitly is synthesised as `expr.<srcField>`,
             // where srcField matches by convention (`_`/case-insensitive). The
             // type checker has already verified every field is covered, so any
@@ -4593,7 +4593,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             if (df_id.len > 0 and self.structs.contains(df_id) and
                                 sf_id.len > 0 and self.structs.contains(sf_id))
                             {
-                                // Nested map: `TargetFieldType{ ..from(src.field) }`.
+                                // Nested map: `TargetFieldType{ ...from(src.field) }`.
                                 // The struct-init codegen recurses into this spread.
                                 const nested = ast.Expression{ .kind = .{ .struct_init = ast.StructInit{
                                     .type_name = df_id,

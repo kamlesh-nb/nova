@@ -1923,7 +1923,7 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
             }
         }
 
-        // Synthesised expressions (e.g. a `..from` mapper spread's generated
+        // Synthesised expressions (e.g. a `...from` mapper spread's generated
         // nested field accesses) are not in the typed IR, which is keyed by
         // pointer. Resolve such a field access structurally: the object's struct
         // type, then the named field's declared type. Deliberately narrow: only

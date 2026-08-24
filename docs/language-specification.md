@@ -194,7 +194,7 @@ struct Point { pub x: int, pub y: int
   Field/method visibility is **module-private** (per §8): a non-`pub` field or method is accessible from
   anywhere in the same module (source file), and requires `pub` to be reached across modules
   *(→ 12, 337_module_private, 39_declared_type_ownership)*.
-- **Mapper spread** — a struct literal may include one `..from(expr)` spread, which fills every target
+- **Mapper spread** — a struct literal may include one `...from(expr)` spread, which fills every target
   field not named explicitly by convention from a same-named field of the source struct. Matching is
   case-insensitive and ignores underscores, so `image_url` fills `imageUrl` and `full_name` fills
   `fullName`. Explicit fields always win, and a field the source does not have is simply given
@@ -205,7 +205,7 @@ struct Point { pub x: int, pub y: int
   struct Product { image_url: string, is_vegetarian: bool, price: double, stock: int }
   struct ProductDto { imageUrl: string, veg: bool, price: double, label: string }
   fn toDto(p: Product): ProductDto {
-      return ProductDto{ ..from(p), veg: p.is_vegetarian, label: "Special" };
+      return ProductDto{ ...from(p), veg: p.is_vegetarian, label: "Special" };
       //                  ^ imageUrl<-image_url, price<-price by convention;
       //                    veg + label given explicitly; stock is not a target field.
   }

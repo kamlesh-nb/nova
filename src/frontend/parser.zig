@@ -2587,7 +2587,7 @@ pub const Parser = struct {
                             var spread: ?*ast.Expression = null;
                             if (self.current().type != .right_brace) {
                                 while (true) {
-                                    if (self.current().type == .dot_dot) {
+                                    if (self.current().type == .ellipsis) {
                                         spread = try self.parseSpreadFrom();
                                         if (!self.match(.comma)) break;
                                         if (self.current().type == .right_brace) break;
@@ -2724,8 +2724,15 @@ pub const Parser = struct {
                     self.advance();
                     var fields = std.ArrayList(ast.ObjectFieldInit).empty;
                     defer fields.deinit(self.allocator);
+                    var spread: ?*ast.Expression = null;
                     if (self.current().type != .right_brace) {
                         while (true) {
+                            if (self.current().type == .ellipsis) {
+                                spread = try self.parseSpreadFrom();
+                                if (!self.match(.comma)) break;
+                                if (self.current().type == .right_brace) break;
+                                continue;
+                            }
                             const f_name = self.current().lexeme;
                             try self.expect(.identifier);
                             try self.expect(.colon);
@@ -2750,6 +2757,7 @@ pub const Parser = struct {
                     expr = ast.Expression{ .kind = .{ .struct_init = ast.StructInit{
                         .type_name = type_name,
                         .fields = try fields.toOwnedSlice(self.allocator),
+                        .spread = spread,
                         .span = self.span(),
                     } } };
                 },
@@ -2974,13 +2982,13 @@ pub const Parser = struct {
     /// scanning for a `=>` after the balanced `)`); array and array-repeat
     /// literals `[a, b]` / `[v; N]`; object literals `{ k: v }`; the `undefined`
     /// and `null` sentinels; a struct-init `Name { ... }`; and bare identifiers.
-    /// Parses a `..from(expr)` mapper spread inside a struct literal, with the
-    /// cursor positioned on the `..` token. Returns the allocated source
+    /// Parses a `...from(expr)` mapper spread inside a struct literal, with the
+    /// cursor positioned on the `...` token. Returns the allocated source
     /// expression; the caller stores it as `StructInit.spread`.
     fn parseSpreadFrom(self: *Parser) ParserError!*ast.Expression {
-        try self.expect(.dot_dot);
+        try self.expect(.ellipsis);
         if (!(self.current().type == .identifier and std.mem.eql(u8, self.current().lexeme, "from"))) {
-            std.debug.print("Expected 'from' after '..' in struct spread at line {}, col {}\n", .{ self.current().line, self.current().column });
+            std.debug.print("Expected 'from' after '...' in struct spread at line {}, col {}\n", .{ self.current().line, self.current().column });
             return error.UnexpectedToken;
         }
         self.advance();
@@ -3196,7 +3204,7 @@ pub const Parser = struct {
                     defer fields.deinit(self.allocator);
                     var spread: ?*ast.Expression = null;
                     while (self.current().type != .right_brace) {
-                        if (self.current().type == .dot_dot) {
+                        if (self.current().type == .ellipsis) {
                             spread = try self.parseSpreadFrom();
                             if (self.current().type == .comma) {
                                 self.advance();
