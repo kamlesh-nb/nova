@@ -30,6 +30,18 @@ import serde.source;
 import web.request;
 import web.response;
 import web.status;
+import crypto.base64;
+
+/// The value for an `Authorization: Bearer <token>` header. Used for OAuth
+/// access tokens and API keys (Stripe, Resend, SendGrid, and most JSON APIs).
+pub fn bearer(token: string): string {
+    return "Bearer " + token;
+}
+
+/// The value for an `Authorization: Basic <base64(user:pass)>` header (RFC 7617).
+pub fn basicAuth(user: string, pass: string): string {
+    return "Basic " + base64.encode(user + ":" + pass);
+}
 
 /// Minimal one-shot HTTP client over a plain (non-TLS) TCP socket.
 ///

@@ -544,3 +544,11 @@ fn i64ToString(val: long): string {
     }
     return str_ptr as string;
 }
+
+/// Reads a top-level string field from a JSON object `src`, returning "" when
+/// the field is absent or not a string. A convenience over
+/// `asString(get(parse(src), key))` for the very common "pull one field out of
+/// an API response body" case.
+pub fn stringField(src: string, key: string): string {
+    return asString(get(parse(src), key)) ?? "";
+}

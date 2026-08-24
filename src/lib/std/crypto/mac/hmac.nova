@@ -224,3 +224,55 @@ pub fn hmacSha384(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void 
 pub fn hmacSha512(key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
     hmac512Core(false, HMAC_SHA512_LEN, key, keyLen, msg, msgLen, out);
 }
+
+// --- String-friendly conveniences ------------------------------------------
+// The four entry points above speak raw pointers and lengths. Webhook and API
+// signing code almost always has string inputs and wants a hex digest, so these
+// wrappers cover that common case (HMAC-SHA-256, the default) without every
+// caller re-deriving hex and a constant-time compare. Kept here (not in
+// crypto/hash/sha) because sha imports this module; duplicating a tiny hex loop
+// avoids an import cycle.
+
+/// Lower-case hex of the first `n` bytes at `buf`.
+fn hmacToHex(buf: ptr, n: int): string {
+    const digits: string = "0123456789abcdef";
+    let out = bytes.alloc(n * 2);
+    let i = 0;
+    while (i < n) {
+        let b = bytes.read_byte(buf, i);
+        bytes.write_byte(out, i * 2, bytes.read_byte(digits, (b >> 4) & 15));
+        bytes.write_byte(out, i * 2 + 1, bytes.read_byte(digits, b & 15));
+        i = i + 1;
+    }
+    return out as string;
+}
+
+/// HMAC-SHA-256(key, msg) as a 64-character lower-case hex string.
+pub fn hmacSha256Hex(key: string, msg: string): string {
+    let out = bytes.alloc(HMAC_SHA256_LEN);
+    hmacSha256(key, key.length, msg, msg.length, out);
+    let hex = hmacToHex(out, HMAC_SHA256_LEN);
+    bytes.free(out);
+    return hex;
+}
+
+/// Constant-time string equality: always scans the whole of the shorter compare
+/// so the timing does not reveal where two values first differ. Use it to check
+/// a received signature against a computed one.
+pub fn constantTimeEqual(a: string, b: string): bool {
+    if (a.length != b.length) { return false; }
+    let diff = 0;
+    let i = 0;
+    while (i < a.length) {
+        diff = diff | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+/// True when `sigHex` equals HMAC-SHA-256(key, msg) rendered as lower-case hex,
+/// compared in constant time. The standard shape for verifying a webhook whose
+/// provider signs "hex(HMAC-SHA256(secret, body))".
+pub fn verifyHmacSha256Hex(key: string, msg: string, sigHex: string): bool {
+    return constantTimeEqual(hmacSha256Hex(key, msg), sigHex);
+}

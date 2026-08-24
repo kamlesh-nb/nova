@@ -275,6 +275,16 @@ pub class App {
             }
             return source.CompositeSource(paramSrc, source.fromJson(req.body));
         }
+        // Datastar sends the client's signals on a GET/DELETE as a URL-encoded
+        // JSON blob in the `datastar` query parameter (its ReadSignals contract),
+        // since those verbs carry no body. Unwrap it so a GET handler binds
+        // signals exactly like a POST binds the JSON body. Explicit query and
+        // path parameters still win, because CompositeSource consults the param
+        // source before the JSON fallback.
+        let dsSignals = req.query.get("datastar");
+        if (dsSignals != undefined) {
+            return source.CompositeSource(paramSrc, source.fromJson(dsSignals ?? "{}"));
+        }
         return paramSrc;
     }
 
