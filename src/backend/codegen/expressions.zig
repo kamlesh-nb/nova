@@ -1302,6 +1302,49 @@ pub fn awaitedCallHandle(self: *LlvmCompiler, operand: ast.Expression, is_spawn:
                 .field_access => |fa| {
                     callee_ident = fa.field;
                     if (fa.object.kind == .ident) obj_name = fa.object.kind.ident;
+                    // Resolve the callee shape for a generic `object.field<T...>()`:
+                    //
+                    //  - If `object` is an INSTANCE (resolves to a struct type), this
+                    //    is a generic METHOD call: build the monomorphized async
+                    //    symbol `Owner_method__T...`, set `method_sym`, and pass the
+                    //    receiver as the implicit first argument.
+                    //  - Otherwise `object` is a MODULE (e.g. `db.query<T>` /
+                    //    `orm.queryAs<T>`): rewrite `callee_ident` to the module's
+                    //    fully-qualified free-function name (e.g. `data_db_query`) so
+                    //    the resolution below builds the EXACT `data_db_query__T`.
+                    //    Without this the mangled candidate is the bare `query__T`,
+                    //    which misses the exact match and falls into an ambiguous
+                    //    suffix search that can pick a SAME-NAMED method
+                    //    (`Dapper_query__T`) instead, self-recursing and crashing.
+                    if (try self.resolveExpressionTypeName(fa.object)) |obj_ty_raw| {
+                        const base_sym = try self.methodSymbol(obj_ty_raw, fa.field);
+                        var nb = std.ArrayListUnmanaged(u8).empty;
+                        errdefer nb.deinit(self.allocator);
+                        try nb.appendSlice(self.allocator, base_sym);
+                        self.allocator.free(base_sym);
+                        for (gc.type_args) |ta| {
+                            const rendered = try self.typeRefToString(ta);
+                            const ma = try types_mod.mangleTypeName(self.allocator, rendered);
+                            defer self.allocator.free(ma);
+                            try nb.appendSlice(self.allocator, "__");
+                            try nb.appendSlice(self.allocator, ma);
+                        }
+                        const cand = try nb.toOwnedSlice(self.allocator);
+                        if (self.async_fns.contains(cand)) {
+                            method_sym = cand;
+                            recv_expr = fa.object;
+                        } else {
+                            self.allocator.free(cand);
+                        }
+                    } else if (fa.object.kind == .ident) {
+                        if (sema_shadow.live_sema) |sm| {
+                            if (sm.tab.findModuleByImportNameForImporter(fa.object.kind.ident, fa.span.file)) |mid| {
+                                if (sm.tab.findFunctionIn(mid, fa.field)) |sid| {
+                                    callee_ident = sm.tab.symbolAt(sid).legacy_mangled;
+                                }
+                            }
+                        }
+                    }
                 },
                 else => return null,
             }
@@ -1818,7 +1861,6 @@ pub fn buildAwait(self: *LlvmCompiler, aw: ast.AwaitExpr) anyerror!types.LLVMVal
     if (self.awaitAsyncIoCall(aw.operand.*)) |io_call| {
         return try self.buildAsyncIo(io_call);
     }
-
     const inner_hi = (try self.awaitedCallHandle(aw.operand.*, false)) orelse {
         const fut_hi = try self.compileExpression(aw.operand.*);
         return try self.buildAwaitFuture(fut_hi);

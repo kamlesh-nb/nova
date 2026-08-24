@@ -1,0 +1,125 @@
+//! A generic, table-scoped repository over the `data` ORM seam.
+//!
+//! `Repository<T>` binds an entity type `T` (a `@serializable` struct) to one SQL
+//! table, so a caller writes `Repository<Product>(conn, "products")` once and then
+//! calls typed methods (`all`, `findBy`, `query`, `add`, `update`, `remove`)
+//! without repeating the type or hand-writing any row binding. It is the
+//! class-shaped counterpart to the free functions in [`data.orm`]: those take an
+//! explicit `T` and `Connection` at every call; this holds the connection and the
+//! type once and forwards them for you.
+//!
+//! Reads go through [`orm.queryRows`], which returns a [`db.Rows`] that OWNS the
+//! wire result, so entities whose text columns bind as zero-copy `str.Str` views
+//! stay valid for as long as the returned `Rows` is held. Writes dump the entity
+//! to parameters with [`orm.toParams`] and run over the connection's async `exec`.
+//!
+//! WHERE THE CONVENIENCE ENDS: [`Repository.all`] and [`Repository.findBy`] emit
+//! `SELECT *`, which binds only when the table's column names match `T`'s field
+//! names (case-insensitively). A table with aliased or joined columns (for
+//! example `image_url AS imageUrl`) needs explicit SQL: pass it to
+//! [`Repository.query`], which still binds the rows to `T` for you. Likewise
+//! [`Repository.add`] inserts EVERY field, so a table with DEFAULT/GENERATED
+//! columns (a `uuid` primary key, a computed total) needs a hand-written
+//! statement rather than `add`.
+//!
+//! The connection is borrowed, never owned: the caller (usually a pool) is
+//! responsible for acquiring and releasing it around a unit of work.
+
+import list;
+import string;
+import data.db;
+import data.orm;
+
+/// A repository bound to entity type `T` and one table, over a borrowed connection.
+pub class Repository<T> {
+    /// The connection every method runs on. Borrowed; the repository never opens
+    /// or closes it.
+    conn: Connection,
+    /// The table (or, for reads, the relation) this repository maps `T` to. Used
+    /// verbatim in the generated SQL, so it must be trusted identifier text.
+    table: string,
+
+    init(conn: Connection, table: string) {
+        self.conn = conn;
+        self.table = table;
+    }
+
+    /// `SELECT * FROM table`, binding every row to `T`. Requires the table's
+    /// columns to match `T`'s field names; use [`Repository.query`] otherwise.
+    pub async fn all(self: Repository<T>): Rows<T> {
+        let none = list.List<DbValue>();
+        return await orm.queryRows<T>(self.conn, "SELECT * FROM " + self.table, none);
+    }
+
+    /// Runs caller-supplied `sql` with bound `params`, binding every row to `T`.
+    /// The escape hatch for aliases, joins, filters, and ordering the generated
+    /// helpers cannot express; the SQL is trusted text, the params are bound.
+    pub async fn query(self: Repository<T>, sql: string, params: list.List<DbValue>): Rows<T> {
+        return await orm.queryRows<T>(self.conn, sql, params);
+    }
+
+    /// `SELECT * FROM table WHERE keyCol = $1`, binding matching rows to `T`.
+    /// `keyCol` is trusted identifier text; `val` is bound as a parameter.
+    pub async fn findBy(self: Repository<T>, keyCol: string, val: DbValue): Rows<T> {
+        let p = list.List<DbValue>();
+        p.push(val);
+        return await orm.queryRows<T>(self.conn, "SELECT * FROM " + self.table + " WHERE " + keyCol + " = $1", p);
+    }
+
+    /// `INSERT INTO table (...) VALUES (...)` for every field of `obj`. Suits plain
+    /// tables; a table with DEFAULT/GENERATED columns needs a hand-written INSERT.
+    pub async fn add(self: Repository<T>, obj: T): ExecResult {
+        let p = orm.toParams<T>(obj);
+        let sql = "INSERT INTO " + self.table + " (";
+        let i = 0;
+        while (i < p.cols.size()) {
+            if (i > 0) { sql = sql + ", "; }
+            sql = sql + (p.cols.get(i) ?? "");
+            i = i + 1;
+        }
+        sql = sql + ") VALUES (";
+        i = 0;
+        while (i < p.vals.size()) {
+            if (i > 0) { sql = sql + ", "; }
+            sql = sql + "$" + `${i + 1}`;
+            i = i + 1;
+        }
+        sql = sql + ")";
+        return await self.conn.exec(sql, p.vals);
+    }
+
+    /// `UPDATE table SET ... WHERE keyCol = ...` from `obj`. The field named
+    /// `keyCol` is excluded from the SET list and used as the WHERE key, so it is
+    /// matched, not overwritten.
+    pub async fn update(self: Repository<T>, obj: T, keyCol: string): ExecResult {
+        let p = orm.toParams<T>(obj);
+        let sql = "UPDATE " + self.table + " SET ";
+        let params = list.List<DbValue>();
+        let keyVal = db.dbNull();
+        let first = true;
+        let i = 0;
+        while (i < p.cols.size()) {
+            let col = p.cols.get(i) ?? "";
+            let v = p.vals.get(i) ?? db.dbNull();
+            if (string.eql(col, keyCol)) {
+                keyVal = v;
+            } else {
+                if (!first) { sql = sql + ", "; }
+                params.push(v);
+                sql = sql + col + " = $" + `${params.size()}`;
+                first = false;
+            }
+            i = i + 1;
+        }
+        params.push(keyVal);
+        sql = sql + " WHERE " + keyCol + " = $" + `${params.size()}`;
+        return await self.conn.exec(sql, params);
+    }
+
+    /// `DELETE FROM table WHERE keyCol = $1`. `keyCol` is trusted text; `val` bound.
+    pub async fn remove(self: Repository<T>, keyCol: string, val: DbValue): ExecResult {
+        let p = list.List<DbValue>();
+        p.push(val);
+        return await self.conn.exec("DELETE FROM " + self.table + " WHERE " + keyCol + " = $1", p);
+    }
+}

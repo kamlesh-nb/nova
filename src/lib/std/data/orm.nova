@@ -182,6 +182,19 @@ pub async fn queryAs<T>(conn: Connection, sql: string, params: List<DbValue>): L
     return serde.bindAll<T>(rs);
 }
 
+/// Prepares and runs `sql`, binding every row to `T`, keeping the wire buffer.
+///
+/// The buffer-safe async read: it returns a [`db.Rows`], which OWNS the wire
+/// result and therefore keeps any zero-copy `str.Str` fields valid for as long as
+/// the caller holds the `Rows`. Prefer this over [`queryAs`] whenever `T` binds
+/// text columns as `str.Str` (the common case): `queryAs` returns a bare
+/// `List<T>` and drops the result set, which dangles those views. Use `queryAs`
+/// only when every text field of `T` is an owned `string`. Thin pass-through to
+/// [`data.db.query`], surfaced here so repository/ORM callers reach one seam.
+pub async fn queryRows<T>(conn: Connection, sql: string, params: List<DbValue>): db.Rows<T> {
+    return await db.query<T>(conn, sql, params);
+}
+
 /// Prepares and runs `sql`, binding the first row to `T`, or `undefined` if none.
 ///
 /// Like [`queryAs`] but stops at row 0 and returns `undefined` on an empty

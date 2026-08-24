@@ -4105,6 +4105,64 @@ pub const LlvmCompiler = struct {
 
                 if (try self.discoverGenericCallsInBlock(fd.body, &gmap)) changed = true;
             }
+
+            // Also walk generic METHOD instantiation bodies. A generic method that
+            // forwards its own type parameter into a generic free-function call
+            // (for example `orm.queryAs<T>(self.conn, ...)` inside `Db.query<T>`)
+            // only becomes concrete at the method instantiation, so inference never
+            // records the nested free-fn instantiation. With the method's
+            // instantiation as the active substitution, `discoverGenericCallsInBlock`
+            // renders the forwarded `T` to its concrete type (via `typeRefToString`)
+            // and registers the free-fn inst, so its body gets emitted and the call
+            // site resolves. Mirrors the free-fn loop above; the fixpoint quiesces
+            // once every nested instantiation has been recorded.
+            if (sema_shadow.live_sema) |sm| {
+                for (sema_mono.method_insts.items) |mi| {
+                    const key = mi.inst_key orelse continue;
+                    const mowner = mi.method_owner orelse continue;
+                    const msym = sm.tab.symbolAt(mowner);
+                    if (msym.decl != .function) continue;
+                    const mfd = msym.decl.function;
+                    if (mfd.type_params.len == 0) continue;
+
+                    const prev_iid_m = self.current_instantiation_id;
+                    self.current_instantiation_id = key;
+                    defer self.current_instantiation_id = prev_iid_m;
+
+                    if (try self.discoverGenericCallsInBlock(mfd.body, &gmap)) changed = true;
+                }
+            }
+
+            // Also walk generic-STRUCT (class) method bodies, once per concrete
+            // instantiation. A non-generic method on a generic class forwards the
+            // CLASS type parameter T into a generic free-function call (for example
+            // `Repository<T>.all()` calling `db.query<T>`), which only becomes
+            // concrete at the struct instantiation. Setting both the instantiation
+            // name and its interned id lets `typeRefToString`/`concreteTidForTypeRef`
+            // render T to the instantiation's type argument, so the nested free-fn
+            // instantiation is registered and emitted.
+            for (program.declarations) |decl| {
+                if (decl != .struct_decl) continue;
+                const s = decl.struct_decl;
+                if (s.type_params.len == 0) continue;
+                const insts = self.instantiationsOf(s) catch continue;
+                defer self.allocator.free(insts);
+                for (insts) |inst_opt| {
+                    const inst = inst_opt orelse continue;
+                    const prev_ci = self.current_instantiation;
+                    const prev_iid_s = self.current_instantiation_id;
+                    self.current_instantiation = inst;
+                    self.current_instantiation_id = sema_mono.live_inst_ids.get(inst);
+                    defer {
+                        self.current_instantiation = prev_ci;
+                        self.current_instantiation_id = prev_iid_s;
+                    }
+                    for (s.methods) |method| {
+                        if (method.decl.type_params.len > 0) continue; // generic methods: handled above
+                        if (try self.discoverGenericCallsInBlock(method.decl.body, &gmap)) changed = true;
+                    }
+                }
+            }
         }
     }
 
@@ -4181,13 +4239,26 @@ pub const LlvmCompiler = struct {
         var any = false;
         switch (expr.kind) {
             .generic_call => |gc| {
+                // The callee is either a bare `fn<T>(...)` (ident) or a
+                // module-qualified `mod.fn<T>(...)` (field access, e.g.
+                // `orm.queryAs<T>`). Match its final name against the generic
+                // free-function map either way; matching by name mirrors the
+                // ident path and is safe, since a spurious match only records an
+                // unused instantiation that later DCE drops.
+                var callee_name: ?[]const u8 = null;
                 if (gc.callee.kind == .ident) {
-                    if (gmap.get(gc.callee.kind.ident)) |callee_fd| {
+                    callee_name = gc.callee.kind.ident;
+                } else if (gc.callee.kind == .field_access) {
+                    callee_name = gc.callee.kind.field_access.field;
+                }
+                if (callee_name) |cn| {
+                    if (gmap.get(cn)) |callee_fd| {
                         if (gc.type_args.len == callee_fd.type_params.len and gc.type_args.len > 0) {
                             if (try self.registerGenericFnInst(callee_fd, gc.type_args)) any = true;
                         }
                     }
                 }
+                if (try self.discoverGenericCallsInExpr(gc.callee.*, gmap)) any = true;
                 for (gc.args) |*a| {
                     if (try self.discoverGenericCallsInExpr(a.*, gmap)) any = true;
                 }

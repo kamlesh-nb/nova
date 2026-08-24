@@ -1,0 +1,68 @@
+// Generic type parameters can be forwarded from a generic FREE FUNCTION, a
+// generic METHOD (on a plain class), and a method of a GENERIC CLASS into a call
+// to another generic free function. Each of these was historically rejected at
+// codegen ("Function '...' not found") because the nested free-fn instantiation
+// was never discovered/emitted for the forwarded, concrete-at-instantiation T.
+//
+// The shape also guards a resolution AMBIGUITY: a method named the same as the
+// forwarded free function must NOT resolve to itself (which self-recursed and
+// crashed); the exact free-fn instantiation must win.
+
+import assert;
+import list;
+
+// The generic free function every path below forwards T into.
+fn boxLen<T>(o: T): int {
+    let l = list.List<T>();
+    l.push(o);
+    return l.size();
+}
+
+// (1) Generic FREE FUNCTION forwarding its own T.
+fn freeForward<T>(o: T): int {
+    return boxLen<T>(o);
+}
+
+// (2) Generic METHOD on a plain (non-generic) class forwarding the method's T.
+//     The method is deliberately named `boxLen` too, to guard the same-name
+//     resolution ambiguity (it must call the FREE `boxLen`, not itself).
+pub class Widget {
+    tag: int,
+    init(tag: int) { self.tag = tag; }
+    fn boxLen<T>(self: Widget, o: T): int {
+        return boxLen<T>(o);
+    }
+}
+
+// (3) GENERIC CLASS whose non-generic method forwards the CLASS type parameter T.
+pub class Holder<T> {
+    value: T,
+    init(v: T) { self.value = v; }
+    fn size(self: Holder<T>): int {
+        return boxLen<T>(self.value);
+    }
+}
+
+@test
+fn free_function_forwarding(): void {
+    assert.equalInt(freeForward<int>(7), 1);
+    assert.equalInt(freeForward<string>("x"), 1);
+}
+
+@test
+fn generic_method_forwarding(): void {
+    let w = Widget(0);
+    assert.equalInt(w.boxLen<int>(9), 1);
+    assert.equalInt(w.boxLen<string>("y"), 1);
+}
+
+@test
+fn generic_class_forwarding(): void {
+    let hi = Holder<int>(3);
+    assert.equalInt(hi.size(), 1);
+    let hs = Holder<string>("z");
+    assert.equalInt(hs.size(), 1);
+    // A second int instantiation shares the same specialization, exercising dedup.
+    let hi2 = Holder<int>(4);
+    assert.equalInt(hi2.size(), 1);
+}
