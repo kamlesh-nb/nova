@@ -129,8 +129,9 @@ pub const web_create_command_sample =
 
 /// The response type returned by the create handler.
 pub const web_create_response_sample =
-    \\// The response DTO returned to the client.
-    \\@serializable pub struct CreateProductResponse {
+    \\// Create response DTO (Domain/Dtos). DTOs are the request/response shapes the
+    \\// feature slices bind and return; entities (Domain/Entities) model the rows.
+    \\@serializable pub struct CreateProductDto {
     \\    pub id: int,
     \\    pub name: string,
     \\}
@@ -154,25 +155,25 @@ pub const web_create_handler_sample =
     \\import web.routing;
     \\import serde.json;
     \\import Features.Products.CreateProduct.command;
-    \\import Features.Products.CreateProduct.response;
+    \\import Domain.Dtos.CreateProductDto;
     \\import Features.Products.CreateProduct.validator;
     \\import Features.Products.Shared.repository;
     \\
     \\// Handles CreateProduct. The request arrives already deserialised (bound from the JSON body), and
     \\// the ProductRepository is injected through the constructor. The handler returns
-    \\// `CreateProductResponse | HttpError`: the framework serialises the ok DTO as 200 JSON, and an
+    \\// `CreateProductDto | HttpError`: the framework serialises the ok DTO as 200 JSON, and an
     \\// HttpError as its status code with the message as the body. No ValueSource, no manual field reads.
-    \\pub struct CreateProductHandler impl RequestHandler<CreateProduct, CreateProductResponse | HttpError> {
+    \\pub struct CreateProductHandler impl RequestHandler<CreateProduct, CreateProductDto | HttpError> {
     \\    repo: ProductRepository,
     \\    init(repo: ProductRepository) { self.repo = repo; }
     \\
-    \\    async fn handle(self: CreateProductHandler, cmd: CreateProduct): CreateProductResponse | HttpError {
+    \\    async fn handle(self: CreateProductHandler, cmd: CreateProduct): CreateProductDto | HttpError {
     \\        let err = validateCreateProduct(cmd);
     \\        if (err.length != 0) {
     \\            return HttpError(400, err);
     \\        }
     \\        let id = self.repo.create(cmd.name);
-    \\        return CreateProductResponse{ id: id, name: cmd.name };
+    \\        return CreateProductDto{ id: id, name: cmd.name };
     \\    }
     \\}
 ;
@@ -180,12 +181,22 @@ pub const web_create_handler_sample =
 /// A data repository for the feature over the `db` seam (the ORM bind + query surface).
 pub const web_repository_sample =
     \\import web.di;
-    \\import Features.Products.GetProductById.response;
+    \\import Domain.Dtos.ProductDto;
     \\
     \\// A repository service. Handlers receive it through their constructor, and the DI container
-    \\// resolves it (see main.nova, which registers it as a singleton). A real repository would talk to
-    \\// a database driver; this one returns stub data. Implementing `Service` is what lets the container
-    \\// store and hand it out.
+    \\// resolves it (see main.nova, which registers it as a singleton). This starter returns stub data so
+    \\// the app runs with no database. Implementing `Service` is what lets the container store and hand it
+    \\// out.
+    \\//
+    \\// For a real database, hold a connection pool (data.pool) and use the generic repository from stdlib:
+    \\//
+    \\//     import data.db;
+    \\//     import data.repository;
+    \\//     let repo = Repository<ProductDto>(conn, "products");
+    \\//     let rows = await repo.query("SELECT id, name FROM products WHERE id = $1", params);  // Rows<ProductDto>
+    \\//     let _r  = await repo.add(entity);   // INSERT from a Domain.Entities.Product
+    \\//
+    \\// Repository<T> binds T from the ORM seam and keeps the connection, so slices stay free of bind code.
     \\pub struct ProductRepository impl Service {
     \\    init() {}
     \\
@@ -212,6 +223,7 @@ pub const web_get_query_sample =
 
 /// The response type returned by the get query handler.
 pub const web_get_response_sample =
+    \\// Read DTO (Domain/Dtos): the shape returned to clients and bound from query rows.
     \\@serializable pub struct ProductDto {
     \\    pub id: int,
     \\    pub name: string,
@@ -223,7 +235,7 @@ pub const web_get_handler_sample =
     \\import web.routing;
     \\import serde.json;
     \\import Features.Products.GetProductById.query;
-    \\import Features.Products.GetProductById.response;
+    \\import Domain.Dtos.ProductDto;
     \\import Features.Products.Shared.repository;
     \\
     \\// Handles GetProductById. `id` is bound from the route param `{id:int}`. The `ProductRepository`

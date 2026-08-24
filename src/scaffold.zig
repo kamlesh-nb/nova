@@ -124,19 +124,21 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
         .{ .rel = "src/main.nova", .content = templates.web_main_sample },
 
         .{ .rel = "src/Features/Products/CreateProduct/command.nova", .content = templates.web_create_command_sample },
-        .{ .rel = "src/Features/Products/CreateProduct/response.nova", .content = templates.web_create_response_sample },
         .{ .rel = "src/Features/Products/CreateProduct/validator.nova", .content = templates.web_create_validator_sample },
         .{ .rel = "src/Features/Products/CreateProduct/handler.nova", .content = templates.web_create_handler_sample },
 
         .{ .rel = "src/Features/Products/GetProductById/query.nova", .content = templates.web_get_query_sample },
-        .{ .rel = "src/Features/Products/GetProductById/response.nova", .content = templates.web_get_response_sample },
         .{ .rel = "src/Features/Products/GetProductById/handler.nova", .content = templates.web_get_handler_sample },
 
         .{ .rel = "src/Features/Products/Shared/repository.nova", .content = templates.web_repository_sample },
 
         .{ .rel = "src/Features/Products/views/product_card.nsx", .content = templates.web_view_sample },
 
-        .{ .rel = "src/Domain/entities/product.nova", .content = templates.web_domain_entity_sample },
+        // Clean-arch Domain layer: entities model the persisted rows, DTOs are the
+        // request/response shapes bound and returned by the feature slices.
+        .{ .rel = "src/Domain/Entities/Product.nova", .content = templates.web_domain_entity_sample },
+        .{ .rel = "src/Domain/Dtos/ProductDto.nova", .content = templates.web_get_response_sample },
+        .{ .rel = "src/Domain/Dtos/CreateProductDto.nova", .content = templates.web_create_response_sample },
         .{ .rel = "wwwroot/index.html", .content = templates.web_index_html_sample },
         .{ .rel = "tests/features/products_test.nova", .content = templates.web_test_sample },
 
