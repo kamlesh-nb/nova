@@ -1,0 +1,42 @@
+// The `..from(expr)` mapper spread: a struct literal fills every field not named
+// explicitly by convention (case-insensitive, ignoring underscores) from a
+// same-named field of the source struct. Explicit fields win. Every target field
+// must be covered by a convention match or an explicit value (checked at compile
+// time; see conformance/expect_fail for the uncovered-field case).
+import assert;
+
+struct Src { a: int, b: int, name: string }
+struct Dst { a: int, b: int, name: string }
+
+// snake_case source (entity-style) -> camelCase target (DTO-style), plus a
+// derived field the source does not have.
+struct Entity { image_url: string, is_veg: bool, price: double }
+struct Dto { imageUrl: string, isVeg: bool, price: double, label: string }
+
+@test
+fn spread_copies_same_name_fields() {
+    let s = Src{ a: 1, b: 2, name: "hello" };
+    let d = Dst{ ..from(s) };
+    assert.equalInt(d.a, 1);
+    assert.equalInt(d.b, 2);
+    assert.equalStr(d.name, "hello");
+}
+
+@test
+fn explicit_field_overrides_spread() {
+    let s = Src{ a: 1, b: 2, name: "hello" };
+    let d = Dst{ ..from(s), b: 99 };
+    assert.equalInt(d.a, 1);
+    assert.equalInt(d.b, 99);
+    assert.equalStr(d.name, "hello");
+}
+
+@test
+fn spread_matches_by_convention_and_fills_derived() {
+    let e = Entity{ image_url: "/img/x.svg", is_veg: true, price: 6.25 };
+    // imageUrl<-image_url, isVeg<-is_veg, price<-price by convention; label given.
+    let d = Dto{ ..from(e), label: "Special" };
+    assert.equalStr(d.imageUrl, "/img/x.svg");
+    assert.isTrue(d.isVeg);
+    assert.equalStr(d.label, "Special");
+}

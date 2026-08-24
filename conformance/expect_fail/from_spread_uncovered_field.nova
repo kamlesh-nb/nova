@@ -1,0 +1,15 @@
+// EXPECT-FAIL: typecheck
+// A `..from` spread must cover EVERY target field: `label` has no field in Src
+// and is not given explicitly, so this must be rejected at compile time (the
+// build-time exhaustiveness check, better than a runtime surprise).
+import assert;
+
+struct Src { a: int, b: int }
+struct Dst { a: int, b: int, label: string }
+
+@test
+fn t_uncovered(): void {
+    let s = Src{ a: 1, b: 2 };
+    let d = Dst{ ..from(s) };
+    assert.equalInt(d.a, 1);
+}

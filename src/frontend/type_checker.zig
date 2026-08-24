@@ -212,6 +212,26 @@ fn identOf(tr: ast.TypeRef) ?[]const u8 {
     };
 }
 
+/// Convention-equality of two field names for the `..from` mapper spread:
+/// case-insensitive and ignoring underscores, so `image_url` matches `imageUrl`
+/// and `full_name` matches `fullName`. Shared conceptually with the codegen
+/// matcher in `expressions.zig` (kept in sync by hand).
+pub fn fieldConvEq(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        while (i < a.len and a[i] == '_') i += 1;
+        while (j < b.len and b[j] == '_') j += 1;
+        if (i >= a.len or j >= b.len) break;
+        if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+        i += 1;
+        j += 1;
+    }
+    while (i < a.len and a[i] == '_') i += 1;
+    while (j < b.len and b[j] == '_') j += 1;
+    return i >= a.len and j >= b.len;
+}
+
 /// Whether `name` is one of the scalar primitive type names allowed as a raw
 /// array element (see the array-literal check in [`TypeChecker.checkExpr`]).
 ///
@@ -1400,6 +1420,16 @@ pub const TypeChecker = struct {
             .struct_init => |si| {
                 for (si.fields) |field| try self.checkExpr(field.value);
 
+                // A `..from(expr)` spread fills every target field not named
+                // explicitly, by convention, from a same-named field of the
+                // source struct. Resolve the source struct so the missing-field
+                // check below treats convention-covered fields as satisfied.
+                var spread_src: ?[]const u8 = null;
+                if (si.spread) |sp| {
+                    try self.checkExpr(sp.*);
+                    if (self.resolveExprType(sp.*)) |src_ty| spread_src = identOf(src_ty);
+                }
+
                 if (self.structs.get(si.type_name)) |s| {
                     for (s.fields) |df| {
                         var found = false;
@@ -1407,6 +1437,18 @@ pub const TypeChecker = struct {
                             if (std.mem.eql(u8, lf.name, df.name)) {
                                 found = true;
                                 break;
+                            }
+                        }
+                        if (!found) {
+                            if (spread_src) |sn| {
+                                if (self.structs.get(sn)) |ss| {
+                                    for (ss.fields) |sf| {
+                                        if (fieldConvEq(df.name, sf.name)) {
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                         if (!found) {

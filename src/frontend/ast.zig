@@ -992,6 +992,12 @@ pub const StructInit = struct {
     fields: []ObjectFieldInit,
     /// Explicit type arguments for a generic struct; empty otherwise.
     type_args: []TypeRef = &.{},
+    /// The source expression of a `..from(expr)` spread, or `null` if the literal
+    /// has no spread. When present, every target field not named explicitly in
+    /// `fields` is filled by convention from a same-named (`_`/case-insensitive)
+    /// field of this source struct; explicit fields win. See the mapper-spread
+    /// section in `docs/specs.md`.
+    spread: ?*Expression = null,
     /// Span of the literal.
     span: Span,
 };

@@ -194,6 +194,25 @@ struct Point { pub x: int, pub y: int
   Field/method visibility is **module-private** (per §8): a non-`pub` field or method is accessible from
   anywhere in the same module (source file), and requires `pub` to be reached across modules
   *(→ 12, 337_module_private, 39_declared_type_ownership)*.
+- **Mapper spread** — a struct literal may include one `..from(expr)` spread, which fills every target
+  field not named explicitly by convention from a same-named field of the source struct. Matching is
+  case-insensitive and ignores underscores, so `image_url` fills `imageUrl` and `full_name` fills
+  `fullName`. Explicit fields always win, and a field the source does not have is simply given
+  explicitly. Every target field must be covered by either a convention match or an explicit value, or
+  the literal is a **compile error** (build-time exhaustiveness, the AutoMapper `ForMember` model with
+  static validation). This is the compiler-generated half of an entity→DTO mapper:
+  ```nova
+  struct Product { image_url: string, is_vegetarian: bool, price: double, stock: int }
+  struct ProductDto { imageUrl: string, veg: bool, price: double, label: string }
+  fn toDto(p: Product): ProductDto {
+      return ProductDto{ ..from(p), veg: p.is_vegetarian, label: "Special" };
+      //                  ^ imageUrl<-image_url, price<-price by convention;
+      //                    veg + label given explicitly; stock is not a target field.
+  }
+  ```
+  Field values are copied, so a spread of owned `string` fields produces an independent DTO. Matching
+  `string`→`str.Str` (a borrowing view) is not what a spread produces; keep both sides owned
+  *(→ 433_from_spread, expect_fail/from_spread_uncovered_field)*.
 - **Enums** are tagged; variants may be payload-less or carry a payload:
   ```nova
   enum Color { Red, Green, Blue }          // Color.Red

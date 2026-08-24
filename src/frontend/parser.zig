@@ -2584,8 +2584,15 @@ pub const Parser = struct {
                             self.advance();
                             var fields = std.ArrayList(ast.ObjectFieldInit).empty;
                             defer fields.deinit(self.allocator);
+                            var spread: ?*ast.Expression = null;
                             if (self.current().type != .right_brace) {
                                 while (true) {
+                                    if (self.current().type == .dot_dot) {
+                                        spread = try self.parseSpreadFrom();
+                                        if (!self.match(.comma)) break;
+                                        if (self.current().type == .right_brace) break;
+                                        continue;
+                                    }
                                     const f_name = self.current().lexeme;
                                     try self.expect(.identifier);
                                     try self.expect(.colon);
@@ -2609,6 +2616,7 @@ pub const Parser = struct {
                                 .type_name = type_name,
                                 .fields = try fields.toOwnedSlice(self.allocator),
                                 .type_args = try type_args.toOwnedSlice(self.allocator),
+                                .spread = spread,
                                 .span = self.span(),
                             } } };
                         } else if (self.current().type == .left_paren) {
@@ -2966,6 +2974,22 @@ pub const Parser = struct {
     /// scanning for a `=>` after the balanced `)`); array and array-repeat
     /// literals `[a, b]` / `[v; N]`; object literals `{ k: v }`; the `undefined`
     /// and `null` sentinels; a struct-init `Name { ... }`; and bare identifiers.
+    /// Parses a `..from(expr)` mapper spread inside a struct literal, with the
+    /// cursor positioned on the `..` token. Returns the allocated source
+    /// expression; the caller stores it as `StructInit.spread`.
+    fn parseSpreadFrom(self: *Parser) ParserError!*ast.Expression {
+        try self.expect(.dot_dot);
+        if (!(self.current().type == .identifier and std.mem.eql(u8, self.current().lexeme, "from"))) {
+            std.debug.print("Expected 'from' after '..' in struct spread at line {}, col {}\n", .{ self.current().line, self.current().column });
+            return error.UnexpectedToken;
+        }
+        self.advance();
+        try self.expect(.left_paren);
+        const e = try self.parseExpression();
+        try self.expect(.right_paren);
+        return try self.allocExpression(e);
+    }
+
     /// An unrecognised leading token prints a diagnostic and errors.
     fn parsePrimary(self: *Parser) ParserError!ast.Expression {
         if (self.current().type == .less) {
@@ -3170,7 +3194,16 @@ pub const Parser = struct {
                     self.advance();
                     var fields = std.ArrayList(ast.ObjectFieldInit).empty;
                     defer fields.deinit(self.allocator);
+                    var spread: ?*ast.Expression = null;
                     while (self.current().type != .right_brace) {
+                        if (self.current().type == .dot_dot) {
+                            spread = try self.parseSpreadFrom();
+                            if (self.current().type == .comma) {
+                                self.advance();
+                                if (self.current().type == .right_brace) break;
+                            }
+                            continue;
+                        }
                         const fname = self.current().lexeme;
                         try self.expect(.identifier);
                         try self.expect(.colon);
@@ -3189,6 +3222,7 @@ pub const Parser = struct {
                     return ast.Expression{ .kind = .{ .struct_init = ast.StructInit{
                         .type_name = name,
                         .fields = try fields.toOwnedSlice(self.allocator),
+                        .spread = spread,
                         .span = self.span(),
                     } } };
                 }

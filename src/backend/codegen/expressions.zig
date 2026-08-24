@@ -4495,7 +4495,66 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             else
                 try self.compileAlloc(size_val);
 
-            for (si.fields) |f_init| {
+            // Effective field list. With a `..from(expr)` spread, every target
+            // field not named explicitly is synthesised as `expr.<srcField>`,
+            // where srcField matches by convention (`_`/case-insensitive). The
+            // type checker has already verified every field is covered, so any
+            // still-unmatched field here is simply skipped.
+            const conv = struct {
+                fn eq(a: []const u8, b: []const u8) bool {
+                    var i: usize = 0;
+                    var j: usize = 0;
+                    while (true) {
+                        while (i < a.len and a[i] == '_') i += 1;
+                        while (j < b.len and b[j] == '_') j += 1;
+                        if (i >= a.len or j >= b.len) break;
+                        if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+                        i += 1;
+                        j += 1;
+                    }
+                    while (i < a.len and a[i] == '_') i += 1;
+                    while (j < b.len and b[j] == '_') j += 1;
+                    return i >= a.len and j >= b.len;
+                }
+            }.eq;
+
+            var eff_fields: []const ast.ObjectFieldInit = si.fields;
+            var synth = std.ArrayList(ast.ObjectFieldInit).empty;
+            defer synth.deinit(self.allocator);
+            if (si.spread) |sp| {
+                for (si.fields) |f| try synth.append(self.allocator, f);
+                const src_name = (try self.resolveExpressionTypeName(sp)) orelse "";
+                if (self.structs.get(src_name)) |ss| {
+                    for (s.fields) |df| {
+                        var explicit = false;
+                        for (si.fields) |f| {
+                            if (std.mem.eql(u8, f.name, df.name)) {
+                                explicit = true;
+                                break;
+                            }
+                        }
+                        if (explicit) continue;
+                        for (ss.fields) |sf| {
+                            if (conv(df.name, sf.name)) {
+                                const fa = ast.Expression{ .kind = .{ .field_access = .{
+                                    .object = sp,
+                                    .field = sf.name,
+                                    .span = si.span,
+                                } }, .span = si.span };
+                                try synth.append(self.allocator, ast.ObjectFieldInit{
+                                    .name = df.name,
+                                    .value = fa,
+                                    .span = si.span,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+                eff_fields = synth.items;
+            }
+
+            for (eff_fields) |f_init| {
                 const offset = try self.getFieldOffset(si.type_name, f_init.name);
                 const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
                 var field_val = try self.compileExpression(f_init.value);
