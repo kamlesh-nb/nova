@@ -1922,6 +1922,32 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
                 if (lt.get(expr_ptr.kind.ident)) |ts| return ts;
             }
         }
+
+        // Synthesised expressions (e.g. a `..from` mapper spread's generated
+        // nested field accesses) are not in the typed IR, which is keyed by
+        // pointer. Resolve such a field access structurally: the object's struct
+        // type, then the named field's declared type. Deliberately narrow: only
+        // when the field's own type is another known struct (the nesting/
+        // flattening intermediates the spread needs). For any/generic/primitive
+        // fields this returns null exactly as before, so no other codegen path
+        // changes behaviour.
+        if (expr_ptr.kind == .field_access) {
+            const fa = expr_ptr.kind.field_access;
+            if (try self.resolveExpressionTypeName(fa.object)) |obj_ty| {
+                if (self.structs.get(obj_ty)) |os| {
+                    for (os.fields) |f| {
+                        if (std.mem.eql(u8, f.name, fa.field)) {
+                            const ft = switch (f.type_name) {
+                                .ident => |n| n,
+                                else => return null,
+                            };
+                            if (self.structs.contains(ft)) return ft;
+                            return null;
+                        }
+                    }
+                }
+            }
+        }
         return null;
     }
     const t = t_opt.?;

@@ -4518,6 +4518,32 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 }
             }.eq;
 
+            // Flatten name-matcher: target == prefix ++ leaf under normalisation
+            // (so `customerName` == `customer` + `name`). Mirrors the type
+            // checker's flattenNameMatch.
+            const flat = struct {
+                fn norm(buf: []u8, name: []const u8) []const u8 {
+                    var n: usize = 0;
+                    for (name) |c| {
+                        if (c == '_') continue;
+                        if (n >= buf.len) break;
+                        buf[n] = std.ascii.toLower(c);
+                        n += 1;
+                    }
+                    return buf[0..n];
+                }
+                fn eq(tgt: []const u8, prefix: []const u8, leaf: []const u8) bool {
+                    var tb: [128]u8 = undefined;
+                    var pb: [128]u8 = undefined;
+                    var lb: [128]u8 = undefined;
+                    const nt = norm(&tb, tgt);
+                    const np = norm(&pb, prefix);
+                    const nl = norm(&lb, leaf);
+                    if (np.len == 0 or nl.len == 0 or nt.len != np.len + nl.len) return false;
+                    return std.mem.startsWith(u8, nt, np) and std.mem.eql(u8, nt[np.len..], nl);
+                }
+            }.eq;
+
             var eff_fields: []const ast.ObjectFieldInit = si.fields;
             var synth = std.ArrayList(ast.ObjectFieldInit).empty;
             defer synth.deinit(self.allocator);
@@ -4534,11 +4560,9 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             }
                         }
                         if (explicit) continue;
+                        var matched = false;
                         for (ss.fields) |sf| {
-                            // Same rule as the type checker: name AND type must
-                            // match (both plain idents, equal). A mismatched-type
-                            // name collision is not a match; the type checker has
-                            // already required it to be given explicitly.
+                            if (!conv(df.name, sf.name)) continue;
                             const df_id = switch (df.type_name) {
                                 .ident => |n| n,
                                 else => "",
@@ -4547,19 +4571,77 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                                 .ident => |n| n,
                                 else => "",
                             };
-                            const type_ok = df_id.len > 0 and std.mem.eql(u8, df_id, sf_id);
-                            if (conv(df.name, sf.name) and type_ok) {
-                                const fa = ast.Expression{ .kind = .{ .field_access = .{
-                                    .object = sp,
-                                    .field = sf.name,
+                            // The source field access (allocated so a nested
+                            // struct-init spread can point at it).
+                            const src_fa = try self.allocator.create(ast.Expression);
+                            src_fa.* = ast.Expression{ .kind = .{ .field_access = .{
+                                .object = sp,
+                                .field = sf.name,
+                                .span = si.span,
+                            } }, .span = si.span };
+
+                            if (df_id.len > 0 and std.mem.eql(u8, df_id, sf_id)) {
+                                // Direct copy: same type.
+                                try synth.append(self.allocator, ast.ObjectFieldInit{
+                                    .name = df.name,
+                                    .value = src_fa.*,
+                                    .span = si.span,
+                                });
+                                matched = true;
+                                break;
+                            }
+                            if (df_id.len > 0 and self.structs.contains(df_id) and
+                                sf_id.len > 0 and self.structs.contains(sf_id))
+                            {
+                                // Nested map: `TargetFieldType{ ..from(src.field) }`.
+                                // The struct-init codegen recurses into this spread.
+                                const nested = ast.Expression{ .kind = .{ .struct_init = ast.StructInit{
+                                    .type_name = df_id,
+                                    .fields = &.{},
+                                    .spread = src_fa,
                                     .span = si.span,
                                 } }, .span = si.span };
                                 try synth.append(self.allocator, ast.ObjectFieldInit{
                                     .name = df.name,
-                                    .value = fa,
+                                    .value = nested,
                                     .span = si.span,
                                 });
+                                matched = true;
                                 break;
+                            }
+                            // else: type mismatch with no nested map — the type
+                            // checker has already required an explicit field.
+                        }
+                        // Flatten: `customerName` <- `customer.name`. Build the
+                        // path `src.<prefixField>.<leafField>`.
+                        if (!matched) {
+                            flatten: for (ss.fields) |sf| {
+                                const sf_id = switch (sf.type_name) {
+                                    .ident => |n| n,
+                                    else => "",
+                                };
+                                if (sf_id.len == 0) continue;
+                                const ns = self.structs.get(sf_id) orelse continue;
+                                for (ns.fields) |nf| {
+                                    if (!flat(df.name, sf.name, nf.name)) continue;
+                                    const prefix_fa = try self.allocator.create(ast.Expression);
+                                    prefix_fa.* = ast.Expression{ .kind = .{ .field_access = .{
+                                        .object = sp,
+                                        .field = sf.name,
+                                        .span = si.span,
+                                    } }, .span = si.span };
+                                    const leaf_fa = ast.Expression{ .kind = .{ .field_access = .{
+                                        .object = prefix_fa,
+                                        .field = nf.name,
+                                        .span = si.span,
+                                    } }, .span = si.span };
+                                    try synth.append(self.allocator, ast.ObjectFieldInit{
+                                        .name = df.name,
+                                        .value = leaf_fa,
+                                        .span = si.span,
+                                    });
+                                    break :flatten;
+                                }
                             }
                         }
                     }

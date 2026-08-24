@@ -224,6 +224,35 @@ pub fn fieldTypeConvCompatible(a: ast.TypeRef, b: ast.TypeRef) bool {
     return std.mem.eql(u8, an, bn);
 }
 
+/// Normalises a field name for convention matching (lowercase, underscores
+/// dropped) into `buf`, returning the written slice. Field names are short.
+pub fn normFieldInto(buf: []u8, name: []const u8) []const u8 {
+    var n: usize = 0;
+    for (name) |c| {
+        if (c == '_') continue;
+        if (n >= buf.len) break;
+        buf[n] = std.ascii.toLower(c);
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// One-level flattening match: whether target name `tgt` equals `prefix` followed
+/// by `leaf`, all compared under the convention normalisation. So `customerName`
+/// matches prefix `customer` + leaf `name`, letting `customerName` be filled from
+/// `customer.name`. Shared conceptually with the codegen matcher.
+pub fn flattenNameMatch(tgt: []const u8, prefix: []const u8, leaf: []const u8) bool {
+    var tb: [128]u8 = undefined;
+    var pb: [128]u8 = undefined;
+    var lb: [128]u8 = undefined;
+    const nt = normFieldInto(&tb, tgt);
+    const np = normFieldInto(&pb, prefix);
+    const nl = normFieldInto(&lb, leaf);
+    if (np.len == 0 or nl.len == 0) return false;
+    if (nt.len != np.len + nl.len) return false;
+    return std.mem.startsWith(u8, nt, np) and std.mem.eql(u8, nt[np.len..], nl);
+}
+
 /// Convention-equality of two field names for the `..from` mapper spread:
 /// case-insensitive and ignoring underscores, so `image_url` matches `imageUrl`
 /// and `full_name` matches `fullName`. Shared conceptually with the codegen
@@ -1209,6 +1238,39 @@ pub const TypeChecker = struct {
         return null;
     }
 
+    /// Whether a `..from` spread of source struct `src_name` can fully fill target
+    /// struct `dst_name` by convention, allowing NESTED spreads: a target field
+    /// whose type differs from its convention-matched source field is covered if
+    /// both are structs and the nested source likewise covers the nested target.
+    /// A struct with a field the source cannot supply (by direct type match or a
+    /// coverable nested map) is not fully covered. `depth` bounds recursion
+    /// against pathological input (value structs are already acyclic per P2).
+    fn spreadStructCovers(self: *TypeChecker, dst_name: []const u8, src_name: []const u8, depth: u8) bool {
+        if (depth > 16) return false;
+        const dst = self.structs.get(dst_name) orelse return false;
+        const src = self.structs.get(src_name) orelse return false;
+        for (dst.fields) |df| {
+            var covered = false;
+            for (src.fields) |sf| {
+                if (!fieldConvEq(df.name, sf.name)) continue;
+                if (fieldTypeConvCompatible(df.type_name, sf.type_name)) {
+                    covered = true;
+                    break;
+                }
+                const dn = identOf(df.type_name) orelse continue;
+                const sn = identOf(sf.type_name) orelse continue;
+                if (self.structs.contains(dn) and self.structs.contains(sn) and
+                    self.spreadStructCovers(dn, sn, depth + 1))
+                {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) return false;
+        }
+        return true;
+    }
+
     /// The parameter list of struct `struct_name`'s `init` constructor, or
     /// `null` if there is none.
     ///
@@ -1463,7 +1525,40 @@ pub const TypeChecker = struct {
                                             found = true;
                                             break;
                                         }
+                                        // Nested map: both struct types and the
+                                        // nested source covers the nested target.
+                                        const dn = identOf(df.type_name);
+                                        const sfn = identOf(sf.type_name);
+                                        if (dn != null and sfn != null and
+                                            self.structs.contains(dn.?) and self.structs.contains(sfn.?) and
+                                            self.spreadStructCovers(dn.?, sfn.?, 0))
+                                        {
+                                            found = true;
+                                            break;
+                                        }
                                         name_only_src_type = identOf(sf.type_name) orelse "?";
+                                    }
+                                }
+                            }
+                        }
+                        // Flattening: `customerName` <- `customer.name`. A source
+                        // struct field whose name is a prefix of the target field
+                        // name, with the remainder naming a compatible leaf inside
+                        // it, one level deep.
+                        if (!found) {
+                            if (spread_src) |sn| {
+                                if (self.structs.get(sn)) |ss| {
+                                    flat: for (ss.fields) |sf| {
+                                        const snf = identOf(sf.type_name) orelse continue;
+                                        const ns = self.structs.get(snf) orelse continue;
+                                        for (ns.fields) |nf| {
+                                            if (flattenNameMatch(df.name, sf.name, nf.name) and
+                                                fieldTypeConvCompatible(df.type_name, nf.type_name))
+                                            {
+                                                found = true;
+                                                break :flat;
+                                            }
+                                        }
                                     }
                                 }
                             }

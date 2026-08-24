@@ -211,10 +211,22 @@ struct Point { pub x: int, pub y: int
   }
   ```
   A convention match requires the name **and the type** to agree: a same-named field whose type differs
-  (`string` vs `int`, or owned `string` vs a zero-copy `str.Str` view) is NOT matched, and the field
-  must be given explicitly. This keeps the spread sound: values are copied as-is, so there is no silent
-  `string`→`int` conversion and no dangling `string`→`str.Str` view. Field values are copied, so a
-  spread of owned `string` fields produces an independent DTO
+  (`string` vs `int`, or owned `string` vs a zero-copy `str.Str` view) is NOT matched by a plain copy,
+  and the field must be given explicitly. This keeps the spread sound: values are copied as-is, so there
+  is no silent `string`→`int` conversion and no dangling `string`→`str.Str` view. A spread of owned
+  `string` fields produces an independent DTO.
+
+  Three richer matches are also supported, all still fully checked at compile time:
+  - **Nested map** — a struct-typed field whose source and target types differ is spread recursively
+    (`address: AddrEnt` fills `address: AddrDto`), when the nested map is itself fully covered.
+  - **Flattening** — a target field whose name is `<sourceField><Leaf>` is filled from the nested path
+    when `sourceField` is a source struct and `Leaf` names a field inside it (`customerName` ←
+    `customer.name`).
+  - **Reverse / bidirectional** — the spread is symmetric, so a DTO→entity map is the same construct:
+    the entity's extra fields (id, timestamps) have no source and are given explicitly.
+
+  Not supported: collection mapping (use `List.map(elementMapper)`, which composes with these) and value
+  conversion (a type mismatch must be given explicitly)
   *(→ 433_from_spread, expect_fail/from_spread_uncovered_field, expect_fail/from_spread_type_mismatch)*.
 - **Enums** are tagged; variants may be payload-less or carry a payload:
   ```nova

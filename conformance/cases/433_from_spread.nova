@@ -40,3 +40,47 @@ fn spread_matches_by_convention_and_fills_derived() {
     assert.isTrue(d.isVeg);
     assert.equalStr(d.label, "Special");
 }
+
+// Nested map: a struct-typed field whose source/target types differ is spread
+// recursively (AddrEnt -> AddrDto), when the nested map is fully convention-covered.
+struct AddrEnt { street: string, post_code: string }
+struct AddrDto { street: string, postCode: string }
+struct UserEnt { full_name: string, address: AddrEnt }
+struct UserDto { fullName: string, address: AddrDto }
+
+@test
+fn spread_maps_nested_struct_field() {
+    let e = UserEnt{ full_name: "Ann", address: AddrEnt{ street: "High St", post_code: "AB1" } };
+    let d = UserDto{ ..from(e) };
+    assert.equalStr(d.fullName, "Ann");
+    assert.equalStr(d.address.street, "High St");
+    assert.equalStr(d.address.postCode, "AB1");
+}
+
+// Flattening: `customerName` is filled from `customer.name` (source field is a
+// struct whose name prefixes the target field name).
+struct Customer { name: string, email: string }
+struct OrderRow { id: string, customer: Customer }
+struct OrderRowDto { id: string, customerName: string, customerEmail: string }
+
+@test
+fn spread_flattens_nested_path() {
+    let o = OrderRow{ id: "o1", customer: Customer{ name: "Ann", email: "a@x.com" } };
+    let d = OrderRowDto{ ..from(o) };
+    assert.equalStr(d.customerName, "Ann");
+    assert.equalStr(d.customerEmail, "a@x.com");
+}
+
+// Reverse map: spread from a small DTO into a larger entity; the entity's extra
+// fields have no source and are given explicitly. `..from` is symmetric.
+struct SmallDto { name: string, price: double }
+struct BigEnt { id: string, name: string, price: double, created_at: string }
+
+@test
+fn spread_is_symmetric_reverse_map() {
+    let dto = SmallDto{ name: "BLT", price: 6.25 };
+    let ent = BigEnt{ ..from(dto), id: "u-1", created_at: "now" };
+    assert.equalStr(ent.id, "u-1");
+    assert.equalStr(ent.name, "BLT");
+    assert.equalStr(ent.created_at, "now");
+}
