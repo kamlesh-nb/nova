@@ -4573,6 +4573,38 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                             }
                         }
                         if (explicit) continue;
+
+                        // Field-level mapper attributes on the TARGET field win
+                        // over convention: `@from("col")` reads a named source
+                        // field; `@derive(fn)` computes `fn(src)` from the whole
+                        // source. (df is the concrete target struct field.)
+                        var attr_handled = false;
+                        for (df.attributes) |at| {
+                            switch (at) {
+                                .from => |col| {
+                                    const fa = ast.Expression{ .kind = .{ .field_access = .{
+                                        .object = sp,
+                                        .field = col,
+                                        .span = si.span,
+                                    } }, .span = si.span };
+                                    try synth.append(self.allocator, ast.ObjectFieldInit{ .name = df.name, .value = fa, .span = si.span });
+                                    attr_handled = true;
+                                },
+                                .derive => |fn_name| {
+                                    const callee = try self.allocator.create(ast.Expression);
+                                    callee.* = ast.Expression{ .kind = .{ .ident = fn_name }, .span = si.span };
+                                    const args = try self.allocator.alloc(ast.Expression, 1);
+                                    args[0] = sp.*;
+                                    const call = ast.Expression{ .kind = .{ .call = .{ .callee = callee, .args = args, .span = si.span } }, .span = si.span };
+                                    try synth.append(self.allocator, ast.ObjectFieldInit{ .name = df.name, .value = call, .span = si.span });
+                                    attr_handled = true;
+                                },
+                                else => {},
+                            }
+                            if (attr_handled) break;
+                        }
+                        if (attr_handled) continue;
+
                         var matched = false;
                         for (ss.fields) |sf| {
                             if (!conv(df.name, sf.name)) continue;

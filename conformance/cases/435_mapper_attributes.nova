@@ -1,0 +1,33 @@
+// `@from("col")` and `@derive(fn)` on a DTO field drive the `...from` mapper
+// spread: @from renames (fill from a named source field), @derive computes
+// (fill with fn(src)). Works in the direct literal and the generic mapper.
+import assert;
+import data.mapper;
+
+struct Ent { pub image_url: string, pub is_veg: bool, pub price: double }
+
+struct Dto {
+    pub imageUrl: string,
+    @from("is_veg") pub veg: bool,
+    pub price: double,
+    @derive(labelOf) pub label: string,
+}
+
+fn labelOf(e: Ent): string { return "P:" + e.image_url; }
+
+@test
+fn attrs_direct() {
+    let e = Ent{ image_url: "/a.svg", is_veg: true, price: 6.25 };
+    let d = Dto{ ...from(e) };
+    assert.equalStr(d.imageUrl, "/a.svg");
+    assert.isTrue(d.veg);
+    assert.equalStr(d.label, "P:/a.svg");
+}
+
+@test
+fn attrs_generic() {
+    let e = Ent{ image_url: "/b.svg", is_veg: false, price: 1.0 };
+    let d = mapper.mapTo<Dto, Ent>(e);
+    assert.isFalse(d.veg);
+    assert.equalStr(d.label, "P:/b.svg");
+}

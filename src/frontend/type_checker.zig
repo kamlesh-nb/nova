@@ -1513,6 +1513,18 @@ pub const TypeChecker = struct {
                                 break;
                             }
                         }
+                        // A `@from`/`@derive` attribute on the target field covers
+                        // it explicitly when a spread is present (rename/computed).
+                        if (!found and si.spread != null) {
+                            for (df.attributes) |at| {
+                                switch (at) {
+                                    .from, .derive => found = true,
+                                    else => {},
+                                }
+                                if (found) break;
+                            }
+                        }
+
                         // If a spread source field matches this field's name but
                         // NOT its type, record it for a clearer error below.
                         var name_only_src_type: ?[]const u8 = null;

@@ -515,6 +515,21 @@ pub const Parser = struct {
                     c.* = std.ascii.toUpper(c.*);
                 }
                 try attrs.append(self.allocator, .{ .route = .{ .method = method, .path = path } });
+            } else if (std.mem.eql(u8, name, "from")) {
+                // `@from("source_col")` on a DTO field: mapper-spread rename.
+                try self.expect(.left_paren);
+                if (self.current().type != .string) return error.UnexpectedToken;
+                const col = try self.allocator.dupe(u8, self.current().lexeme);
+                self.advance();
+                try self.expect(.right_paren);
+                try attrs.append(self.allocator, .{ .from = col });
+            } else if (std.mem.eql(u8, name, "derive")) {
+                // `@derive(fnName)` on a DTO field: mapper-spread computed value.
+                try self.expect(.left_paren);
+                const fn_name = self.current().lexeme;
+                try self.expect(.identifier);
+                try self.expect(.right_paren);
+                try attrs.append(self.allocator, .{ .derive = try self.allocator.dupe(u8, fn_name) });
             }
         }
         return try attrs.toOwnedSlice(self.allocator);
@@ -946,7 +961,6 @@ pub const Parser = struct {
                     .decl = fd,
                 });
             } else {
-                if (attrs.len > 0) return error.UnexpectedToken;
                 const field_span = self.span();
                 const field_name = self.current().lexeme;
                 try self.expect(.identifier);
@@ -956,6 +970,7 @@ pub const Parser = struct {
                     .name = field_name,
                     .type_name = field_type,
                     .is_public = field_is_pub,
+                    .attributes = attrs,
                     .span = field_span,
                 });
                 if (self.current().type == .comma) self.advance();

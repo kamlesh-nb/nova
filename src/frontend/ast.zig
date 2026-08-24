@@ -214,6 +214,8 @@ pub const Field = struct {
     type_name: TypeRef,
     /// Whether the field is publicly accessible.
     is_public: bool,
+    /// Field-level attributes (`@from`, `@derive`); empty for a plain field.
+    attributes: []Attribute = &.{},
     /// Span of the field.
     span: Span,
 };
@@ -418,6 +420,12 @@ pub const Attribute = union(enum) {
     response: ResponseAttr,
     /// `@deprecated` with an optional explanatory message.
     deprecated: ?[]const u8,
+    /// `@from("source_col")` on a DTO field: the `...from` mapper spread fills
+    /// this field from the named source field instead of by name convention.
+    from: []const u8,
+    /// `@derive(fnName)` on a DTO field: the `...from` mapper spread fills this
+    /// field with `fnName(src)` (the whole source), for a computed value.
+    derive: []const u8,
 };
 
 /// The payload of a `@route` attribute: HTTP method and path template.

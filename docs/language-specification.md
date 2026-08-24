@@ -225,9 +225,21 @@ struct Point { pub x: int, pub y: int
   - **Reverse / bidirectional** — the spread is symmetric, so a DTO→entity map is the same construct:
     the entity's extra fields (id, timestamps) have no source and are given explicitly.
 
-  Not supported: collection mapping (use `List.map(elementMapper)`, which composes with these) and value
-  conversion (a type mismatch must be given explicitly)
-  *(→ 433_from_spread, expect_fail/from_spread_uncovered_field, expect_fail/from_spread_type_mismatch)*.
+  Two **field attributes** on the target DTO drive the spread declaratively, so a whole DTO can carry its
+  mapping and be filled with no hand-written mapper:
+  - `@from("source_col")` — fill this field from the named source field instead of by name convention (a
+    rename): `@from("is_vegetarian") pub veg: bool`.
+  - `@derive(fn)` — fill this field with `fn(src)`, the whole source passed to a function, for a computed
+    value: `@derive(displayPrice) pub label: string`. (Whole-source only; there is no positional
+    field-list form.)
+
+  A generic callable form lives in the stdlib, `data.mapper.mapTo<To, From>(src)` (the destination type is
+  written first; both type arguments are required), and `Repository.listAs<D>()` / `oneAs<D>()` read
+  entities and map them to DTOs. Collection mapping otherwise composes as `List.map(elementMapper)`. Value
+  conversion of a plain field is never implicit — a type mismatch must be given explicitly
+  *(→ 433_from_spread, 434_generic_map_spread, 435_mapper_attributes,
+  expect_fail/from_spread_uncovered_field, expect_fail/from_spread_type_mismatch,
+  expect_fail/generic_spread_uncovered)*.
 - **Enums** are tagged; variants may be payload-less or carry a payload:
   ```nova
   enum Color { Red, Green, Blue }          // Color.Red
