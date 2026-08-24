@@ -1,0 +1,46 @@
+// A generic mapper: `map<To, From>(src) = To{ ...from(src) }`. The `...from`
+// spread works when the target/source are type parameters resolved by
+// monomorphisation. Exhaustiveness is checked at the instantiation (see
+// expect_fail/generic_spread_uncovered).
+import assert;
+import list;
+import data.mapper;
+
+struct Ent { image_url: string, is_veg: bool, price: double }
+struct Dto { imageUrl: string, isVeg: bool, price: double }
+
+@test
+fn generic_map_single() {
+    let e = Ent{ image_url: "/a.svg", is_veg: true, price: 1.5 };
+    let d = mapper.mapTo<Dto, Ent>(e);
+    assert.equalStr(d.imageUrl, "/a.svg");
+    assert.isTrue(d.isVeg);
+}
+
+// A generic-method-on-generic-class mapping a list, mirroring Repository.listAs:
+// forwards the class type param T and the method type param D into mapper.map.
+class Repo<T> {
+    init() {}
+    fn listAs<D>(self: Repo<T>, xs: list.List<T>): list.List<D> {
+        let out = list.List<D>();
+        let i = 0;
+        while (i < xs.size()) {
+            let e = xs.get(i);
+            if (e != undefined) { out.push(mapper.mapTo<D, T>(e)); }
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+@test
+fn generic_method_list_map() {
+    let r = Repo<Ent>();
+    let xs = list.List<Ent>();
+    xs.push(Ent{ image_url: "/p", is_veg: false, price: 2.0 });
+    xs.push(Ent{ image_url: "/q", is_veg: true, price: 3.0 });
+    let ds = r.listAs<Dto>(xs);
+    assert.equalInt(ds.size(), 2);
+    assert.equalStr(ds.get(0)?.imageUrl ?? "", "/p");
+    assert.isTrue(ds.get(1)?.isVeg ?? false);
+}

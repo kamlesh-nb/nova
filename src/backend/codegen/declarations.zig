@@ -870,7 +870,16 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                         decl_name_owned = true;
                     }
                 }
-                const dn_match = std.mem.eql(u8, decl_name, func.name);
+                // Match the exact name, OR a generic free-fn instantiation whose
+                // spec name is `<decl_name>__<args>` (mirrors the method path).
+                // Without this a generic free fn's params were never registered in
+                // current_local_types, so a `...from(param)` spread could not
+                // resolve the param's type at the instantiation.
+                const is_spec = func.instantiation_id != null and
+                    std.mem.startsWith(u8, func.name, decl_name) and
+                    func.name.len > decl_name.len + 2 and
+                    std.mem.eql(u8, func.name[decl_name.len .. decl_name.len + 2], "__");
+                const dn_match = std.mem.eql(u8, decl_name, func.name) or is_spec;
                 if (decl_name_owned) allocator.free(decl_name);
                 if (dn_match) {
                     compiler.current_module_prefix = compiler.getModulePrefix(decl.fn_decl.span);

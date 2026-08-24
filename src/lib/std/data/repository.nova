@@ -29,6 +29,7 @@ import list;
 import string;
 import data.db;
 import data.orm;
+import data.mapper;
 
 /// A repository bound to entity type `T` and one table, over a borrowed connection.
 pub class Repository<T> {
@@ -64,6 +65,32 @@ pub class Repository<T> {
         let p = list.List<DbValue>();
         p.push(val);
         return await orm.queryRows<T>(self.conn, "SELECT * FROM " + self.table + " WHERE " + keyCol + " = $1", p);
+    }
+
+    /// Read all rows and map each entity `T` to a DTO `D` by convention (via the
+    /// `mapper.mapTo` / `...from` spread). The DTO type is given; the entity type is
+    /// the repository's `T`. A `D` field with no matching `T` field is a compile
+    /// error, so the mapping is always total. Owned-string DTOs are independent of
+    /// the result buffer.
+    pub async fn listAs<D>(self: Repository<T>): list.List<D> {
+        let rows = await self.all();
+        let out = list.List<D>();
+        let i = 0;
+        while (i < rows.items.size()) {
+            let e = rows.items.get(i);
+            if (e != undefined) { out.push(mapper.mapTo<D, T>(e)); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// Read one row (`WHERE keyCol = val`) and map it to a DTO `D`, or `undefined`
+    /// if there is no match.
+    pub async fn oneAs<D>(self: Repository<T>, keyCol: string, val: DbValue): D | undefined {
+        let rows = await self.findBy(keyCol, val);
+        let e = rows.items.get(0);
+        if (e != undefined) { return mapper.mapTo<D, T>(e); }
+        return undefined;
     }
 
     /// `INSERT INTO table (...) VALUES (...)` for every field of `obj`. Suits plain

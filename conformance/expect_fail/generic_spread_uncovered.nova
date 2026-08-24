@@ -1,0 +1,17 @@
+// EXPECT-FAIL: codegen
+// A generic `...from` mapper cannot be checked for exhaustiveness by the type
+// checker (the target is a type parameter), so it is checked at the
+// instantiation: `Dto.extra` has no source field in `Ent`, so the mapping is not
+// total and must be rejected (at codegen) rather than leaving `extra` garbage.
+import assert;
+import data.mapper;
+
+struct Ent { a: string }
+struct Dto { a: string, extra: string }
+
+@test
+fn t_uncovered_generic(): void {
+    let e = Ent{ a: "x" };
+    let d = mapper.mapTo<Dto, Ent>(e);
+    assert.equalStr(d.a, "x");
+}

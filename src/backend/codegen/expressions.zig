@@ -4484,13 +4484,16 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                 return union_ptr_val;
             }
 
-            const s = self.structs.get(si.type_name) orelse {
+            // Substitute a type parameter (e.g. a generic mapper's `To`) to the
+            // concrete struct at this monomorphisation; a no-op for a plain literal.
+            const tn = try self.substTypeParams(si.type_name);
+            const s = self.structs.get(tn) orelse {
                 return error.StructNotFound;
             };
-            const total_size = self.getTypeSize(ast.TypeRef{ .ident = si.type_name }, false);
+            const total_size = self.getTypeSize(ast.TypeRef{ .ident = tn }, false);
             const size_val = core.LLVMConstInt(self.val_type, total_size, 0);
 
-            const struct_ptr_val = if (self.isValueStructName(si.type_name))
+            const struct_ptr_val = if (self.isValueStructName(tn))
                 try self.buildValueStructStorage(total_size)
             else
                 try self.compileAlloc(size_val);
@@ -4549,7 +4552,17 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             defer synth.deinit(self.allocator);
             if (si.spread) |sp| {
                 for (si.fields) |f| try synth.append(self.allocator, f);
-                const src_name = (try self.resolveExpressionTypeName(sp)) orelse "";
+                var src_name_raw = (try self.resolveExpressionTypeName(sp)) orelse "";
+                // When the source is a bare local/param whose type did not resolve
+                // via the typed IR (e.g. a generic mapper's `src: From`), fall back
+                // to its declared local type so a type parameter can be substituted.
+                if (src_name_raw.len == 0 and sp.kind == .ident) {
+                    if (self.current_local_types) |lt| {
+                        if (lt.get(sp.kind.ident)) |ts| src_name_raw = ts;
+                    }
+                }
+                // Substitute a type-parameter source (a generic mapper's `From`).
+                const src_name = try self.substTypeParams(src_name_raw);
                 if (self.structs.get(src_name)) |ss| {
                     for (s.fields) |df| {
                         var explicit = false;
@@ -4647,10 +4660,31 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     }
                 }
                 eff_fields = synth.items;
+
+                // Exhaustiveness at the instantiation. For a non-generic literal the
+                // type checker already proved every field is covered; but a spread
+                // into a type parameter (a generic mapper's `To`) cannot be checked
+                // there (To is abstract), so verify here that every target field was
+                // filled, else it would be left as garbage. Erroring keeps the
+                // generic `...from` sound.
+                for (s.fields) |df| {
+                    var covered = false;
+                    for (eff_fields) |ef| {
+                        if (std.mem.eql(u8, ef.name, df.name)) {
+                            covered = true;
+                            break;
+                        }
+                    }
+                    if (!covered) {
+                        std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m spread '...from' into '{s}' leaves field '{s}' uncovered\x1b[0m (no convention/@from match, and not given explicitly)\n", .{ tn, df.name });
+                        std.debug.print("(compilation failed)\n", .{});
+                        std.process.exit(70);
+                    }
+                }
             }
 
             for (eff_fields) |f_init| {
-                const offset = try self.getFieldOffset(si.type_name, f_init.name);
+                const offset = try self.getFieldOffset(tn, f_init.name);
                 const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
                 var field_val = try self.compileExpression(f_init.value);
 
