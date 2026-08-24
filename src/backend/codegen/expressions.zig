@@ -4535,7 +4535,20 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                         }
                         if (explicit) continue;
                         for (ss.fields) |sf| {
-                            if (conv(df.name, sf.name)) {
+                            // Same rule as the type checker: name AND type must
+                            // match (both plain idents, equal). A mismatched-type
+                            // name collision is not a match; the type checker has
+                            // already required it to be given explicitly.
+                            const df_id = switch (df.type_name) {
+                                .ident => |n| n,
+                                else => "",
+                            };
+                            const sf_id = switch (sf.type_name) {
+                                .ident => |n| n,
+                                else => "",
+                            };
+                            const type_ok = df_id.len > 0 and std.mem.eql(u8, df_id, sf_id);
+                            if (conv(df.name, sf.name) and type_ok) {
                                 const fa = ast.Expression{ .kind = .{ .field_access = .{
                                     .object = sp,
                                     .field = sf.name,

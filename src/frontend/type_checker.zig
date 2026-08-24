@@ -212,6 +212,18 @@ fn identOf(tr: ast.TypeRef) ?[]const u8 {
     };
 }
 
+/// Whether two field types are compatible for a `..from` convention copy. The
+/// rule is deliberately strict: both must be the same named type. A spread copies
+/// the value as-is (no conversion), so a name match whose types differ (e.g.
+/// `string` vs `int`, or owned `string` vs a zero-copy `str.Str` view) is NOT a
+/// match, and the field must be given explicitly. This is what keeps the spread
+/// sound: no silent int/​string mixups and no dangling `string`->`str.Str` views.
+pub fn fieldTypeConvCompatible(a: ast.TypeRef, b: ast.TypeRef) bool {
+    const an = identOf(a) orelse return false;
+    const bn = identOf(b) orelse return false;
+    return std.mem.eql(u8, an, bn);
+}
+
 /// Convention-equality of two field names for the `..from` mapper spread:
 /// case-insensitive and ignoring underscores, so `image_url` matches `imageUrl`
 /// and `full_name` matches `fullName`. Shared conceptually with the codegen
@@ -1439,20 +1451,27 @@ pub const TypeChecker = struct {
                                 break;
                             }
                         }
+                        // If a spread source field matches this field's name but
+                        // NOT its type, record it for a clearer error below.
+                        var name_only_src_type: ?[]const u8 = null;
                         if (!found) {
                             if (spread_src) |sn| {
                                 if (self.structs.get(sn)) |ss| {
                                     for (ss.fields) |sf| {
-                                        if (fieldConvEq(df.name, sf.name)) {
+                                        if (!fieldConvEq(df.name, sf.name)) continue;
+                                        if (fieldTypeConvCompatible(df.type_name, sf.type_name)) {
                                             found = true;
                                             break;
                                         }
+                                        name_only_src_type = identOf(sf.type_name) orelse "?";
                                     }
                                 }
                             }
                         }
                         if (!found) {
-                            if (self.structInitParamCount(si.type_name) != null) {
+                            if (name_only_src_type) |src_ty| {
+                                self.addError(si.span, "spread '..from' cannot fill field '{s}': the source has a matching '{s}' but its type '{s}' differs from the target type '{s}', give this field explicitly", .{ df.name, df.name, src_ty, identOf(df.type_name) orelse "?" });
+                            } else if (self.structInitParamCount(si.type_name) != null) {
                                 self.addError(si.span, "struct literal '{s}{{ ... }}' is missing field '{s}', initialize every field, or use the constructor '{s}(...)'", .{ si.type_name, df.name, si.type_name });
                             } else {
                                 self.addError(si.span, "struct literal '{s}{{ ... }}' is missing field '{s}', every field must be initialized (fields have no defaults)", .{ si.type_name, df.name });

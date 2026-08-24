@@ -210,9 +210,12 @@ struct Point { pub x: int, pub y: int
       //                    veg + label given explicitly; stock is not a target field.
   }
   ```
-  Field values are copied, so a spread of owned `string` fields produces an independent DTO. Matching
-  `string`→`str.Str` (a borrowing view) is not what a spread produces; keep both sides owned
-  *(→ 433_from_spread, expect_fail/from_spread_uncovered_field)*.
+  A convention match requires the name **and the type** to agree: a same-named field whose type differs
+  (`string` vs `int`, or owned `string` vs a zero-copy `str.Str` view) is NOT matched, and the field
+  must be given explicitly. This keeps the spread sound: values are copied as-is, so there is no silent
+  `string`→`int` conversion and no dangling `string`→`str.Str` view. Field values are copied, so a
+  spread of owned `string` fields produces an independent DTO
+  *(→ 433_from_spread, expect_fail/from_spread_uncovered_field, expect_fail/from_spread_type_mismatch)*.
 - **Enums** are tagged; variants may be payload-less or carry a payload:
   ```nova
   enum Color { Red, Green, Blue }          // Color.Red
