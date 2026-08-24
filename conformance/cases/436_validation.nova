@@ -1,0 +1,44 @@
+// FluentValidation-style validation: a concrete per-command validator struct
+// with a `validate` method builds a ValidationResult via the `Rules` accumulator.
+// A concrete struct is injectable into a handler field (like RequestHandler).
+import assert;
+import web.validation;
+
+struct Register { email: string, password: string, age: int }
+
+struct RegisterValidator {
+    init() {}
+    fn validate(self: RegisterValidator, c: Register): validation.ValidationResult {
+        return validation.Rules()
+            .check(validation.notEmpty(c.email), "email", "Email required")
+            .check(validation.isEmail(c.email), "email", "Email invalid")
+            .check(validation.minLen(c.password, 8), "password", "Password too short")
+            .check(validation.between(c.age, 18, 120), "age", "Age out of range")
+            .result();
+    }
+}
+
+struct Handler {
+    validator: RegisterValidator,
+    init(validator: RegisterValidator) { self.validator = validator; }
+    fn run(self: Handler, c: Register): validation.ValidationResult {
+        return self.validator.validate(c);
+    }
+}
+
+@test
+fn valid_input_passes() {
+    let h = Handler(RegisterValidator());
+    let r = h.run(Register{ email: "a@b.com", password: "longenough", age: 30 });
+    assert.isTrue(r.valid);
+    assert.equalInt(r.errors.size(), 0);
+}
+
+@test
+fn invalid_input_collects_errors() {
+    let h = Handler(RegisterValidator());
+    let r = h.run(Register{ email: "bad", password: "x", age: 5 });
+    assert.isFalse(r.valid);
+    assert.equalInt(r.errors.size(), 3);
+    assert.equalStr(r.errors.get(0)?.field ?? "", "email");
+}

@@ -1,0 +1,84 @@
+//! FluentValidation-style model validation.
+//!
+//! Write one concrete validator struct per command with a `validate(self, c)`
+//! method, and build the result with the `Rules` accumulator, which reads
+//! fluently. A concrete struct is injectable/storable exactly like a
+//! `RequestHandler`; there is deliberately no generic `Validator<T>` trait (a
+//! generic trait would be auto-adapted by the mediator, and a generic class held
+//! in a field is not yet supported), so nothing here relies on either.
+//!
+//! ```
+//! struct RegisterValidator {
+//!     init() {}
+//!     fn validate(self: RegisterValidator, c: Register): ValidationResult {
+//!         return Rules()
+//!             .check(notEmpty(c.email),      "email",    "Email is required")
+//!             .check(isEmail(c.email),       "email",    "Email is invalid")
+//!             .check(minLen(c.password, 8),  "password", "Password too short")
+//!             .check(between(c.age, 18, 120),"age",      "Age out of range")
+//!             .result();
+//!     }
+//! }
+//! ```
+//!
+//! The handler holds its validator by constructor injection and calls
+//! `validate(cmd)` before doing its work, returning the errors as the response
+//! when invalid. The predicate helpers below compose inside a `.check(...)`, or
+//! write the boolean inline.
+import list;
+import string;
+
+/// One validation failure: which field, and a human-readable message.
+pub struct ValidationError {
+    pub field: string,
+    pub message: string,
+}
+
+/// The outcome of validating an object: a flag plus the list of failures.
+pub struct ValidationResult {
+    pub valid: bool,
+    pub errors: list.List<ValidationError>,
+}
+
+/// A fluent accumulator used inside a validator's `validate`. Each `check` adds
+/// an error when its condition is false; `result` seals the outcome. Non-generic
+/// on purpose, so validators never store a generic type.
+pub class Rules {
+    errors: list.List<ValidationError>,
+    init() { self.errors = list.List<ValidationError>(); }
+
+    /// Record a failure `{field, message}` when `ok` is false; returns `self`.
+    pub fn check(self: Rules, ok: bool, field: string, message: string): Rules {
+        if (!ok) { self.errors.push(ValidationError{ field: field, message: message }); }
+        return self;
+    }
+
+    /// Seal the accumulated checks into a `ValidationResult`.
+    pub fn result(self: Rules): ValidationResult {
+        return ValidationResult{ valid: self.errors.size() == 0, errors: self.errors };
+    }
+}
+
+// --- predicate helpers (compose inside a `.check(...)`) ---
+
+/// Non-empty string.
+pub fn notEmpty(s: string): bool { return s.length > 0; }
+
+/// At least `n` characters.
+pub fn minLen(s: string, n: int): bool { return s.length >= n; }
+
+/// At most `n` characters.
+pub fn maxLen(s: string, n: int): bool { return s.length <= n; }
+
+/// Integer within an inclusive range.
+pub fn between(x: int, lo: int, hi: int): bool { return x >= lo && x <= hi; }
+
+/// A crude e-mail shape check: one `@` with text on both sides and a dot after
+/// it. Not RFC-complete; good enough for form validation.
+pub fn isEmail(s: string): bool {
+    let at = string.indexOf(s, "@");
+    if (at <= 0) { return false; }
+    if (at >= s.length - 1) { return false; }
+    let dot = string.indexOf(string.substring(s, at, s.length), ".");
+    return dot > 0;
+}
