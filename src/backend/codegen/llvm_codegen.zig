@@ -5138,6 +5138,7 @@ pub const LlvmCompiler = struct {
     pub const jsxFlushLiteral = expressions_mod.jsxFlushLiteral;
     /// Grafted from `expressions.zig`: appends an interpolated expression to JSX output.
     pub const jsxAppendExpr = expressions_mod.jsxAppendExpr;
+    pub const jsxAppendExprRaw = expressions_mod.jsxAppendExprRaw;
     /// Grafted from `expressions.zig`: sets the source location for JSX debug info.
     pub const jsxSetLoc = expressions_mod.jsxSetLoc;
     /// Grafted from `expressions.zig`: lowers a generic `parse<T>` call.

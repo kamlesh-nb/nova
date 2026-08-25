@@ -5882,27 +5882,40 @@ pub fn jsxFlushLiteral(self: *LlvmCompiler, sb: types.LLVMValueRef) !void {
 /// appended without escaping. This escaping is the XSS boundary for interpolated
 /// hypermedia content. Anything else is appended raw.
 pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression) !void {
+    try self.jsxAppendExprRaw(sb, expr, false);
+}
+
+/// As [`jsxAppendExpr`], but `raw` suppresses HTML-escaping of `string`/`Str` values.
+/// Used ONLY for datastar/event attribute values (`data-*`, `@*`), whose content is a
+/// framework CODE expression, not HTML text: escaping `@get('/x/' + id)` would turn the
+/// JS string quotes into `&#39;` and break the handler. Element CHILDREN always pass
+/// `raw = false` and stay escaped, which is the XSS boundary for interpolated content.
+pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression, raw: bool) !void {
     try self.jsxFlushLiteral(sb);
     const val = try self.compileExpression(expr.*);
     const type_name = try self.resolveExpressionTypeName(expr);
     if (type_name) |t| {
         if (std.mem.eql(u8, t, "string")) {
-            if (self.getFunc("web_response_escapeHtmlInto")) |escInto| {
-                const escInto_t = core.LLVMGlobalGetValueType(escInto);
-                var ea = [_]types.LLVMValueRef{ sb, self.coerceToSlotType(val, self.val_type) };
-                _ = core.LLVMBuildCall2(self.builder, escInto_t, escInto, &ea, 2, "");
-            } else {
-                try self.jsxAppendVal(sb, val);
+            if (!raw) {
+                if (self.getFunc("web_response_escapeHtmlInto")) |escInto| {
+                    const escInto_t = core.LLVMGlobalGetValueType(escInto);
+                    var ea = [_]types.LLVMValueRef{ sb, self.coerceToSlotType(val, self.val_type) };
+                    _ = core.LLVMBuildCall2(self.builder, escInto_t, escInto, &ea, 2, "");
+                    return;
+                }
             }
+            try self.jsxAppendVal(sb, val);
             return;
         } else if (std.mem.eql(u8, t, "Str")) {
-            if (self.getFunc("web_response_escapeHtmlIntoView")) |escView| {
-                const escView_t = core.LLVMGlobalGetValueType(escView);
-                var ea = [_]types.LLVMValueRef{ sb, val };
-                _ = core.LLVMBuildCall2(self.builder, escView_t, escView, &ea, 2, "");
-            } else {
-                try self.jsxAppendVal(sb, val);
+            if (!raw) {
+                if (self.getFunc("web_response_escapeHtmlIntoView")) |escView| {
+                    const escView_t = core.LLVMGlobalGetValueType(escView);
+                    var ea = [_]types.LLVMValueRef{ sb, val };
+                    _ = core.LLVMBuildCall2(self.builder, escView_t, escView, &ea, 2, "");
+                    return;
+                }
             }
+            try self.jsxAppendVal(sb, val);
             return;
         } else if (types_mod.isPrimitiveTypeName(t) and !std.mem.eql(u8, t, "void") and !std.mem.eql(u8, t, "any")) {
             const str_temp = try self.numToString(val, t);
@@ -5945,7 +5958,12 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
             .string_literal => |lit| try self.jsxAppendLiteral(sb_val, lit),
             .expression => |*expr| {
                 self.jsxSetLoc(expr.span);
-                try self.jsxAppendExpr(sb_val, expr);
+                // datastar / event attribute values (`data-*`, `@*`) are framework CODE
+                // expressions, not HTML text -- append raw so `@get('/x/' + id)` keeps its JS
+                // quotes instead of being turned into `&#39;`. Every other attribute value stays
+                // HTML-escaped (the injection boundary for interpolated attribute data).
+                const code_attr = std.mem.startsWith(u8, attr.name, "data-") or std.mem.startsWith(u8, attr.name, "@");
+                try self.jsxAppendExprRaw(sb_val, expr, code_attr);
                 self.jsxSetLoc(jsx.span);
             },
         }
@@ -5965,7 +5983,22 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
             .element => |sub_el| try self.emitJsxInto(sb_val, sub_el),
             .expression => |*expr| {
                 self.jsxSetLoc(expr.span);
-                try self.jsxAppendExpr(sb_val, expr);
+                // `{raw(x)}` embeds an already-rendered, trusted HTML fragment WITHOUT escaping,
+                // for composing sub-views (a parent view interpolating a child view's output). Every
+                // other `{expr}` child stays HTML-escaped -- the XSS boundary for interpolated text.
+                // `raw` is the marker (a std helper returning its arg); only this exact call shape is
+                // treated as raw, and only its single string argument is appended unescaped.
+                const is_raw_call = expr.kind == .call and expr.kind.call.args.len == 1 and blk: {
+                    const callee = expr.kind.call.callee.kind;
+                    if (callee == .ident) break :blk std.mem.eql(u8, callee.ident, "raw");
+                    if (callee == .field_access) break :blk std.mem.eql(u8, callee.field_access.field, "raw");
+                    break :blk false;
+                };
+                if (is_raw_call) {
+                    try self.jsxAppendExprRaw(sb_val, &expr.kind.call.args[0], true);
+                } else {
+                    try self.jsxAppendExpr(sb_val, expr);
+                }
             },
             .statement => |stmt| {
                 try self.jsxFlushLiteral(sb_val);
