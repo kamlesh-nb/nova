@@ -72,7 +72,7 @@ fn makeApp(dbPort: int): App {
     services.addSingleton("DbConfig", (sp) => { return DbConfig(dbPort); });
     let a = App();
     a.useServices(services);
-    a.get<GetUser>("/user");
+    a.mediated<GetUser>("GET", "/user");
     return a;
 }
 

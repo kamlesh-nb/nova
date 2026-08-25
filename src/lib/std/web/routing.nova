@@ -30,6 +30,83 @@ pub trait RequestHandler<TReq, TResp> {
     async fn handle(self, req: TReq): TResp;
 }
 
+/// Everything a direct route handler needs for one request: the raw request,
+/// the matched path parameters, and typed access to the incoming data. This is
+/// the axum/FastAPI/Flask `request`/extractor role, kept in one value the
+/// handler receives.
+///
+/// `bind<T>()` deserialises the request into a typed struct `T` from a single
+/// merged source: cookies (lowest precedence), then query string, then path
+/// params, then the body. The body is read per content type, so a hypermedia
+/// form POST (`application/x-www-form-urlencoded` or `multipart/form-data`)
+/// binds exactly like a JSON body would, which is what hypermedia clients send,
+/// not JSON. `query`/`param` fetch a single value directly.
+pub struct Context {
+    /// The raw HTTP request.
+    pub request: request.Request,
+    /// Path parameters captured from the route pattern (for example `{id}`).
+    pub params: Map<string, string>,
+
+    init(req: request.Request, params: Map<string, string>) {
+        self.request = req;
+        self.params = params;
+    }
+
+    /// Builds the merged value source for this request: cookies, then query, then
+    /// path params, in front of a body source chosen by content type. For POST/
+    /// PUT/PATCH the body is read as a form (urlencoded or multipart) or, failing
+    /// that, JSON; other verbs use query/params only (plus the datastar signals
+    /// blob when present).
+    pub fn source(self: Context): ValueSource {
+        let merged = Map<string, string>(8, string.hash);
+        self.request.cookies.forEach((k, v) => { merged.set(k, v); });
+        self.request.query.forEach((k, v) => { merged.set(k, v); });
+        self.params.forEach((k, v) => { merged.set(k, v); });
+        let paramSrc = source.ParamSource(merged);
+        let mth = self.request.method;
+        if (string.eql(mth, "POST") || string.eql(mth, "PUT") || string.eql(mth, "PATCH")) {
+            let ct = string.toLowerCase(self.request.getHeader("content-type") ?? "");
+            if (string.indexOf(ct, "multipart/form-data") != -1) {
+                return source.CompositeSource(paramSrc, request.multipartSource(ct, self.request.body));
+            }
+            if (string.indexOf(ct, "x-www-form-urlencoded") != -1) {
+                return source.CompositeSource(paramSrc, request.formSource(self.request.body));
+            }
+            return source.CompositeSource(paramSrc, source.fromJson(self.request.body));
+        }
+        let ds = self.request.query.get("datastar");
+        if (ds != undefined) {
+            return source.CompositeSource(paramSrc, source.fromJson(ds ?? "{}"));
+        }
+        return paramSrc;
+    }
+
+    /// Deserialises the request into a typed `T` from the merged source above.
+    pub fn bind<T>(self: Context): T {
+        return serde.bind<T>(self.source());
+    }
+
+    /// A single query-string value, or `""` if absent.
+    pub fn query(self: Context, key: string): string {
+        return self.request.query.get(key) ?? "";
+    }
+
+    /// A single path parameter, or `""` if absent.
+    pub fn param(self: Context, key: string): string {
+        return self.params.get(key) ?? "";
+    }
+}
+
+/// A direct, Go/axum/Flask-style route handler: one uniform async method from a
+/// `Context` to a response. Handlers are plain structs that hold their own
+/// dependencies as fields (a repository, a connection pool) and are stored
+/// homogeneously as `RouteHandler` trait objects, then dispatched by trait
+/// method, with no mediator, no DI container, and no per-request downcast. This
+/// mirrors how `web.app`'s SSE handlers are already stored and dispatched.
+pub trait RouteHandler {
+    async fn serve(self: RouteHandler, ctx: Context): response.Response;
+}
+
 /// One parsed segment of a route pattern: either a literal path component or a
 /// named parameter (optionally typed).
 pub struct Seg {

@@ -103,6 +103,14 @@ pub class ServiceProvider {
         return self.require(serde.typeName<T>());
     }
 
+    /// Resolves a service by its type `T` and returns it as `T` directly, so the
+    /// call site needs neither a string key nor a cast: `sp.get<AuthRepository>()`.
+    /// `T` may be a concrete type or a trait the concrete impl was registered
+    /// under. Panics if `T` is not registered, same as `require`.
+    pub fn get<T>(self: ServiceProvider): T {
+        return self.require(serde.typeName<T>()) as T;
+    }
+
     /// Creates a new `ServiceScope` rooted at this provider, for resolving scoped and per-request services.
     pub fn createScope(self: ServiceProvider): ServiceScope {
         return ServiceScope(self);
@@ -164,6 +172,14 @@ pub struct ServiceScope {
     pub fn resolveType<T>(self: ServiceScope): Service {
         return self.require(serde.typeName<T>());
     }
+
+    /// Resolves a service by its type `T` within this scope and returns it as `T`
+    /// directly, so the call site needs neither a string key nor a cast. `T` may
+    /// be a concrete type or a trait the concrete impl was registered under.
+    /// Panics if `T` is not registered, same as `require`.
+    pub fn get<T>(self: ServiceScope): T {
+        return self.require(serde.typeName<T>()) as T;
+    }
 }
 
 /// Mutable registry of service factories used at application startup, before any services can be resolved.
@@ -202,6 +218,26 @@ pub class ServiceCollection {
     pub fn addTransient(self: ServiceCollection, key: string, factory: (ServiceProvider) -> Service): void {
         self.factories.set(key, factory);
         self.lifetimes.set(key, LIFETIME_TRANSIENT);
+    }
+
+    /// Registers a singleton factory keyed by the type `T`, so registration needs
+    /// no string key: `services.singleton<Db>((sp) => Db())`. `T` may be a concrete
+    /// type or a trait the concrete impl is registered under (register the impl
+    /// under the trait, then handlers depend on the trait and it can be swapped).
+    /// This is the preferred typed form; the string `addSingleton(key, factory)`
+    /// remains for cases that genuinely need a non-type key.
+    pub fn singleton<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
+        self.addSingleton(serde.typeName<T>(), factory);
+    }
+
+    /// Registers a scoped factory keyed by the type `T` (one instance per `ServiceScope`).
+    pub fn scoped<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
+        self.addScoped(serde.typeName<T>(), factory);
+    }
+
+    /// Registers a transient factory keyed by the type `T` (a fresh instance per resolve).
+    pub fn transient<T>(self: ServiceCollection, factory: (ServiceProvider) -> Service): void {
+        self.addTransient(serde.typeName<T>(), factory);
     }
 
     /// Registers a singleton factory keyed by `serde.typeName<T>()` instead of an explicit string key.

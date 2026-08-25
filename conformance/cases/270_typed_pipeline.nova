@@ -33,7 +33,7 @@ struct GuardBehavior impl PipelineBehavior {
 fn buildApp(): App {
     let app = App();
     app.useBehavior(GuardBehavior{});
-    app.get<GetX>("/x/{id:int}");
+    app.mediated<GetX>("GET", "/x/{id:int}");
     return app;
 }
 
@@ -56,7 +56,7 @@ fn test_behavior_short_circuits(): void {
 @test
 fn test_no_behavior_direct(): void {
     let app = App();
-    app.get<GetX>("/x/{id:int}");
+    app.mediated<GetX>("GET", "/x/{id:int}");
     let res = app.dispatch(Request.fromString("GET /x/3 HTTP/1.1\r\nHost: x\r\n\r\n"));
     assert.equalStr(res.body, `{"id":3,"name":"real"}`);
 }

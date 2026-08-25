@@ -31,7 +31,7 @@ fn makeApp(): App {
     services.addSingleton("GCount", (sp) => { return GCount(); });
     let a = App();
     a.useServices(services);
-    a.get<Req>("/count/{x:int}");
+    a.mediated<Req>("GET", "/count/{x:int}");
     return a;
 }
 

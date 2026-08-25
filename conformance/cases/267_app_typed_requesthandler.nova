@@ -27,8 +27,8 @@ struct CreateProductHandler impl RequestHandler<CreateProduct, ProductDto> {
 
 fn makeApp(): App {
     let a = App();
-    a.get<GetProductById>("/api/products/{id:int}");
-    a.post<CreateProduct>("/api/products");
+    a.mediated<GetProductById>("GET", "/api/products/{id:int}");
+    a.mediated<CreateProduct>("POST", "/api/products");
     return a;
 }
 

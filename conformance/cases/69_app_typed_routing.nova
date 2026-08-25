@@ -28,8 +28,8 @@ struct CreateUserHandler impl RequestHandler<CreateUser, CreatedDto> {
 
 fn makeApp(): App {
     let a = App();
-    a.get<GetUser>("/api/user/{id:int}");
-    a.post<CreateUser>("/api/user");
+    a.mediated<GetUser>("GET", "/api/user/{id:int}");
+    a.mediated<CreateUser>("POST", "/api/user");
     return a;
 }
 

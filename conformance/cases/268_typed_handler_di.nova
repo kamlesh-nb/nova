@@ -35,7 +35,7 @@ fn makeApp(): App {
     services.addSingleton("ProductRepository", (sp) => { return ProductRepository(); });
     let a = App();
     a.useServices(services);
-    a.get<GetProductById>("/api/products/{id:int}");
+    a.mediated<GetProductById>("GET", "/api/products/{id:int}");
     return a;
 }
 

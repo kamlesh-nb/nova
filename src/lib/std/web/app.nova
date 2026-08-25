@@ -34,7 +34,6 @@ import web.static_content;
 import web.di;
 import web.mediator;
 import web.routing;
-import web.handlers;
 import web.http2.frame;
 import web.http2.hpack;
 import compress.gzip;
@@ -69,13 +68,10 @@ pub trait SseHandler {
 pub class App {
     /// Route table mapping method and path pattern to a registered request type.
     pub router: routing.Router,
-    /// Dispatches a resolved route's typed request through the registered pipeline behaviours to its handler.
+    /// Optional legacy mediator, kept for the opt-in pipeline (validation/auth
+    /// behaviours) reached via `mediated`. The default `get`/`post`/… path does
+    /// not use it.
     pub mediator: mediator.Mediator,
-    /// The explicit command-to-handler registration for this app. When non-empty
-    /// it gates dispatch: a route whose command type is not registered here is
-    /// refused. Left empty, the app falls back to auto-discovery of every
-    /// `RequestHandler` implementation. Set with `useHandlers`. See `web.handlers`.
-    pub handlers: handlers.HandlerRegistry,
     /// Static file mounts consulted, in order, for GET requests that miss the router.
     pub static_mounts: List<static_content.StaticMount>,
 
@@ -115,12 +111,18 @@ pub class App {
     pub sseRouter: routing.Router,
     pub sseHandlers: List<SseHandler>,
 
+    /// Direct route handlers (the Go/axum/Flask-style path), stored homogeneously
+    /// as `RouteHandler` trait objects exactly like `sseHandlers`. `routeRouter`
+    /// maps a matched request to an index into `routeHandlers`; dispatch calls the
+    /// handler's `serve` by trait method, with no mediator, no DI, no downcast.
+    pub routeRouter: routing.Router,
+    pub routeHandlers: List<routing.RouteHandler>,
+
     init() {
         self.router = routing.Router();
         self.provider = ServiceCollection().buildServiceProvider();
         self.mediator = mediator.Mediator(self.provider);
         __registerHandlers(self.mediator);
-        self.handlers = handlers.HandlerRegistry();
         self.static_mounts = List<static_content.StaticMount>();
         self.cache = Map<string, string>(16, string.hash);
         self.cacheable = Map<string, bool>(16, string.hash);
@@ -134,6 +136,17 @@ pub class App {
         self.serverPort = 0;
         self.sseRouter = routing.Router();
         self.sseHandlers = List<SseHandler>();
+        self.routeRouter = routing.Router();
+        self.routeHandlers = List<routing.RouteHandler>();
+    }
+
+    /// Registers a direct route handler (Go/axum/Flask style): `handler` is a
+    /// `RouteHandler` instance holding its own dependencies, stored homogeneously
+    /// and dispatched by trait method. No mediator, no DI container.
+    pub fn route(self: App, method: string, path: string, handler: routing.RouteHandler): void {
+        let idx = self.routeHandlers.size();
+        self.routeHandlers.push(handler);
+        self.routeRouter.__addRoute(method, path, `${idx}`);
     }
 
     /// Turns on gzip compression for eligible outgoing response bodies.
@@ -165,17 +178,6 @@ pub class App {
     pub fn useServices(self: App, sc: ServiceCollection): void {
         self.provider = sc.buildServiceProvider();
         self.mediator.setProvider(self.provider);
-    }
-
-    /// Adopts an explicit command-to-handler registry.
-    ///
-    /// Once set with a non-empty registry, dispatch is gated: a matched route
-    /// whose command type is not registered in `reg` is answered with 404 rather
-    /// than resolved by convention, so the set of reachable handlers is exactly
-    /// the set written down here. Leaving this unset (or passing an empty
-    /// registry) keeps the auto-discovery behaviour. See `web.handlers`.
-    pub fn useHandlers(self: App, reg: handlers.HandlerRegistry): void {
-        self.handlers = reg;
     }
 
     /// Registers a pipeline behaviour that wraps every request dispatched through the mediator.
@@ -236,25 +238,38 @@ pub class App {
         self.static_mounts.push(static_content.StaticMount(prefix, dir, 128));
     }
 
-    /// Registers a GET route at `path`, binding matched requests to type `TReq`.
-    pub fn get<TReq>(self: App, path: string): void {
-        self.router.__addRoute("GET", path, serde.typeName<TReq>());
+    /// Registers a GET route handled directly by `handler` (Go/axum/Flask style).
+    ///
+    /// `handler` is a `RouteHandler` instance holding its own dependencies. On a
+    /// match the framework builds a `Context` (path params + typed body binding)
+    /// and calls `handler.serve(ctx)` directly, with no mediator and no DI.
+    pub fn get(self: App, path: string, handler: routing.RouteHandler): void {
+        self.route("GET", path, handler);
     }
-    /// Registers a POST route at `path`, binding matched requests to type `TReq`.
-    pub fn post<TReq>(self: App, path: string): void {
-        self.router.__addRoute("POST", path, serde.typeName<TReq>());
+    /// Registers a POST route handled directly by `handler`. See `get`.
+    pub fn post(self: App, path: string, handler: routing.RouteHandler): void {
+        self.route("POST", path, handler);
     }
-    /// Registers a PUT route at `path`, binding matched requests to type `TReq`.
-    pub fn put<TReq>(self: App, path: string): void {
-        self.router.__addRoute("PUT", path, serde.typeName<TReq>());
+    /// Registers a PUT route handled directly by `handler`. See `get`.
+    pub fn put(self: App, path: string, handler: routing.RouteHandler): void {
+        self.route("PUT", path, handler);
     }
-    /// Registers a DELETE route at `path`, binding matched requests to type `TReq`.
-    pub fn delete<TReq>(self: App, path: string): void {
-        self.router.__addRoute("DELETE", path, serde.typeName<TReq>());
+    /// Registers a DELETE route handled directly by `handler`. See `get`.
+    pub fn delete(self: App, path: string, handler: routing.RouteHandler): void {
+        self.route("DELETE", path, handler);
     }
-    /// Registers a PATCH route at `path`, binding matched requests to type `TReq`.
-    pub fn patch<TReq>(self: App, path: string): void {
-        self.router.__addRoute("PATCH", path, serde.typeName<TReq>());
+    /// Registers a PATCH route handled directly by `handler`. See `get`.
+    pub fn patch(self: App, path: string, handler: routing.RouteHandler): void {
+        self.route("PATCH", path, handler);
+    }
+
+    /// Registers a route dispatched through the OPT-IN mediator pipeline, keyed by
+    /// the request type `TReq`. Use this only when you want the mediator's
+    /// `PipelineBehavior`s or DI-container-constructed handlers; the direct
+    /// `get`/`post`/… path above is the default and needs neither. `method` is
+    /// the HTTP verb (`"GET"`, `"POST"`, …).
+    pub fn mediated<TReq>(self: App, method: string, path: string): void {
+        self.router.__addRoute(method, path, serde.typeName<TReq>());
     }
 
     /// Registers a streaming (Server-Sent Events) route at `path`.
@@ -310,18 +325,22 @@ pub class App {
     /// unmatched GET through the static mounts, otherwise a Bad Request, Method Not
     /// Allowed, or Not Found response as appropriate.
     pub async fn dispatch(self: App, req: Request): response.Response {
+        // Direct route handlers first (Go/axum/Flask style): homogeneous
+        // RouteHandler trait objects, dispatched by trait method, no mediator/DI.
+        let hm = self.routeRouter.resolve(req.method, req.path);
+        if (hm.matched) {
+            let idx = string.parseI64(hm.key) as int;
+            let h = self.routeHandlers.at(idx);
+            return await h.serve(routing.Context(req, hm.params));
+        }
+
         let m = self.router.resolve(req.method, req.path);
         if (m.typedBad) {
             return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
         }
         if (m.matched) {
-            // Explicit-registration gate: when the app opted in with a non-empty
-            // handler registry, only commands registered there are reachable. An
-            // unregistered command is a wiring omission, so answer 404 rather than
-            // dispatching by convention. An empty registry means auto-discovery.
-            if (self.handlers.size() > 0 && !self.handlers.has(m.key)) {
-                return response.Response(Status.NotFound, "No handler registered for " + m.key);
-            }
+            // A route registered via the opt-in `mediated` path: dispatch through
+            // the mediator (pipeline behaviours + DI-constructed handler).
             let src = self.sourceFor(req, m.params);
             return await __mediator_dispatch_runtime(m.key, src, self.mediator);
         }

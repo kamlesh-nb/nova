@@ -41,7 +41,7 @@ fn makeApp(): App {
     services.addSingleton("Greeter", (sp) => { return Greeter("Hello"); });
     let a = App();
     a.useServices(services);
-    a.get<Hit>("/hit/{name}");
+    a.mediated<Hit>("GET", "/hit/{name}");
     return a;
 }
 

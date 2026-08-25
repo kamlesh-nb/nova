@@ -23,7 +23,7 @@ struct PingHandler impl RequestHandler<Ping, PongDto> {
 
 fn makeApp(): App {
     let a = App();
-    a.get<Ping>("/ping");
+    a.mediated<Ping>("GET", "/ping");
     return a;
 }
 

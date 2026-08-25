@@ -1,0 +1,77 @@
+// Direct (Go/axum/Flask-style) routing: a handler is a plain struct impl
+// RouteHandler holding its own dependency, registered on a route with a verb
+// method (`app.get`/`app.post`). Dispatch builds a Context (path params + typed
+// body binding) and calls `serve(ctx)` by trait method, with no mediator and no
+// DI container. `ctx.bind<T>()` binds from form/query/path (a hypermedia POST is
+// form-encoded, not JSON); the handler's dependency (a value struct with an
+// owned string field) is stored via a homogeneous trait table, so it stays
+// intact across dispatch, which the `any`-downcast approach did not.
+import assert;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import web.routing;
+import serde.json;
+import serde.source;
+import string;
+
+// A dependency held by value with an owned string field.
+struct Prefixer {
+    pub prefix: string,
+    init(p: string) { self.prefix = p; }
+    fn tag(self: Prefixer, s: string): string { return self.prefix + s; }
+}
+
+@serializable struct Greet impl Message { pub name: string }
+@serializable struct Signup impl Message { pub email: string, pub who: string }
+
+// GET handler: reads a path param via the Context.
+struct Hello impl RouteHandler {
+    p: Prefixer,
+    init(p: Prefixer) { self.p = p; }
+    async fn serve(self: Hello, ctx: routing.Context): Response {
+        return response.Response(Status.Ok, self.p.tag(ctx.param("who")));
+    }
+}
+
+// POST handler: binds a typed model from form data via the Context.
+struct DoSignup impl RouteHandler {
+    p: Prefixer,
+    init(p: Prefixer) { self.p = p; }
+    async fn serve(self: DoSignup, ctx: routing.Context): Response {
+        let form = ctx.bind<Signup>();
+        return response.Response(Status.Ok, self.p.tag(form.who) + "<" + form.email + ">");
+    }
+}
+
+fn makeApp(): App {
+    let app = App();
+    let pfx = Prefixer("hi, ");
+    app.get("/hello/{who}", Hello(pfx));
+    app.post("/signup", DoSignup(pfx));
+    return app;
+}
+
+@test
+fn test_get_path_param_and_dep(): void {
+    let a = makeApp();
+    let resp = a.dispatch(Request.fromString("GET /hello/Ada HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalStr(resp.body, "hi, Ada");
+    assert.equalInt(resp.status.toCode(), 200);
+}
+
+@test
+fn test_post_form_bind(): void {
+    let a = makeApp();
+    let req = Request.fromString("POST /signup HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nemail=a@x.io&who=Grace");
+    let resp = a.dispatch(req);
+    assert.equalStr(resp.body, "hi, Grace<a@x.io>");
+}
+
+@test
+fn test_unmatched_404(): void {
+    let a = makeApp();
+    let resp = a.dispatch(Request.fromString("GET /nope HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalInt(resp.status.toCode(), 404);
+}
