@@ -1,0 +1,56 @@
+// Regression: the explicit web handler registry (`web.handlers.HandlerRegistry`)
+// records a command-to-handler registration keyed by the command type name, so a
+// route bound with `app.post<TCmd>` can be gated on whether its command has a
+// registered handler. The key must be exactly `serde.typeName<TCmd>()`, i.e. the
+// bare command type name, so the registry key and the route key agree. A handler
+// registered under one command must not answer for another.
+import assert;
+import web.handlers;
+import web.mediator;
+import web.routing;
+import web.response;
+import web.status;
+import serde.source;
+
+// A command routed through the mediator, plus a second unrelated command.
+@serializable
+pub struct Greet impl Message {
+    pub name: string,
+    init() { self.name = ""; }
+}
+
+@serializable
+pub struct Farewell impl Message {
+    pub name: string,
+    init() { self.name = ""; }
+}
+
+pub struct GreetHandler impl RequestHandler<Greet, Response> {
+    init() {}
+    async fn handle(self: GreetHandler, c: Greet): Response {
+        return response.Response(Status.Ok, "hi " + c.name);
+    }
+}
+
+@test
+fn registry_keys_by_command_type() {
+    let reg = handlers.HandlerRegistry();
+    // Empty registry means auto-discovery; size is the opt-in signal.
+    assert.isTrue(reg.size() == 0);
+
+    reg.add<Greet, GreetHandler>();
+    assert.isTrue(reg.size() == 1);
+
+    // The key is the bare command type name, matching app.post<Greet>.
+    assert.isTrue(reg.has(serde.typeName<Greet>()));
+    assert.isTrue(reg.has("Greet"));
+
+    // A different command is not covered by Greet's registration.
+    assert.isTrue(!reg.has(serde.typeName<Farewell>()));
+    assert.isTrue(!reg.has("Farewell"));
+
+    // The recorded handler type name is retrievable for reporting/navigation.
+    let hn = reg.handlerFor("Greet") ?? "";
+    assert.isTrue(hn.length == 12);
+    assert.isTrue(hn == "GreetHandler");
+}

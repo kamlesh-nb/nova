@@ -34,6 +34,7 @@ import web.static_content;
 import web.di;
 import web.mediator;
 import web.routing;
+import web.handlers;
 import web.http2.frame;
 import web.http2.hpack;
 import compress.gzip;
@@ -70,6 +71,11 @@ pub class App {
     pub router: routing.Router,
     /// Dispatches a resolved route's typed request through the registered pipeline behaviours to its handler.
     pub mediator: mediator.Mediator,
+    /// The explicit command-to-handler registration for this app. When non-empty
+    /// it gates dispatch: a route whose command type is not registered here is
+    /// refused. Left empty, the app falls back to auto-discovery of every
+    /// `RequestHandler` implementation. Set with `useHandlers`. See `web.handlers`.
+    pub handlers: handlers.HandlerRegistry,
     /// Static file mounts consulted, in order, for GET requests that miss the router.
     pub static_mounts: List<static_content.StaticMount>,
 
@@ -114,6 +120,7 @@ pub class App {
         self.provider = ServiceCollection().buildServiceProvider();
         self.mediator = mediator.Mediator(self.provider);
         __registerHandlers(self.mediator);
+        self.handlers = handlers.HandlerRegistry();
         self.static_mounts = List<static_content.StaticMount>();
         self.cache = Map<string, string>(16, string.hash);
         self.cacheable = Map<string, bool>(16, string.hash);
@@ -158,6 +165,17 @@ pub class App {
     pub fn useServices(self: App, sc: ServiceCollection): void {
         self.provider = sc.buildServiceProvider();
         self.mediator.setProvider(self.provider);
+    }
+
+    /// Adopts an explicit command-to-handler registry.
+    ///
+    /// Once set with a non-empty registry, dispatch is gated: a matched route
+    /// whose command type is not registered in `reg` is answered with 404 rather
+    /// than resolved by convention, so the set of reachable handlers is exactly
+    /// the set written down here. Leaving this unset (or passing an empty
+    /// registry) keeps the auto-discovery behaviour. See `web.handlers`.
+    pub fn useHandlers(self: App, reg: handlers.HandlerRegistry): void {
+        self.handlers = reg;
     }
 
     /// Registers a pipeline behaviour that wraps every request dispatched through the mediator.
@@ -297,6 +315,13 @@ pub class App {
             return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
         }
         if (m.matched) {
+            // Explicit-registration gate: when the app opted in with a non-empty
+            // handler registry, only commands registered there are reachable. An
+            // unregistered command is a wiring omission, so answer 404 rather than
+            // dispatching by convention. An empty registry means auto-discovery.
+            if (self.handlers.size() > 0 && !self.handlers.has(m.key)) {
+                return response.Response(Status.NotFound, "No handler registered for " + m.key);
+            }
             let src = self.sourceFor(req, m.params);
             return await __mediator_dispatch_runtime(m.key, src, self.mediator);
         }
