@@ -1,0 +1,44 @@
+// The direct RouteHandler dispatch path must report the same status signals the
+// mediator path does: a typed path param that fails its check is 400 (not 404), and
+// a wrong verb on an existing path shape is 405 (not 404). Before this was wired,
+// the direct router's typedBad/methodNotAllowed outcomes were dropped and both fell
+// through to 404. Surfaced by the nova-notes-api second app (its ids are {id:int};
+// the shop's path params are strings, so it never hit this).
+import assert;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import web.routing;
+import string;
+
+struct One impl RouteHandler {
+    init() {}
+    async fn serve(self: One, ctx: routing.Context): Response {
+        return response.Response(Status.Ok, "id=" + ctx.param("id"));
+    }
+}
+
+fn doGet(app: App, path: string): Response {
+    return app.dispatch(request.Request.fromString("GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n"));
+}
+
+@test
+fn test_direct_typed_param_400(): void {
+    let app = App();
+    app.get("/items/{id:int}", One());
+    // Valid integer id -> 200.
+    assert.equalInt(doGet(app, "/items/7").status.toCode(), 200);
+    // Non-integer id on a {id:int} route -> 400, not 404.
+    assert.equalInt(doGet(app, "/items/abc").status.toCode(), 400);
+    // A different path shape entirely -> 404.
+    assert.equalInt(doGet(app, "/other/x/y").status.toCode(), 404);
+}
+
+@test
+fn test_direct_method_not_allowed_405(): void {
+    let app = App();
+    app.post("/items", One());
+    // GET on a path registered only for POST -> 405, not 404.
+    assert.equalInt(doGet(app, "/items").status.toCode(), 405);
+}

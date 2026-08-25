@@ -351,6 +351,12 @@ pub class App {
             }
             return await h.serve(ctx);
         }
+        // A direct route matched the path shape but a typed parameter (for example
+        // `{id:int}`) failed its check: report 400, exactly as the mediator path
+        // below does. Without this the direct path silently fell through to 404.
+        if (hm.typedBad) {
+            return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
+        }
 
         let m = self.router.resolve(req.method, req.path);
         if (m.typedBad) {
@@ -362,7 +368,10 @@ pub class App {
             let src = self.sourceFor(req, m.params);
             return await __mediator_dispatch_runtime(m.key, src, self.mediator);
         }
-        if (m.methodNotAllowed) {
+        // 405 when either router saw the path shape but under a different method
+        // (the direct router's signal was previously ignored, so a wrong-verb hit
+        // on a direct route fell through to 404).
+        if (m.methodNotAllowed || hm.methodNotAllowed) {
             return response.Response(Status.MethodNotAllowed, "Method Not Allowed");
         }
 
