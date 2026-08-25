@@ -1,0 +1,27 @@
+// EXPECT-FAIL: codegen
+// Harden #3 fail-closed guard: boxing a trait object into `any` is unsound today
+// (the erased box loses the fat-pointer shape and its destructor corrupts memory at
+// container teardown -> UAF/SIGSEGV, or a silent wrong value on `as Concrete`). The
+// compiler must REJECT it at codegen with a clear message rather than emit crashing
+// IR. The sound seam is a homogeneous trait container (List<Trait>), which is
+// unaffected. See memory note nova-web-explicit-handler-attempt.
+import assert;
+import map;
+import string;
+
+pub trait H { fn go(self: H): string; }
+pub struct Impl impl H {
+    pub s: string,
+    init(v: string) { self.s = v; }
+    fn go(self: Impl): string { return self.s; }
+}
+
+// Passing a trait-typed value into an `any`-valued container is the rejected shape.
+fn store(m: Map<string, any>, h: H): void { m.set("k", h); }
+
+@test
+fn trait_into_any_rejected(): void {
+    let m = Map<string, any>(8, string.hash);
+    store(m, Impl("hello"));
+    assert.isTrue(true);
+}

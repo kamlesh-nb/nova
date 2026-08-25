@@ -1496,6 +1496,28 @@ pub const LlvmCompiler = struct {
         const payload = self.coerceToSlotType(val, self.val_type);
         const src_name = (try self.resolveExpressionTypeName(src_expr)) orelse "";
         if (std.mem.eql(u8, src_name, "any")) return payload;
+        // FAIL-CLOSED (harden #3): boxing a trait object into `any` is unsound today. The
+        // value reaching here is a fat pointer {struct_ptr, vtable} (or, on some call paths,
+        // a not-yet-widened concrete pointer typed as the trait), but the `any` box pairs it
+        // with the trait destructor and later reads it as the wrong shape -> UAF / SIGSEGV at
+        // container teardown, or a silent wrong value on `as Concrete`. The proper fix
+        // (fat-pointer-aware `any` box + centralised concrete->trait arg widening) is a deep,
+        // cross-cutting codegen change; until then reject it with a clear diagnostic and a
+        // workaround rather than emit crashing IR. Homogeneous trait containers (List<Trait>,
+        // dispatched by trait method) are the sound seam and are unaffected.
+        if (self.traits.contains(getStructBaseName(src_name))) {
+            const sp = src_expr.span;
+            std.debug.print(
+                "\x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m cannot store a trait value (`{s}`) into `any`\x1b[0m\n" ++
+                "  Boxing a trait object into `any` is not sound in Nova today: the erased box loses the\n" ++
+                "  fat-pointer shape and its destructor corrupts memory when the container is torn down.\n" ++
+                "  Use a homogeneous trait container instead, e.g. `List<{s}>` dispatched by trait method,\n" ++
+                "  or downcast to the concrete type before boxing (`let c: ConcreteType = value;`).\n",
+                .{ sp.file, sp.line, sp.col, src_name, src_name },
+            );
+            std.debug.print("(compilation failed)\n", .{});
+            std.process.exit(70);
+        }
         var dtor = core.LLVMConstInt(self.val_type, 0, 0);
         const src_tid = self.typeOfExprConcrete(src_expr);
         const is_vstruct = if (src_tid) |t| self.isValueStructTid(t) else self.isValueStructName(src_name);
