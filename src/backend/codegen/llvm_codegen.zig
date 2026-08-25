@@ -3723,7 +3723,18 @@ pub const LlvmCompiler = struct {
 
                         const suffix = try std.fmt.allocPrint(self.allocator, "_{s}", .{name});
                         defer self.allocator.free(suffix);
-                        if (std.mem.endsWith(u8, f.name, suffix)) return;
+                        // A suffix match is meant to recognise a module-qualified FREE
+                        // function (e.g. `web_validation_notEmpty` for `notEmpty`) so it
+                        // is reached directly, not captured. It must NOT match a METHOD
+                        // symbol (`Type_method`, e.g. `Rules_result`): a same-suffixed
+                        // method name would otherwise shadow a captured local like
+                        // `result`, so the local is never captured and codegen cannot
+                        // find it. Methods take `self` as their first parameter, so skip
+                        // those and let the identifier fall through to the capture path.
+                        if (std.mem.endsWith(u8, f.name, suffix)) {
+                            const is_method = f.param_names.len > 0 and std.mem.eql(u8, f.param_names[0], "self");
+                            if (!is_method) return;
+                        }
                     }
                 }
 

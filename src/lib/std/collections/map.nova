@@ -403,8 +403,18 @@ pub class Map<K, V> {
     /// new owned collection; the keys inside it follow the usual value/ARC rules
     /// for `K`.
     pub fn keys(self: Map<K, V>): list.List<K> {
+        // Iterate the occupied slots directly rather than via a `forEach` closure:
+        // the closure body would reference `result` as a free variable, and Nova
+        // closures capture by value, so a mutating capture of the accumulator does
+        // not round-trip. An explicit scan keeps the accumulator in local scope.
         let result = list.List<K>();
-        self.forEach((k, v) => result.push(k));
+        let i = 0;
+        while (i < self.cap) {
+            if (bytes.read_byte(self.slots, i) == SLOT_OCCUPIED) {
+                result.push(self.keys.at(i));
+            }
+            i = i + 1;
+        }
         return result;
     }
 
@@ -413,8 +423,15 @@ pub class Map<K, V> {
     /// Order is unspecified and parallel to [`Map.keys`] over the same
     /// iteration, but the two are separate lists.
     pub fn values(self: Map<K, V>): list.List<V> {
+        // Direct scan (see `keys` for why not a `forEach` closure).
         let result = list.List<V>();
-        self.forEach((k, v) => result.push(v));
+        let i = 0;
+        while (i < self.cap) {
+            if (bytes.read_byte(self.slots, i) == SLOT_OCCUPIED) {
+                result.push(self.vals.at(i));
+            }
+            i = i + 1;
+        }
         return result;
     }
 

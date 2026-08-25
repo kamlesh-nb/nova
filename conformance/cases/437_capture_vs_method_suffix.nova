@@ -1,0 +1,35 @@
+// Regression: a closure that captures a local named `result` must still capture
+// it even when some struct has a METHOD whose mangled symbol ends in `_result`
+// (e.g. `Acc.result`). The capture scan used to treat any function symbol ending
+// in `_<name>` as a global free-function reference and skip the capture, so the
+// local `result` was never captured and codegen reported "Identifier 'result'
+// not found". Methods take `self`, so they must not shadow a captured local.
+import list;
+import assert;
+
+// A struct with a `result` method — its mangled symbol ends in `_result`.
+struct Acc {
+    total: int,
+    init() { self.total = 0; }
+    fn result(self: Acc): int { return self.total; }
+}
+
+// `collect` builds a list inside a closure that captures the local `result`.
+fn collect(xs: list.List<int>): list.List<int> {
+    let result = list.List<int>();
+    xs.forEach((v) => result.push(v * 2));
+    return result;
+}
+
+@test
+fn captures_local_result_despite_method() {
+    let xs = list.List<int>();
+    xs.push(1); xs.push(2); xs.push(3);
+    let doubled = collect(xs);
+    assert.isTrue(doubled.size() == 3);
+    assert.isTrue((doubled.get(0) ?? 0) == 2);
+    assert.isTrue((doubled.get(2) ?? 0) == 6);
+    // Touch the method so its `_result` symbol is emitted and reachable.
+    let a = Acc();
+    assert.isTrue(a.result() == 0);
+}
