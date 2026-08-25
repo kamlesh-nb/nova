@@ -134,12 +134,21 @@ pub const Formatter = struct {
     /// after this returns the formatter's `out` is empty and the caller must
     /// free the returned slice.
     pub fn formatProgram(self: *Formatter, program: ast.Program) ![]const u8 {
+        var prev_import = false;
         for (program.declarations, 0..) |decl, idx| {
+            const is_import = decl == .import_decl;
             if (idx > 0) {
-
-                try self.write("\n");
+                // Keep the import block tight: no blank line between two
+                // consecutive imports. The single blank line still appears
+                // between the import block and the first real declaration (that
+                // transition is import -> non-import), and between all other
+                // top-level declarations.
+                if (!(prev_import and is_import)) {
+                    try self.write("\n");
+                }
             }
             try self.formatDeclaration(decl);
+            prev_import = is_import;
         }
         return try self.out.toOwnedSlice(self.allocator);
     }
