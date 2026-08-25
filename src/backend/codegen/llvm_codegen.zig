@@ -1454,6 +1454,18 @@ pub const LlvmCompiler = struct {
     /// Boxes a value into an `any` via `nova_any_box`, pairing the payload word with
     /// a destructor function pointer (zero for a non-owning payload) so the boxed
     /// value can be released correctly later. Declares the extern lazily.
+    /// Get-or-declare an `i64 name(i64)` runtime extern (memoised in `func_map`).
+    /// Used for always-linked runtime helpers the codegen calls directly, e.g. the
+    /// NSX child-escape `nova_html_escape`.
+    pub fn getOrDeclareI64Fn(self: *LlvmCompiler, name: [:0]const u8) types.LLVMValueRef {
+        if (self.func_map.get(name)) |g| return g;
+        var at = [_]types.LLVMTypeRef{self.val_type};
+        const ft = core.LLVMFunctionType(self.val_type, &at, 1, 0);
+        const g = core.LLVMAddFunction(self.module, name.ptr, ft);
+        self.func_map.put(name, g) catch {};
+        return g;
+    }
+
     pub fn buildAnyBox(self: *LlvmCompiler, payload: types.LLVMValueRef, dtor: types.LLVMValueRef) anyerror!types.LLVMValueRef {
         const f = if (self.func_map.get("nova_any_box")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{ self.val_type, self.val_type };

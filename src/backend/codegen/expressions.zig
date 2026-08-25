@@ -5897,12 +5897,17 @@ pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *cons
     if (type_name) |t| {
         if (std.mem.eql(u8, t, "string")) {
             if (!raw) {
-                if (self.getFunc("web_response_escapeHtmlInto")) |escInto| {
-                    const escInto_t = core.LLVMGlobalGetValueType(escInto);
-                    var ea = [_]types.LLVMValueRef{ sb, self.coerceToSlotType(val, self.val_type) };
-                    _ = core.LLVMBuildCall2(self.builder, escInto_t, escInto, &ea, 2, "");
-                    return;
-                }
+                // Escape via the ALWAYS-LINKED runtime `nova_html_escape` (i64 -> i64), not the
+                // stdlib `escapeHtmlInto`: the stdlib helper is demand-pruned if nothing else in
+                // the compile references it, which silently dropped escaping (an XSS hole). The
+                // runtime fn returns the input unchanged when it has no metachars, so the common
+                // case stays alloc-free.
+                const esc = self.getOrDeclareI64Fn("nova_html_escape");
+                const esc_t = core.LLVMGlobalGetValueType(esc);
+                var ea = [_]types.LLVMValueRef{self.coerceToSlotType(val, self.val_type)};
+                const escaped = core.LLVMBuildCall2(self.builder, esc_t, esc, &ea, 1, "esc");
+                try self.jsxAppendVal(sb, escaped);
+                return;
             }
             try self.jsxAppendVal(sb, val);
             return;

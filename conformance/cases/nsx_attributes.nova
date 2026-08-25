@@ -1,5 +1,6 @@
 import assert;
 import string;
+import web.response;
 
 fn control(sig: string): string {
     return <button
@@ -14,7 +15,10 @@ fn control(sig: string): string {
 }
 
 fn fieldset(childrenHtml: string): string {
-    return <fieldset class="grp">{childrenHtml}</fieldset>;
+    // Embedding an already-rendered, trusted fragment: use response.raw so the child is
+    // NOT re-escaped. A plain `{childrenHtml}` is now always HTML-escaped (the XSS boundary
+    // for interpolated text), so raw fragment composition must be explicit.
+    return <fieldset class="grp">{response.raw(childrenHtml)}</fieldset>;
 }
 
 fn boolInput(): string {
@@ -53,12 +57,13 @@ fn checkbox(label: string, sig: string): string {
     return <label class="row"><input type="checkbox" data-bind={sig}/>{label}</label>;
 }
 fn section(title: string, body: string): string {
-    return <section><h3>{title}</h3>{body}</section>;
+    // title is text (escaped); body is a pre-rendered fragment (raw via response.raw).
+    return <section><h3>{title}</h3>{response.raw(body)}</section>;
 }
 
 @test
 fn test_compound_expression_child(): void {
-    let h = <div class="wrap">{checkbox("Autoscale enabled", "auto")}</div>;
+    let h = <div class="wrap">{response.raw(checkbox("Autoscale enabled", "auto"))}</div>;
     assert.isTrue(string.contains(h, "Autoscale enabled"));
     assert.isTrue(string.contains(h, "data-bind=\"auto\""));
     assert.isTrue(!string.contains(h, "1055"));
@@ -66,7 +71,7 @@ fn test_compound_expression_child(): void {
 
 @test
 fn test_nsx_element_as_concat_operand(): void {
-    let body = checkbox("First", "a") + <div class="mt-3">{checkbox("Second", "b")}</div>;
+    let body = checkbox("First", "a") + <div class="mt-3">{response.raw(checkbox("Second", "b"))}</div>;
     let h = section("Options", body);
     assert.isTrue(string.contains(h, "<section><h3>Options</h3>"));
     assert.isTrue(string.contains(h, "First"));

@@ -822,6 +822,52 @@ int nova_html_find_meta(long long base, int start, int len) {
   return len;
 }
 
+extern "C" long long nova_bytes_alloc(long long size);
+
+// Returns an HTML-escaped Nova string of `s`, escaping the five metacharacters
+// (& < > " ') exactly as the stdlib `web.response.escapeHtml` does. If `s` contains
+// none of them the ORIGINAL string is returned unchanged (no allocation), matching
+// the stdlib's free common case. This is the always-linked runtime the NSX child-escape
+// codegen calls, so interpolated `{expr}` content is ALWAYS escaped regardless of
+// whether the (DCE-able) stdlib helper was pulled into the compile. Length lives in the
+// object header at payload-4 (int32), refcount at payload-8.
+extern "C" long long nova_html_escape(long long s) {
+  if (!s) return s;
+  const int len = *reinterpret_cast<const int32_t *>(s - 4);
+  if (len <= 0) return s;
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(s);
+  // First metachar (reuse the SWAR scanner); no metachars -> return input as-is.
+  const int first = nova_html_find_meta(s, 0, len);
+  if (first >= len) return s;
+  // Compute the escaped length.
+  long long out_len = 0;
+  for (int i = 0; i < len; i++) {
+    switch (p[i]) {
+      case 38: out_len += 5; break;   // &amp;
+      case 60: out_len += 4; break;   // &lt;
+      case 62: out_len += 4; break;   // &gt;
+      case 34: out_len += 6; break;   // &quot;
+      case 39: out_len += 5; break;   // &#39;
+      default: out_len += 1; break;
+    }
+  }
+  const long long box = nova_bytes_alloc(out_len);
+  if (!box) return s;
+  char *o = reinterpret_cast<char *>(box);
+  long long w = 0;
+  for (int i = 0; i < len; i++) {
+    switch (p[i]) {
+      case 38: std::memcpy(o + w, "&amp;", 5); w += 5; break;
+      case 60: std::memcpy(o + w, "&lt;", 4); w += 4; break;
+      case 62: std::memcpy(o + w, "&gt;", 4); w += 4; break;
+      case 34: std::memcpy(o + w, "&quot;", 6); w += 6; break;
+      case 39: std::memcpy(o + w, "&#39;", 5); w += 5; break;
+      default: o[w] = static_cast<char>(p[i]); w += 1; break;
+    }
+  }
+  return box;
+}
+
 long long nova_spin_create(void) { return (long long)new std::atomic_flag{}; }
 void nova_spin_lock(long long h) {
   if (!h) return;
