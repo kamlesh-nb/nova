@@ -107,6 +107,46 @@ pub trait RouteHandler {
     async fn serve(self: RouteHandler, ctx: Context): response.Response;
 }
 
+/// A middleware in the direct route pipeline (the Go/axum/Flask `Use` shape). It
+/// receives the request `Context` and a `Chain` cursor; it may run logic before
+/// and after calling `next.proceed(ctx)`, or return its own response without
+/// calling `next` to short-circuit (an auth guard, a rate limiter). Middlewares
+/// are registered with `App.use` and run in registration order, wrapping every
+/// direct route handler.
+pub trait RouteMiddleware {
+    async fn handle(self: RouteMiddleware, ctx: Context, next: Chain): response.Response;
+}
+
+/// Cursor over the middleware chain for one request. `proceed` advances to the
+/// next middleware, or to the route's `RouteHandler` once the chain is
+/// exhausted. A fresh `Chain` is built at each step, holding the index of the
+/// middleware still to run.
+pub struct Chain {
+    /// The full ordered middleware list, shared across every step of one request.
+    pub mws: List<RouteMiddleware>,
+    /// Index of the next middleware in `mws` to invoke.
+    pub idx: int,
+    /// The route handler to run once every middleware has called `proceed`.
+    pub terminal: RouteHandler,
+
+    init(mws: List<RouteMiddleware>, idx: int, terminal: RouteHandler) {
+        self.mws = mws;
+        self.idx = idx;
+        self.terminal = terminal;
+    }
+
+    /// Runs the next middleware, or the terminal route handler once `idx` reaches
+    /// the end of `mws`.
+    pub async fn proceed(self: Chain, ctx: Context): response.Response {
+        if (self.idx >= self.mws.size()) {
+            return await self.terminal.serve(ctx);
+        }
+        let mw = self.mws.at(self.idx);
+        let nxt = Chain(self.mws, self.idx + 1, self.terminal);
+        return await mw.handle(ctx, nxt);
+    }
+}
+
 /// One parsed segment of a route pattern: either a literal path component or a
 /// named parameter (optionally typed).
 pub struct Seg {

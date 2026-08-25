@@ -1,0 +1,71 @@
+// Direct-path middleware (the Go/axum/Flask `use` shape): middlewares registered
+// with `app.use` wrap every RouteHandler, run in registration order, may act
+// after `next.proceed` (edit the response), and may short-circuit by returning
+// without calling `next` (an auth guard). Homogeneous trait table like the
+// handlers, dispatched by trait method.
+import assert;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import web.routing;
+import serde.json;
+import serde.source;
+import string;
+
+@serializable struct Hit impl Message { pub name: string }
+
+struct Handler impl RouteHandler {
+    init() {}
+    async fn serve(self: Handler, ctx: routing.Context): Response {
+        return response.Response(Status.Ok, "handler");
+    }
+}
+
+// Appends a tag AFTER the downstream runs (proves wrap + post-processing + order).
+struct Tag impl RouteMiddleware {
+    label: string,
+    init(label: string) { self.label = label; }
+    async fn handle(self: Tag, ctx: routing.Context, next: routing.Chain): Response {
+        let resp = await next.proceed(ctx);
+        resp.body = resp.body + "[" + self.label + "]";
+        return resp;
+    }
+}
+
+// Short-circuits with 401 when the `x-auth` header is absent; never calls next.
+struct Guard impl RouteMiddleware {
+    init() {}
+    async fn handle(self: Guard, ctx: routing.Context, next: routing.Chain): Response {
+        if (ctx.request.getHeader("x-auth") == undefined) {
+            return response.Response(Status.Unauthorized, "denied");
+        }
+        return await next.proceed(ctx);
+    }
+}
+
+@test
+fn test_middleware_wraps_in_order(): void {
+    let app = App();
+    app.use(Tag("outer"));
+    app.use(Tag("inner"));
+    app.get("/hit", Handler());
+    let resp = app.dispatch(Request.fromString("GET /hit HTTP/1.1\r\nHost: x\r\n\r\n"));
+    // inner is closer to the handler, so its tag is appended first, then outer.
+    assert.equalStr(resp.body, "handler[inner][outer]");
+    assert.equalInt(resp.status.toCode(), 200);
+}
+
+@test
+fn test_middleware_short_circuits(): void {
+    let app = App();
+    app.use(Guard());
+    app.get("/hit", Handler());
+    // No x-auth header -> guard returns 401, handler never runs.
+    let denied = app.dispatch(Request.fromString("GET /hit HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.equalInt(denied.status.toCode(), 401);
+    // With x-auth -> passes through to the handler.
+    let ok = app.dispatch(Request.fromString("GET /hit HTTP/1.1\r\nHost: x\r\nx-auth: t\r\n\r\n"));
+    assert.equalStr(ok.body, "handler");
+    assert.equalInt(ok.status.toCode(), 200);
+}

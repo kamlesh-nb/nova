@@ -117,6 +117,9 @@ pub class App {
     /// handler's `serve` by trait method, with no mediator, no DI, no downcast.
     pub routeRouter: routing.Router,
     pub routeHandlers: List<routing.RouteHandler>,
+    /// Middleware run, in registration order, around every direct route handler.
+    /// Registered with `use`. See `web.routing.RouteMiddleware`.
+    pub middlewares: List<routing.RouteMiddleware>,
 
     init() {
         self.router = routing.Router();
@@ -138,6 +141,15 @@ pub class App {
         self.sseHandlers = List<SseHandler>();
         self.routeRouter = routing.Router();
         self.routeHandlers = List<routing.RouteHandler>();
+        self.middlewares = List<routing.RouteMiddleware>();
+    }
+
+    /// Registers a middleware that wraps every direct route handler, in
+    /// registration order (Go/axum/Flask `Use`). A middleware runs logic before
+    /// and after `next.proceed(ctx)`, or returns its own response to
+    /// short-circuit. See `web.routing.RouteMiddleware`.
+    pub fn use(self: App, mw: routing.RouteMiddleware): void {
+        self.middlewares.push(mw);
     }
 
     /// Registers a direct route handler (Go/axum/Flask style): `handler` is a
@@ -331,7 +343,13 @@ pub class App {
         if (hm.matched) {
             let idx = string.parseI64(hm.key) as int;
             let h = self.routeHandlers.at(idx);
-            return await h.serve(routing.Context(req, hm.params));
+            let ctx = routing.Context(req, hm.params);
+            // Run the middleware chain, which ends by calling the handler; when no
+            // middleware is registered, call the handler directly (no overhead).
+            if (self.middlewares.size() > 0) {
+                return await routing.Chain(self.middlewares, 0, h).proceed(ctx);
+            }
+            return await h.serve(ctx);
         }
 
         let m = self.router.resolve(req.method, req.path);
