@@ -559,6 +559,10 @@ void nova_arc_dump_survivors(void);
 // Diagnostic: dump ARC survivors on SIGUSR1 without exiting, so a long-running server (which never reaches
 // the exit-time audit) can be inspected mid-run. Enable with NOVA_ARC_AUDIT=1 NOVA_ARC_DUMP=1, then
 // `kill -USR1 <pid>`. Async-signal-safety is intentionally relaxed here (diagnostic only).
+// Windows has no SIGUSR1 (the UCRT defines only the six ANSI signals), and there is no `kill` to raise one
+// with either, so the whole hook is POSIX-only. The dump is still reachable on Windows via the exit-time
+// audit; only the mid-run inspection is unavailable.
+#ifndef _WIN32
 static void nova_arc_sigusr1(int) {
   std::fprintf(stderr, "\n=== SIGUSR1: live=%lld bytes=%lld ===\n",
                (long long)0, (long long)0);
@@ -567,6 +571,7 @@ static void nova_arc_sigusr1(int) {
 __attribute__((constructor)) static void nova_arc_install_sigusr1(void) {
   signal(SIGUSR1, nova_arc_sigusr1);
 }
+#endif
 
 long long nova_arc_audit_report(void) {
   if (!audit_enabled())

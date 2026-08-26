@@ -338,6 +338,13 @@ pub fn appendRuntimeLink(
 ) !void {
     if (builtin.target.os.tag == .windows) {
         try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/lib/{s}.o", .{ shared_nova, lib_name }));
+        // The integrated-assembly crypto kernel is a separate object. On macOS/Linux it rides along
+        // inside libnovacore.a, but this path links the runtime as a BARE COFF OBJECT (link.exe cannot
+        // read llvm-ar's GNU archive), so the crypto object has to be named here or its symbols go
+        // unresolved. `has_asm_crypto_obj` is set by the same build.zig decision that assembled it.
+        if (build_options.has_asm_crypto_obj) {
+            try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/lib/nova_crypto.o", .{shared_nova}));
+        }
         try args.append(allocator, "-rtlib=compiler-rt");
         try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
         return;

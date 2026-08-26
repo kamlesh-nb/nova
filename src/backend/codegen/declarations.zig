@@ -161,11 +161,18 @@ fn peakRssBytes() u64 {
                 PeakPagefileUsage: usize,
             };
             const psapi = struct {
-                extern "psapi" fn GetProcessMemoryInfo(hProcess: w.HANDLE, counters: *PROCESS_MEMORY_COUNTERS, cb: w.DWORD) callconv(w.WINAPI) w.BOOL;
+                // `.winapi` is the calling-convention tag; the old `w.WINAPI` constant was removed from
+                // std.os.windows in Zig 0.16, and referencing it is a hard compile error on a Windows host.
+                // Returns c_int, not `w.BOOL`: Zig 0.16 made BOOL a distinct `Bool(c_int)` wrapper that no
+                // longer compares against an integer literal. c_int is the actual Win32 ABI type.
+                extern "psapi" fn GetProcessMemoryInfo(hProcess: w.HANDLE, counters: *PROCESS_MEMORY_COUNTERS, cb: w.DWORD) callconv(.winapi) c_int;
+                // Declared here rather than taken from `w.kernel32`, whose surface Zig 0.16 trimmed; this
+                // is a two-line extern and does not depend on what std chooses to re-export.
+                extern "kernel32" fn GetCurrentProcess() callconv(.winapi) w.HANDLE;
             };
             var pmc: PROCESS_MEMORY_COUNTERS = undefined;
             pmc.cb = @sizeOf(PROCESS_MEMORY_COUNTERS);
-            if (psapi.GetProcessMemoryInfo(w.kernel32.GetCurrentProcess(), &pmc, pmc.cb) != 0) {
+            if (psapi.GetProcessMemoryInfo(psapi.GetCurrentProcess(), &pmc, pmc.cb) != 0) {
                 break :blk @as(u64, pmc.PeakWorkingSetSize);
             }
             break :blk 0;

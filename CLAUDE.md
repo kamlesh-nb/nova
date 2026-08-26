@@ -77,6 +77,39 @@ zig build                                  # build.zig has a PowerShell install 
 is missing, every corpus case reports `<compile/link error>` and `nova.exe` exits `0xC0000135`
 (STATUS_DLL_NOT_FOUND) with no output — reads exactly like a compiler regression, but it is the DLL.
 
+**Build `-Doptimize=ReleaseFast` before running the corpus. A Debug build cannot pass it, for reasons
+that have nothing to do with the cases.** `cli.run` installs a leak-detecting allocator in Debug and
+ends with `if (gpa.detectLeaks() > 0) std.process.exit(1)`. On the current Zig the driver leaks ~12k
+allocations across dozens of sites (net-live, per `NOVA_ALLOC_PROFILE=1`; almost certainly std API
+drift, since this tree also needed three unrelated Zig-0.16 fixes), so **every** `nova test` exits 1
+while printing `Results: N passed, 0 failed` — and `conformance/run.sh` keys off the exit code, so the
+entire corpus reports FAIL with passing output. It also prints ~9k lines of leak traces per case, and
+Debug codegen makes each case ~40x slower (**~60s vs ~1.4s**), which turns the corpus from ~20 minutes
+into ~7 hours. If you see a red corpus where every case says it passed, this is why; it is not a
+regression in the cases. Repairing the leak gate itself is separate outstanding work.
+
+Corpus on this host, ReleaseFast, `run.sh -j 3`: **436/444**. The 8 failures are `188_kqueue_readiness`
+and `189_epoll_event_layout` (assert kqueue/epoll struct layouts, inapplicable off their platform) plus
+six pre-existing Windows platform gaps: `118_actor`, `163_process`, `256_dns_ipv6`, `261_simd_f64x4`,
+`413_file_write_ok`, `42_nested_owned_aggregates`. Note that readiness cases 192/194/195, listed as
+open in an earlier revision of this file, now PASS — `iocp.nova` grew `armZeroByte`.
+
+Three Windows-host build breakages were fixed to get here, all Zig/UCRT drift rather than design:
+`w.WINAPI` and `w.kernel32.GetCurrentProcess` no longer exist and `w.BOOL` became a distinct type
+(`src/backend/codegen/declarations.zig`), and `SIGUSR1` does not exist in the UCRT, so the ARC
+mid-run dump hook is now POSIX-only (`src/runtime/alloc.cpp`).
+
+**The `--asan` gate now works on Windows.** clang's AddressSanitizer is fully functional here against
+the MSVC runtime, so `NOVA_ASAN=1 zig build` builds `novacore_asan.o` in the PowerShell branch exactly
+as the sh branch does. Two things to know:
+- **`clang_rt.asan_dynamic-x86_64.dll` must be on PATH at run time.** It lives in
+  `<llvm>/lib/clang/<ver>/lib/windows`, NOT in `bin`, so adding `C:\LLVM\bin` is not enough. Without it
+  the instrumented test binary cannot load and the harness reports `Test suite FAILED (exit code 53)`
+  with no ASAN output at all — the same shape as the LLVM-C.dll trap, and just as misleading.
+- ASAN is selected by the **`--asan` flag**, not by `NOVA_ASAN` in the environment. `run.sh` maps the
+  env var onto the flag; invoking `nova test` by hand needs `nova test --asan <file>`. Setting only the
+  env var silently runs an ordinary uninstrumented build.
+
 **C. Cross-compile from macOS/Linux/WSL (no Windows host needed).**
 ```bash
 nova app.nova --target windows-x86_64      # real PE32+ .exe; adds -lws2_32 -lmswsock -lbcrypt
@@ -98,7 +131,6 @@ target-conditional file rule `targetVariantPath` swaps whole modules so shared c
   `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` in `nova_wsa_connectex`, io.cpp).
 - `/tmp` is not a Windows path (a leading `/` resolves against the current drive root) — use
   `dir.Dir.tempDir()`.
-- `--asan`/`--arc` gates are not wired on Windows (the install step skips those runtimes).
 
 ## Layout
 
@@ -107,7 +139,8 @@ target-conditional file rule `targetVariantPath` swaps whole modules so shared c
   `statements.zig`, `arc.zig`, `types.zig`), `main.zig` (driver + linking).
 - `src/lib/std/` — the Nova standard library (compiled from source per build; import-graph gated).
 - `src/runtime/` — the small C++20 runtime (`concurrency.cpp` = reactor scheduler + async I/O,
-  `crypto.cpp` + `nova_crypto_arm64.S` = hardware AES/SHA hooks; TLS itself is pure Nova).
+  `crypto.cpp` + `nova_crypto_arm64.S` + `nova_crypto_amd64.S` = the integrated-assembly crypto kernels
+  and their dispatch; TLS itself is pure Nova).
 - `conformance/` — `cases/*.nova` (positive, run via `nova test`) + `expect_fail/` (must be rejected) +
   `run.sh` (the harness, self-tests its own negative-case classifier).
 - `docs/design/` — **`execution-plan.md`** (the master status table + per-item design — READ THIS for
@@ -280,6 +313,60 @@ the empty inbox reveals anything is wrong. `nova_uring_prep` now clears `off` fo
 Worth knowing generally — several io_uring opcodes alias fields through that union, so "set the field
 the docs name" is not sufficient; the ones it overlaps have to be cleared.
 
+## Integrated-assembly crypto (the `nova_*` kernels)
+
+Hand-written assembly linked straight into `libnovacore.a` and called from Nova by symbol via
+`extern("c")` — a plain `call`, no cgo/FFI marshalling. Two architectures have kernels:
+`nova_crypto_arm64.S` (ARMv8 crypto extensions) and `nova_crypto_amd64.S` (AES-NI, PCLMULQDQ, SHA-NI, and
+SSE fallbacks). `build.zig`'s `asmCryptoFor()` picks one from the RESOLVED TARGET — not `uname -m`, so a
+cross build never assembles the host's asm — and the same helper decides whether to pass
+`-DNOVA_ASM_CRYPTO_X86`, which is what switches `crypto.cpp` to the CPUID dispatchers.
+
+**arm64 assumes, x86 dispatches.** Every ARMv8 part anyone runs this on has AES+PMULL+SHA2, so the arm64
+file calls its instructions unconditionally. x86 cannot: AES-NI is 2010+, and SHA-NI did not reach
+mainstream Intel until Ice Lake. So `nova_crypto_amd64.S` exports FEATURE-SUFFIXED symbols
+(`…_aesni`, `…_clmul`, `…_shani`, `…_sse`, `…_x64`) and `crypto.cpp` owns the CPUID logic in C, where it
+is readable. `nova_has_asm_crypto()` is therefore a RUNTIME answer on x86, gated on
+AES-NI + PCLMULQDQ + SSSE3 + SSE4.1. That set is the gate because the Nova callers share ONE gate, so
+returning 1 promises that every entry point works. SHA-NI is deliberately outside it — it only selects a
+faster SHA-256 kernel, and its absence must not switch off AES-GCM on the very many machines that have
+AES-NI without it. `NOVA_NO_ASM_CRYPTO=1` forces the gate off (A/B measurement, or bisecting a suspected
+miscompare) while leaving `nova_cpu_has_aes()` truthful, so the fallback is Nova's SIMD path rather than
+bitsliced software.
+
+Things that bite, recorded so they are not rediscovered:
+- **A Nova buffer is NEVER 16-byte aligned.** `bytes.alloc(n)` is `malloc(n+8)+8` for the object header,
+  so it is 16-byte aligned *plus 8*. Legacy-SSE memory operands require 16-byte alignment and fault
+  otherwise — and that includes the implicit one in `pclmulqdq $0,(%rdx),%xmm4` or `paddd (%rsi),%xmm0`.
+  Every load from a caller buffer must be `movdqu` into a register first. Only the file's own `.rodata`
+  (`.p2align`ed) may be touched with an aligned form.
+- **Two ABIs, and Windows is the awkward one.** Win64 passes rcx/rdx/r8/r9 + stack, reserves 32 bytes of
+  shadow space, and makes rdi/rsi AND xmm6-xmm15 callee-saved. The `PROLOG_n`/`SAVE_XMM` macros normalise
+  it to SysV so each body is written once. The stack-argument offsets in `PROLOG_5/6` are only valid
+  before any other push, which is why the 8-argument `nova_gcm_seal_aesni` spells its prologue out by
+  hand rather than using a macro.
+- **Windows links the runtime as a bare COFF object**, not the archive (link.exe cannot read llvm-ar's
+  GNU archive), so `nova_crypto.o` must be named explicitly on the link line —
+  `pipeline.appendRuntimeLink`, gated on the `has_asm_crypto_obj` build option. On macOS/Linux it simply
+  rides along inside `libnovacore.a`. Forgetting this is an unresolved-symbol error, not a silent miss.
+- **x86 has no per-byte bit reverse.** GHASH's "standard order" reflection is a single `RBIT` on arm64;
+  here it is `BREV8`, two `PSHUFB` nibble-table lookups.
+- **x86 has no SHA-512 instruction** on any mainstream part, and no SHA-256 one before Ice Lake, so both
+  hashes also carry a SIMD-message-schedule + scalar-rounds kernel. That is what actually runs on
+  pre-Ice-Lake hardware.
+- **SHA-NI is validated but not silicon-tested.** The development host has no SHA-NI. The sequence was
+  checked by emulating SHA256RNDS2/MSG1/MSG2 from the SDM pseudocode and replaying the exact macro
+  sequence against the SHA-256 KATs, so the arrangement is right; only the encoding is unexercised.
+  Re-run `conformance/cases/445_asm_crypto_kernels.nova` on an Ice Lake or Zen box to close that. Every
+  OTHER kernel is executed and differentially checked on both ABIs — Win64 natively and SysV under WSL,
+  same 3563 checks — because the ABI shim is exactly the kind of thing that passes on one and not the
+  other.
+
+Gates: `380_asm_crypto_path` (AES block vs pure-Nova `encBlock`), `378_aesgcm_hw` (AES-GCM differential
+against the independent `crypto/aead/aesgcm`), `445_asm_crypto_kernels` (FIPS 180-4 and RFC 8439 KATs
+straight at the ABI boundary — the digest state is BIG-ENDIAN and the count is BLOCKS, not bytes, and
+both are easy to get wrong in a way that still looks plausible).
+
 ## Status & dependencies
 
 Master roadmap: `docs/design/execution-plan.md` (per-item design + state). Language spec: `docs/specs.md`.
@@ -287,29 +374,55 @@ Depends on **NovaDB** (separate repo); pairs with **nls** (LSP) + the VSCode **e
 
 ## Planned / next work
 
-1. **All crypto hardware-asm for x86_64.** ARM64 has `src/runtime/nova_crypto_arm64.S` (AES + SHA-256
-   via the ARMv8 crypto extensions, wired through `nova_has_asm_crypto()` / `nova_sha256_blocks` and
-   `simd.aesenc`). Add the x86_64 equivalents — AES-NI, SHA-NI (`sha256rnds2`/`sha256msg1/2`), PCLMULQDQ
-   for GHASH, and the AVX2 SHA path — behind the same gates, with runtime CPUID detection and a scalar
-   fallback. Reference Go's `crypto/internal/fips140/sha256/_asm/sha256block_amd64_{shani,avx2}.go` and
-   the AES-GCM assembly for the instruction sequences.
+1. ~~**All crypto hardware-asm for x86_64.**~~ DONE — see "Integrated-assembly crypto" above.
+   `src/runtime/nova_crypto_amd64.S` implements AES-NI (block, 8-way CTR, stitched GCM seal), PCLMULQDQ
+   GHASH, SHA-NI SHA-256, SIMD-schedule SHA-256/SHA-512, ChaCha20 and Poly1305, all behind CPUID dispatch
+   in `crypto.cpp`. Remaining headroom, deliberately not taken: Go's `blockAVX2` hashes TWO SHA-256
+   blocks at once in 256-bit lanes for perhaps another 1.3x, but it is ~1100 lines of intricate register
+   juggling that only pays off on multi-block input AND only on CPUs lacking SHA-NI — poor risk/reward
+   against the SIMD-schedule kernel that is there now. Also open: SHA-NI has no silicon test (see above).
 
 2. **A small CRUD web app on MSSQL** (like `nova-pg-web` is for Postgres) to exercise the web framework
    AND the `mssql` driver end to end — scaffold with `nova init web`, wire the `mssql` package as the
    `Connection`, run the same load/soak test. Shakes out driver + framework edges together.
 
-3. **Orchestrator fd-handoff: io_uring test + a Windows port.** The zero-downtime handoff passes client
+3. **Orchestrator fd-handoff: verify it on io_uring.** The zero-downtime handoff passes client
    sockets over an **AF_UNIX** control channel via **`SCM_RIGHTS`** (`src/net/proxy.nova`), with the
    rendezvous under `/tmp/nova-*.sock` — the short path is DELIBERATE (AF_UNIX `sun_path` caps at ~104
    bytes on macOS; `$TMPDIR`/`/var/folders` would overflow it, so do NOT "portably" swap `/tmp` for
-   `dir.tempDir()`). It works on kqueue/epoll; still to do: **(a)** verify it on **io_uring** (a
-   proactor's in-flight ops + inherited socket state differ from a readiness engine's); **(b)** a
-   **Windows** path — `SCM_RIGHTS` does not exist there, so it needs `WSADuplicateSocket` (or a named
-   pipe) plus re-associating the handed-off socket with the new process's IOCP. This is a genuine
-   platform port, not a cross-platform find-replace. (Audit note: the DB drivers use the target-swapped
+   `dir.tempDir()`). It works on kqueue/epoll; what remains is verifying it on **io_uring**, where a
+   proactor's in-flight ops and inherited socket state differ from a readiness engine's.
+
+   **A Windows port is explicitly NOT planned. The handoff is POSIX-only by design.** The orchestrator
+   is a Linux production concern — Windows is a development host here, the same way k8s is not a Windows
+   story. A port was prototyped and then dropped, and the reason is worth keeping because it is a design
+   fact rather than an effort estimate: the two mechanisms do not abstract behind one API.
+   `SCM_RIGHTS` hands a descriptor to whoever holds the other end of the socket, whereas
+   `WSADuplicateSocketW` prepares a duplicate **for a process named by PID**. That forces a PID
+   handshake into the shared surface, makes `sendFd(sock, fd, payload)` unimplementable on Windows
+   (nowhere to put the pid), and needs a second wire format because the descriptor travels as ordinary
+   stream bytes rather than ancillary data. The result would be a permanently divergent protocol in
+   shared code, maintained for a platform that never runs it. (All of it does *work* — AF_UNIX,
+   `WSADuplicateSocketW` → `WSASocketW` across a process boundary, and overlapped `WSARecv` on AF_UNIX
+   for the IOCP op were each probed successfully on Windows 10 — so this is a scope decision, not a
+   blocked one.) (Audit note: the DB drivers use the target-swapped
    `os.sys` seam and the novadb server `src/` cross-builds clean for Windows — both already portable;
    this handoff is the only POSIX-locked surface.)
 
-4. **Windows/WSL parity gates.** Wire `--asan`/`--arc` on Windows and close the remaining IOCP
-   readiness cases (`armRead`/`armWrite` have no proactor analogue; convert to the zero-byte-receive
-   completion path already used by io_uring — see "Readiness on a proactor" above).
+4. **Windows/WSL parity gates.** Mostly done, and the two headline items turned out not to be the
+   real blockers:
+   - `--asan` is now wired on Windows (`NOVA_ASAN=1 zig build` builds `novacore_asan.o` in the
+     PowerShell branch). See the Windows section for the `clang_rt.asan_dynamic-x86_64.dll`-on-PATH
+     requirement and the `--asan`-flag-vs-env-var distinction, both of which fail confusingly.
+   - The IOCP readiness cases (192/194/195) **already pass** — `iocp.nova` grew `armZeroByte`, the
+     zero-byte-receive completion path this item asked for.
+   - What actually blocked every gate on Windows was neither: a **Debug** build of the driver cannot
+     pass the corpus at all, because `cli.run`'s leak gate exits 1 on a compiler that legitimately
+     leaks. Build `-Doptimize=ReleaseFast`. Details in the Windows section.
+
+   Still open: **repair the driver's leak gate** (~12k live allocations across dozens of sites, so
+   `zig build` + `run.sh` is red on Debug everywhere, not just Windows — almost certainly Zig-0.16 std
+   drift), and confirm `--arc` end to end on Windows. Note when testing gates: run ONE corpus at a
+   time. `--asan`/`--arc` are sequential and execute in the repo root, so two concurrent runs clobber
+   the same hardcoded `__nova_test` binary and the failure surfaces as "HARNESS INTEGRITY BROKEN",
+   which reads like a classifier regression rather than the collision it is.

@@ -1,0 +1,100 @@
+// Direct known-answer gate on the integrated-assembly crypto kernels, at the ABI boundary.
+//
+// 380 does this for nova_aes_encrypt_block. This covers the three kernels whose CONTRACT is easy to get
+// subtly wrong and whose breakage would otherwise only show up as a mysterious handshake failure:
+//
+//   * nova_sha256_blocks / nova_sha512_blocks take the digest as 8 BIG-ENDIAN words and a BLOCK COUNT,
+//     not a byte length. An implementation that assumed native-endian state, or a length, still produces
+//     plausible-looking output — so the state layout is pinned here explicitly.
+//   * nova_chacha20_xor takes a BLOCK counter (not a byte offset) and processes whole 64-byte blocks,
+//     so an off-by-one in the counter shows up only from the second block onward. 256 bytes exercises
+//     four blocks and the multi-block loop.
+//
+// The vectors are independent of this repository: the SHA digests are the FIPS 180-4 "abc" KATs and the
+// ChaCha keystream is RFC 8439 section 2.3.2 (key 00..1f, nonce 00:00:00:09:00:00:00:4a:00:00:00:00,
+// block counter 1) — whose first 64 bytes are printed in the RFC itself.
+//
+// Skipped when no assembly kernel exists for the host: the symbols still resolve there, but they are
+// deliberate traps (see crypto.cpp), because nothing is supposed to call them behind a 0 gate.
+import assert;
+import bytes;
+
+extern("c") fn nova_has_asm_crypto(): int;
+extern("c") fn nova_sha256_blocks(state: ptr, data: ptr, blocks: int): void;
+extern("c") fn nova_sha512_blocks(state: ptr, data: ptr, blocks: int): void;
+extern("c") fn nova_chacha20_xor(key: ptr, counter: int, nonce: ptr, dataIn: ptr, len: int, out: ptr): void;
+
+fn hexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return c - 55; }
+fn hexBuf(hex: string): ptr {
+    let n = hex.length / 2; let b = bytes.alloc(n); let i = 0;
+    while (i < n) { bytes.write_byte(b, i, hexNib(hex[i*2]) * 16 + hexNib(hex[i*2+1])); i = i + 1; }
+    return b;
+}
+fn zeroBuf(n: int): ptr { let b = bytes.alloc(n); let i = 0; while (i < n) { bytes.write_byte(b, i, 0); i = i + 1; } return b; }
+fn expectBytes(got: ptr, want: ptr, n: int): void {
+    let i = 0; while (i < n) { assert.equalInt(bytes.read_byte(got, i), bytes.read_byte(want, i)); i = i + 1; }
+}
+
+@test
+fn asm_sha256_blocks_abc(): void {
+    if (nova_has_asm_crypto() == 0) { return; }
+    // SHA-256 IV, stored big-endian exactly as crypto/hash/sha256 keeps it.
+    let state = hexBuf("6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19");
+    // One padded block for "abc": the message, 0x80, zero fill, then the 64-bit big-endian bit length 24.
+    let blk = zeroBuf(64);
+    bytes.write_byte(blk, 0, 97); bytes.write_byte(blk, 1, 98); bytes.write_byte(blk, 2, 99);
+    bytes.write_byte(blk, 3, 0x80);
+    bytes.write_byte(blk, 63, 24);
+    nova_sha256_blocks(state, blk, 1);
+    expectBytes(state, hexBuf("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), 32);
+}
+
+@test
+fn asm_sha512_blocks_abc(): void {
+    if (nova_has_asm_crypto() == 0) { return; }
+    let state = hexBuf("6a09e667f3bcc908bb67ae8584caa73b3c6ef372fe94f82ba54ff53a5f1d36f1"
+                     + "510e527fade682d19b05688c2b3e6c1f1f83d9abfb41bd6b5be0cd19137e2179");
+    // SHA-512 blocks are 128 bytes and the length field is 128 bits wide.
+    let blk = zeroBuf(128);
+    bytes.write_byte(blk, 0, 97); bytes.write_byte(blk, 1, 98); bytes.write_byte(blk, 2, 99);
+    bytes.write_byte(blk, 3, 0x80);
+    bytes.write_byte(blk, 127, 24);
+    nova_sha512_blocks(state, blk, 1);
+    expectBytes(state, hexBuf("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+                            + "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"), 64);
+}
+
+@test
+fn asm_sha256_blocks_multi(): void {
+    if (nova_has_asm_crypto() == 0) { return; }
+    // Four blocks in one call must equal four single-block calls: pins the loop's state carry-over,
+    // which a one-block-only implementation would pass the KAT above without ever exercising.
+    let data = bytes.alloc(256);
+    let i = 0; while (i < 256) { bytes.write_byte(data, i, (i * 31 + 7) & 0xff); i = i + 1; }
+    let a = hexBuf("6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19");
+    let b = hexBuf("6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19");
+    nova_sha256_blocks(a, data, 4);
+    let k = 0;
+    while (k < 4) { nova_sha256_blocks(b, (data as long + k * 64) as ptr, 1); k = k + 1; }
+    expectBytes(a, b, 32);
+}
+
+@test
+fn asm_chacha20_rfc8439_keystream(): void {
+    if (nova_has_asm_crypto() == 0) { return; }
+    let key = hexBuf("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    let nonce = hexBuf("000000090000004a00000000");
+    // XORing the keystream against zeros yields the keystream itself. Blocks 1..4, counter base 1.
+    let zin = zeroBuf(256);
+    let out = bytes.alloc(256);
+    nova_chacha20_xor(key, 1, nonce, zin, 256, out);
+    let want = hexBuf("10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"
+                    + "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"
+                    + "0a88837739d7bf4ef8ccacb0ea2bb9d69d56c394aa351dfda5bf459f0a2e9fe8"
+                    + "e721f89255f9c486bf21679c683d4f9c5cf2fa27865526005b06ca374c86af3b"
+                    + "dcbfbdcb83be65862ed5c20eae5a43241d6a92da6dca9a156be25297f51c2718"
+                    + "8a861e93cc3aeb129a76598baccd27453ac6941b4b4e1e5153a9fee95d1ba00e"
+                    + "69d09f0d336478ca9068335ae2b3090905fb0fe5d45115371d126e5ba85e9924"
+                    + "32729aa7d77ddc5e3cc689d8445c1ab754a7409ee8befc2bdd3868d27f6e1ad8");
+    expectBytes(out, want, 256);
+}

@@ -146,6 +146,11 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "inprocess_lld", inprocess_lld);
     build_opts.addOption([]const u8, "nova_version", nova_version);
     build_opts.addOption(u32, "nova_abi_version", nova_abi_version);
+    // Whether the install step assembled `nova_crypto.o`. Windows links the runtime as a bare COFF
+    // object rather than an archive (link.exe cannot read llvm-ar's GNU archive), so the crypto object
+    // has to be named explicitly on the link line there — see pipeline.appendRuntimeLink. Passing this
+    // as a build option rather than probing the filesystem keeps the two decisions provably identical.
+    build_opts.addOption(bool, "has_asm_crypto_obj", asmCryptoFor(target) != null);
     const build_opts_mod = build_opts.createModule();
 
     mod.addImport("llvm", llvm_mod);
@@ -204,6 +209,29 @@ pub fn build(b: *std.Build) void {
 }
 
 const TargetInfo = struct { triple: []const u8, os_name: []const u8, arch_name: []const u8, is_cross: bool };
+
+/// The hand-written integrated-assembly crypto source for `target`, plus any define it needs, or null
+/// when this target has none.
+///
+/// Two architectures have a kernel: `nova_crypto_arm64.S` (AES/GHASH/SHA/ChaCha/Poly over the ARMv8
+/// crypto extensions) and `nova_crypto_amd64.S` (the AES-NI / PCLMULQDQ / SHA-NI / SSE equivalents).
+/// `-DNOVA_ASM_CRYPTO_X86` is what switches crypto.cpp from portable C to the CPUID dispatchers, so it
+/// must be set on exactly the builds that also assemble the x86 file — hence one helper answering both
+/// questions, rather than two conditions that can drift apart.
+///
+/// Returns null for a CROSS build. The assembled object goes into the NATIVE `libnovacore.a`; a cross
+/// build produces `novacore_<triple>.o` on a different path that never sees this object, and emitting
+/// the define there would leave crypto.cpp calling symbols nothing assembled. That was the trap worth
+/// designing out: it would surface as a link error far from here.
+fn asmCryptoFor(target: std.Build.ResolvedTarget) ?struct { src: []const u8, define: []const u8 } {
+    if (target.result.os.tag != builtin.target.os.tag or
+        target.result.cpu.arch != builtin.target.cpu.arch) return null;
+    return switch (target.result.cpu.arch) {
+        .aarch64 => .{ .src = "src/runtime/nova_crypto_arm64.S", .define = "" },
+        .x86_64 => .{ .src = "src/runtime/nova_crypto_amd64.S", .define = "-DNOVA_ASM_CRYPTO_X86" },
+        else => null,
+    };
+}
 
 fn targetInfo(b: *std.Build, target: std.Build.ResolvedTarget) TargetInfo {
     const arch = @tagName(target.result.cpu.arch);
@@ -294,6 +322,19 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
     const bin_dest = b.fmt("{s}/.nova/bin", .{home});
     const std_dest = b.fmt("{s}/.nova/std", .{home});
 
+    // Integrated-assembly crypto path (the Go/BoringSSL model): assemble this architecture's hand-written
+    // crypto routines and bundle the object into libnovacore.a, so every Nova binary links them and calls
+    // them by symbol via extern("c") — a plain call, with no cgo/FFI marshalling. The three strings below
+    // are spliced into both install scripts; `# no integrated assembly` is a comment in sh AND PowerShell,
+    // so the no-kernel case needs no branching in either.
+    const asm_crypto = asmCryptoFor(target);
+    const asm_cmd = if (asm_crypto) |ac|
+        b.fmt("{s} -O2 -c {s} -o \"{s}/.nova/lib/nova_crypto.o\"", .{ cxx, ac.src, home })
+    else
+        "# no integrated assembly crypto kernel for this target";
+    const asm_obj = if (asm_crypto != null) b.fmt("\"{s}/.nova/lib/nova_crypto.o\"", .{home}) else "";
+    const asm_def = if (asm_crypto) |ac| ac.define else "";
+
     if (builtin.os.tag == .windows) {
         const ps = b.fmt(
             \\$ErrorActionPreference = "Stop"
@@ -303,12 +344,34 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
             \\Copy-Item -Recurse -Force src/runtime/* "{[home]s}/.nova/src/runtime/"
             \\Copy-Item -Recurse -Force deps/* "{[home]s}/.nova/deps/"
             \\Write-Host "Building libnovacore.a (Windows; reactor runtime + Win32 syscall shims) ..."
-            \\{[cxx]s} -std=c++20 -O2 -DNOVA_DROP_ARENA -c src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore.o"
-            \\llvm-ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o"
+            \\{[asm_cmd]s}
+            \\{[cxx]s} -std=c++20 -O2 -DNOVA_DROP_ARENA {[asm_def]s} -c src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore.o"
+            \\llvm-ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o" {[asm_obj]s}
+            \\# NOVA_ASAN=1: additionally build an AddressSanitizer runtime, so `conformance/run.sh --asan`
+            \\# works here too. clang's ASAN is fully functional on Windows against the MSVC runtime; what
+            \\# it needs is clang_rt.asan_dynamic-x86_64.dll on PATH at RUN time (it lives in
+            \\# <llvm>/lib/clang/<ver>/lib/windows, NOT in bin), or the instrumented binary dies with
+            \\# "error while loading shared libraries" before main. Same class of trap as LLVM-C.dll.
+            \\# Note the archive is a convenience only: appendRuntimeLink names the bare .o on Windows,
+            \\# because link.exe cannot read llvm-ar's GNU archive.
+            \\if ($env:NOVA_ASAN -eq "1") {{
+            \\  Write-Host "Building libnovacore_asan.a (AddressSanitizer) ..."
+            \\  {[cxx]s} -std=c++20 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DNOVA_DROP_ARENA {[asm_def]s} -c src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore_asan.o"
+            \\  llvm-ar rcs "{[home]s}/.nova/lib/libnovacore_asan.a" "{[home]s}/.nova/lib/novacore_asan.o" {[asm_obj]s}
+            \\  Write-Host "ASAN runtime built. Use: NOVA_ASAN=1 nova test <file>"
+            \\}}
             \\Write-Host "Installed compiler to {[bin]s}/nova.exe"
             \\Write-Host "Prebuilt libnovacore.a; synced std/runtime/deps to {[home]s}/.nova/"
             \\
-        , .{ .bin = bin_dest, .std = std_dest, .home = home, .cxx = cxx });
+        , .{
+            .bin = bin_dest,
+            .std = std_dest,
+            .home = home,
+            .cxx = cxx,
+            .asm_cmd = asm_cmd,
+            .asm_obj = asm_obj,
+            .asm_def = asm_def,
+        });
         const install_cmd_ps = b.addSystemCommand(&.{ "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps });
         const install_exe_ps = b.addInstallArtifact(exe, .{});
         install_cmd_ps.step.dependOn(&install_exe_ps.step);
@@ -351,20 +414,20 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\# TLS is pure Nova (M9/M11/M13): crypto/tls + net/tlsmembio + net/tls12bio. wolfSSL is retired,
         \\# so there is no C TLS library to build or link, and no NOVA_HAVE_WOLFSSL define.
         \\echo "Building libnovacore.a (no Boost, no wolfSSL; reactor runtime) ..."
+        \\# Integrated-assembly crypto path (Go/BoringSSL model): assemble this architecture's hand-written
+        \\# crypto routines -- nova_crypto_arm64.S on aarch64, nova_crypto_amd64.S on x86_64 -- and bundle
+        \\# the object into libnovacore.a, so every Nova binary links them and calls them by symbol
+        \\# (extern "c") with NO cgo/FFI marshalling. Chosen in build.zig from the RESOLVED TARGET rather
+        \\# than `uname -m`, so a cross build never assembles the host's assembly by mistake. On an
+        \\# architecture with no kernel the symbols come from the C fallbacks in crypto.cpp instead.
+        \\# This runs BEFORE the runtime.cpp compile because the x86 path also contributes
+        \\# -DNOVA_ASM_CRYPTO_X86, which is what switches crypto.cpp to the CPUID dispatchers.
+        \\{[asm_cmd]s}
         \\# Workstream A: NOVA_DROP_ARENA makes every heap object honestly refcounted
         \\# (no load-bearing thread-local arena). Required for multi-core + clean ARC.
-        \\{[cxx]s} -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA -c \
+        \\{[cxx]s} -std=c++20 -O2 -pthread -DNOVA_DROP_ARENA {[asm_def]s} -c \
         \\    src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore.o"
-        \\# Integrated-assembly crypto path (Go/BoringSSL model): on an aarch64 host, assemble the
-        \\# hand-written AES/GHASH AArch64 routines and bundle their object into libnovacore.a, so every
-        \\# Nova binary links them and calls them by symbol (extern "c") with NO cgo/FFI marshalling.
-        \\# On other hosts the same symbols come from the C fallbacks in crypto.cpp, so nothing to assemble.
-        \\NOVA_ASM_OBJ=""
-        \\if [ "$(uname -m)" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then
-        \\  {[cxx]s} -O2 -c src/runtime/nova_crypto_arm64.S -o "{[home]s}/.nova/lib/nova_crypto.o" \
-        \\    && NOVA_ASM_OBJ="{[home]s}/.nova/lib/nova_crypto.o"
-        \\fi
-        \\ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o" $NOVA_ASM_OBJ
+        \\ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o" {[asm_obj]s}
         \\# T1: the cross-compilation cache (novacore_<triple>.o, built lazily by `nova build
         \\# --target ...`) is keyed only by triple, so it must be invalidated whenever the runtime
         \\# source changes. Clear it here, triples contain dashes, so this glob spares novacore_asan.o.
@@ -387,9 +450,9 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\if [ "${{NOVA_ASAN:-0}}" = "1" ]; then
         \\  echo "Building libnovacore_asan.a (AddressSanitizer) ..."
         \\  clang++ -std=c++20 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
-        \\      -pthread -DNOVA_DROP_ARENA -c \
+        \\      -pthread -DNOVA_DROP_ARENA {[asm_def]s} -c \
         \\      src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore_asan.o"
-        \\  ar rcs "{[home]s}/.nova/lib/libnovacore_asan.a" "{[home]s}/.nova/lib/novacore_asan.o" $NOVA_ASM_OBJ
+        \\  ar rcs "{[home]s}/.nova/lib/libnovacore_asan.a" "{[home]s}/.nova/lib/novacore_asan.o" {[asm_obj]s}
         \\  echo "ASAN runtime built. Use: NOVA_ASAN=1 nova test <file>"
         \\fi
         \\# NOVA_TSAN=1: additionally build a ThreadSanitizer runtime. This is the gate for the
@@ -409,7 +472,15 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\echo "Installed compiler to {[bin]s}/nova"
         \\echo "Prebuilt libnovacore.a; synced std/runtime/deps to {[home]s}/.nova/"
         \\
-    , .{ .bin = bin_dest, .std = std_dest, .home = home, .cxx = cxx });
+    , .{
+        .bin = bin_dest,
+        .std = std_dest,
+        .home = home,
+        .cxx = cxx,
+        .asm_cmd = asm_cmd,
+        .asm_obj = asm_obj,
+        .asm_def = asm_def,
+    });
 
     const install_cmd = b.addSystemCommand(&.{ "sh", "-c", script });
     const install_exe = b.addInstallArtifact(exe, .{});
