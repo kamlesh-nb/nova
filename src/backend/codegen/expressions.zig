@@ -5888,7 +5888,17 @@ pub fn jsxFlushLiteral(self: *LlvmCompiler, sb: types.LLVMValueRef) !void {
 /// appended without escaping. This escaping is the XSS boundary for interpolated
 /// hypermedia content. Anything else is appended raw.
 pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression) !void {
-    try self.jsxAppendExprRaw(sb, expr, false);
+    try self.jsxAppendExprRaw(sb, expr, false, false);
+}
+
+/// True for HTML attributes whose value is a URL. A dynamic `string` in one of
+/// these is URL-context-escaped (dangerous schemes neutralised) in addition to
+/// HTML-escaping -- `javascript:`/non-image-`data:` survive HTML-escaping and
+/// would otherwise execute on click/load.
+fn isUrlAttr(name: []const u8) bool {
+    const url_attrs = [_][]const u8{ "href", "src", "action", "formaction", "poster", "cite", "background", "manifest", "data", "ping", "xlink:href" };
+    for (url_attrs) |u| if (std.ascii.eqlIgnoreCase(name, u)) return true;
+    return false;
 }
 
 /// As [`jsxAppendExpr`], but `raw` suppresses HTML-escaping of `string`/`Str` values.
@@ -5896,7 +5906,7 @@ pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const a
 /// framework CODE expression, not HTML text: escaping `@get('/x/' + id)` would turn the
 /// JS string quotes into `&#39;` and break the handler. Element CHILDREN always pass
 /// `raw = false` and stay escaped, which is the XSS boundary for interpolated content.
-pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression, raw: bool) !void {
+pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression, raw: bool, url_ctx: bool) !void {
     try self.jsxFlushLiteral(sb);
     const val = try self.compileExpression(expr.*);
     const type_name = try self.resolveExpressionTypeName(expr);
@@ -5921,9 +5931,18 @@ pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *cons
                 // the compile references it, which silently dropped escaping (an XSS hole). The
                 // runtime fn returns the input unchanged when it has no metachars, so the common
                 // case stays alloc-free.
+                var to_escape = self.coerceToSlotType(val, self.val_type);
+                // URL-context attributes (href/src/...): neutralise a dangerous scheme
+                // BEFORE HTML-escaping (HTML-escaping does not stop `javascript:`).
+                if (url_ctx) {
+                    const san = self.getOrDeclareI64Fn("nova_url_sanitize");
+                    const san_t = core.LLVMGlobalGetValueType(san);
+                    var sa = [_]types.LLVMValueRef{to_escape};
+                    to_escape = core.LLVMBuildCall2(self.builder, san_t, san, &sa, 1, "urlsan");
+                }
                 const esc = self.getOrDeclareI64Fn("nova_html_escape");
                 const esc_t = core.LLVMGlobalGetValueType(esc);
-                var ea = [_]types.LLVMValueRef{self.coerceToSlotType(val, self.val_type)};
+                var ea = [_]types.LLVMValueRef{to_escape};
                 const escaped = core.LLVMBuildCall2(self.builder, esc_t, esc, &ea, 1, "esc");
                 try self.jsxAppendVal(sb, escaped);
                 return;
@@ -6741,7 +6760,7 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
                 // quotes instead of being turned into `&#39;`. Every other attribute value stays
                 // HTML-escaped (the injection boundary for interpolated attribute data).
                 const code_attr = std.mem.startsWith(u8, attr.name, "data-") or std.mem.startsWith(u8, attr.name, "@");
-                try self.jsxAppendExprRaw(sb_val, expr, code_attr);
+                try self.jsxAppendExprRaw(sb_val, expr, code_attr, isUrlAttr(attr.name));
                 self.jsxSetLoc(jsx.span);
             },
         }
@@ -6773,7 +6792,7 @@ pub fn emitJsxInto(self: *LlvmCompiler, sb_val: types.LLVMValueRef, jsx: ast.Jsx
                     break :blk false;
                 };
                 if (is_raw_call) {
-                    try self.jsxAppendExprRaw(sb_val, &expr.kind.call.args[0], true);
+                    try self.jsxAppendExprRaw(sb_val, &expr.kind.call.args[0], true, false);
                 } else {
                     try self.jsxAppendExpr(sb_val, expr);
                 }

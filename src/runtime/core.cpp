@@ -868,6 +868,64 @@ extern "C" long long nova_html_escape(long long s) {
   return box;
 }
 
+// Neutralises a dangerous URL scheme in a value interpolated into a URL-bearing
+// HTML attribute (href/src/action/...). Browsers execute `javascript:`/`vbscript:`
+// and non-image `data:` URLs, and HTML-escaping does NOT stop them (they carry no
+// HTML metacharacters), so this is the URL-context half of the escape boundary
+// (mirrors Go html/template's urlFilter). Returns the input unchanged for safe or
+// relative URLs; returns "#" (a harmless anchor) for a dangerous scheme. Leading
+// whitespace/control bytes are ignored the way browsers ignore them.
+extern "C" long long nova_url_sanitize(long long s) {
+  if (!s) return s;
+  const int len = *reinterpret_cast<const int32_t *>(s - 4);
+  if (len <= 0) return s;
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(s);
+  int i = 0;
+  while (i < len && (p[i] <= 0x20)) i++; // skip leading ws/control (\t \n \r space, etc.)
+  // Find the scheme: [a-zA-Z][a-zA-Z0-9+.-]* ':' before any '/', '?', '#'.
+  int j = i;
+  if (j >= len || !((p[j] >= 'a' && p[j] <= 'z') || (p[j] >= 'A' && p[j] <= 'Z'))) return s; // no scheme -> relative -> safe
+  while (j < len) {
+    const unsigned char c = p[j];
+    if (c == ':') break;
+    const bool sch = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '+' || c == '.' || c == '-';
+    if (!sch) return s; // '/', '?', '#', etc. before ':' -> no scheme -> relative -> safe
+    j++;
+  }
+  if (j >= len) return s; // no ':' -> no scheme -> safe
+  // Lowercase-compare the scheme [i, j).
+  auto scheme_is = [&](const char *name) -> bool {
+    int n = 0;
+    while (name[n]) n++;
+    if (j - i != n) return false;
+    for (int k = 0; k < n; k++) {
+      unsigned char c = p[i + k];
+      if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
+      if (c != static_cast<unsigned char>(name[k])) return false;
+    }
+    return true;
+  };
+  bool dangerous = scheme_is("javascript") || scheme_is("vbscript");
+  if (scheme_is("data")) {
+    // Allow only image data URIs (`data:image/...`); block scripts/html data URIs.
+    const int m = j + 1;
+    const char *img = "image/";
+    bool is_img = true;
+    for (int k = 0; k < 6; k++) {
+      if (m + k >= len) { is_img = false; break; }
+      unsigned char c = p[m + k];
+      if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
+      if (c != static_cast<unsigned char>(img[k])) { is_img = false; break; }
+    }
+    if (!is_img) dangerous = true;
+  }
+  if (!dangerous) return s;
+  const long long box = nova_bytes_alloc(1);
+  if (!box) return s;
+  reinterpret_cast<char *>(box)[0] = '#';
+  return box;
+}
+
 long long nova_spin_create(void) { return (long long)new std::atomic_flag{}; }
 void nova_spin_lock(long long h) {
   if (!h) return;

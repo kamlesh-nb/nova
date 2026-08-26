@@ -1,0 +1,56 @@
+// URL-context escaping: a dynamic value in a URL-bearing attribute (href/src/...)
+// is scheme-sanitised in addition to HTML-escaping, because `javascript:` and
+// non-image `data:` URLs survive HTML-escaping and would execute on click/load.
+// A dangerous scheme is neutralised to "#"; safe and relative URLs pass through.
+import assert;
+import string;
+
+fn link(u: string): Html {
+    return <a href={u}>go</a>;
+}
+
+fn img(u: string): Html {
+    return <img src={u}/>;
+}
+
+@test
+fn test_javascript_scheme_neutralised(): void {
+    let h = link("javascript:alert(1)");
+    assert.isTrue(!string.contains(h, "javascript:"));
+    assert.isTrue(string.contains(h, "href=\"#\""));
+}
+
+@test
+fn test_scheme_match_is_case_insensitive(): void {
+    let h = link("JaVaScRiPt:alert(1)");
+    assert.isTrue(!string.contains(h, "alert"));
+    assert.isTrue(string.contains(h, "href=\"#\""));
+}
+
+@test
+fn test_relative_url_passes(): void {
+    let h = link("/products?id=7");
+    assert.isTrue(string.contains(h, "href=\"/products?id=7\""));
+}
+
+@test
+fn test_https_url_passes(): void {
+    let h = link("https://example.com/x");
+    assert.isTrue(string.contains(h, "https://example.com/x"));
+}
+
+@test
+fn test_data_html_blocked_but_image_ok(): void {
+    let bad = img("data:text/html,<script>alert(1)</script>");
+    assert.isTrue(!string.contains(bad, "text/html"));
+    let ok = img("data:image/png;base64,AAAA");
+    assert.isTrue(string.contains(ok, "data:image/png;base64,AAAA"));
+}
+
+@test
+fn test_href_still_html_escaped(): void {
+    // A safe URL carrying HTML metachars is still HTML-escaped (quotes -> entities).
+    let h = link("/a?x=1&y=2");
+    assert.isTrue(string.contains(h, "&amp;"));
+    assert.isTrue(!string.contains(h, "x=1&y=2"));
+}
