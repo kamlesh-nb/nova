@@ -88,24 +88,39 @@ Debug codegen makes each case ~40x slower (**~60s vs ~1.4s**), which turns the c
 into ~7 hours. If you see a red corpus where every case says it passed, this is why; it is not a
 regression in the cases. Repairing the leak gate itself is separate outstanding work.
 
-Corpus on this host, ReleaseFast, `run.sh -j 3`: **437/444**. The 7 failures are NOT one category, and
-the difference matters — only two of them are actually about the platform:
-
-- **Inapplicable by design (2):** `188_kqueue_readiness` (unresolved `kqueue`/`kevent`) and
-  `189_epoll_event_layout` (unresolved `epoll_ctl`). They assert those platforms' struct layouts.
-- **Real Windows stdlib gaps (3), all failing before they run:** `163_process` type-checks a
-  possibly-`undefined` string the POSIX module narrows and the Windows one does not; `256_dns_ipv6`
-  wants `socket.connectBlocking6`, which `os/windows/socket` never implemented; `413_file_write_ok`
-  asserts a write succeeds and it does not.
-- **Compiler/ARC bugs that are not Windows-specific (2):** `42_nested_owned_aggregates` NULL-derefs in
-  `RawBuffer_string_push` — a `List<string>` nested in a struct literal inside another struct literal
-  gets a NULL backing buffer — and `118_actor` takes a heap-buffer-overflow READ inside `nova_release`
-  from `ActorCell_i32_init`, i.e. it releases something that was never a refcounted heap object (the
-  "ARC guessed from the type name and freed it" failure described under ARC above). Both were located
-  with `--asan`, which is the whole reason that gate is worth having wired.
-
 Note that readiness cases 192/194/195, listed as open in an earlier revision of this file, now PASS —
 `iocp.nova` grew `armZeroByte`.
+
+### Corpus status, measured on both hosts (ReleaseFast, `run.sh -j 3`)
+
+| Gate | Windows / IOCP | Linux / epoll (WSL2, Ubuntu 24.04) |
+|---|---|---|
+| positive corpus | **437/444** | **440/444** |
+| `--asan` | crypto subset clean | **439/444** |
+
+Running BOTH is what makes the failure list interpretable, because "fails on Windows" turned out to
+mean four different things. Do not assume a failure is a platform gap without checking the other host:
+
+- **Inapplicable by design (1 each):** `188_kqueue_readiness` needs macOS (`kqueue`/`kevent` do not
+  link elsewhere).
+- **Genuine Windows stdlib gaps (3), all failing before they run, and all PASSING on Linux:**
+  `163_process` type-checks a possibly-`undefined` string the POSIX module narrows and the Windows one
+  does not; `256_dns_ipv6` wants `socket.connectBlocking6`, which `os/windows/socket` never
+  implemented; `413_file_write_ok` asserts a write succeeds and it does not.
+- **A genuine LINUX bug**, which only a Linux run could show: `189_epoll_event_layout` fails on Linux
+  with `Expected 2147483649, got -2147483647`. Same 32-bit pattern (`0x80000001` = `EPOLLET|EPOLLIN`)
+  read back signed — a signedness bug in the epoll event accessor, not a layout mismatch.
+- **Cross-platform compiler/ARC bugs (2), failing on BOTH hosts:** `42_nested_owned_aggregates`
+  NULL-derefs in `RawBuffer_string_push` (a `List<string>` nested in a struct literal inside another
+  struct literal gets a NULL backing buffer), and `118_actor` takes a heap-buffer-overflow READ inside
+  `nova_release` from `ActorCell_i32_init` — releasing something that was never a refcounted heap
+  object, the "ARC guessed from the type name and freed it" failure described under ARC above.
+- **Found ONLY by `--asan`, and only on Linux because that is where the gate has been run over the
+  whole corpus:** `123_any_container` passes the plain corpus but is a **double release**.
+  `nova_any_box` allocates the box; `__destruct_Map_string_any` frees it; then
+  `RawBuffer_any_delete` releases it again. The Map and its backing RawBuffer both believe they own
+  the boxed elements. This is precisely the class of bug the ASAN gate exists for — invisible to a
+  passing test, located exactly by ASAN.
 
 Three Windows-host build breakages were fixed to get here, all Zig/UCRT drift rather than design:
 `w.WINAPI` and `w.kernel32.GetCurrentProcess` no longer exist and `w.BOOL` became a distinct type
@@ -182,12 +197,15 @@ target-conditional file rule `targetVariantPath` swaps whole modules so shared c
 
 - **A vector load/store needs an EXPLICIT alignment, or LLVM assumes the type's ABI alignment.** A
   `<4 x double>` wants 32 bytes; Nova arrays and `bytes.alloc` buffers are 8-byte aligned. Omit the
-  alignment and x86_64 gets an aligned 32-byte move against an 8-aligned address — #GP, surfacing on
-  Windows as "Test suite FAILED (exit code 5)" and nothing else. It is INVISIBLE on arm64, where NEON
-  does not fault on a misaligned load, so the identical IR works there and the bug looks like "SIMD
-  only supports arm64". This bit `simd.load4`/`store4` (fixed, conformance 261); `compileIntSimd`
-  already set `align 1`. The same trap applies to hand-written asm: a legacy-SSE memory operand
-  requires 16-byte alignment, which a Nova buffer never has — see the integrated-assembly section.
+  alignment and EVERY x86_64 target gets an aligned 32-byte move against an 8-aligned address — #GP.
+  Confirmed at the codegen level rather than inferred: for both the linux-gnu and windows-msvc
+  triples, `load <4 x double>, ptr %p` emits `vmovaps` and `... , align 8` emits `vmovups`. It is
+  INVISIBLE on arm64, where NEON does not fault on a misaligned load, so the identical IR works there
+  and the bug looks like "SIMD only supports arm64" — it is not, `simd_target` dispatches AES/CLMUL to
+  x86 correctly and everything else is target-neutral IR. This bit `simd.load4`/`store4` (fixed,
+  conformance 261, which was broken on Windows AND Linux); `compileIntSimd` already set `align 1`. The
+  same trap applies to hand-written asm: a legacy-SSE memory operand requires 16-byte alignment, which
+  a Nova buffer never has — see the integrated-assembly section.
 - **`int` is 32-bit, `long` is 64-bit.** Heap ADDRESSES must be `long`/`ptr` — `intAddr + offset`
   TRUNCATES to 32 bits (LLVM `trunc i64→i32`) → garbage pointer → SIGSEGV. Address-dependent, so it fakes
   a heisenbug. `bytes.read_byte`/`write_byte` compute the offset internally at i64 (safe), but explicit
