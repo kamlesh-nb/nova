@@ -2878,12 +2878,13 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
                     var r_minted = false;
                     if (is_string_concat) {
 
-                        const left_is_str = if (left_type) |lt| std.mem.eql(u8, lt, "string") else false;
+                        // `Html` is a nominal string -- already string data, no numToString.
+                        const left_is_str = if (left_type) |lt| (std.mem.eql(u8, lt, "string") or std.mem.eql(u8, lt, "Html")) else false;
                         if (!left_is_str) {
                             l_val = try self.numToString(l_val, left_type);
                             l_minted = true;
                         }
-                        const right_is_str = if (right_type) |rt| std.mem.eql(u8, rt, "string") else false;
+                        const right_is_str = if (right_type) |rt| (std.mem.eql(u8, rt, "string") or std.mem.eql(u8, rt, "Html")) else false;
                         if (!right_is_str) {
                             r_val = try self.numToString(r_val, right_type);
                             r_minted = true;
@@ -5750,7 +5751,7 @@ pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValue
             if (self.type_store) |st| {
                 if (ir.typeOf(&part)) |tid| {
                     switch (st.get(tid)) {
-                        .string => {
+                        .string, .html => {
                             var args = [_]types.LLVMValueRef{ sb_val, val };
                             _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &args, 2, "");
                             return;
@@ -5793,7 +5794,7 @@ pub fn compileAppendToStringBuilder(self: *LlvmCompiler, sb_val: types.LLVMValue
                                     _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &pa, 2, "");
                                     try self.compileRelease(str_temp, null);
                                 }
-                            } else if (st.get(st.get(tid).optional) == .string) {
+                            } else if (st.get(st.get(tid).optional) == .string or st.get(st.get(tid).optional) == .html) {
                                 var pa = [_]types.LLVMValueRef{ sb_val, val };
                                 _ = core.LLVMBuildCall2(self.builder, sb_append_t, sb_append, &pa, 2, "");
                             }
@@ -5897,14 +5898,21 @@ pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const a
 /// `raw = false` and stay escaped, which is the XSS boundary for interpolated content.
 pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression, raw: bool) !void {
     try self.jsxFlushLiteral(sb);
-    // A value-position `{expr}` is HTML-escaped by default (the XSS boundary for
-    // interpolated text), UNLESS it is already-safe markup: a literal element, a
-    // call to a view helper (a function that returns NSX), or an explicit `raw(...)`.
-    // This lets a view compose sub-views naturally -- `{productCard(p)}` -- without
-    // double-escaping, while `{order.name}` (a plain string) still escapes.
-    const eff_raw = raw or try self.nsxExprIsRaw(expr);
     const val = try self.compileExpression(expr.*);
     const type_name = try self.resolveExpressionTypeName(expr);
+    // TYPE-DRIVEN escape boundary: a value-position `{expr}` whose static type is
+    // `Html` is trusted, pre-escaped markup (an NSX `<...>` literal, a view helper
+    // returning `Html`, or `raw(s)`) and is inserted RAW; a plain `string` is
+    // HTML-escaped (the XSS boundary for interpolated text). This replaces the old
+    // body-scanning heuristic: composition -- `{productCard(p)}` -- is raw because
+    // `productCard` returns `Html`, while `{order.name}` (a `string`) still escapes.
+    // `raw` (the parameter) additionally forces raw for datastar/event attribute
+    // values (`data-*`/`@*`), which are framework CODE, not HTML text.
+    const eff_raw = raw;
+    if (self.isHtmlExpr(expr)) {
+        try self.jsxAppendVal(sb, val);
+        return;
+    }
     if (type_name) |t| {
         if (std.mem.eql(u8, t, "string")) {
             if (!eff_raw) {
@@ -5943,71 +5951,11 @@ pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *cons
     try self.jsxAppendVal(sb, val);
 }
 
-/// Whether a return statement (recursively) returns an NSX `<jsx>` element, used
-/// to classify a function as a view helper for JSX interpolation.
-fn stmtReturnsJsx(stmt: *const ast.Statement) bool {
-    switch (stmt.*) {
-        .return_stmt => |r| {
-            if (r.value) |v| return v.kind == .jsx_element;
-            return false;
-        },
-        .block => |b| {
-            for (b.statements) |*s| if (stmtReturnsJsx(s)) return true;
-            return false;
-        },
-        .if_stmt => |i| {
-            if (stmtReturnsJsx(i.then_branch)) return true;
-            if (i.else_branch) |eb| return stmtReturnsJsx(eb);
-            return false;
-        },
-        else => return false,
-    }
-}
-
-/// Lazily record the base names of free functions whose body returns NSX markup
-/// (view helpers). Scanned once on first JSX interpolation.
-pub fn ensureNsxReturning(self: *LlvmCompiler) !void {
-    if (self.nsx_returning_done) return;
-    self.nsx_returning_done = true;
-    for (self.program.declarations) |decl| {
-        switch (decl) {
-            .fn_decl => |fd| {
-                for (fd.body.statements) |*s| {
-                    if (stmtReturnsJsx(s)) {
-                        try self.nsx_returning.put(fd.name, {});
-                        break;
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-}
-
-/// Whether a JSX value-position `{expr}` is already-safe markup that should be
-/// inserted RAW rather than HTML-escaped: a literal `<jsx>` element, a call to a
-/// view helper (returns NSX), or an explicit `raw(...)`.
-pub fn nsxExprIsRaw(self: *LlvmCompiler, expr: *const ast.Expression) !bool {
-    switch (expr.kind) {
-        .jsx_element => return true,
-        .call => |c| {
-            switch (c.callee.kind) {
-                .ident => |n| {
-                    if (std.mem.eql(u8, n, "raw")) return true;
-                    try self.ensureNsxReturning();
-                    return self.nsx_returning.contains(n);
-                },
-                .field_access => |fa| {
-                    if (std.mem.eql(u8, fa.field, "raw")) return true;
-                    try self.ensureNsxReturning();
-                    return self.nsx_returning.contains(fa.field);
-                },
-                else => return false,
-            }
-        },
-        else => return false,
-    }
-}
+// (The old view-helper body-scanning heuristic -- `nsxExprIsRaw` /
+// `ensureNsxReturning` / `stmtReturnsJsx` -- has been removed. The NSX escape
+// decision is now type-driven: `{expr}` is inserted raw iff its static type is
+// `Html` (see `jsxAppendExprRaw` -> `isHtmlExpr`), which subsumes the literal,
+// `raw(...)`, and view-helper cases soundly.)
 
 // ---- compile-time SQL checking -----------------------------------------------------------------
 // A typed query whose SQL is a STRING LITERAL is checked at build time: `$N` bind

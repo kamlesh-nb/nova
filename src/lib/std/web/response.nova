@@ -102,7 +102,7 @@ pub fn escapeHtmlIntoView(sb: StringBuilder, v: str.Str): void {
 // `raw(...)` / `x.raw(...)` call shape in child position and skips escaping only there.
 // Use ONLY for HTML your own code produced, never for user input (that would be an XSS
 // hole -- every other `{expr}` child is escaped precisely to prevent it).
-pub fn raw(s: string): string { return s; }
+pub fn raw(s: string): Html { return s; }
 
 pub fn escapeHtml(s: string): string {
     let n = string.len(s);

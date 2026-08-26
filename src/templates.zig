@@ -281,7 +281,7 @@ pub const web_view_sample =
     \\// A `{expr}` interpolation is HTML-ESCAPED automatically, so user text like a product name is safe by
     \\// default: you never call an escaper here. To insert an ALREADY-rendered HTML fragment unescaped (one
     \\// view composing another), wrap it in `response.raw(fragment)` from `web.response`.
-    \\pub fn productCard(name: string, price: int): string {
+    \\pub fn productCard(name: string, price: int): Html {
     \\    return <div class="rounded-lg border border-slate-200 p-4 shadow-sm">
     \\        <h3 class="font-semibold text-slate-800">{name}</h3>
     \\        <p class="mt-1 text-sm text-slate-500">{price}</p>

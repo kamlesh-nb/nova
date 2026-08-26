@@ -1,0 +1,68 @@
+// The nominal `Html` type drives the NSX escape boundary. An NSX `<...>` literal
+// and any view helper declared to return `Html` are trusted, pre-escaped markup
+// and interpolate RAW; a plain `string` value is HTML-escaped. This is
+// type-driven (not a body-scanning heuristic): a helper with a JSX body but a
+// `string` return type is treated as untrusted and ESCAPED when composed.
+import assert;
+import string;
+import web.response;
+
+// A view helper: returns Html, so `{card(...)}` composes it raw.
+fn card(inner: string): Html {
+    return <div class="card">{inner}</div>;
+}
+
+// Declared `string` even though the body is JSX (the Html body coerces to the
+// string return). Composing its result must ESCAPE it -- the author did not
+// vouch for it as Html.
+fn stringySpan(): string {
+    return <span>trusted?</span>;
+}
+
+fn page(userText: string): Html {
+    return <section>
+        {card(userText)}
+        {stringySpan()}
+        {response.raw("<hr/>")}
+    </section>;
+}
+
+// Html coerces to string (same runtime representation).
+fn lengthOf(s: string): int { return string.len(s); }
+
+@test
+fn test_view_helper_composes_raw(): void {
+    // card(...) returns Html -> its <div> markup is inserted raw.
+    let h = page("plain");
+    assert.isTrue(string.contains(h, "<div class=\"card\">"));
+}
+
+@test
+fn test_inner_string_is_escaped_inside_helper(): void {
+    // card's own `{inner}` (a string) still escapes its argument.
+    let h = page("<script>x</script>");
+    assert.isTrue(!string.contains(h, "<script>"));
+    assert.isTrue(string.contains(h, "&lt;script&gt;"));
+}
+
+@test
+fn test_string_typed_view_is_escaped_when_composed(): void {
+    // stringySpan() is declared `string`, so composing `{stringySpan()}` ESCAPES
+    // it -- proving the decision is by static type, not by scanning the body.
+    let h = page("plain");
+    assert.isTrue(!string.contains(h, "<span>trusted?</span>"));
+    assert.isTrue(string.contains(h, "&lt;span&gt;trusted?&lt;/span&gt;"));
+}
+
+@test
+fn test_raw_embeds_unescaped(): void {
+    let h = page("plain");
+    assert.isTrue(string.contains(h, "<hr/>"));
+}
+
+@test
+fn test_html_coerces_to_string(): void {
+    // An Html value flows into a `string` parameter without ceremony.
+    let h = card("hi");
+    assert.isTrue(lengthOf(h) > 0);
+}

@@ -157,6 +157,13 @@ pub const Type = union(enum) {
     /// The built-in owned string type. Payload-free singleton; owned for ARC.
     string,
 
+    /// Trusted, pre-escaped HTML markup. Payload-free singleton, represented at
+    /// runtime EXACTLY as `string` (owned for ARC), but NOMINALLY distinct so the
+    /// NSX interpolation `{expr}` can insert it raw while a plain `string` is
+    /// HTML-escaped (the XSS boundary). Produced by NSX `<...>` literals and by
+    /// `raw(s)`; coerces to `string` (see the front-end checker's `assignable`).
+    html,
+
     /// The exact-precision `decimal` type. Payload-free singleton; owned for ARC.
     decimal,
 
@@ -222,7 +229,7 @@ fn hashType(t: Type) u64 {
             h.update(std.mem.asBytes(&p.bits));
             h.update(&[_]u8{@intFromBool(p.signed)});
         },
-        .string, .decimal, .ptr, .any_, .unresolved => {},
+        .string, .html, .decimal, .ptr, .any_, .unresolved => {},
         .error_union => |eu| {
             h.update(std.mem.asBytes(&eu.ok));
             h.update(std.mem.asBytes(&eu.err));
@@ -306,7 +313,7 @@ fn eqlType(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .prim => |p| p.eql(b.prim),
-        .string, .decimal, .ptr, .any_, .unresolved => true,
+        .string, .html, .decimal, .ptr, .any_, .unresolved => true,
         .struct_ => |s| s.decl == b.struct_.decl and eqlIds(s.args, b.struct_.args),
         .enum_ => |x| x == b.enum_,
         .error_union => |eu| eu.ok == b.error_union.ok and eu.err == b.error_union.err,
@@ -513,6 +520,10 @@ pub const TypeStore = struct {
     pub fn stringT(self: *TypeStore) !TypeId {
         return self.intern(.string);
     }
+    /// Interns and returns the built-in `Html` type (trusted pre-escaped markup).
+    pub fn htmlT(self: *TypeStore) !TypeId {
+        return self.intern(.html);
+    }
     /// Interns and returns the exact-precision `decimal` type.
     pub fn decimalT(self: *TypeStore) !TypeId {
         return self.intern(.decimal);
@@ -548,7 +559,7 @@ pub const TypeStore = struct {
         return switch (self.get(id)) {
             .prim, .ptr => false,
             .any_ => true,
-            .string, .decimal, .struct_, .array, .tuple => true,
+            .string, .html, .decimal, .struct_, .array, .tuple => true,
 
             .error_union => true,
             .func => true,

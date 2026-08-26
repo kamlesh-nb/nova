@@ -344,13 +344,6 @@ pub const LlvmCompiler = struct {
     sql_schema: std.StringHashMap(std.StringHashMap([]const u8)),
     sql_schema_src: ?[]u8 = null,
     sql_schema_loaded: bool = false,
-    /// Base names of functions whose body returns NSX markup (a `<jsx>` element).
-    /// Used by JSX value-position interpolation `{expr}`: a call to such a function
-    /// (a view helper) is inserted RAW rather than HTML-escaped, so composing
-    /// sub-views reads naturally without double-escaping. Built lazily on first use
-    /// (see `ensureNsxReturning`); `nsx_returning_done` guards the one-time scan.
-    nsx_returning: std.StringHashMap(void),
-    nsx_returning_done: bool = false,
     /// Symbol name -> LLVM function value, the authoritative call target table
     /// (also used to lazily declare runtime `nova_*` externs).
     func_map: std.StringHashMap(types.LLVMValueRef),
@@ -645,7 +638,6 @@ pub const LlvmCompiler = struct {
             .persistent_ptr = null,
             .locals = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .sql_schema = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
-            .nsx_returning = std.StringHashMap(void).init(allocator),
             .func_map = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .param_type_cache = std.StringHashMap(?ast.TypeRef).init(allocator),
             .param_type_str_cache = std.StringHashMap(?[]const u8).init(allocator),
@@ -1070,7 +1062,6 @@ pub const LlvmCompiler = struct {
             self.sql_schema.deinit();
             if (self.sql_schema_src) |s| self.allocator.free(s);
         }
-        self.nsx_returning.deinit();
         self.func_map.deinit();
         {
             var it = self.param_type_cache.keyIterator();
@@ -5008,6 +4999,7 @@ pub const LlvmCompiler = struct {
     pub const isOwnedErrUnionOk = types_mod.isOwnedErrUnionOk;
     /// Grafted from `types.zig`: whether an expression has string type.
     pub const isStringExpr = types_mod.isStringExpr;
+    pub const isHtmlExpr = types_mod.isHtmlExpr;
     /// Grafted from `types.zig`: whether an expression has floating-point type.
     pub const isFloatExpr = types_mod.isFloatExpr;
     /// Grafted from `types.zig`: whether an expression has bool type.
@@ -5192,8 +5184,6 @@ pub const LlvmCompiler = struct {
     /// Grafted from `expressions.zig`: appends an interpolated expression to JSX output.
     pub const jsxAppendExpr = expressions_mod.jsxAppendExpr;
     pub const jsxAppendExprRaw = expressions_mod.jsxAppendExprRaw;
-    pub const ensureNsxReturning = expressions_mod.ensureNsxReturning;
-    pub const nsxExprIsRaw = expressions_mod.nsxExprIsRaw;
     /// Grafted from `expressions.zig`: sets the source location for JSX debug info.
     pub const jsxSetLoc = expressions_mod.jsxSetLoc;
     /// Grafted from `expressions.zig`: lowers a generic `parse<T>` call.

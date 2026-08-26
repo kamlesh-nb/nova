@@ -287,6 +287,10 @@ pub const Lowerer = struct {
                     self.stats.lowered += 1;
                     return self.store.stringT();
                 }
+                if (std.mem.eql(u8, name, "Html")) {
+                    self.stats.lowered += 1;
+                    return self.store.htmlT();
+                }
                 if (std.mem.eql(u8, name, "decimal")) {
                     self.stats.lowered += 1;
                     return self.store.decimalT();

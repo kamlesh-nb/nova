@@ -178,7 +178,7 @@ pub fn substitute(
         // Leaf types with no substitutable inner structure. Primitives, strings,
         // decimals, raw pointers, `any`, enums, trait objects, and the
         // unresolved placeholder all pass through by identity.
-        .prim, .string, .decimal, .ptr, .any_, .enum_, .trait_, .unresolved => t,
+        .prim, .string, .html, .decimal, .ptr, .any_, .enum_, .trait_, .unresolved => t,
     };
 }
 

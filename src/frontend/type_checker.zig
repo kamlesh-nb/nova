@@ -837,7 +837,7 @@ pub const TypeChecker = struct {
         const builtin_types = [_][]const u8{
             "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool", "string", "void",
             "any", "char", "ptr", "uptr", "usize", "isize", "never", "unit", "decimal", "byte",
-            "future", "channel",
+            "future", "channel", "Html",
             "u8x16", "u32x4", "u64x2", "f64x4",
         };
         for (builtin_types) |b| if (std.mem.eql(u8, c, b) or std.mem.eql(u8, name, b)) return true;
@@ -2195,7 +2195,7 @@ pub const TypeChecker = struct {
                 return self.resolveExprType(ie.then_branch.*);
             },
             .jsx_element => {
-                return ast.TypeRef{ .ident = "string" };
+                return ast.TypeRef{ .ident = "Html" };
             },
             .block_expr => {
                 return ast.TypeRef{ .ident = "string" };
@@ -2462,12 +2462,18 @@ fn isNumericTypeName(name: []const u8) bool {
            std.mem.eql(u8, c, "f64");
 }
 
+/// `string` or the nominal-string `Html` -- the two coerce to each other.
+fn isHtmlOrStringName(name: []const u8) bool {
+    const c = canonicalizeTypeName(name);
+    return std.mem.eql(u8, c, "string") or std.mem.eql(u8, c, "Html");
+}
+
 const PrimCat = enum { numeric, boolean, text, other };
 fn primCategory(name: []const u8) PrimCat {
     if (isNumericTypeName(name)) return .numeric;
     const c = canonicalizeTypeName(name);
     if (std.mem.eql(u8, c, "bool")) return .boolean;
-    if (std.mem.eql(u8, c, "string")) return .text;
+    if (std.mem.eql(u8, c, "string") or std.mem.eql(u8, c, "Html")) return .text;
     return .other;
 }
 
@@ -2503,6 +2509,12 @@ fn isTypeCompatible(from: ast.TypeRef, to: ast.TypeRef) bool {
             if (isNumericTypeName(c_from) and isNumericTypeName(c_to)) {
                 return true;
             }
+
+            // `Html` is a nominal string: it coerces to/from `string` freely (same
+            // runtime representation), so views can flow into string-typed slots
+            // and `raw(s)` can wrap a string. The nominal distinction is used only
+            // for the NSX escape decision, not to gate assignment.
+            if (isHtmlOrStringName(c_from) and isHtmlOrStringName(c_to)) return true;
 
             return false;
         },
