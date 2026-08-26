@@ -4498,8 +4498,20 @@ pub const LlvmCompiler = struct {
                 for (call.args) |arg| try self.collectStringsFromExpr(arg);
             },
             .generic_call => |gc| {
+                // Compile-time SQL check runs in this pre-codegen walk so it covers
+                // every function body (reachable or not), not just emitted ones.
+                try expressions_mod.checkSqlQuery(self, gc);
                 try self.collectStringsFromExpr(gc.callee.*);
                 for (gc.args) |arg| try self.collectStringsFromExpr(arg);
+            },
+            // Wrapper expressions (previously not recursed, so string literals and
+            // the SQL check inside `await`/`spawn`/`try`/`catch` were missed).
+            .await_expr => |a| try self.collectStringsFromExpr(a.operand.*),
+            .go_expr => |g| try self.collectStringsFromExpr(g.operand.*),
+            .try_expr => |t| try self.collectStringsFromExpr(t.*),
+            .catch_expr => |c| {
+                try self.collectStringsFromExpr(c.expr.*);
+                try self.collectStringsFromExpr(c.handler.*);
             },
             .field_access => |fa| try self.collectStringsFromExpr(fa.object.*),
             .index => |idx| {

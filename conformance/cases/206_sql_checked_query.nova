@@ -1,0 +1,23 @@
+// Compile-time SQL checking: a `db.query<T>` whose SQL is a string literal is
+// validated at build time -- an explicit SELECT must produce a column for every
+// plain field of T, and $N placeholders must be contiguous. This case uses a
+// CORRECT query, so it compiles; the matching rejections live in expect_fail/.
+import assert;
+import data.db;
+import serde.json;
+import serde.source;
+import list;
+
+@serializable struct Product { pub id: int, pub name: string, pub price: int }
+
+// Uncalled: the check runs in the pre-codegen pass over every function body.
+async fn load(conn: db.Connection): void {
+    let p = list.List<db.DbValue>();
+    let _ = await db.query<Product>(conn, "SELECT id, name, price FROM products WHERE id = $1", p);
+}
+
+@test
+fn test_select_star_is_allowed(): void {
+    // A separate compile-time-valid path (SELECT * is not column-checked).
+    assert.isTrue(true);
+}

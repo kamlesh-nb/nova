@@ -1,0 +1,13 @@
+// EXPECT-FAIL: codegen
+// $1 and $3 are used but $2 is missing -- a non-contiguous bind placeholder set,
+// which the compiler must reject.
+import data.db;
+import serde.json;
+import serde.source;
+import list;
+@serializable struct Product { pub id: int, pub name: string }
+async fn load(conn: db.Connection): void {
+    let p = list.List<db.DbValue>();
+    let _ = await db.query<Product>(conn, "SELECT id, name FROM products WHERE a = $1 AND b = $3", p);
+}
+fn main(): void {}

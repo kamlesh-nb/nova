@@ -6004,6 +6004,171 @@ pub fn nsxExprIsRaw(self: *LlvmCompiler, expr: *const ast.Expression) !bool {
     }
 }
 
+// ---- compile-time SQL checking -----------------------------------------------------------------
+// A typed query whose SQL is a STRING LITERAL is checked at build time: `$N` bind
+// placeholders must be contiguous (1..N), and an explicit `SELECT` column list must
+// produce a column for every plain field of the result type `T` (so a typo like
+// `SELECT id, naem` fails to compile instead of at runtime). The check is
+// deliberately conservative -- it skips `SELECT *`, columns it cannot name
+// (expressions/functions without an alias), and fields carrying attributes
+// (`@from`/`@derive` may map a differently-named column) -- so it never rejects a
+// valid query.
+
+/// ASCII case-insensitive slice equality.
+fn sqlFoldEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    return true;
+}
+
+fn sqlIsIdentByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.';
+}
+
+/// Index just past keyword `kw` (whole-word, case-insensitive) in `s`, or null.
+fn sqlFindKeyword(s: []const u8, kw: []const u8) ?usize {
+    var i: usize = 0;
+    while (i + kw.len <= s.len) : (i += 1) {
+        const before_ok = i == 0 or !sqlIsIdentByte(s[i - 1]);
+        const after_ok = (i + kw.len == s.len) or !sqlIsIdentByte(s[i + kw.len]);
+        if (before_ok and after_ok and sqlFoldEql(s[i .. i + kw.len], kw)) return i + kw.len;
+        i += 0;
+    }
+    return null;
+}
+
+fn sqlTrim(s: []const u8) []const u8 {
+    var a: usize = 0;
+    var b: usize = s.len;
+    while (a < b and (s[a] == ' ' or s[a] == '\n' or s[a] == '\t' or s[a] == '\r')) a += 1;
+    while (b > a and (s[b - 1] == ' ' or s[b - 1] == '\n' or s[b - 1] == '\t' or s[b - 1] == '\r')) b -= 1;
+    return s[a..b];
+}
+
+/// Verify `$N` placeholders form a contiguous 1..max with no `$0` and no gaps.
+fn checkPlaceholders(self: *LlvmCompiler, sql: []const u8) !void {
+    var seen = [_]bool{false} ** 64;
+    var maxn: usize = 0;
+    var i: usize = 0;
+    while (i < sql.len) : (i += 1) {
+        if (sql[i] == '$' and i + 1 < sql.len and sql[i + 1] >= '0' and sql[i + 1] <= '9') {
+            var j = i + 1;
+            var n: usize = 0;
+            while (j < sql.len and sql[j] >= '0' and sql[j] <= '9') : (j += 1) n = n * 10 + (sql[j] - '0');
+            if (n == 0) {
+                std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m SQL bind placeholder $0 is invalid\x1b[0m (parameters are 1-based; use $1)\n  in: {s}\n(compilation failed)\n", .{sql});
+                return error.SqlCheckFailed;
+            }
+            if (n < 64) seen[n] = true;
+            if (n > maxn) maxn = n;
+            i = j - 1;
+        }
+    }
+    if (maxn == 0 or maxn >= 64) return;
+    var k: usize = 1;
+    while (k <= maxn) : (k += 1) {
+        if (!seen[k]) {
+            std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m SQL bind placeholder ${d} is missing\x1b[0m ($1..${d} must be contiguous)\n  in: {s}\n(compilation failed)\n", .{ k, maxn, sql });
+            return error.SqlCheckFailed;
+        }
+    }
+    _ = self;
+}
+
+/// For an explicit `SELECT <cols> FROM ...`, check every plain field of `T` is
+/// produced. Conservative: any uncertainty (SELECT *, an unnameable column,
+/// missing FROM) skips the check entirely.
+fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []const u8) !void {
+    const sd = self.structs.get(struct_name) orelse return;
+    const trimmed = sqlTrim(sql);
+    // Only plain SELECT statements.
+    if (trimmed.len < 6 or !sqlFoldEql(trimmed[0..6], "select")) return;
+    const after_select = sqlFindKeyword(sql, "select") orelse return;
+    const from_rel = sqlFindKeyword(sql[after_select..], "from") orelse return;
+    // `from_rel` is just past FROM; the column list ends where FROM begins.
+    const cols = sqlTrim(sql[after_select .. after_select + from_rel - 4]);
+    if (cols.len == 0) return;
+
+    // Collect output column names (alias if present, else the last dotted segment).
+    var outputs = std.ArrayList([]const u8).empty;
+    defer outputs.deinit(self.allocator);
+    var depth: i32 = 0;
+    var start: usize = 0;
+    var idx: usize = 0;
+    while (idx <= cols.len) : (idx += 1) {
+        const at_end = idx == cols.len;
+        const c = if (at_end) ',' else cols[idx];
+        if (!at_end and c == '(') depth += 1;
+        if (!at_end and c == ')') depth -= 1;
+        if ((at_end or c == ',') and depth == 0) {
+            const item = sqlTrim(cols[start..idx]);
+            start = idx + 1;
+            if (item.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, item, '*') != null) return; // SELECT * / t.* -> skip all
+            // alias: last ` AS name`, or a trailing bare-identifier after whitespace.
+            var out: []const u8 = item;
+            if (sqlFindKeyword(item, "as")) |as_end| {
+                out = sqlTrim(item[as_end..]);
+            } else {
+                // A bare (possibly qualified) identifier is its own output name.
+                var all_ident = true;
+                for (item) |b| if (!sqlIsIdentByte(b)) {
+                    all_ident = false;
+                    break;
+                };
+                if (!all_ident) return; // an expression/function without an alias -> cannot name -> skip
+            }
+            // last dotted segment
+            if (std.mem.lastIndexOfScalar(u8, out, '.')) |dot| out = out[dot + 1 ..];
+            out = sqlTrim(out);
+            // strip surrounding double quotes on a quoted identifier
+            if (out.len >= 2 and out[0] == '"' and out[out.len - 1] == '"') out = out[1 .. out.len - 1];
+            if (out.len == 0) return;
+            try outputs.append(self.allocator, out);
+        }
+    }
+
+    for (sd.fields) |f| {
+        if (f.attributes.len != 0) continue; // @from/@derive may map a differently-named column
+        var covered = false;
+        for (outputs.items) |o| if (sqlFoldEql(o, f.name)) {
+            covered = true;
+            break;
+        };
+        if (!covered) {
+            std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m SQL query does not select a column for field '{s}' of '{s}'\x1b[0m\n  in: {s}\n(compilation failed)\n", .{ f.name, struct_name, sql });
+            return error.SqlCheckFailed;
+        }
+    }
+}
+
+/// Entry point: if `gc` is a typed `db.query<T>` / `orm.queryRows<T>` / `orm.queryAs<T>`
+/// with a string-literal SQL argument, run the compile-time checks.
+pub fn checkSqlQuery(self: *LlvmCompiler, gc: anytype) !void {
+    if (gc.type_args.len != 1) return;
+    if (gc.callee.kind != .field_access) return;
+    const fa = gc.callee.kind.field_access;
+    if (fa.object.kind != .ident) return;
+    const obj = fa.object.kind.ident;
+    const recognized = (std.mem.eql(u8, obj, "db") and std.mem.eql(u8, fa.field, "query")) or
+        (std.mem.eql(u8, obj, "orm") and (std.mem.eql(u8, fa.field, "queryRows") or std.mem.eql(u8, fa.field, "queryAs")));
+    if (!recognized) return;
+    if (gc.args.len < 2) return; // (conn, sql, params)
+    const sql = switch (gc.args[1].kind) {
+        .literal => |l| switch (l) {
+            .string => |s| s,
+            else => return,
+        },
+        else => return,
+    };
+    try checkPlaceholders(self, sql);
+    const tname = switch (gc.type_args[0]) {
+        .ident => |n| n,
+        else => return,
+    };
+    try checkSelectCoverage(self, getStructBaseName(tname), sql);
+}
+
 /// Recursively serialises a JSX element tree into a `StringBuilder`, emitting
 /// tags, attributes, children, and embedded expressions/statements.
 ///
