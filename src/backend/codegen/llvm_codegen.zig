@@ -4494,6 +4494,8 @@ pub const LlvmCompiler = struct {
             },
             .unary => |uni| try self.collectStringsFromExpr(uni.operand.*),
             .call => |call| {
+                // Compile-time SQL check for the `Repository<T>(...).query("...", p)` method form.
+                try expressions_mod.checkSqlMethodCall(self, call);
                 try self.collectStringsFromExpr(call.callee.*);
                 for (call.args) |arg| try self.collectStringsFromExpr(arg);
             },

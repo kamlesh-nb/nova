@@ -1,0 +1,14 @@
+// EXPECT-FAIL: codegen
+// The Repository<T>(...).query method form is also checked: this SELECT omits a
+// column for the plain field `name` (typo `naem`), so it must be rejected.
+import data.db;
+import data.repository;
+import serde.json;
+import serde.source;
+import list;
+@serializable struct Product { pub id: int, pub name: string }
+async fn load(conn: db.Connection): void {
+    let p = list.List<db.DbValue>();
+    let _ = await Repository<Product>(conn, "products").query("SELECT id, naem FROM products", p);
+}
+fn main(): void {}

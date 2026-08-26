@@ -6078,26 +6078,70 @@ fn checkPlaceholders(self: *LlvmCompiler, sql: []const u8) !void {
 /// For an explicit `SELECT <cols> FROM ...`, check every plain field of `T` is
 /// produced. Conservative: any uncertainty (SELECT *, an unnameable column,
 /// missing FROM) skips the check entirely.
+/// Index just past a whole-word keyword `kw` in `s[from..]`, matched only at paren
+/// depth 0 and outside single-quoted string literals. Null if not found.
+fn sqlFindKeywordDepth0(s: []const u8, from: usize, kw: []const u8) ?usize {
+    var depth: i32 = 0;
+    var in_str = false;
+    var i = from;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (in_str) {
+            if (c == '\'') in_str = false;
+            continue;
+        }
+        if (c == '\'') {
+            in_str = true;
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')') {
+            depth -= 1;
+            continue;
+        }
+        if (depth == 0 and i + kw.len <= s.len) {
+            const before_ok = i == 0 or !sqlIsIdentByte(s[i - 1]);
+            const after_ok = (i + kw.len == s.len) or !sqlIsIdentByte(s[i + kw.len]);
+            if (before_ok and after_ok and sqlFoldEql(s[i .. i + kw.len], kw)) return i + kw.len;
+        }
+    }
+    return null;
+}
+
 fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []const u8) !void {
     const sd = self.structs.get(struct_name) orelse return;
     const trimmed = sqlTrim(sql);
     // Only plain SELECT statements.
     if (trimmed.len < 6 or !sqlFoldEql(trimmed[0..6], "select")) return;
     const after_select = sqlFindKeyword(sql, "select") orelse return;
-    const from_rel = sqlFindKeyword(sql[after_select..], "from") orelse return;
-    // `from_rel` is just past FROM; the column list ends where FROM begins.
-    const cols = sqlTrim(sql[after_select .. after_select + from_rel - 4]);
+    // The column list runs up to the DEPTH-0 FROM (an inner FROM inside a subquery
+    // column does not count). A query with no top-level FROM (e.g. SELECT of scalar
+    // subqueries) is skipped -- too complex to name soundly.
+    const from_start = sqlFindKeywordDepth0(sql, after_select, "from") orelse return;
+    const cols = sqlTrim(sql[after_select .. from_start - 4]);
     if (cols.len == 0) return;
 
     // Collect output column names (alias if present, else the last dotted segment).
     var outputs = std.ArrayList([]const u8).empty;
     defer outputs.deinit(self.allocator);
     var depth: i32 = 0;
+    var in_str = false;
     var start: usize = 0;
     var idx: usize = 0;
     while (idx <= cols.len) : (idx += 1) {
         const at_end = idx == cols.len;
         const c = if (at_end) ',' else cols[idx];
+        if (!at_end and in_str) {
+            if (c == '\'') in_str = false;
+            continue;
+        }
+        if (!at_end and c == '\'') {
+            in_str = true;
+            continue;
+        }
         if (!at_end and c == '(') depth += 1;
         if (!at_end and c == ')') depth -= 1;
         if ((at_end or c == ',') and depth == 0) {
@@ -6105,12 +6149,11 @@ fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []cons
             start = idx + 1;
             if (item.len == 0) continue;
             if (std.mem.indexOfScalar(u8, item, '*') != null) return; // SELECT * / t.* -> skip all
-            // alias: last ` AS name`, or a trailing bare-identifier after whitespace.
+            // alias: a depth-0 trailing ` AS name`, or a bare (possibly qualified) identifier.
             var out: []const u8 = item;
-            if (sqlFindKeyword(item, "as")) |as_end| {
+            if (sqlFindKeywordDepth0(item, 0, "as")) |as_end| {
                 out = sqlTrim(item[as_end..]);
             } else {
-                // A bare (possibly qualified) identifier is its own output name.
                 var all_ident = true;
                 for (item) |b| if (!sqlIsIdentByte(b)) {
                     all_ident = false;
@@ -6123,6 +6166,8 @@ fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []cons
             out = sqlTrim(out);
             // strip surrounding double quotes on a quoted identifier
             if (out.len >= 2 and out[0] == '"' and out[out.len - 1] == '"') out = out[1 .. out.len - 1];
+            // a still-unclean output name (spaces, residual punctuation) -> skip, don't guess
+            for (out) |b| if (!sqlIsIdentByte(b)) return;
             if (out.len == 0) return;
             try outputs.append(self.allocator, out);
         }
@@ -6163,6 +6208,34 @@ pub fn checkSqlQuery(self: *LlvmCompiler, gc: anytype) !void {
     };
     try checkPlaceholders(self, sql);
     const tname = switch (gc.type_args[0]) {
+        .ident => |n| n,
+        else => return,
+    };
+    try checkSelectCoverage(self, getStructBaseName(tname), sql);
+}
+
+/// Entry point for the method form `Repository<T>(conn, table).query("<literal>", params)`
+/// -- the common repository usage. `T` comes from the inline `Repository<T>(...)`
+/// receiver, so it needs no type inference.
+pub fn checkSqlMethodCall(self: *LlvmCompiler, call: anytype) !void {
+    if (call.callee.kind != .field_access) return;
+    const fa = call.callee.kind.field_access;
+    if (!std.mem.eql(u8, fa.field, "query")) return;
+    // Receiver must be an inline Repository<T>(...) construction.
+    if (fa.object.kind != .generic_call) return;
+    const rgc = fa.object.kind.generic_call;
+    if (rgc.callee.kind != .ident or !std.mem.eql(u8, rgc.callee.kind.ident, "Repository")) return;
+    if (rgc.type_args.len != 1) return;
+    if (call.args.len < 1) return; // (sql, params)
+    const sql = switch (call.args[0].kind) {
+        .literal => |l| switch (l) {
+            .string => |s| s,
+            else => return,
+        },
+        else => return,
+    };
+    try checkPlaceholders(self, sql);
+    const tname = switch (rgc.type_args[0]) {
         .ident => |n| n,
         else => return,
     };
