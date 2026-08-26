@@ -3,7 +3,6 @@ import assert;
 import string;
 import web.csrf;
 import web.logger;
-import web.recovery;
 import web.app;
 import web.routing;
 import web.request;

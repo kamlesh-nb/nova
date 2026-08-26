@@ -9,10 +9,6 @@ import web.request;
 import web.response;
 import web.status;
 import web.routing;
-import web.mediator;
-import web.di;
-import serde.json;
-import serde.source;
 
 const SO_REUSEADDR: int = 4;
 
@@ -39,18 +35,19 @@ fn containsAscii(buf: long, n: int, s: string): bool {
     return false;
 }
 
-@serializable struct GetUser impl Message { pub id: int }
-@serializable struct ValDto { pub val: int }
-
-struct DbConfig impl Service {
+// Config the handler holds as a plain field (direct composition, no DI container).
+struct DbConfig {
     pub port: int,
     init(port: int) { self.port = port; }
 }
 
-struct GetUserHandler impl RequestHandler<GetUser, ValDto> {
+// Direct RouteHandler: on GET /user it reaches out to the (fake) DB over the
+// reactor, reads a value, and returns it as JSON. Its dependency (DbConfig) is a
+// plain constructor argument wired at registration.
+struct GetUserHandler impl RouteHandler {
     cfg: DbConfig,
     init(cfg: DbConfig) { self.cfg = cfg; }
-    async fn handle(self: GetUserHandler, q: GetUser): ValDto {
+    async fn serve(self: GetUserHandler, ctx: routing.Context): Response {
         let db = await aio.asyncConnect("127.0.0.1", self.cfg.port);
         let val = 0;
         if (db.isOpen()) {
@@ -63,16 +60,13 @@ struct GetUserHandler impl RequestHandler<GetUser, ValDto> {
             bytes.free(buf);
             db.close();
         }
-        return ValDto{ val: val };
+        return response.Response(Status.Ok, `{"val":${val}}`);
     }
 }
 
 fn makeApp(dbPort: int): App {
-    let services = ServiceCollection();
-    services.addSingleton("DbConfig", (sp) => { return DbConfig(dbPort); });
     let a = App();
-    a.useServices(services);
-    a.mediated<GetUser>("GET", "/user");
+    a.get("/user", GetUserHandler(DbConfig(dbPort)));
     return a;
 }
 

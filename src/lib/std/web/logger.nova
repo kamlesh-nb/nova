@@ -5,16 +5,14 @@
 //! `info`/`log` depending on level. `LoggerMiddleware` wraps a `Logger` in
 //! the `RouteMiddleware` contract so a request's method and path, and its
 //! final response status, are logged automatically as part of the request
-//! pipeline. Both structs also implement `Service` so they can be resolved
-//! through `web.di`.
+//! pipeline.
 
 import io.file;
 import web.routing;
 import web.response;
-import web.di;
 
 /// Appends timestamped, levelled log lines to a file and echoes them to the console.
-pub struct Logger impl Service {
+pub struct Logger {
     /// Path of the file that log lines are appended to.
     pub filepath: string,
 
@@ -56,7 +54,7 @@ pub struct Logger impl Service {
 }
 
 /// Middleware that logs every request on the way in and every response on the way out.
-pub struct LoggerMiddleware impl RouteMiddleware, Service {
+pub struct LoggerMiddleware impl RouteMiddleware {
     /// The `Logger` used to record request and response lines.
     pub logger: Logger,
 

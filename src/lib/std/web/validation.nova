@@ -2,10 +2,9 @@
 //!
 //! Write one concrete validator struct per command with a `validate(self, c)`
 //! method, and build the result with the `Rules` accumulator, which reads
-//! fluently. A concrete struct is injectable/storable exactly like a
-//! `RequestHandler`; there is deliberately no generic `Validator<T>` trait (a
-//! generic trait would be auto-adapted by the mediator, and a generic class held
-//! in a field is not yet supported), so nothing here relies on either.
+//! fluently. Each validator is a plain concrete struct; there is deliberately no
+//! generic `Validator<T>` trait (a generic class held in a field is not yet
+//! supported), so a handler just calls the validator it needs directly.
 //!
 //! ```
 //! struct RegisterValidator {

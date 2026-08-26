@@ -23,8 +23,8 @@ struct Prefixer {
     fn tag(self: Prefixer, s: string): string { return self.prefix + s; }
 }
 
-@serializable struct Greet impl Message { pub name: string }
-@serializable struct Signup impl Message { pub email: string, pub who: string }
+@serializable struct Greet { pub name: string }
+@serializable struct Signup { pub email: string, pub who: string }
 
 // GET handler: reads a path param via the Context.
 struct Hello impl RouteHandler {

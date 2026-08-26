@@ -1,8 +1,8 @@
 import assert;
 import map;
-import web.di;
 
-struct Logger impl Service { pub tag: int, init(t: int) { self.tag = t; } }
+// A plain struct used purely as a value to box into `any` slots.
+struct Logger { pub tag: int, init(t: int) { self.tag = t; } }
 
 @test
 fn test_any_map_value(): void {
@@ -35,35 +35,6 @@ fn test_closure_into_any_map(): void {
     assert.isTrue(true);
 }
 
-@test
-fn test_di_singleton_roundtrip(): void {
-    let sc = ServiceCollection();
-    sc.addSingleton("Logger", (sp) => { return Logger(9); });
-    let p = sc.buildServiceProvider();
-    let r: Resolved = p.resolve("Logger");
-    switch (r) {
-        case Resolved.Ok(v): { let lg = v as Logger; assert.equalInt(9, lg.tag); }
-        case Resolved.NotRegistered(k): { assert.fail("Logger should be registered"); }
-    }
-}
-
-@test
-fn test_di_singleton_cached_reresolve(): void {
-    let sc = ServiceCollection();
-    sc.addSingleton("Logger", (sp) => { return Logger(11); });
-    let p = sc.buildServiceProvider();
-    let first: Resolved = p.resolve("Logger");
-    switch (first) {
-        case Resolved.Ok(v): { assert.equalInt(11, (v as Logger).tag); }
-        case Resolved.NotRegistered(k): { assert.fail("first resolve"); }
-    }
-    let second: Resolved = p.resolve("Logger");
-    switch (second) {
-        case Resolved.Ok(v): { assert.equalInt(11, (v as Logger).tag); }
-        case Resolved.NotRegistered(k): { assert.fail("cached resolve"); }
-    }
-}
-
 struct Box { pub v: int, init(x: int) { self.v = x; } }
 @test
 fn test_heap_struct_any_survives_binding(): void {
@@ -90,16 +61,5 @@ fn test_heap_string_any_roundtrip(): void {
         assert.equalStr("payload string in an any slot", (got ?? "") as string);
     } else {
         assert.fail("string should be present");
-    }
-}
-
-@test
-fn test_di_miss_carries_key(): void {
-    let sc = ServiceCollection();
-    let p = sc.buildServiceProvider();
-    let miss: Resolved = p.resolve("Nope");
-    switch (miss) {
-        case Resolved.Ok(v): { assert.fail("should miss"); }
-        case Resolved.NotRegistered(k): { assert.equalStr("Nope", k); }
     }
 }

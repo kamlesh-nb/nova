@@ -5,11 +5,6 @@ import serde.source;
 import web.request;
 import web.response;
 import web.status;
-import web.di;
-
-pub trait RequestHandler<TReq, TResp> {
-    async fn handle(self: self, req: TReq): TResp;
-}
 
 pub struct Context {
     pub request: Request,
@@ -229,36 +224,16 @@ pub struct Router {
         return undefined;
     }
 
-    pub fn dispatch(self: Router, method: string, path: string, body: ValueSource): string {
-        let m = self.resolve(method, path);
-        if (m.matched) {
-            let composite = CompositeSource(ParamSource(m.params), body);
-            let provider = ServiceCollection().buildServiceProvider();
-            let resp = __mediator_dispatch_by_name(m.key, composite, provider);
-            return resp.body;
-        }
-        if (m.typedBad) {
-            return "400";
-        }
-        if (m.methodNotAllowed) {
-            return "405";
-        }
-        return "404";
-    }
-
+    // Serves a request through a CLOSURE-registered route table (routes added via
+    // `handle(method, path, fn)`, so `isCtrl` is true). This is the small,
+    // self-contained router used directly in tests and simple handlers; the full
+    // App uses `routeRouter.resolve` + a `RouteHandler` trait table instead.
     pub fn serve(self: Router, req: Request): Response {
         let m = self.resolve(req.method, req.path);
         if (m.matched) {
             let route = self.routes.at(m.routeIndex);
-            if (route.isCtrl) {
-                let h = route.handler;
-                return h(req);
-            }
-            let jsonBody = if (req.body == "") "{}" else req.body;
-            let src = source.fromJson(jsonBody);
-            let composite = CompositeSource(ParamSource(m.params), src);
-            let provider = ServiceCollection().buildServiceProvider();
-            return __mediator_dispatch_by_name(m.key, composite, provider);
+            let h = route.handler;
+            return h(req);
         }
         if (m.typedBad) {
             return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");

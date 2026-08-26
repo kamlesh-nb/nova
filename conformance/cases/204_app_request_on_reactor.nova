@@ -8,22 +8,20 @@ import web.request;
 import web.response;
 import web.status;
 import web.routing;
-import web.mediator;
-import serde.json;
-import serde.source;
 
-@serializable struct Ping impl Message { pub n: int }
-@serializable struct PongDto { pub pong: int }
-
-struct PingHandler impl RequestHandler<Ping, PongDto> {
-    async fn handle(self: PingHandler, q: Ping): PongDto {
-        return PongDto{ pong: 1 };
+// Direct RouteHandler on the reactor: GET /ping returns a small JSON body. This
+// exercises the whole app-request path (parse, route, handler, serialize) driven
+// by the real reactor, with no mediator and no DI.
+struct PingHandler impl RouteHandler {
+    init() {}
+    async fn serve(self: PingHandler, ctx: routing.Context): Response {
+        return response.Response(Status.Ok, `{"pong":1}`);
     }
 }
 
 fn makeApp(): App {
     let a = App();
-    a.mediated<Ping>("GET", "/ping");
+    a.get("/ping", PingHandler());
     return a;
 }
 

@@ -13,7 +13,7 @@ import serde.json;
 import serde.source;
 import string;
 
-@serializable struct Hit impl Message { pub name: string }
+@serializable struct Hit { pub name: string }
 
 struct Handler impl RouteHandler {
     init() {}

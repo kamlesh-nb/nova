@@ -1,9 +1,9 @@
-//! The Nova web application: routing, mediator dispatch, static file serving,
-//! response caching and the HTTP/1.1 and HTTP/2 connection handling that
-//! sits on top of Nova's own reactor (`net.poller`, `net.eventedio`).
+//! The Nova web application: routing, static file serving, response caching
+//! and the HTTP/1.1 and HTTP/2 connection handling that sits on top of Nova's
+//! own reactor (`net.poller`, `net.eventedio`).
 //!
 //! `App` is the entry point a project's `main` builds up (`useTls`, `useGzip`,
-//! `useStatic`, `get`/`post`/... route registration, `useServices`) and then
+//! `useStatic`, `use` middleware, `get`/`post`/... route registration) and then
 //! hands to `run`, which starts a single-reactor event loop and serves
 //! connections until the process exits. Two ways to come up are supported:
 //! a normal listening socket bound directly to `port` (`reactorWorkerBody`),
@@ -12,10 +12,11 @@
 //! when `NOVA_HANDOFF_SOCK` is set for zero-downtime deploys under `proxyd`).
 //!
 //! Requests are read off raw buffers (chunked and content-length bodies both
-//! handled), matched against `web.routing.Router`, converted into typed
-//! request objects via `web.serde.source`, and dispatched through
-//! `web.mediator.Mediator` to the handler registered for that request type.
-//! HTTP/2 support (behind ALPN over TLS) speaks frames directly using
+//! handled), matched against `web.routing.Router`, and dispatched to a
+//! `RouteHandler` instance by trait method. A handler is a plain struct holding
+//! its own dependencies; it reads its typed input with `ctx.bind<T>()` and
+//! returns a `Response`. There is no mediator and no DI container. HTTP/2
+//! support (behind ALPN over TLS) speaks frames directly using
 //! `web.http2.frame` and `web.http2.hpack` rather than reusing the HTTP/1.1
 //! text parsing path.
 
@@ -29,10 +30,7 @@ import io.file;
 import web.request;
 import web.response;
 import web.status;
-import serde.source;
 import web.static_content;
-import web.di;
-import web.mediator;
 import web.routing;
 import web.http2.frame;
 import web.http2.hpack;
@@ -62,16 +60,9 @@ pub trait SseHandler {
     async fn stream(self, req: request.Request, io: aio.AsyncIO): void;
 }
 
-/// The web application: holds routing, dependency injection, static
-/// mounts, response caching and server configuration, and owns the
-/// connection-handling loop started by `run`.
+/// The web application: holds routing, static mounts, response caching and
+/// server configuration, and owns the connection-handling loop started by `run`.
 pub class App {
-    /// Route table mapping method and path pattern to a registered request type.
-    pub router: routing.Router,
-    /// Optional legacy mediator, kept for the opt-in pipeline (validation/auth
-    /// behaviours) reached via `mediated`. The default `get`/`post`/… path does
-    /// not use it.
-    pub mediator: mediator.Mediator,
     /// Static file mounts consulted, in order, for GET requests that miss the router.
     pub static_mounts: List<static_content.StaticMount>,
 
@@ -79,9 +70,6 @@ pub class App {
     pub cache: Map<string, string>,
     /// Paths marked eligible for caching via `enableCache`.
     pub cacheable: Map<string, bool>,
-
-    /// Dependency injection container built from the last `ServiceCollection` passed to `useServices` (or the default, empty one).
-    pub provider: ServiceProvider,
 
     /// Milliseconds to wait for request data before the connection is dropped.
     pub readTimeoutMs: int,
@@ -122,10 +110,6 @@ pub class App {
     pub middlewares: List<routing.RouteMiddleware>,
 
     init() {
-        self.router = routing.Router();
-        self.provider = ServiceCollection().buildServiceProvider();
-        self.mediator = mediator.Mediator(self.provider);
-        __registerHandlers(self.mediator);
         self.static_mounts = List<static_content.StaticMount>();
         self.cache = Map<string, string>(16, string.hash);
         self.cacheable = Map<string, bool>(16, string.hash);
@@ -184,17 +168,6 @@ pub class App {
         self.readTimeoutMs = readTimeoutMs;
         self.maxHeaderBytes = maxHeaderBytes;
         self.maxBodyBytes = maxBodyBytes;
-    }
-
-    /// Replaces the dependency injection provider by building it from `sc`, and rebinds the mediator to it.
-    pub fn useServices(self: App, sc: ServiceCollection): void {
-        self.provider = sc.buildServiceProvider();
-        self.mediator.setProvider(self.provider);
-    }
-
-    /// Registers a pipeline behaviour that wraps every request dispatched through the mediator.
-    pub fn useBehavior(self: App, behavior: mediator.PipelineBehavior): void {
-        self.mediator.useBehavior(behavior);
     }
 
     /// Marks a path as cacheable: its first successfully served, non-gzipped GET response is cached for later hits.
@@ -275,15 +248,6 @@ pub class App {
         self.route("PATCH", path, handler);
     }
 
-    /// Registers a route dispatched through the OPT-IN mediator pipeline, keyed by
-    /// the request type `TReq`. Use this only when you want the mediator's
-    /// `PipelineBehavior`s or DI-container-constructed handlers; the direct
-    /// `get`/`post`/… path above is the default and needs neither. `method` is
-    /// the HTTP verb (`"GET"`, `"POST"`, …).
-    pub fn mediated<TReq>(self: App, method: string, path: string): void {
-        self.router.__addRoute(method, path, serde.typeName<TReq>());
-    }
-
     /// Registers a streaming (Server-Sent Events) route at `path`.
     ///
     /// A GET matching `path` is handed straight to `handler`, which takes over
@@ -298,47 +262,12 @@ pub class App {
         self.sseRouter.__addRoute("GET", path, `${idx}`);
     }
 
-    // Builds the value source a matched request's fields are bound from: request
-    // cookies (lowest precedence), then query and path params, plus a body source
-    // chosen by content type for POST/PUT/PATCH. Cookies are merged in so a
-    // request field can bind from a cookie (for example a session or cart id),
-    // while any query, path, or body value of the same name overrides it.
-    fn sourceFor(self: App, req: Request, params: Map<string, string>): ValueSource {
-        let merged = Map<string, string>(8, string.hash);
-        req.cookies.forEach((k, v) => { merged.set(k, v); });
-        req.query.forEach((k, v) => { merged.set(k, v); });
-        params.forEach((k, v) => { merged.set(k, v); });
-        let paramSrc = source.ParamSource(merged);
-        if (string.eql(req.method, "POST") || string.eql(req.method, "PUT") || string.eql(req.method, "PATCH")) {
-            let contentType = req.getHeader("content-type") ?? "";
-            let ct = string.toLowerCase(contentType);
-            if (string.indexOf(ct, "multipart/form-data") != -1) {
-                return source.CompositeSource(paramSrc, request.multipartSource(contentType, req.body));
-            }
-            if (string.indexOf(ct, "x-www-form-urlencoded") != -1) {
-                return source.CompositeSource(paramSrc, request.formSource(req.body));
-            }
-            return source.CompositeSource(paramSrc, source.fromJson(req.body));
-        }
-        // Datastar sends the client's signals on a GET/DELETE as a URL-encoded
-        // JSON blob in the `datastar` query parameter (its ReadSignals contract),
-        // since those verbs carry no body. Unwrap it so a GET handler binds
-        // signals exactly like a POST binds the JSON body. Explicit query and
-        // path parameters still win, because CompositeSource consults the param
-        // source before the JSON fallback.
-        let dsSignals = req.query.get("datastar");
-        if (dsSignals != undefined) {
-            return source.CompositeSource(paramSrc, source.fromJson(dsSignals ?? "{}"));
-        }
-        return paramSrc;
-    }
-
-    /// Resolves and serves one request: a matched route through the mediator, an
+    /// Resolves and serves one request: a matched direct route handler, an
     /// unmatched GET through the static mounts, otherwise a Bad Request, Method Not
     /// Allowed, or Not Found response as appropriate.
     pub async fn dispatch(self: App, req: Request): response.Response {
-        // Direct route handlers first (Go/axum/Flask style): homogeneous
-        // RouteHandler trait objects, dispatched by trait method, no mediator/DI.
+        // Direct route handlers (Go/axum/Flask style): homogeneous RouteHandler
+        // trait objects, dispatched by trait method, with no mediator and no DI.
         let hm = self.routeRouter.resolve(req.method, req.path);
         if (hm.matched) {
             let idx = string.parseI64(hm.key) as int;
@@ -351,27 +280,13 @@ pub class App {
             }
             return await h.serve(ctx);
         }
-        // A direct route matched the path shape but a typed parameter (for example
-        // `{id:int}`) failed its check: report 400, exactly as the mediator path
-        // below does. Without this the direct path silently fell through to 404.
+        // The path shape matched but a typed parameter (for example `{id:int}`)
+        // failed its check: report 400 rather than falling through to 404.
         if (hm.typedBad) {
             return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
         }
-
-        let m = self.router.resolve(req.method, req.path);
-        if (m.typedBad) {
-            return response.Response(Status.BadRequest, "Bad Request: invalid path parameter");
-        }
-        if (m.matched) {
-            // A route registered via the opt-in `mediated` path: dispatch through
-            // the mediator (pipeline behaviours + DI-constructed handler).
-            let src = self.sourceFor(req, m.params);
-            return await __mediator_dispatch_runtime(m.key, src, self.mediator);
-        }
-        // 405 when either router saw the path shape but under a different method
-        // (the direct router's signal was previously ignored, so a wrong-verb hit
-        // on a direct route fell through to 404).
-        if (m.methodNotAllowed || hm.methodNotAllowed) {
+        // The path exists but under a different method: 405 rather than 404.
+        if (hm.methodNotAllowed) {
             return response.Response(Status.MethodNotAllowed, "Method Not Allowed");
         }
 
