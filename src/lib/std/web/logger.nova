@@ -3,15 +3,14 @@
 //! `Logger` appends levelled log lines to a file on disk and, at the same
 //! time, mirrors each message to the console via `console.err`/`debug`/
 //! `info`/`log` depending on level. `LoggerMiddleware` wraps a `Logger` in
-//! the `Middleware` contract so a request's method and path, and its final
-//! response status, are logged automatically as part of the request
+//! the `RouteMiddleware` contract so a request's method and path, and its
+//! final response status, are logged automatically as part of the request
 //! pipeline. Both structs also implement `Service` so they can be resolved
 //! through `web.di`.
 
 import io.file;
-import web.request;
+import web.routing;
 import web.response;
-import web.middleware;
 import web.di;
 
 /// Appends timestamped, levelled log lines to a file and echoes them to the console.
@@ -57,7 +56,7 @@ pub struct Logger impl Service {
 }
 
 /// Middleware that logs every request on the way in and every response on the way out.
-pub struct LoggerMiddleware impl Middleware, Service {
+pub struct LoggerMiddleware impl RouteMiddleware, Service {
     /// The `Logger` used to record request and response lines.
     pub logger: Logger,
 
@@ -65,16 +64,12 @@ pub struct LoggerMiddleware impl Middleware, Service {
         self.logger = logger;
     }
 
-    /// Logs the incoming method and path at INFO level, then always continues
-    /// the middleware chain (never short-circuits the request).
-    pub fn execute(self: LoggerMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
-        self.logger.info("Incoming request: " + req.method + " " + req.path);
-        return MiddlewareAction.Next;
-    }
-
-    /// Logs the final response status alongside the originating method and path,
-    /// once the route has finished handling the request.
-    pub fn after(self: LoggerMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
-        self.logger.info(`Response sent: status=${res.status as int} for ${req.method} ${req.path}`);
+    /// Logs the incoming method and path, runs the rest of the chain, then logs
+    /// the final response status. Never short-circuits the request.
+    async fn handle(self: LoggerMiddleware, ctx: routing.Context, next: routing.Chain): Response {
+        self.logger.info("Incoming request: " + ctx.request.method + " " + ctx.request.path);
+        let res = await next.proceed(ctx);
+        self.logger.info(`Response sent: status=${res.status.toCode()} for ${ctx.request.method} ${ctx.request.path}`);
+        return res;
     }
 }

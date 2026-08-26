@@ -4,37 +4,51 @@ import string;
 import web.csrf;
 import web.logger;
 import web.recovery;
-import web.mediator;
+import web.app;
 import web.routing;
-import web.middleware;
 import web.request;
 import web.response;
 import web.status;
 
+// A trivial route handler used as the terminal of the middleware chain.
+struct OkHandler impl RouteHandler {
+    init() {}
+    async fn serve(self: OkHandler, ctx: routing.Context): Response {
+        return response.Response.ok("ok");
+    }
+}
+
+// Build an app whose routes sit behind the CSRF middleware, so dispatching a
+// request drives the real `app.use` chain (the direct RouteMiddleware path).
+fn csrfApp(): App {
+    let app = App();
+    app.use(csrf.CsrfMiddleware());
+    app.get("/", OkHandler());
+    app.post("/f", OkHandler());
+    return app;
+}
+
 @test
 fn test_csrf_get_passes(): void {
-    let m = csrf.CsrfMiddleware();
-    let req = request.Request.fromString("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    let res = response.Response.ok("");
-    assert.isTrue(m.execute(req, res) == MiddlewareAction.Next);
+    let app = csrfApp();
+    let res = app.dispatch(request.Request.fromString("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+    assert.isTrue(res.status == Status.Ok);
 }
 
 @test
 fn test_csrf_post_token_mismatch_stops(): void {
-    let m = csrf.CsrfMiddleware();
-    let req = request.Request.fromString(
-        "POST /f HTTP/1.1\r\nHost: x\r\nX-Session-CSRF: secret123\r\nX-CSRF-Token: wrong\r\n\r\n");
-    let res = response.Response.ok("");
-    assert.isTrue(m.execute(req, res) == MiddlewareAction.Stop);
+    let app = csrfApp();
+    let res = app.dispatch(request.Request.fromString(
+        "POST /f HTTP/1.1\r\nHost: x\r\nX-Session-CSRF: secret123\r\nX-CSRF-Token: wrong\r\n\r\n"));
+    assert.isTrue(res.status == Status.Forbidden);
 }
 
 @test
 fn test_csrf_post_token_match_passes(): void {
-    let m = csrf.CsrfMiddleware();
-    let req = request.Request.fromString(
-        "POST /f HTTP/1.1\r\nHost: x\r\nX-Session-CSRF: secret123\r\nX-CSRF-Token: secret123\r\n\r\n");
-    let res = response.Response.ok("");
-    assert.isTrue(m.execute(req, res) == MiddlewareAction.Next);
+    let app = csrfApp();
+    let res = app.dispatch(request.Request.fromString(
+        "POST /f HTTP/1.1\r\nHost: x\r\nX-Session-CSRF: secret123\r\nX-CSRF-Token: secret123\r\n\r\n"));
+    assert.isTrue(res.status == Status.Ok);
 }
 
 @test

@@ -1,22 +1,21 @@
 //! Request correlation ID middleware for the web framework.
 //!
-//! Provides `RequestIdMiddleware`, a `Middleware` implementation that stamps every
-//! request and response with a correlation ID (header `X-Request-Id` by default),
-//! so a single request can be traced across logs, downstream calls, and error
-//! reports. If the incoming request already carries an ID (from an upstream proxy
-//! or client), that ID is reused instead of minting a new one, which keeps the
-//! correlation chain intact across hops.
+//! Provides `RequestIdMiddleware`, a `RouteMiddleware` implementation that stamps
+//! every request and response with a correlation ID (header `X-Request-Id` by
+//! default), so a single request can be traced across logs, downstream calls, and
+//! error reports. If the incoming request already carries an ID (from an upstream
+//! proxy or client), that ID is reused instead of minting a new one, which keeps
+//! the correlation chain intact across hops.
 
-import web.request;
+import web.routing;
 import web.response;
-import web.middleware;
 import datetime;
 
 /// Middleware that assigns or forwards a request correlation ID on every request.
 ///
-/// Register it early in the middleware chain so the ID is available to later
-/// middleware and route handlers via the request header.
-pub struct RequestIdMiddleware impl Middleware {
+/// Register it early (via `app.use`) so the ID is available to later middleware
+/// and route handlers via the request header.
+pub struct RequestIdMiddleware impl RouteMiddleware {
     /// Name of the header used to carry the request ID, defaults to `"X-Request-Id"`.
     pub headerName: string,
     /// Monotonic counter used to keep generated IDs unique within this middleware
@@ -31,10 +30,10 @@ pub struct RequestIdMiddleware impl Middleware {
     /// Reuses the request's existing ID (checked under `headerName` and, as a
     /// fallback, the lower-case `"x-request-id"`), or mints a fresh one of the
     /// form `req-<timestamp>-<counter>` when none is present. The resolved ID is
-    /// written back onto both the request headers and the response headers, then
-    /// processing continues to the next middleware.
-    pub fn execute(self: RequestIdMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
-        let existing = req.headers.get(self.headerName) ?? req.headers.get("x-request-id") ?? "";
+    /// stamped onto the request headers BEFORE the handler runs (so handlers and
+    /// later middleware can read it) and onto the response headers on the way out.
+    async fn handle(self: RequestIdMiddleware, ctx: routing.Context, next: routing.Chain): Response {
+        let existing = ctx.request.headers.get(self.headerName) ?? ctx.request.headers.get("x-request-id") ?? "";
 
         let id = "";
         if (existing != "") {
@@ -45,13 +44,9 @@ pub struct RequestIdMiddleware impl Middleware {
             id = `req-${ts}-${self.counter}`;
         }
 
-        req.headers.set(self.headerName, id);
+        ctx.request.headers.set(self.headerName, id);
+        let res = await next.proceed(ctx);
         res.setHeader(self.headerName, id);
-        return MiddlewareAction.Next;
-    }
-
-    /// Post-route hook required by the `Middleware` trait; intentionally a no-op,
-    /// since the request ID is already applied during `execute`.
-    pub fn after(self: RequestIdMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+        return res;
     }
 }

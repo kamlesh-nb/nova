@@ -1,5 +1,5 @@
 //! Server-side session support for the web framework: in-memory session
-//! storage with expiry, and a `Middleware` that binds each request to a
+//! storage with expiry, and a `RouteMiddleware` that binds each request to a
 //! session via a cookie.
 //!
 //! `SessionStore` owns the session table and is the single source of truth
@@ -13,9 +13,8 @@
 import map;
 import string;
 import datetime;
-import web.request;
+import web.routing;
 import web.response;
-import web.middleware;
 
 /// A single server-side session: an opaque id, an arbitrary string-keyed
 /// data bag, and an absolute expiry timestamp.
@@ -90,7 +89,7 @@ pub struct SessionStore {
 /// Middleware that attaches a `Session` to every request via a cookie,
 /// creating one on first visit, and stamps a per-session CSRF token onto the
 /// request headers for handlers or later middleware to validate.
-pub struct SessionMiddleware impl Middleware {
+pub struct SessionMiddleware impl RouteMiddleware {
     /// Backing session store this middleware reads and writes.
     pub store: SessionStore,
     /// Name of the cookie used to carry the session id (defaults to `session_id`).
@@ -101,36 +100,35 @@ pub struct SessionMiddleware impl Middleware {
         self.cookieName = "session_id";
     }
 
-    /// Resolves the session for this request: reads the session cookie, and
-    /// if it is missing or invalid, creates a new session and sets the
-    /// cookie on the response. Also mints a CSRF token on first use and
-    /// exposes both the session id and the CSRF token as request headers
-    /// (`X-Session-ID`, `X-Session-CSRF`) so downstream code does not need
-    /// to know about the session store. Always continues the middleware
-    /// chain.
-    pub fn execute(self: SessionMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
-        let sid = req.getCookie(self.cookieName) ?? "";
+    /// Resolves the session for this request: reads the session cookie, and if
+    /// it is missing or invalid, mints a new session. The session id and its
+    /// CSRF token are stamped onto the request headers (`X-Session-ID`,
+    /// `X-Session-CSRF`) BEFORE the handler runs, so downstream code does not
+    /// need to know about the session store. On the way out, a freshly created
+    /// session's cookie is set on the response. Always continues the chain.
+    async fn handle(self: SessionMiddleware, ctx: routing.Context, next: routing.Chain): Response {
+        let sid = ctx.request.getCookie(self.cookieName) ?? "";
 
         let sess = self.store.getSession(sid);
+        let isNew = false;
         if (sess == undefined) {
             sess = self.store.createSession();
-            res.setCookie(self.cookieName, sess.id);
+            isNew = true;
         }
 
-        req.headers.set("X-Session-ID", sess.id);
+        ctx.request.headers.set("X-Session-ID", sess.id);
 
         let csrfToken = sess.data.get("csrf_token") ?? "";
         if (csrfToken == "") {
             sess.data.set("csrf_token", "csrf-" + sess.id);
             csrfToken = "csrf-" + sess.id;
         }
-        req.headers.set("X-Session-CSRF", csrfToken);
+        ctx.request.headers.set("X-Session-CSRF", csrfToken);
 
-        return MiddlewareAction.Next;
-    }
-
-    /// Post-route hook required by `Middleware`; this middleware has no
-    /// after-route work to do.
-    pub fn after(self: SessionMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+        let res = await next.proceed(ctx);
+        if (isNew) {
+            res.setCookie(self.cookieName, sess.id);
+        }
+        return res;
     }
 }

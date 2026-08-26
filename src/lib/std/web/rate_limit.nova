@@ -1,16 +1,14 @@
 //! Per-client request rate limiting for the web framework.
 //!
 //! Implements a token bucket algorithm keyed by client IP address, exposed as
-//! a `RateLimitMiddleware` that can be dropped into the standard `Middleware`
-//! chain (see `web.middleware`). Tokens are tracked in fixed-point thousandths
-//! (1000 units per request) so fractional refill rates below one request per
-//! second stay exact under integer arithmetic. A request over the limit gets
-//! a 429 response with a `Retry-After` header rather than being silently
-//! dropped.
+//! a `RateLimitMiddleware` that can be dropped into the chain via `app.use`.
+//! Tokens are tracked in fixed-point thousandths (1000 units per request) so
+//! fractional refill rates below one request per second stay exact under
+//! integer arithmetic. A request over the limit gets a 429 response with a
+//! `Retry-After` header rather than being silently dropped.
 
-import web.request;
+import web.routing;
 import web.response;
-import web.middleware;
 import web.status;
 import map;
 import string;
@@ -101,7 +99,7 @@ pub struct RateLimiter {
 }
 
 /// Middleware that enforces a `RateLimiter` against the requesting client's IP.
-pub struct RateLimitMiddleware impl Middleware {
+pub struct RateLimitMiddleware impl RouteMiddleware {
     /// The shared limiter state consulted (and mutated) on every request.
     pub limiter: RateLimiter,
 
@@ -110,10 +108,11 @@ pub struct RateLimitMiddleware impl Middleware {
     }
 
     /// Resolves the client IP from `X-Forwarded-For` (first entry) or
-    /// `X-Real-IP`, falling back to `127.0.0.1`, and stops the chain with a
-    /// 429 JSON error and a `Retry-After: 60` header if the limiter rejects it.
-    pub fn execute(self: RateLimitMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
-        let ip = req.headers.get("X-Forwarded-For") ?? req.headers.get("X-Real-IP") ?? "127.0.0.1";
+    /// `X-Real-IP`, falling back to `127.0.0.1`, and short-circuits with a 429
+    /// JSON error and a `Retry-After: 60` header if the limiter rejects it;
+    /// otherwise the chain proceeds.
+    async fn handle(self: RateLimitMiddleware, ctx: routing.Context, next: routing.Chain): Response {
+        let ip = ctx.request.headers.get("X-Forwarded-For") ?? ctx.request.headers.get("X-Real-IP") ?? "127.0.0.1";
 
         let comma = string.indexOf(ip, ",");
         if (comma != -1) {
@@ -121,16 +120,11 @@ pub struct RateLimitMiddleware impl Middleware {
         }
 
         if (!self.limiter.isAllowed(ip)) {
-            res.status = Status.fromCode(429);
+            let res = response.Response(Status.fromCode(429), "{\"error\":\"Rate limit exceeded\"}");
             res.setHeader("Retry-After", "60");
-            res.body = "{\"error\":\"Rate limit exceeded\"}";
-            return MiddlewareAction.Stop;
+            return res;
         }
 
-        return MiddlewareAction.Next;
-    }
-
-    /// Post-route hook required by `Middleware`; rate limiting has nothing to do here.
-    pub fn after(self: RateLimitMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+        return await next.proceed(ctx);
     }
 }

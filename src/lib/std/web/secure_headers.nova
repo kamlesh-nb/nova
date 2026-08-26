@@ -1,22 +1,20 @@
 //! Baseline security headers for the web framework.
 //!
-//! Provides `SecureHeadersMiddleware`, a `Middleware` implementation that stamps a
-//! fixed set of defensive HTTP response headers (CSP, frame options, content type
-//! sniffing protection, HSTS, XSS protection, referrer policy) onto every response.
-//! It slots into the standard middleware pipeline defined in `web.middleware` and
-//! is meant to be attached once near the top of an app's middleware chain so the
-//! headers apply uniformly across routes.
+//! Provides `SecureHeadersMiddleware`, a `RouteMiddleware` implementation that
+//! stamps a fixed set of defensive HTTP response headers (CSP, frame options,
+//! content type sniffing protection, HSTS, XSS protection, referrer policy) onto
+//! every response. Register it once near the top of the chain (via `app.use`) so
+//! the headers apply uniformly across routes.
 
-import web.request;
+import web.routing;
 import web.response;
-import web.middleware;
 
 /// Middleware that adds a standard set of security-related response headers.
 ///
 /// The header values are fixed except for `csp`, which callers may override after
 /// construction (e.g. `mw.csp = "default-src 'self'; script-src 'self'"`) before
 /// registering the middleware with the app.
-pub struct SecureHeadersMiddleware impl Middleware {
+pub struct SecureHeadersMiddleware impl RouteMiddleware {
     /// Content-Security-Policy header value. Defaults to `default-src 'self'`.
     pub csp: string,
 
@@ -24,20 +22,16 @@ pub struct SecureHeadersMiddleware impl Middleware {
         self.csp = "default-src 'self'";
     }
 
-    /// Sets the security headers on the response, then always continues the
-    /// middleware chain (never short-circuits the request).
-    pub fn execute(self: SecureHeadersMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
+    /// Runs the chain, then stamps the security headers onto the response on the
+    /// way out. Never short-circuits the request.
+    async fn handle(self: SecureHeadersMiddleware, ctx: routing.Context, next: routing.Chain): Response {
+        let res = await next.proceed(ctx);
         res.setHeader("Content-Security-Policy", self.csp);
         res.setHeader("X-Frame-Options", "DENY");
         res.setHeader("X-Content-Type-Options", "nosniff");
         res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
         res.setHeader("X-XSS-Protection", "1; mode=block");
         res.setHeader("Referrer-Policy", "no-referrer-when-downgrade");
-        return MiddlewareAction.Next;
-    }
-
-    /// No-op post-route hook; this middleware has nothing left to do after
-    /// routing since all header work happens in `execute`.
-    pub fn after(self: SecureHeadersMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+        return res;
     }
 }

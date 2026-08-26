@@ -1,4 +1,3 @@
-
 //! Request body size guard for the web framework's middleware pipeline.
 //!
 //! `BodyLimitMiddleware` inspects the incoming request's `Content-Length`
@@ -6,17 +5,15 @@
 //! a `413 Payload Too Large` response, so a handler never has to defend
 //! itself against an unbounded body. It only checks the declared length: it
 //! does not stream-count actual bytes read, so a request that lies about (or
-//! omits) `Content-Length` is not caught here. Plug it into the middleware
-//! chain alongside the other `web.middleware` implementations.
+//! omits) `Content-Length` is not caught here. Register it via `app.use`.
 
-import web.request;
+import web.routing;
 import web.response;
-import web.middleware;
 import web.status;
 
 /// Middleware that rejects requests whose declared `Content-Length` exceeds
 /// a configured maximum, before the request reaches the route handler.
-pub struct BodyLimitMiddleware impl Middleware {
+pub struct BodyLimitMiddleware impl RouteMiddleware {
     /// Maximum allowed body size in bytes, as declared by `Content-Length`.
     pub maxSize: int,
 
@@ -28,26 +25,18 @@ pub struct BodyLimitMiddleware impl Middleware {
     ///
     /// If the header is present (checked case-sensitively as `Content-Length`,
     /// then falling back to lower-case `content-length`) and its numeric value
-    /// exceeds `maxSize`, sets a `413` JSON error body on `res` and returns
-    /// `MiddlewareAction.Stop` to halt the pipeline. Otherwise returns
-    /// `MiddlewareAction.Next` so the next middleware or handler runs. A
-    /// missing or non-numeric header is treated as unbounded and allowed
-    /// through.
-    pub fn execute(self: BodyLimitMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
-        let len_str = req.headers.get("Content-Length") ?? req.headers.get("content-length") ?? "";
+    /// exceeds `maxSize`, short-circuits with a `413` JSON error and never calls
+    /// the rest of the chain. Otherwise the chain proceeds normally. A missing or
+    /// non-numeric header is treated as unbounded and allowed through.
+    async fn handle(self: BodyLimitMiddleware, ctx: routing.Context, next: routing.Chain): Response {
+        let len_str = ctx.request.headers.get("Content-Length") ?? ctx.request.headers.get("content-length") ?? "";
         if (len_str != "") {
             let len = parseNumber(len_str);
             if (len > self.maxSize) {
-                res.status = Status.PayloadTooLarge;
-                res.body = "{\"error\":\"Payload Too Large\"}";
-                return MiddlewareAction.Stop;
+                return response.Response(Status.PayloadTooLarge, "{\"error\":\"Payload Too Large\"}");
             }
         }
-        return MiddlewareAction.Next;
-    }
-
-    /// Post-route hook required by the `Middleware` trait; this middleware has nothing to do after the handler runs.
-    pub fn after(self: BodyLimitMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+        return await next.proceed(ctx);
     }
 }
 

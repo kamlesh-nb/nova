@@ -3,15 +3,13 @@
 //! This file provides `CorsConfig`, which holds the policy an application wants
 //! to expose (allowed origin or origins, methods, headers, credentials and
 //! preflight cache lifetime), and `CorsMiddleware`, which applies that policy to
-//! every request by implementing the `Middleware` trait. It fits into the
-//! request pipeline alongside the other `web.middleware` implementations: on
-//! each request it sets the appropriate `Access-Control-*` response headers,
-//! and short-circuits `OPTIONS` preflight requests with a `204 No Content`
-//! reply instead of letting them reach route handlers.
+//! every request by implementing the `RouteMiddleware` contract. Register it via
+//! `app.use`: it sets the appropriate `Access-Control-*` response headers, and
+//! short-circuits `OPTIONS` preflight requests with a `204 No Content` reply
+//! instead of letting them reach route handlers.
 
-import web.request;
+import web.routing;
 import web.response;
-import web.middleware;
 import web.status;
 import collections.list;
 
@@ -42,7 +40,7 @@ pub struct CorsConfig {
 /// Middleware that applies a `CorsConfig` to every request: sets the
 /// `Access-Control-*` response headers, and answers `OPTIONS` preflight
 /// requests directly rather than forwarding them to a route handler.
-pub struct CorsMiddleware impl Middleware {
+pub struct CorsMiddleware impl RouteMiddleware {
     /// The policy this middleware instance enforces.
     pub config: CorsConfig,
 
@@ -50,62 +48,57 @@ pub struct CorsMiddleware impl Middleware {
         self.config = config;
     }
 
-    /// Resolves the allowed origin for this request and writes the
-    /// `Access-Control-*` headers onto `res`.
-    ///
-    /// When `config.allowOrigins` is non-empty, the request's `Origin` header
-    /// is matched against that list (a `"*"` entry matches any origin) and, on
-    /// a match, echoed back with `Vary: Origin` added; otherwise no
-    /// `Access-Control-Allow-Origin` header is set. When `allowOrigins` is
-    /// empty, `config.allowOrigin` is used unconditionally.
-    ///
-    /// For `OPTIONS` preflight requests, sets `Access-Control-Max-Age`, forces
-    /// the response status to `204 No Content`, and returns
-    /// `MiddlewareAction.Stop` so the request never reaches route handlers.
-    /// Every other method returns `MiddlewareAction.Next` to continue the
-    /// pipeline.
-    pub fn execute(self: CorsMiddleware, req: request.Request, res: response.Response): MiddlewareAction {
-        let origin_header = req.headers.get("Origin") ?? req.headers.get("origin") ?? "";
-        let origin_resolved = "";
-
+    /// Resolves the origin to echo for this request's `Origin` header. When
+    /// `config.allowOrigins` is non-empty, the request origin is matched against
+    /// that list (a `"*"` entry matches any origin) and returned on a match, else
+    /// `""`; when the list is empty, `config.allowOrigin` is used unconditionally.
+    fn resolveOrigin(self: CorsMiddleware, originHeader: string): string {
         if (self.config.allowOrigins.size() > 0) {
             let i = 0;
             while (i < self.config.allowOrigins.size()) {
                 let allowed = self.config.allowOrigins.get(i);
-                if (allowed == "*" || allowed == origin_header) {
-                    origin_resolved = origin_header;
-                    break;
+                if (allowed == "*" || allowed == originHeader) {
+                    return originHeader;
                 }
                 i = i + 1;
             }
-        } else {
-            origin_resolved = self.config.allowOrigin;
+            return "";
         }
+        return self.config.allowOrigin;
+    }
 
-        if (origin_resolved != "") {
-            res.setHeader("Access-Control-Allow-Origin", origin_resolved);
+    /// Writes the `Access-Control-*` headers for `originResolved` onto `res`.
+    fn applyHeaders(self: CorsMiddleware, res: Response, originResolved: string): void {
+        if (originResolved != "") {
+            res.setHeader("Access-Control-Allow-Origin", originResolved);
         }
         if (self.config.allowOrigins.size() > 0) {
             res.setHeader("Vary", "Origin");
         }
-
         res.setHeader("Access-Control-Allow-Methods", self.config.allowMethods);
         res.setHeader("Access-Control-Allow-Headers", self.config.allowHeaders);
         if (self.config.allowCredentials) {
             res.setHeader("Access-Control-Allow-Credentials", "true");
         }
-
-        if (req.method == "OPTIONS") {
-            res.setHeader("Access-Control-Max-Age", self.config.maxAge);
-            res.status = Status.NoContent;
-            return MiddlewareAction.Stop;
-        }
-
-        return MiddlewareAction.Next;
     }
 
-    /// No-op post-route hook required by the `Middleware` trait: CORS has
-    /// nothing left to do once a route has already run.
-    pub fn after(self: CorsMiddleware, req: request.Request, res: response.Response, matched: MatchedRoute): void {
+    /// For an `OPTIONS` preflight, answers directly with a `204 No Content`
+    /// carrying the CORS headers (plus `Access-Control-Max-Age`) and never
+    /// reaches a route handler. Every other method runs the chain and has the
+    /// CORS headers stamped onto the response on the way out.
+    async fn handle(self: CorsMiddleware, ctx: routing.Context, next: routing.Chain): Response {
+        let origin_header = ctx.request.headers.get("Origin") ?? ctx.request.headers.get("origin") ?? "";
+        let origin_resolved = self.resolveOrigin(origin_header);
+
+        if (ctx.request.method == "OPTIONS") {
+            let res = response.Response(Status.NoContent, "");
+            self.applyHeaders(res, origin_resolved);
+            res.setHeader("Access-Control-Max-Age", self.config.maxAge);
+            return res;
+        }
+
+        let res = await next.proceed(ctx);
+        self.applyHeaders(res, origin_resolved);
+        return res;
     }
 }

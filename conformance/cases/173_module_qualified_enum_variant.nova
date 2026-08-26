@@ -1,16 +1,15 @@
 
 import assert;
-import web.middleware;
 import web.status;
 import web.response;
 
 @test
 fn test_qualified_variant_value_and_compare(): void {
-    let a = middleware.MiddlewareAction.Next;
-    assert.isTrue(a == middleware.MiddlewareAction.Next);
-    assert.isTrue((a == middleware.MiddlewareAction.Stop) == false);
-    let b = middleware.MiddlewareAction.Stop;
-    assert.isTrue(b == middleware.MiddlewareAction.Stop);
+    let a = status.Status.Ok;
+    assert.isTrue(a == status.Status.Ok);
+    assert.isTrue((a == status.Status.NotFound) == false);
+    let b = status.Status.NotFound;
+    assert.isTrue(b == status.Status.NotFound);
 }
 
 @test
@@ -23,6 +22,6 @@ fn test_qualified_variant_assigned_to_field(): void {
 
 @test
 fn test_unqualified_still_works(): void {
-    let a = MiddlewareAction.Next;
-    assert.isTrue(a == MiddlewareAction.Next);
+    let a = Status.Ok;
+    assert.isTrue(a == Status.Ok);
 }
