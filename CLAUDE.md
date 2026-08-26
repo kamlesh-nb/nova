@@ -298,11 +298,17 @@ Depends on **NovaDB** (separate repo); pairs with **nls** (LSP) + the VSCode **e
    AND the `mssql` driver end to end — scaffold with `nova init web`, wire the `mssql` package as the
    `Connection`, run the same load/soak test. Shakes out driver + framework edges together.
 
-3. **Test the orchestrator's fd-handoff on every reactor backend.** The zero-downtime handoff
-   (`SCM_RIGHTS` fd passing between proxyd/orchd instances) has been exercised mainly on kqueue/epoll;
-   verify it on **IOCP** (Windows — a listening socket handed to another process must be re-associated
-   with the new process's completion port) and **io_uring**, since a proactor's in-flight ops and the
-   inherited socket state differ from a readiness engine's.
+3. **Orchestrator fd-handoff: io_uring test + a Windows port.** The zero-downtime handoff passes client
+   sockets over an **AF_UNIX** control channel via **`SCM_RIGHTS`** (`src/net/proxy.nova`), with the
+   rendezvous under `/tmp/nova-*.sock` — the short path is DELIBERATE (AF_UNIX `sun_path` caps at ~104
+   bytes on macOS; `$TMPDIR`/`/var/folders` would overflow it, so do NOT "portably" swap `/tmp` for
+   `dir.tempDir()`). It works on kqueue/epoll; still to do: **(a)** verify it on **io_uring** (a
+   proactor's in-flight ops + inherited socket state differ from a readiness engine's); **(b)** a
+   **Windows** path — `SCM_RIGHTS` does not exist there, so it needs `WSADuplicateSocket` (or a named
+   pipe) plus re-associating the handed-off socket with the new process's IOCP. This is a genuine
+   platform port, not a cross-platform find-replace. (Audit note: the DB drivers use the target-swapped
+   `os.sys` seam and the novadb server `src/` cross-builds clean for Windows — both already portable;
+   this handoff is the only POSIX-locked surface.)
 
 4. **Windows/WSL parity gates.** Wire `--asan`/`--arc` on Windows and close the remaining IOCP
    readiness cases (`armRead`/`armWrite` have no proactor analogue; convert to the zero-byte-receive
