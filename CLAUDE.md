@@ -7,11 +7,12 @@ apps, and WebAssembly. This repo is the **language implementation**:
 
 - **Compiler** — written in **Zig 0.16**, lowers Nova → **LLVM IR** → native object → linked binary
   (in-process LLD or `clang++`). WASM target via `wasm-ld`.
-- **Runtime** — **C++20** (`src/runtime/`), on **Boost.Asio** with C++20 coroutines: a real async
-  scheduler (io_context + per-coroutine strands), non-blocking sockets, TLS via **wolfSSL** (memory-BIO
-  pumped by Nova async — crypto stays in wolfSSL), channels, actors.
-- **Standard library** — written in **Nova itself** (`src/std/`): collections, string, json/yaml/bson,
-  http/web framework, sql/db drivers, crypto, concurrency, regex, decimal128.
+- **Runtime** — a small **C++20** core (`src/runtime/`): the reactor-native async scheduler
+  (`concurrency.cpp`), LLVM-coroutine drive, sockets, and hardware-crypto hooks. **Boost.Asio and
+  wolfSSL are RETIRED** — the event loop is Nova's own reactor (kqueue/epoll/io_uring/IOCP) and TLS +
+  all crypto are self-hosted in pure Nova (hardware AES/SHA where available).
+- **Standard library** — written in **Nova itself** (`src/lib/std/`): collections, string,
+  json/yaml/bson, http/web framework, sql/db drivers, crypto + TLS, concurrency, regex, decimal128.
 
 ## Build / run / test
 
@@ -25,9 +26,9 @@ nova test <file.nova>           # run @test functions
 nova build [--release]          # project build → build/<profile>/{obj,bin} (reads project.json)
 nova init web|desktop --name X  # scaffold an app
 
-conformance/run.sh              # the corpus — run BEFORE and AFTER any change (currently 148/148)
+conformance/run.sh              # the corpus — run BEFORE and AFTER any change
 conformance/run.sh -j           # SAME corpus, run in parallel (cores-1 workers) — ~5x faster (~2min vs >10min)
-conformance/run.sh --asan       # AddressSanitizer gate (catches UAF/double-free; 266/266). Requires NOVA_ASAN=1 build first.
+conformance/run.sh --asan       # AddressSanitizer gate (catches UAF/double-free). Requires NOVA_ASAN=1 build first.
 conformance/run.sh --arc        # ARC leak gate (baseline-gated)
 NOVA_ARC_AUDIT=1 nova test f    # per-run ARC audit ("ARC audit: clean" or survivors)
 ```
@@ -51,94 +52,62 @@ Known limitation: a case that links a package's **native** lib (the `mysql`/`mss
 (link error) and `-j` exits non-zero. Those few are environment-dependent anyway (some need a live DB) —
 verify them with the plain sequential `run.sh`. Everything else is authoritative under `-j`.
 
-## Working on Windows — read this first if the repo is cloned on a Windows host
+## Build on Windows and WSL
 
-**Native `zig build` on a Windows host now works, and the runtime is run-verified there** — see the
-status section below for the exact invocation, what was implemented, and what is still open. Both of
-the original blockers are gone: the install step no longer needs `sh`/`rsync` (there is a PowerShell
-branch), and the compiler links the LLVM **C API** dynamically instead of needing a Windows-host
-static-LLVM dist.
+Three supported ways to work with the repo on a Windows machine:
 
-**WSL2 (Ubuntu) remains a fine path too**, and is still the way to exercise the Linux gates. Clone
-the repo *inside* WSL, install **Zig 0.16**, and use the normal Linux flow. (Before cloning,
-`git config --global core.autocrlf input` so the bash scripts and `.nova` sources keep LF.) Note that
-`-Dstatic-llvm` currently 404s on the mirror, so point `NOVA_LLVM_PREFIX` at a system LLVM instead.
-
-**Cross-compilation still works and is unchanged.** From macOS / Linux / WSL,
-`nova app.nova --target windows-x86_64` produces a real **PE32+ .exe** (adds
-`-lws2_32 -lmswsock -lbcrypt`). What changed is that Windows is no longer *only* a cross-target:
-execution — including the async reactor — is now exercised on a real host.
-
-### Windows host status — native dev + runtime, as of 2026-07-31
-
-A Windows 10 host is now in the loop, and the port is **run-verified**, not just compile-verified.
-Corpus on Windows: see `conformance/windows-baseline.txt`.
-
-**Native `zig build` on a Windows host works.** Requirements: Zig 0.16, and an LLVM install with
-`LLVM-C.dll` + `LLVM-C.lib` (LLVM 21 verified) pointed at by `NOVA_LLVM_PREFIX`, with its `bin/` on
-PATH for `clang++`/`llvm-ar`:
-
-```powershell
-$env:NOVA_LLVM_PREFIX = 'C:/LLVM'; $env:PATH = 'C:\LLVM\bin;' + $env:PATH; zig build
+**A. WSL2 (Ubuntu) — the simplest, and the way to run the Linux gates.**
+```bash
+git config --global core.autocrlf input   # BEFORE cloning: keep bash scripts + .nova sources LF
+# clone INSIDE the WSL filesystem, then:
+cd lang
+export NOVA_LLVM_PREFIX=/usr/lib/llvm-21   # point at a system LLVM (-Dstatic-llvm 404s on the mirror)
+zig build                                  # Zig 0.16 required; normal Linux flow from here
+conformance/run.sh -j
 ```
 
-`C:\LLVM\bin` must be on PATH at **RUN** time too, not only to build: the produced `nova.exe`
-links `LLVM-C.dll` dynamically. Without it EVERY corpus case reports `<compile/link error>` and
-the harness declares its own negative-case classifier broken — which reads exactly like a compiler
-regression. The tell is `nova.exe` exiting `0xC0000135` (STATUS_DLL_NOT_FOUND) with no output.
+**B. Native Windows host (PowerShell) — run-verified, reactor and all.**
+Requires Zig 0.16 and an LLVM install exposing `LLVM-C.dll` + `LLVM-C.lib` (LLVM 21 verified):
+```powershell
+$env:NOVA_LLVM_PREFIX = 'C:/LLVM'
+$env:PATH = 'C:\LLVM\bin;' + $env:PATH     # bin/ on PATH for clang++/llvm-ar AND at RUN time
+zig build                                  # build.zig has a PowerShell install step (no sh/rsync)
+```
+`C:\LLVM\bin` must stay on PATH at **run** time too — `nova.exe` links `LLVM-C.dll` dynamically. If it
+is missing, every corpus case reports `<compile/link error>` and `nova.exe` exits `0xC0000135`
+(STATUS_DLL_NOT_FOUND) with no output — reads exactly like a compiler regression, but it is the DLL.
 
-Both original blockers are resolved: `build.zig` has a PowerShell install step (no sh/rsync), and
-the dynamic path links the LLVM **C API** rather than needing a static Windows LLVM dist. Two
-Windows-specific traps are handled and worth knowing about:
-- The LLVM.org Windows `LLVM-C.dll` ships a REDUCED target set (AArch64, ARM, BPF, NVPTX, RISCV,
-  WebAssembly, X86). Referencing an absent `LLVMInitialize<T>*` is a hard link error, not a runtime
-  no-op — `deps/llvm-zig/src/target.zig` filters the aggregate initializers to what is present.
-- The link path drives MSVC's `link.exe`: `/OPT:REF` not `--gc-sections`, the runtime's COFF object
-  not `-lnova_runtime` (link.exe cannot read llvm-ar's GNU archive), `-rtlib=compiler-rt` for the
-  128-bit helpers, and `-lc`/`-lm`/`-lpthread` dropped (MSVC folds them into its CRT).
+**C. Cross-compile from macOS/Linux/WSL (no Windows host needed).**
+```bash
+nova app.nova --target windows-x86_64      # real PE32+ .exe; adds -lws2_32 -lmswsock -lbcrypt
+```
 
-**Windows syscalls are Nova over Win32 FFI**, mirroring how `os/windows/socket` sits over
-`os/windows/winsock` — not C++ shims in the runtime. The target-conditional file rule (`targetVariantPath`)
-swaps the whole module, so shared callers are unchanged:
-- `os/windows/fs` + `os/windows/sys` — file/dir/env. MSVC's UCRT has no `<dirent.h>`, its `O_CREAT`/
-  `O_TRUNC` are NOT the macOS values `os/sys` declares, its `struct stat` puts `st_mode` elsewhere,
-  and `setenv` is absent — so this is a real reimplementation, not a thin alias.
-- `os/windows/proc` + `std/process_windows` — spawn/stdio/wait/kill over CreateProcessW + pipes.
-- IOCP reactor: `nova_run_root` in `concurrency.cpp` has a Windows branch (it was kqueue-only, so
-  EVERY async program aborted with "no reactor driver" — note this still applies to **Linux**).
-
-Things that bite, recorded so they are not rediscovered:
-- **WSAStartup**: POSIX has no init step so callers do not make one. `os/windows/sys.socket` and
-  `os/windows/socket.getAddrInfo` initialise Winsock themselves; without that, `bind` and hostname
-  resolution fail while a numeric address appears to work.
-- **Timers**: IOCP has no `EVFILT_TIMER` equivalent. Deadlines use a one-shot timer-queue timer whose
-  callback only `PostQueuedCompletionStatus`es, so the fire arrives as a completion and BOTH drivers
-  (the C loop and the Nova-side `Poller`) see it. A thread-local list only serves the former.
-- **Association**: a socket must be `CreateIoCompletionPort`'d before its first overlapped op or the
-  completion is delivered nowhere and the op silently never finishes.
-- **ConnectEx** is the one piece that is NOT pure FFI, unavoidably: `AcceptEx` is a real mswsock.lib
-  export and binds by name, but ConnectEx is only reachable through
-  `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` as a runtime pointer, and Nova FFI binds named
-  symbols only. `nova_wsa_connectex` (`io.cpp`) does that one resolution + indirect call.
-- `nova_run_reactors` did **not** need a Windows-threads path — it already uses `std::thread`.
-- `/tmp` is not a path on Windows (Win32 resolves a leading `/` against the current drive root); use
+**Windows internals worth knowing** (the port is Nova-over-Win32-FFI, not C++ shims; the
+target-conditional file rule `targetVariantPath` swaps whole modules so shared callers are unchanged):
+- The LLVM.org Windows `LLVM-C.dll` ships a REDUCED target set — referencing an absent
+  `LLVMInitialize<T>*` is a hard LINK error; `deps/llvm-zig/src/target.zig` filters to what is present.
+- The link path drives MSVC `link.exe`: `/OPT:REF` (not `--gc-sections`), the runtime COFF object (not
+  `-lnova_runtime`, link.exe can't read llvm-ar's GNU archive), `-rtlib=compiler-rt`, and
+  `-lc`/`-lm`/`-lpthread` dropped (MSVC folds them into its CRT).
+- `os/windows/{fs,sys,proc}` reimplement file/dir/env/spawn (UCRT has no `<dirent.h>`, different
+  `O_CREAT`/`O_TRUNC`, `st_mode` moved, no `setenv`).
+- **WSAStartup**: initialise Winsock in `os/windows/sys.socket` + `getAddrInfo` yourself (no POSIX init
+  step), else `bind`/hostname resolution fail while numeric addresses appear to work.
+- **IOCP**: a socket must be `CreateIoCompletionPort`'d before its first overlapped op or the completion
+  goes nowhere. `ConnectEx` is the one non-pure-FFI piece (resolved via
+  `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` in `nova_wsa_connectex`, io.cpp).
+- `/tmp` is not a Windows path (a leading `/` resolves against the current drive root) — use
   `dir.Dir.tempDir()`.
-
-**Still open on Windows:**
-1. **Readiness cases 192/194/195** — `armRead`/`armWrite` have no IOCP analogue (a proactor has no
-   "tell me when readable"). These need converting to the completion API, which the design notes
-   already plan; the draining half (`waitReady`/`ev*`) is implemented and shares the completion path.
-2. **`--asan` / `--arc` gates** are not wired on Windows (the install step skips those runtimes).
-3. **Linux still aborts in `nova_run_root`** — it needs the epoll driver, exactly as Windows needed
-   the IOCP one. Same shape; `NOVA_HAVE_IOCP` is the template.
+- `--asan`/`--arc` gates are not wired on Windows (the install step skips those runtimes).
 
 ## Layout
 
 - `src/` — lexer, parser, `type_checker.zig`, **`sema/`** (infer/mono/ownership/lower/symbols — the
   authoritative typed-IR pass), **`codegen/`** (`llvm_codegen.zig`, `declarations.zig`, `expressions.zig`,
   `statements.zig`, `arc.zig`, `types.zig`), `main.zig` (driver + linking).
-- `src/std/` — the Nova standard library (compiled from source per build; import-graph gated).
-- `src/runtime/` — the C++20 runtime (`concurrency.cpp` = scheduler + async I/O, `io.cpp` = TLS memory-BIO).
+- `src/lib/std/` — the Nova standard library (compiled from source per build; import-graph gated).
+- `src/runtime/` — the small C++20 runtime (`concurrency.cpp` = reactor scheduler + async I/O,
+  `crypto.cpp` + `nova_crypto_arm64.S` = hardware AES/SHA hooks; TLS itself is pure Nova).
 - `conformance/` — `cases/*.nova` (positive, run via `nova test`) + `expect_fail/` (must be rejected) +
   `run.sh` (the harness, self-tests its own negative-case classifier).
 - `docs/design/` — **`execution-plan.md`** (the master status table + per-item design — READ THIS for
@@ -174,7 +143,7 @@ Things that bite, recorded so they are not rediscovered:
   `NOVA_ARC_DUMP`/`NOVA_ARC_AUDIT` to see survivors.
 - Debug output: `NOVA_DUMP_MERGED=1` writes the merged IR; `NOVA_SEMA_SHADOW=1` diffs the type engines.
 
-## Reactor backends — status, corpus, and measured throughput
+## Reactor backends — models, selection, and the hard-won gotchas
 
 Four backends now exist, selected per target (and, on Linux, per run):
 
@@ -190,15 +159,10 @@ between them: `nova_reactor_backend()` decides once per process. The probe matte
 being present says nothing about the running kernel, which can be too old or have io_uring disabled
 administratively (`/proc/sys/kernel/io_uring_disabled`).
 
-### Conformance (234 cases, run 2026-08-01)
+### Conformance across backends
 
-| Backend | Passed | Failed |
-|---|---|---|
-| Windows / IOCP | **224** | 10 |
-| Linux / epoll | **225** | 9 |
-| Linux / io_uring | **225** | 9 |
-
-epoll and io_uring have IDENTICAL failure lists — every reachable case passes on both.
+epoll and io_uring have IDENTICAL failure lists — every reachable case passes on both. Windows/IOCP
+trails by a few readiness cases (see below).
 
 Run the corpora ONE AT A TIME. Running two concurrently on a 4-core box starves the app/server cases
 past the per-case timeout and invents phantom failures (they report a timeout, which is how to
@@ -215,50 +179,21 @@ Every remaining failure is structural, not a bug to chase:
   **`189_epoll_event_layout`** asserts epoll's (fails off Linux). Inapplicable by design.
 (`210_cross_reactor_wakeup` was an io_uring-only failure and is fixed — see the SQE note below.)
 
-### Throughput (oha, release build)
+### Benchmarking + throughput regression-hunting
 
 **Measure with a FIXED REQUEST COUNT (`-n`), not a time box (`-z`).** A time-boxed run stops at the
 deadline and never waits for outstanding requests, so it reports "100% success" even when the server
 is stranding connections — which is exactly how the IOCP stall below hid for so long. `-z` also
 charges ~100 in-flight requests as "aborted due to deadline" at c=100, which reads as a fake 99.9%.
+Run the load generator on a separate box where possible; co-resident it steals cores and the numbers
+become lower bounds. Rough shape on a good single core: the Nova-owned reactor clears tens of
+thousands of req/s (epoll ≈ io_uring, io_uring slightly hotter per request — see below).
 
-Measured on a 4-core box with the load generator CO-RESIDENT, so these are lower bounds. Two servers:
-`web.app` with one typed JSON route (workers = `nproc - 1`), and the flagship's Nova-owned reactor
-(`flagship/bench/headtohead/nova-reactor/server.nova`, ONE core).
+io_uring is still slightly slower than epoll (~1.4x more CPU per request) because it is readiness
+EMULATED on a completion engine — poll, then a separate read, plus a re-arm, where epoll does two
+kernel interactions. Multishot `RECV` + `SQPOLL` is the real headroom there.
 
-| Server / backend | req/s | Cores | Success |
-|---|---|---|---|
-| Nova reactor / epoll | 75,621 | 0.87 | 300,000/300,000 |
-| Nova reactor / io_uring | ~65,000 | 0.93 | 299,995/300,000 |
-| web.app / epoll | 26,599 | ~3 | 100% |
-| web.app / io_uring | ~30,000 | ~3 | 100% |
-| web.app / IOCP (Windows) | ~11,300-13,200 | ~3 | 300,000/300,000 |
-
-### The kqueue gap is mostly the ENVIRONMENT — measured, not assumed
-
-The M1 figure (186k on one core) is ~2.6x this box. That is NOT a Linux-backend deficiency: the
-head-to-head peers were built and run here with the identical method, and they degrade as much or
-more.
-
-| Server | req/s here | Cores | per core |
-|---|---|---|---|
-| Nova reactor / epoll | 75,621 | 0.87 | **86,921** |
-| Rust axum + tokio | 55,094 | 1.74 | 31,663 |
-| Go net/http | 15,846 | 1.57 | 10,092 |
-
-Go scores 15,846 here against 121,743 on the M1 — a **7.7x** environment penalty; Rust drops 2.4x;
-Nova 2.6x. So Nova's fall is in-band. Contributors, in order: WSL2 virtualises syscalls and loopback
-(worst case for a syscall-per-request path), the load generator takes ~3 of 4 cores, and the M1
-P-core is simply faster. On THIS box one Nova reactor core beats Rust axum's 1.74 and Go's 1.57.
-
-**The one genuinely OURS**: io_uring is still slower than epoll (65k at 93% CPU vs 75.6k at 87%),
-~1.4x more CPU per request, because it is readiness EMULATED on a completion engine — poll, then a
-separate read, plus a re-arm, where epoll does two kernel interactions. Multishot `RECV` + `SQPOLL`
-is the real headroom. That comparison is same-box/same-minute, so unlike the M1 numbers it is not
-confounded.
-
-**Earlier figures for regression-hunting were 8.0k / 14.1k / 13.6k (web.app, time-boxed).** If
-throughput regresses, suspect these first:
+If throughput regresses, suspect these first:
 1. **Persistent fd registration** (`net/ev/epoll`). The reactor used to `EPOLL_CTL_ADD` on every
    submit and `EPOLL_CTL_DEL` on every completion — four `epoll_ctl` calls per keep-alive request on
    top of recv/send. It now ADDs once, re-arms with `EPOLL_CTL_MOD` + `EPOLLONESHOT`, and only DELs
@@ -345,11 +280,30 @@ the empty inbox reveals anything is wrong. `nova_uring_prep` now clears `off` fo
 Worth knowing generally — several io_uring opcodes alias fields through that union, so "set the field
 the docs name" is not sufficient; the ones it overlaps have to be cleared.
 
-## Status
+## Status & dependencies
 
-See `docs/design/execution-plan.md` — the master table (27/31 items ✅). Recent: **T6 per-file `.o` split
-DONE** (default-on, content-hash cache, F4-6 satisfied); **T1 cross-compilation** — from macOS build Linux
-x86_64/arm64 (static ELF) + Windows x86_64 (PE32+) via bundled `zig c++`; **build deps generalized off
-Homebrew** — vendored Boost.Asio subset (`deps/boost`) + static LLVM from a self-hosted lazy `build.zig.zon`
-mirror (`kamlesh-nb/llvm-dist`; tarballs staged in `~/.nova-llvmdist`, upload pending). Depends on **NovaDB**
-(separate repo) and pairs with **nls** (LSP) + the VSCode **extension**.
+Master roadmap: `docs/design/execution-plan.md` (per-item design + state). Language spec: `docs/specs.md`.
+Depends on **NovaDB** (separate repo); pairs with **nls** (LSP) + the VSCode **extension**.
+
+## Planned / next work
+
+1. **All crypto hardware-asm for x86_64.** ARM64 has `src/runtime/nova_crypto_arm64.S` (AES + SHA-256
+   via the ARMv8 crypto extensions, wired through `nova_has_asm_crypto()` / `nova_sha256_blocks` and
+   `simd.aesenc`). Add the x86_64 equivalents — AES-NI, SHA-NI (`sha256rnds2`/`sha256msg1/2`), PCLMULQDQ
+   for GHASH, and the AVX2 SHA path — behind the same gates, with runtime CPUID detection and a scalar
+   fallback. Reference Go's `crypto/internal/fips140/sha256/_asm/sha256block_amd64_{shani,avx2}.go` and
+   the AES-GCM assembly for the instruction sequences.
+
+2. **A small CRUD web app on MSSQL** (like `nova-pg-web` is for Postgres) to exercise the web framework
+   AND the `mssql` driver end to end — scaffold with `nova init web`, wire the `mssql` package as the
+   `Connection`, run the same load/soak test. Shakes out driver + framework edges together.
+
+3. **Test the orchestrator's fd-handoff on every reactor backend.** The zero-downtime handoff
+   (`SCM_RIGHTS` fd passing between proxyd/orchd instances) has been exercised mainly on kqueue/epoll;
+   verify it on **IOCP** (Windows — a listening socket handed to another process must be re-associated
+   with the new process's completion port) and **io_uring**, since a proactor's in-flight ops and the
+   inherited socket state differ from a readiness engine's.
+
+4. **Windows/WSL parity gates.** Wire `--asan`/`--arc` on Windows and close the remaining IOCP
+   readiness cases (`armRead`/`armWrite` have no proactor analogue; convert to the zero-byte-receive
+   completion path already used by io_uring — see "Readiness on a proactor" above).
