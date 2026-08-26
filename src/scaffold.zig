@@ -123,6 +123,8 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
     const files = [_]f{
         .{ .rel = "src/main.nova", .content = templates.web_main_sample },
 
+        .{ .rel = "src/Features/Products/routes.nova", .content = templates.web_routes_sample },
+
         .{ .rel = "src/Features/Products/CreateProduct/command.nova", .content = templates.web_create_command_sample },
         .{ .rel = "src/Features/Products/CreateProduct/validator.nova", .content = templates.web_create_validator_sample },
         .{ .rel = "src/Features/Products/CreateProduct/handler.nova", .content = templates.web_create_handler_sample },
