@@ -302,7 +302,16 @@ pub struct Sha256 {
                 i = i + 1;
             }
             if (self.blockLen == SHA256_BLOCK_LEN) {
-                self.compress(self.block, 0);
+                // Route the completed block through the hardware SHA-2 path too, not
+                // just the bulk run below. This is the block that finalises a small
+                // message (e.g. every HMAC inner/outer close in PBKDF2), so leaving
+                // it on the pure-Nova compressor kept ~half of all compressions in
+                // software and dominated PBKDF2 cost.
+                if (nova_has_asm_crypto() == 1) {
+                    nova_sha256_blocks(self.h, self.block, 1);
+                } else {
+                    self.compress(self.block, 0);
+                }
                 self.blockLen = 0;
             }
         }
