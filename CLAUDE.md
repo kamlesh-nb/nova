@@ -109,6 +109,9 @@ as the sh branch does. Two things to know:
 - ASAN is selected by the **`--asan` flag**, not by `NOVA_ASAN` in the environment. `run.sh` maps the
   env var onto the flag; invoking `nova test` by hand needs `nova test --asan <file>`. Setting only the
   env var silently runs an ordinary uninstrumented build.
+Prefer `--asan -j`: the sequential ASAN branch has no per-case timeout, so one server/reactor case that
+waits on a socket wedges the whole gate with no output. Measured here: the crypto subset (the 14 cases
+covering the new x86_64 assembly) is ASAN-clean.
 
 **C. Cross-compile from macOS/Linux/WSL (no Windows host needed).**
 ```bash
@@ -420,9 +423,19 @@ Depends on **NovaDB** (separate repo); pairs with **nls** (LSP) + the VSCode **e
      pass the corpus at all, because `cli.run`'s leak gate exits 1 on a compiler that legitimately
      leaks. Build `-Doptimize=ReleaseFast`. Details in the Windows section.
 
+   - `--arc` works on Windows now too, after fixing what turned out to be the same root cause in a
+     different place: **the sequential harness paths ran every case in the repo root**, so each one
+     reused the hardcoded `build/test/__nova_test{,.o}`. On Windows the previous case's object or
+     binary is still locked when the next link opens it, and the link fails with `LNK1104 cannot open
+     file` roughly HALF the time — measured 3/6 sharing a directory against 6/6 isolated. It presents
+     as a random `<compile/link error>` on an unrelated case, and because the case then never prints
+     "Running N test(s)", the harness self-test trips too and aborts the run with HARNESS INTEGRITY
+     BROKEN, which reads like a classifier regression rather than the file lock it is. `run_case`, the
+     `--asan` sequential loop, the `--arc` loop and the self-test now each run in their own temp dir,
+     the way the `-j` worker already did. That is also why the `-j` corpus was reliable while every
+     sequential gate looked broken.
+
    Still open: **repair the driver's leak gate** (~12k live allocations across dozens of sites, so
    `zig build` + `run.sh` is red on Debug everywhere, not just Windows — almost certainly Zig-0.16 std
-   drift), and confirm `--arc` end to end on Windows. Note when testing gates: run ONE corpus at a
-   time. `--asan`/`--arc` are sequential and execute in the repo root, so two concurrent runs clobber
-   the same hardcoded `__nova_test` binary and the failure surfaces as "HARNESS INTEGRITY BROKEN",
-   which reads like a classifier regression rather than the collision it is.
+   drift), and fill in `arc-baseline.txt`, which is missing entries for cases added since it was
+   written (244, 344, 440-444) so `--arc` reports them as `no baseline entry`.

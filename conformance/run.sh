@@ -29,7 +29,19 @@ CASE_TIMEOUT="${NOVA_CASE_TIMEOUT:-120}"
 HAVE_TIMEOUT="$(command -v timeout || true)"   # coreutils on Linux/Git-Bash; absent on stock macOS
 
 run_case() {
-  local rc out
+  local rc out wd
+  # Each case gets its own working directory. `nova test` writes a HARDCODED build/test/__nova_test{,.o}
+  # relative to the cwd, so a sequential loop that stays put has every case reusing one output path.
+  # That self-collides on Windows: the previous case's object or binary is still locked when the next
+  # link opens it, and the link fails with LNK1104 "cannot open file" (or a missing .o) about HALF the
+  # time — measured 3/6 sharing a directory against 6/6 isolated. It surfaces as a random
+  # <compile/link error> on an unrelated case, which is close to undiagnosable. The -j path already
+  # worked this way; this brings the sequential path (and therefore --arc, --asan and any filtered run)
+  # in line. packages/ is symlinked so driver-importing cases still resolve.
+  local prev="$PWD"
+  wd="$(mktemp -d)"
+  ln -s "$(cd "$HERE/.." && pwd)/packages" "$wd/packages" 2>/dev/null
+  cd "$wd" || { rm -rf "$wd"; return 1; }
   if [[ -n "$HAVE_TIMEOUT" ]]; then
     out="$("$HAVE_TIMEOUT" -k 5 "$CASE_TIMEOUT" "$NOVA" test $ASAN_FLAG "$1" 2>&1)"; rc=$?
   else
@@ -46,6 +58,10 @@ run_case() {
     out="$(cat "$tmp" 2>/dev/null)"
     rm -f "$tmp" 2>/dev/null
   fi
+  # Restore the caller's directory before returning: this is a function, not a subshell, so the cd
+  # above would otherwise leak into the rest of the script (which resolves paths from the repo root).
+  cd "$prev" || true
+  rm -rf "$wd"
   printf '%s\n' "$out"
   # 124 is timeout(1)'s verdict; a background kill surfaces as 128+SIGKILL. Either way, say so —
   # otherwise a hang reads as an ordinary non-zero exit and gets misdiagnosed.
@@ -356,8 +372,14 @@ if [[ -d "$HERE/harness-selftest" && $WASM_MODE -ne 1 && $WASMRUN_MODE -ne 1 ]];
   selftest_ok=1
   check_selftest() {
     local file="$1" want="$2"
-    local o c a
-    o="$("$NOVA" test "$HERE/harness-selftest/$file" 2>&1)"; c=$?
+    local o c a d
+    # Own temp dir, for the same reason the case loops use one: the hardcoded build/test/__nova_test
+    # output path is shared with whatever ran last, and on Windows the stale handle makes the link fail
+    # intermittently. A self-test that trips on that reports HARNESS INTEGRITY BROKEN and aborts the
+    # whole run — the most confusing possible symptom for a file-locking race.
+    d="$(mktemp -d)"
+    o="$(cd "$d" && "$NOVA" test "$HERE/harness-selftest/$file" 2>&1)"; c=$?
+    rm -rf "$d"
     a="$(classify_failure "$o" "$c")"
     if [[ "$a" == "$want" ]]; then
       printf "  \033[32mPASS\033[0m  %-32s %s\n" "$file" "(classified: $a)"
@@ -442,10 +464,17 @@ AWORKER
     done < <(sort "$_averd")
     rm -f "$_averd"
   else
+  ASAN_ROOT="$(cd "$HERE/.." && pwd)"
   for f in "$HERE"/cases/*.nova; do
     name="$(basename "$f" .nova)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
-    out="$("$NOVA" test --asan "$f" 2>&1)"
+    # Per-case temp dir, as in the -j branch above: the shared build/test/__nova_test output path
+    # self-collides on Windows and fails the link intermittently. (This sequential branch still has no
+    # per-case timeout, so prefer `--asan -j` for a full gate; this only removes the collision.)
+    _swd="$(mktemp -d)"
+    ln -s "$ASAN_ROOT/packages" "$_swd/packages" 2>/dev/null
+    out="$(cd "$_swd" && "$NOVA" test --asan "$f" 2>&1)"
+    rm -rf "$_swd"
     if printf '%s' "$out" | grep -q "ERROR: AddressSanitizer"; then
       kind="$(printf '%s' "$out" | grep -m1 -oE 'AddressSanitizer: [a-z-]+' | sed 's/AddressSanitizer: //')"
       where="$(printf '%s' "$out" | grep -m1 -oE '#0 0x[0-9a-f]+ in [A-Za-z_][A-Za-z0-9_]*' | sed 's/.* in //')"
@@ -557,6 +586,7 @@ if [[ $ARC_MODE -eq 1 ]]; then
     echo "  ERROR: $baseline_file missing" >&2; exit 2
   fi
   improved=()
+  ARC_ROOT="$(cd "$HERE/.." && pwd)"
   for f in "$HERE"/cases/*.nova; do
     name="$(basename "$f" .nova)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
@@ -565,7 +595,19 @@ if [[ $ARC_MODE -eq 1 ]]; then
       printf "  \033[31mFAIL\033[0m  %-32s %s\n" "$name" "(no baseline entry — add one)"
       fail=$((fail+1)); failed_cases+=("$name:arc-nobaseline"); continue
     fi
-    out="$(NOVA_ARC_AUDIT=1 "$NOVA" test "$f" 2>&1 | grep -vE '^DEBUG')"
+    # Run in a per-case temp dir, exactly as the -j and --asan -j workers do. `nova test` writes a
+    # HARDCODED build/test/__nova_test{,.o} relative to the cwd, so a loop that stays in one directory
+    # has every case reusing one output path. On Windows that self-collides: the previous case's object
+    # or binary is still locked when the next link opens it, and the run fails with LNK1104 "cannot open
+    # file" (or a missing .o) about HALF the time — measured 3/6 here against 6/6 with isolation. It
+    # presents as a random compile/link error, and because the case then never prints "Running N
+    # test(s)" the harness self-test also trips with HARNESS INTEGRITY BROKEN, which reads like a
+    # classifier regression rather than the collision it is. packages/ is symlinked in so cases that
+    # import a driver still resolve.
+    _awd="$(mktemp -d)"
+    ln -s "$ARC_ROOT/packages" "$_awd/packages" 2>/dev/null
+    out="$(cd "$_awd" && NOVA_ARC_AUDIT=1 "$NOVA" test "$f" 2>&1 | grep -vE '^DEBUG')"
+    rm -rf "$_awd"
     if printf '%s' "$out" | grep -q "ARC audit: clean"; then live=0
     else live="$(printf '%s' "$out" | grep -oE 'ARC AUDIT FAILED: [0-9]+' | grep -oE '[0-9]+' | head -1)"; fi
     live="${live:-}"

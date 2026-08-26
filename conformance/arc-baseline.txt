@@ -61,6 +61,7 @@
 42_nested_owned_aggregates 0
 43_stdlib_shaped_ownership 0
 44_downcast_and_struct_literal_args 0
+445_asm_crypto_kernels 0
 45_try_returns_owned 0
 46_orphaned_tuple 0
 47_ifexpr_owned 0
