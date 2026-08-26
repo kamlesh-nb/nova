@@ -722,18 +722,34 @@ pub fn compileSimdCall(self: *LlvmCompiler, field: []const u8, args: []const ast
         }
         return v;
     }
+    // The explicit alignment on these two is load-bearing, and its absence was an x86_64-only crash.
+    //
+    // `<4 x double>` has an ABI alignment of 32 bytes, and that is what LLVM assumes when a load/store
+    // carries no alignment of its own. The pointer here comes from an int-to-ptr of a Nova array word,
+    // so LLVM knows nothing about it and takes the type's word for it — then on x86_64 emits an ALIGNED
+    // 32-byte move (VMOVAPS). A Nova `double[]` is only 8-byte aligned, so that faults: #GP, delivered
+    // on Windows as an access violation, which `nova test` reports as the uninformative "Test suite
+    // FAILED (exit code 5)". It never showed up on arm64 because NEON loads do not fault on a
+    // misaligned address, so the identical IR happens to work there.
+    //
+    // 8, not 1: the element type is double and the GEP indexes it, so the address is 8-aligned by
+    // construction. What must not be claimed is the VECTOR's 32-byte alignment. (compileIntSimd uses 1
+    // for the same reason — its buffers are raw bytes with no such guarantee.)
     if (std.mem.eql(u8, field, "load4")) {
         const arr = try self.compileExpression(args[0]);
         const idx = try self.compileExpression(args[1]);
         const p = elemPtr(self, arr, idx);
-        return core.LLVMBuildLoad2(self.builder, vecTy, p, "load4");
+        const ld = core.LLVMBuildLoad2(self.builder, vecTy, p, "load4");
+        core.LLVMSetAlignment(ld, 8);
+        return ld;
     }
     if (std.mem.eql(u8, field, "store4")) {
         const arr = try self.compileExpression(args[0]);
         const idx = try self.compileExpression(args[1]);
         const v = try self.compileExpression(args[2]);
         const p = elemPtr(self, arr, idx);
-        _ = core.LLVMBuildStore(self.builder, v, p);
+        const st = core.LLVMBuildStore(self.builder, v, p);
+        core.LLVMSetAlignment(st, 8);
         return core.LLVMConstInt(self.val_type, 0, 0);
     }
     if (std.mem.eql(u8, field, "sum4")) {
