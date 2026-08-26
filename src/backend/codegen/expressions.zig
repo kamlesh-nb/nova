@@ -5242,12 +5242,30 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const nc_is_valopt = self.exprYieldsValoptBox(nc.left);
             const left_present = if (nc_is_valopt) try self.buildValoptUnbox(left_val) else left_val;
 
+            // Fast path: the optional was narrowed to present by an enclosing `if (x != undefined)`,
+            // so the RHS branch is dead and the whole phi can collapse to the payload.
+            //
+            // The `!ownedByName` half is load-bearing and its absence was a DOUBLE RELEASE. Returning
+            // `left_val` hands back a BORROW — the payload is still owned by whatever the optional came
+            // from — so it is only safe when the payload needs no reference counting at all. The
+            // ordinary path below retains the payload after the phi for exactly this reason.
+            //
+            // `isPrimitiveTypeName` alone is the wrong question, because it answers TRUE for `any`
+            // while `ownedByName` also answers true for it: `any` is a heap box from `nova_any_box`,
+            // reference-counted like anything else, and the only type that is both. So a
+            // `Map<string, any>` value read out and coalesced (`(m.get(k) ?? 0)`) took this path,
+            // skipped the retain, and was then released once by the local and again by the map's
+            // destructor — a use-after-free that the plain corpus does not see because the freed box
+            // usually still reads back plausibly. Found by `--asan` on conformance 123.
+            //
+            // Both predicates are kept rather than just the ownership one: every genuinely primitive
+            // type is already non-owned, so this changes behaviour for `any` and nothing else.
             if (!nc_is_valopt and nc.left.kind == .ident and self.narrowed_present.contains(nc.left.kind.ident)) {
                 if (self.type_store) |st| {
                     if (self.typeOfExprConcrete(nc.left)) |lt| {
                         const inner = self.valueOptionalInner(lt) orelse lt;
                         const iname = self.cachedTypeName(st, inner) catch "";
-                        if (types_mod.isPrimitiveTypeName(iname)) {
+                        if (types_mod.isPrimitiveTypeName(iname) and !self.ownedByName(iname)) {
                             return left_val;
                         }
                     }

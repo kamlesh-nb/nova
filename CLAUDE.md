@@ -96,7 +96,7 @@ Note that readiness cases 192/194/195, listed as open in an earlier revision of 
 | Gate | Windows / IOCP | Linux / epoll (WSL2, Ubuntu 24.04) |
 |---|---|---|
 | positive corpus | **437/444** | **440/444** |
-| `--asan` | crypto subset clean | **439/444** |
+| `--asan` | crypto subset clean | **440/444** |
 
 Running BOTH is what makes the failure list interpretable, because "fails on Windows" turned out to
 mean four different things. Do not assume a failure is a platform gap without checking the other host:
@@ -115,12 +115,10 @@ mean four different things. Do not assume a failure is a platform gap without ch
   struct literal gets a NULL backing buffer), and `118_actor` takes a heap-buffer-overflow READ inside
   `nova_release` from `ActorCell_i32_init` — releasing something that was never a refcounted heap
   object, the "ARC guessed from the type name and freed it" failure described under ARC above.
-- **Found ONLY by `--asan`, and only on Linux because that is where the gate has been run over the
-  whole corpus:** `123_any_container` passes the plain corpus but is a **double release**.
-  `nova_any_box` allocates the box; `__destruct_Map_string_any` frees it; then
-  `RawBuffer_any_delete` releases it again. The Map and its backing RawBuffer both believe they own
-  the boxed elements. This is precisely the class of bug the ASAN gate exists for — invisible to a
-  passing test, located exactly by ASAN.
+- **Found ONLY by `--asan` (FIXED):** `123_any_container` passed the plain corpus while
+  double-releasing. See the `any` note under Gotchas — it is the one type that is both "primitive" and
+  owned, and a `??` fast path trusted the wrong predicate. Precisely the class of bug the ASAN gate
+  exists for: invisible to a passing test, located exactly by ASAN.
 
 Three Windows-host build breakages were fixed to get here, all Zig/UCRT drift rather than design:
 `w.WINAPI` and `w.kernel32.GetCurrentProcess` no longer exist and `w.BOOL` became a distinct type
@@ -195,6 +193,14 @@ target-conditional file rule `targetVariantPath` swaps whole modules so shared c
 
 ## Gotchas (bitten before)
 
+- **`any` is the one type that is BOTH "primitive" and OWNED.** `isPrimitiveTypeName("any")` is true
+  (it is a single word, not a struct) and `ownedByName("any")` is ALSO true (that word points at a
+  refcounted `nova_any_box`). Any codegen path that asks "is this primitive?" as a stand-in for "does
+  this need reference counting?" is therefore wrong for `any` alone, and wrong in the dangerous
+  direction: it skips a retain. That is what made `(m.get(k) ?? 0)` on a `Map<string, any>` a
+  use-after-free — the `??` narrowed-present fast path returned the payload as a borrow with no
+  retain, and it was then released by both the local and the map's destructor. When you need the ARC
+  question, ask `ownedByName`. `isPrimitiveTypeName` answers a layout question, not an ownership one.
 - **A vector load/store needs an EXPLICIT alignment, or LLVM assumes the type's ABI alignment.** A
   `<4 x double>` wants 32 bytes; Nova arrays and `bytes.alloc` buffers are 8-byte aligned. Omit the
   alignment and EVERY x86_64 target gets an aligned 32-byte move against an 8-aligned address — #GP.
