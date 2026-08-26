@@ -224,6 +224,13 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     compiler.f2_types = sema_shadow.f2_types_enabled;
     defer compiler.deinit();
 
+    // Best-effort load of the project's SQL schema for compile-time query type
+    // checking (see checkSelectCoverage). Read here where `io` is available; codegen
+    // only parses the bytes. Absent schema.sql -> schema-aware checks are skipped.
+    if (std.Io.Dir.readFileAlloc(.cwd(), io, "schema.sql", allocator, .unlimited)) |sbytes| {
+        compiler.sql_schema_src = sbytes;
+    } else |_| {}
+
     {
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (std.Io.Dir.realPathFile(.cwd(), io, ".", &cwd_buf)) |n| {

@@ -334,6 +334,16 @@ pub const LlvmCompiler = struct {
     scopes: std.ArrayList(Scope),
     /// Name -> stack-slot for the locals in the function currently being emitted.
     locals: std.StringHashMap(types.LLVMValueRef),
+    /// Compile-time SQL schema, loaded lazily from `schema.sql` (or `$NOVA_SQL_SCHEMA`)
+    /// once, on the first typed query with a literal SELECT. Maps table name -> (column
+    /// name -> SQL type, first word uppercased, e.g. "DECIMAL"/"UUID"/"BIGSERIAL"). Used
+    /// to check that a SELECTed column exists and that its type is bind-compatible with
+    /// the result struct's field. `sql_schema_src` owns the backing bytes the map slices
+    /// into. Absent schema -> the existence/type checks are skipped (column-coverage +
+    /// $N-placeholder checks still run).
+    sql_schema: std.StringHashMap(std.StringHashMap([]const u8)),
+    sql_schema_src: ?[]u8 = null,
+    sql_schema_loaded: bool = false,
     /// Base names of functions whose body returns NSX markup (a `<jsx>` element).
     /// Used by JSX value-position interpolation `{expr}`: a call to such a function
     /// (a view helper) is inserted RAW rather than HTML-escaped, so composing
@@ -634,6 +644,7 @@ pub const LlvmCompiler = struct {
             .free_list = null,
             .persistent_ptr = null,
             .locals = std.StringHashMap(types.LLVMValueRef).init(allocator),
+            .sql_schema = std.StringHashMap(std.StringHashMap([]const u8)).init(allocator),
             .nsx_returning = std.StringHashMap(void).init(allocator),
             .func_map = std.StringHashMap(types.LLVMValueRef).init(allocator),
             .param_type_cache = std.StringHashMap(?ast.TypeRef).init(allocator),
@@ -1053,6 +1064,12 @@ pub const LlvmCompiler = struct {
         }
         self.scopes.deinit(self.allocator);
         self.locals.deinit();
+        {
+            var sit = self.sql_schema.valueIterator();
+            while (sit.next()) |cols| cols.deinit();
+            self.sql_schema.deinit();
+            if (self.sql_schema_src) |s| self.allocator.free(s);
+        }
         self.nsx_returning.deinit();
         self.func_map.deinit();
         {

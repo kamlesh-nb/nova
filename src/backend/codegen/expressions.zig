@@ -6111,6 +6111,145 @@ fn sqlFindKeywordDepth0(s: []const u8, from: usize, kw: []const u8) ?usize {
     return null;
 }
 
+fn sqlStripQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
+    return s;
+}
+
+fn sqlSkipWs(s: []const u8, i: usize) usize {
+    var j = i;
+    while (j < s.len and (s[j] == ' ' or s[j] == '\n' or s[j] == '\t' or s[j] == '\r')) j += 1;
+    return j;
+}
+
+/// Start index of a whole-word, case-insensitive `kw` in `s[from..]`, or null.
+fn sqlCiFindWord(s: []const u8, from: usize, kw: []const u8) ?usize {
+    var i = from;
+    while (i + kw.len <= s.len) : (i += 1) {
+        const before_ok = i == 0 or !sqlIsIdentByte(s[i - 1]);
+        const after_ok = (i + kw.len == s.len) or !sqlIsIdentByte(s[i + kw.len]);
+        if (before_ok and after_ok and sqlFoldEql(s[i .. i + kw.len], kw)) return i;
+    }
+    return null;
+}
+
+const SqlIdent = struct { name: []const u8, next: usize };
+fn sqlReadIdent(s: []const u8, i: usize) SqlIdent {
+    var j = i;
+    while (j < s.len and (sqlIsIdentByte(s[j]) or s[j] == '"')) j += 1;
+    return .{ .name = s[i..j], .next = j };
+}
+
+fn sqlIsConstraintKw(w: []const u8) bool {
+    const ks = [_][]const u8{ "primary", "foreign", "unique", "check", "constraint", "exclude", "like" };
+    for (ks) |k| if (sqlFoldEql(w, k)) return true;
+    return false;
+}
+
+/// SQL type (first word) -> category: 'i' int, 'f' numeric, 'b' bool, 't' text/
+/// time/uuid/json/bytea, '?' unknown.
+fn sqlTypeCat(t: []const u8) u8 {
+    const ints = [_][]const u8{ "INT", "INTEGER", "INT2", "INT4", "INT8", "SMALLINT", "BIGINT", "SERIAL", "BIGSERIAL", "SMALLSERIAL" };
+    const nums = [_][]const u8{ "DECIMAL", "NUMERIC", "REAL", "DOUBLE", "FLOAT", "FLOAT4", "FLOAT8", "MONEY" };
+    const bools = [_][]const u8{ "BOOLEAN", "BOOL" };
+    const texts = [_][]const u8{ "TEXT", "VARCHAR", "CHAR", "CHARACTER", "UUID", "JSON", "JSONB", "TIMESTAMP", "TIMESTAMPTZ", "DATE", "TIME", "TIMETZ", "INET", "CIDR", "BYTEA", "CITEXT", "NAME" };
+    for (ints) |k| if (sqlFoldEql(t, k)) return 'i';
+    for (nums) |k| if (sqlFoldEql(t, k)) return 'f';
+    for (bools) |k| if (sqlFoldEql(t, k)) return 'b';
+    for (texts) |k| if (sqlFoldEql(t, k)) return 't';
+    return '?';
+}
+
+fn novaTypeCat(t: []const u8) u8 {
+    if (std.mem.eql(u8, t, "int") or std.mem.eql(u8, t, "long")) return 'i';
+    if (std.mem.eql(u8, t, "double") or std.mem.eql(u8, t, "decimal")) return 'f';
+    if (std.mem.eql(u8, t, "bool")) return 'b';
+    if (std.mem.eql(u8, t, "string") or std.mem.eql(u8, t, "str") or std.mem.eql(u8, t, "Str")) return 't';
+    return '?';
+}
+
+/// Incompatible only on the high-confidence boundaries: text vs non-text, and
+/// bool vs non-bool. Numeric int/float are interchangeable (no false positives on
+/// int/decimal/double), and any '?' (unknown) skips the check.
+fn sqlCatIncompatible(colc: u8, fldc: u8) bool {
+    if (colc == '?' or fldc == '?') return false;
+    if ((colc == 't') != (fldc == 't')) return true;
+    if ((colc == 'b') != (fldc == 'b')) return true;
+    return false;
+}
+
+/// Parse `CREATE TABLE` statements from the loaded schema bytes into
+/// `self.sql_schema` (table -> col -> SQL type word). One-time; slices reference
+/// `sql_schema_src`, which outlives the map.
+fn ensureSqlSchema(self: *LlvmCompiler) !void {
+    if (self.sql_schema_loaded) return;
+    self.sql_schema_loaded = true;
+    const src = self.sql_schema_src orelse return;
+    var i: usize = 0;
+    while (sqlCiFindWord(src, i, "create")) |cpos| {
+        i = cpos + 6;
+        var p = sqlSkipWs(src, i);
+        if (!(p + 5 <= src.len and sqlFoldEql(src[p .. p + 5], "table"))) continue;
+        p = sqlSkipWs(src, p + 5);
+        if (p + 2 <= src.len and sqlFoldEql(src[p .. p + 2], "if")) {
+            const ex = sqlCiFindWord(src, p, "exists") orelse continue;
+            p = sqlSkipWs(src, ex + 6);
+        }
+        const nm = sqlReadIdent(src, p);
+        if (nm.name.len == 0) continue;
+        var tname = sqlStripQuotes(nm.name);
+        if (std.mem.lastIndexOfScalar(u8, tname, '.')) |d| tname = tname[d + 1 ..];
+        p = sqlSkipWs(src, nm.next);
+        if (p >= src.len or src[p] != '(') continue;
+        var depth: i32 = 1;
+        var q = p + 1;
+        const body_start = q;
+        while (q < src.len and depth > 0) : (q += 1) {
+            if (src[q] == '(') depth += 1 else if (src[q] == ')') {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+        const body = src[body_start..q];
+        i = if (q < src.len) q + 1 else src.len;
+
+        var cols = std.StringHashMap([]const u8).init(self.allocator);
+        var d2: i32 = 0;
+        var in_s = false;
+        var st: usize = 0;
+        var k: usize = 0;
+        while (k <= body.len) : (k += 1) {
+            const at_end = k == body.len;
+            const c = if (at_end) ',' else body[k];
+            if (!at_end and in_s) {
+                if (c == '\'') in_s = false;
+                continue;
+            }
+            if (!at_end and c == '\'') {
+                in_s = true;
+                continue;
+            }
+            if (!at_end and c == '(') d2 += 1;
+            if (!at_end and c == ')') d2 -= 1;
+            if ((at_end or c == ',') and d2 == 0) {
+                const def = sqlTrim(body[st..k]);
+                st = k + 1;
+                if (def.len == 0) continue;
+                const first = sqlReadIdent(def, 0);
+                const fname = sqlStripQuotes(first.name);
+                if (fname.len == 0 or sqlIsConstraintKw(fname)) continue;
+                const tp = sqlSkipWs(def, first.next);
+                const typ = sqlReadIdent(def, tp);
+                if (typ.name.len == 0) continue;
+                cols.put(fname, typ.name) catch {};
+            }
+        }
+        self.sql_schema.put(tname, cols) catch {};
+    }
+}
+
+const SqlSelCol = struct { source: ?[]const u8, output: []const u8 };
+
 fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []const u8) !void {
     const sd = self.structs.get(struct_name) orelse return;
     const trimmed = sqlTrim(sql);
@@ -6124,9 +6263,9 @@ fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []cons
     const cols = sqlTrim(sql[after_select .. from_start - 4]);
     if (cols.len == 0) return;
 
-    // Collect output column names (alias if present, else the last dotted segment).
-    var outputs = std.ArrayList([]const u8).empty;
-    defer outputs.deinit(self.allocator);
+    // Collect {source column, output name} for each select item.
+    var sel = std.ArrayList(SqlSelCol).empty;
+    defer sel.deinit(self.allocator);
     var depth: i32 = 0;
     var in_str = false;
     var start: usize = 0;
@@ -6149,40 +6288,107 @@ fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []cons
             start = idx + 1;
             if (item.len == 0) continue;
             if (std.mem.indexOfScalar(u8, item, '*') != null) return; // SELECT * / t.* -> skip all
-            // alias: a depth-0 trailing ` AS name`, or a bare (possibly qualified) identifier.
-            var out: []const u8 = item;
+            var out: []const u8 = undefined;
+            var src_col: ?[]const u8 = null;
             if (sqlFindKeywordDepth0(item, 0, "as")) |as_end| {
                 out = sqlTrim(item[as_end..]);
+                // the pre-AS part is the source column only if it is a simple identifier
+                const pre = sqlTrim(item[0 .. as_end - 2]);
+                var simple = pre.len > 0;
+                for (pre) |b| if (!sqlIsIdentByte(b)) {
+                    simple = false;
+                    break;
+                };
+                if (simple) {
+                    var scol = pre;
+                    if (std.mem.lastIndexOfScalar(u8, scol, '.')) |dot| scol = scol[dot + 1 ..];
+                    src_col = sqlStripQuotes(scol);
+                }
             } else {
                 var all_ident = true;
                 for (item) |b| if (!sqlIsIdentByte(b)) {
                     all_ident = false;
                     break;
                 };
-                if (!all_ident) return; // an expression/function without an alias -> cannot name -> skip
+                if (!all_ident) return; // expression/function without an alias -> cannot name -> skip
+                out = item;
+                var scol = item;
+                if (std.mem.lastIndexOfScalar(u8, scol, '.')) |dot| scol = scol[dot + 1 ..];
+                src_col = sqlStripQuotes(scol);
             }
-            // last dotted segment
             if (std.mem.lastIndexOfScalar(u8, out, '.')) |dot| out = out[dot + 1 ..];
-            out = sqlTrim(out);
-            // strip surrounding double quotes on a quoted identifier
-            if (out.len >= 2 and out[0] == '"' and out[out.len - 1] == '"') out = out[1 .. out.len - 1];
-            // a still-unclean output name (spaces, residual punctuation) -> skip, don't guess
-            for (out) |b| if (!sqlIsIdentByte(b)) return;
+            out = sqlStripQuotes(sqlTrim(out));
+            for (out) |b| if (!sqlIsIdentByte(b)) return; // unclean output name -> skip, don't guess
             if (out.len == 0) return;
-            try outputs.append(self.allocator, out);
+            try sel.append(self.allocator, .{ .source = src_col, .output = out });
         }
     }
 
+    // 1) Coverage: every plain field of T must be produced by the SELECT.
     for (sd.fields) |f| {
         if (f.attributes.len != 0) continue; // @from/@derive may map a differently-named column
         var covered = false;
-        for (outputs.items) |o| if (sqlFoldEql(o, f.name)) {
+        for (sel.items) |o| if (sqlFoldEql(o.output, f.name)) {
             covered = true;
             break;
         };
         if (!covered) {
             std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m SQL query does not select a column for field '{s}' of '{s}'\x1b[0m\n  in: {s}\n(compilation failed)\n", .{ f.name, struct_name, sql });
             return error.SqlCheckFailed;
+        }
+    }
+
+    // 2) Schema-aware: column existence + column/field type compatibility.
+    try ensureSqlSchema(self);
+    if (self.sql_schema.count() == 0) return; // no schema.sql -> stop after coverage
+    // Resolve a SINGLE-table FROM clause (skip joins / comma-separated tables).
+    const tbl_id = sqlReadIdent(sql, sqlSkipWs(sql, from_start));
+    if (tbl_id.name.len == 0) return;
+    var table = sqlStripQuotes(tbl_id.name);
+    if (std.mem.lastIndexOfScalar(u8, table, '.')) |d| table = table[d + 1 ..];
+    // Bound the FROM clause at the next depth-0 clause keyword; bail on join/comma.
+    var clause_end = sql.len;
+    for ([_][]const u8{ "where", "group", "order", "limit", "having", "union", "offset" }) |kw| {
+        if (sqlFindKeywordDepth0(sql, from_start, kw)) |e| {
+            const kwstart = e - kw.len;
+            if (kwstart < clause_end) clause_end = kwstart;
+        }
+    }
+    const from_clause = sql[from_start..clause_end];
+    if (std.mem.indexOfScalar(u8, from_clause, ',') != null) return; // multi-table
+    if (sqlCiFindWord(from_clause, 0, "join") != null) return; // joins -> skip
+    const tcols = self.sql_schema.get(table) orelse return; // unknown table -> skip (partial schema)
+
+    for (sel.items) |sc| {
+        const source = sc.source orelse continue;
+        // existence
+        var col_type: ?[]const u8 = null;
+        var cit = tcols.iterator();
+        while (cit.next()) |e| {
+            if (sqlFoldEql(e.key_ptr.*, source)) {
+                col_type = e.value_ptr.*;
+                break;
+            }
+        }
+        if (col_type == null) {
+            std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m SQL column '{s}' does not exist in table '{s}'\x1b[0m\n  in: {s}\n(compilation failed)\n", .{ source, table, sql });
+            return error.SqlCheckFailed;
+        }
+        // type compatibility with the T field bound by the output name
+        for (sd.fields) |f| {
+            if (f.attributes.len != 0) continue; // @from/@derive may bind a different column
+            if (!sqlFoldEql(f.name, sc.output)) continue;
+            const ft = switch (f.type_name) {
+                .ident => |n| n,
+                else => "",
+            };
+            const colc = sqlTypeCat(col_type.?);
+            const fldc = novaTypeCat(ft);
+            if (sqlCatIncompatible(colc, fldc)) {
+                std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m SQL column '{s}' ({s}) is not type-compatible with field '{s}' ({s}) of '{s}'\x1b[0m\n  in: {s}\n(compilation failed)\n", .{ source, col_type.?, f.name, ft, struct_name, sql });
+                return error.SqlCheckFailed;
+            }
+            break;
         }
     }
 }
