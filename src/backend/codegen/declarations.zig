@@ -136,16 +136,58 @@ pub const flags = struct {
     pub var mem_stats: bool = false;
 };
 
-/// Print the current process peak resident set (`maxrss`) in MB against a phase
-/// label, or do nothing if `flags.mem_stats` is off.
+/// Peak resident-set size of the current process, in BYTES, on every host OS.
+///
+/// The units are normalised here: `getrusage.maxrss` is kilobytes on Linux but
+/// bytes on macOS/BSD, and Windows has no `getrusage` at all (it uses the psapi
+/// `GetProcessMemoryInfo` peak working-set instead). The `switch` on the comptime
+/// `os.tag` compiles only the prong for the target, so no POSIX-only symbol is
+/// referenced on Windows. Returns 0 if the query fails.
+fn peakRssBytes() u64 {
+    const builtin = @import("builtin");
+    return switch (builtin.os.tag) {
+        .windows => blk: {
+            const w = std.os.windows;
+            const PROCESS_MEMORY_COUNTERS = extern struct {
+                cb: w.DWORD,
+                PageFaultCount: w.DWORD,
+                PeakWorkingSetSize: usize,
+                WorkingSetSize: usize,
+                QuotaPeakPagedPoolUsage: usize,
+                QuotaPagedPoolUsage: usize,
+                QuotaPeakNonPagedPoolUsage: usize,
+                QuotaNonPagedPoolUsage: usize,
+                PagefileUsage: usize,
+                PeakPagefileUsage: usize,
+            };
+            const psapi = struct {
+                extern "psapi" fn GetProcessMemoryInfo(hProcess: w.HANDLE, counters: *PROCESS_MEMORY_COUNTERS, cb: w.DWORD) callconv(w.WINAPI) w.BOOL;
+            };
+            var pmc: PROCESS_MEMORY_COUNTERS = undefined;
+            pmc.cb = @sizeOf(PROCESS_MEMORY_COUNTERS);
+            if (psapi.GetProcessMemoryInfo(w.kernel32.GetCurrentProcess(), &pmc, pmc.cb) != 0) {
+                break :blk @as(u64, pmc.PeakWorkingSetSize);
+            }
+            break :blk 0;
+        },
+        else => blk: {
+            const ru = std.posix.getrusage(std.posix.rusage.SELF);
+            const maxrss: u64 = @intCast(@max(ru.maxrss, 0));
+            // Linux reports maxrss in KB; macOS/BSD report it in bytes.
+            break :blk if (builtin.os.tag == .linux) maxrss * 1024 else maxrss;
+        },
+    };
+}
+
+/// Print the current process peak resident set in MB against a phase label, or
+/// do nothing if `flags.mem_stats` is off.
 ///
 /// A cheap memory checkpoint dropped between the expensive phases of [`compile`]
 /// (collection, body emit, optimisation) so a memory regression can be pinned to
-/// a phase without a profiler.
+/// a phase without a profiler. Portable across host OSes via [`peakRssBytes`].
 fn memPhase(label: []const u8) void {
     if (!flags.mem_stats) return;
-    const ru = std.posix.getrusage(std.posix.rusage.SELF);
-    const mb = @as(u64, @intCast(ru.maxrss)) / (1024 * 1024);
+    const mb = peakRssBytes() / (1024 * 1024);
     std.debug.print("[MEM] {s:<28} peak={d} MB\n", .{ label, mb });
 }
 
