@@ -3769,6 +3769,11 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             return try self.buildClosureCall(box_val, call.args);
         },
         .generic_call => |gc| {
+            // `db.querySql<T>(conn, `...${x}...`)` -> `db.query<T>(conn, "...$N...", params)`.
+            // The rewritten node is a plain expression, compiled normally below.
+            if (try desugarQuerySql(self, gc)) |rewritten| {
+                return try self.compileExpression(rewritten);
+            }
             if (gc.type_args.len == 1) {
                 const wcallee: ?[]const u8 = switch (gc.callee.kind) {
                     .field_access => |fa| if (fa.object.kind == .ident and std.mem.eql(u8, fa.object.kind.ident, "witness")) fa.field else null,
@@ -6446,6 +6451,174 @@ pub fn checkSqlMethodCall(self: *LlvmCompiler, call: anytype) !void {
         else => return,
     };
     try checkSelectCoverage(self, getStructBaseName(tname), sql);
+}
+
+// ---------------------------------------------------------------------------
+// `querySql<T>` tagged-template form: type-safe, injection-safe SQL.
+//
+// The user writes  db.querySql<T>(conn, `SELECT ... WHERE id = ${orderId}`)
+// and the compiler rewrites it, before codegen, into
+//   db.query<T>(conn, "SELECT ... WHERE id = $1", Params().a(db.dbInt(orderId)).list)
+// so every `${x}` interpolation is BOUND as a parameter (never concatenated) --
+// which is what makes the form injection-safe by construction -- while the SQL
+// text is still checked against T and schema.sql at build time.
+//
+// Template parts: a `.literal .string` part is SQL text (appended verbatim);
+// any other expression part is an interpolation (boxed + bound as `$N`). A
+// statement-shaped hole (`${ let x = ...}`, parsed as `.block_expr`) cannot be
+// a bind value, so such a template is left un-rewritten.
+// ---------------------------------------------------------------------------
+
+/// Picks the `db.dbX` boxing constructor for an interpolation's resolved Nova
+/// type. Unknown / string-like types box as text (the safe default).
+fn sqlDbFnForType(t: ?[]const u8) []const u8 {
+    const tn = t orelse return "dbText";
+    if (std.mem.eql(u8, tn, "int")) return "dbInt";
+    if (std.mem.eql(u8, tn, "long")) return "dbLong";
+    if (std.mem.eql(u8, tn, "bool")) return "dbBool";
+    if (std.mem.eql(u8, tn, "double") or std.mem.eql(u8, tn, "float")) return "dbDouble";
+    if (std.mem.eql(u8, tn, "decimal")) return "dbDecimal";
+    return "dbText";
+}
+
+/// True when a `db.querySql<T>(conn, `...`)` generic call is the tagged-template
+/// form we rewrite (single type arg, `db.querySql`, template-literal 2nd arg).
+fn isQuerySqlTemplate(gc: anytype) bool {
+    if (gc.type_args.len != 1) return false;
+    if (gc.callee.kind != .field_access) return false;
+    const fa = gc.callee.kind.field_access;
+    if (fa.object.kind != .ident or !std.mem.eql(u8, fa.object.kind.ident, "db")) return false;
+    if (!std.mem.eql(u8, fa.field, "querySql")) return false;
+    if (gc.args.len < 2) return false;
+    return gc.args[1].kind == .template_expr;
+}
+
+/// Renders a template's parts into the parameterised SQL text ("... $1 ... $2"),
+/// returning an allocator-owned string, or null if a part is a statement hole.
+fn sqlBuildTextForTemplate(self: *LlvmCompiler, te: anytype) !?[]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(self.allocator);
+    var n: usize = 0;
+    for (te.parts) |*part| {
+        switch (part.kind) {
+            .literal => |l| switch (l) {
+                .string => |s| try buf.appendSlice(self.allocator, s),
+                else => {
+                    // a non-string literal hole (${5}) still binds as a param
+                    n += 1;
+                    var tmp: [16]u8 = undefined;
+                    const ds = std.fmt.bufPrint(&tmp, "${d}", .{n}) catch unreachable;
+                    try buf.appendSlice(self.allocator, ds);
+                },
+            },
+            .block_expr => {
+                buf.deinit(self.allocator);
+                return null; // statement hole -- not a bindable value
+            },
+            else => {
+                n += 1;
+                var tmp: [16]u8 = undefined;
+                const ds = std.fmt.bufPrint(&tmp, "${d}", .{n}) catch unreachable;
+                try buf.appendSlice(self.allocator, ds);
+            },
+        }
+    }
+    return try buf.toOwnedSlice(self.allocator);
+}
+
+/// Build-time check for the tagged-template form: same coverage + placeholder +
+/// schema checks as `checkSqlQuery`, run over the rendered template text.
+pub fn checkSqlTemplate(self: *LlvmCompiler, gc: anytype) !void {
+    if (!isQuerySqlTemplate(gc)) return;
+    const text = (try sqlBuildTextForTemplate(self, gc.args[1].kind.template_expr)) orelse return;
+    defer self.allocator.free(text);
+    try checkPlaceholders(self, text);
+    const tname = switch (gc.type_args[0]) {
+        .ident => |n| n,
+        else => return,
+    };
+    try checkSelectCoverage(self, getStructBaseName(tname), text);
+}
+
+fn sqlMkExpr(self: *LlvmCompiler, e: ast.Expression) !*ast.Expression {
+    const p = try self.allocator.create(ast.Expression);
+    p.* = e;
+    return p;
+}
+
+/// Rewrites `db.querySql<T>(conn, `...${e}...`)` into the equivalent
+/// `db.query<T>(conn, "...$N...", Params().a(db.dbX(e))....list)` expression,
+/// or returns null when the call is not the tagged-template form. Called from
+/// `compileExpression`'s `.generic_call` case (the rewritten node is then
+/// compiled normally, reusing all of `db.query<T>`'s codegen).
+pub fn desugarQuerySql(self: *LlvmCompiler, gc: anytype) !?ast.Expression {
+    if (!isQuerySqlTemplate(gc)) return null;
+    const fa = gc.callee.kind.field_access;
+    const te = gc.args[1].kind.template_expr;
+    const text = (try sqlBuildTextForTemplate(self, te)) orelse return null;
+    const span = fa.span;
+    const db_obj = fa.object; // *Expression -> ident "db"
+
+    // params chain: db.Params()
+    var chain = try sqlMkExpr(self, .{ .kind = .{ .call = .{
+        .callee = try sqlMkExpr(self, .{ .kind = .{ .field_access = .{
+            .object = db_obj,
+            .field = "Params",
+            .span = span,
+        } } }),
+        .args = &[_]ast.Expression{},
+        .span = span,
+    } } });
+
+    for (te.parts) |*part| {
+        const is_interp = switch (part.kind) {
+            .literal => |l| l != .string, // non-string literal binds; string is SQL text
+            .block_expr => false,
+            else => true,
+        };
+        if (!is_interp) continue;
+        const fn_name = sqlDbFnForType(try self.resolveExpressionTypeName(part));
+        // db.dbX(part)
+        const box = try sqlMkExpr(self, .{ .kind = .{ .call = .{
+            .callee = try sqlMkExpr(self, .{ .kind = .{ .field_access = .{
+                .object = db_obj,
+                .field = fn_name,
+                .span = span,
+            } } }),
+            .args = try self.allocator.dupe(ast.Expression, &[_]ast.Expression{part.*}),
+            .span = span,
+        } } });
+        // chain.a(box)
+        chain = try sqlMkExpr(self, .{ .kind = .{ .call = .{
+            .callee = try sqlMkExpr(self, .{ .kind = .{ .field_access = .{
+                .object = chain,
+                .field = "a",
+                .span = span,
+            } } }),
+            .args = try self.allocator.dupe(ast.Expression, &[_]ast.Expression{box.*}),
+            .span = span,
+        } } });
+    }
+
+    // chain.list
+    const params_expr = ast.Expression{ .kind = .{ .field_access = .{
+        .object = chain,
+        .field = "list",
+        .span = span,
+    } } };
+    const text_lit = ast.Expression{ .kind = .{ .literal = .{ .string = text } } };
+    const query_callee = try sqlMkExpr(self, .{ .kind = .{ .field_access = .{
+        .object = db_obj,
+        .field = "query",
+        .span = span,
+    } } });
+    const args3 = try self.allocator.dupe(ast.Expression, &[_]ast.Expression{ gc.args[0], text_lit, params_expr });
+    return ast.Expression{ .kind = .{ .generic_call = .{
+        .callee = query_callee,
+        .type_args = gc.type_args,
+        .args = args3,
+        .span = span,
+    } } };
 }
 
 /// Recursively serialises a JSX element tree into a `StringBuilder`, emitting

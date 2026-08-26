@@ -1948,6 +1948,33 @@ pub fn resolveExpressionTypeName(self: *LlvmCompiler, expr_ptr: *const ast.Expre
                 }
             }
         }
+
+        // Synthesised constructor / method calls (e.g. the `querySql` tagged-template
+        // desugar's `db.Params().a(...)` chain) are not in the typed IR either.
+        // Resolve structurally, narrowly: a call whose callee names a struct is a
+        // constructor (-> that struct); a `recv.method(...)` whose receiver resolves
+        // to a struct takes the method's declared return type, but only when that
+        // return type is itself a known struct (mirrors the field_access rule above).
+        if (expr_ptr.kind == .call) {
+            const c = expr_ptr.kind.call;
+            switch (c.callee.kind) {
+                .ident => |n| if (self.structs.contains(n)) return n,
+                .field_access => |cfa| {
+                    if (self.structs.contains(cfa.field)) return cfa.field;
+                    if (try self.resolveExpressionTypeName(cfa.object)) |recv_ty| {
+                        const mangled = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ recv_ty, cfa.field });
+                        defer self.allocator.free(mangled);
+                        for (self.functions.items) |f| {
+                            if (std.mem.eql(u8, f.name, mangled)) {
+                                if (self.structs.contains(f.return_type)) return f.return_type;
+                                return null;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
         return null;
     }
     const t = t_opt.?;

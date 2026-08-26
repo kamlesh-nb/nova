@@ -4520,6 +4520,7 @@ pub const LlvmCompiler = struct {
                 // Compile-time SQL check runs in this pre-codegen walk so it covers
                 // every function body (reachable or not), not just emitted ones.
                 try expressions_mod.checkSqlQuery(self, gc);
+                try expressions_mod.checkSqlTemplate(self, gc);
                 try self.collectStringsFromExpr(gc.callee.*);
                 for (gc.args) |arg| try self.collectStringsFromExpr(arg);
             },

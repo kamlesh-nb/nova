@@ -828,3 +828,23 @@ pub async fn query<T>(conn: Connection, sql: string, params: List<DbValue>): Row
     let w = await conn.queryWire(sql, params);
     return Rows<T>(w, serde.bindWire<T>(w));
 }
+
+// A chainable bind-parameter list builder. Used by the compiler's desugaring of
+// `querySql<T>(conn, `... ${x} ...`)`: each `${x}` interpolation becomes an
+// `.a(dbX(x))` call, so the parameters are BOUND (never string-interpolated),
+// which is what makes the tagged form injection-safe by construction.
+pub struct Params {
+    pub list: List<DbValue>,
+    init() { self.list = List<DbValue>(); }
+    pub fn a(self: Params, v: DbValue): Params { self.list.push(v); return self; }
+}
+
+// Type-safe, injection-safe query: the SQL is written as a template literal whose
+// `${...}` interpolations are BOUND as parameters, not concatenated. The compiler
+// rewrites `querySql<T>(conn, `SELECT ... ${id}`)` into
+// `query<T>(conn, "SELECT ... $1", Params().a(dbInt(id)).list)` AND checks the SQL
+// against T (and schema.sql) at build time. Passing a plain (non-template) string
+// runs this body unchanged, with no bound parameters.
+pub async fn querySql<T>(conn: Connection, sql: string): Rows<T> {
+    return await query<T>(conn, sql, List<DbValue>());
+}

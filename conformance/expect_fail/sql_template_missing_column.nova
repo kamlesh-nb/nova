@@ -1,0 +1,13 @@
+// EXPECT-FAIL: codegen
+// The tagged-template `querySql` form is coverage-checked just like `db.query`:
+// this SELECT omits a column for the plain field `name` (typo `naem`), so the
+// compiler must reject it at build time even though the value is interpolated.
+import data.db;
+import serde.json;
+import serde.source;
+import list;
+@serializable struct Product { pub id: int, pub name: string }
+async fn load(conn: db.Connection, wantId: int): void {
+    let _ = await db.querySql<Product>(conn, `SELECT id, naem FROM products WHERE id = ${wantId}`);
+}
+fn main(): void {}

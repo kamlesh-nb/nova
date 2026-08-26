@@ -1,0 +1,26 @@
+// Injection-safe tagged-template SQL: `db.querySql<T>(conn, `... ${x} ...`)` is
+// rewritten at compile time into `db.query<T>(conn, "... $N ...", params)` -- each
+// `${x}` interpolation is BOUND as a parameter (never concatenated), and the SQL
+// text is still coverage/placeholder/schema-checked against T. This case uses a
+// correct query, so it compiles.
+import assert;
+import data.db;
+import serde.json;
+import serde.source;
+import list;
+
+@serializable struct Product { pub id: int, pub name: string, pub price: int }
+
+// Uncalled: the check + desugar run in the pre-codegen pass over every body.
+async fn load(conn: db.Connection, wantId: int, wantName: string): void {
+    // Two interpolations of different types -> $1 (int, dbInt) and $2 (text, dbText).
+    let rows = await db.querySql<Product>(
+        conn,
+        `SELECT id, name, price FROM products WHERE id = ${wantId} AND name = ${wantName}`);
+    let _ = rows;
+}
+
+@test
+fn test_compiles(): void {
+    assert.isTrue(true);
+}
