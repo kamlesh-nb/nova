@@ -6114,8 +6114,14 @@ fn sqlTypeCat(t: []const u8) u8 {
 }
 
 fn novaTypeCat(t: []const u8) u8 {
-    if (std.mem.eql(u8, t, "int") or std.mem.eql(u8, t, "long")) return 'i';
-    if (std.mem.eql(u8, t, "double") or std.mem.eql(u8, t, "decimal")) return 'f';
+    // Accept both the Nova surface names (`int`/`long`/`double`) and the canonical
+    // rendered names the typed IR produces (`i32`/`i64`/`f64`), since this is called
+    // from both the codegen desugar (surface) and the pre-codegen check (canonical).
+    if (std.mem.eql(u8, t, "int") or std.mem.eql(u8, t, "long") or
+        std.mem.eql(u8, t, "i8") or std.mem.eql(u8, t, "i16") or std.mem.eql(u8, t, "i32") or
+        std.mem.eql(u8, t, "i64") or std.mem.eql(u8, t, "i128") or std.mem.eql(u8, t, "byte")) return 'i';
+    if (std.mem.eql(u8, t, "double") or std.mem.eql(u8, t, "decimal") or
+        std.mem.eql(u8, t, "f32") or std.mem.eql(u8, t, "f64")) return 'f';
     if (std.mem.eql(u8, t, "bool")) return 'b';
     if (std.mem.eql(u8, t, "string") or std.mem.eql(u8, t, "str") or std.mem.eql(u8, t, "Str")) return 't';
     return '?';
@@ -6131,6 +6137,73 @@ fn sqlCatIncompatible(colc: u8, fldc: u8) bool {
     return false;
 }
 
+fn sqlIsWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// Type-check bound parameters in a tagged-template query: for each `col OP $N`
+/// comparison (punctuation operators only), verify the column's schema type is
+/// compatible with the Nova type category bound at `$N` (`param_cats[N-1]`).
+/// Conservative -- only checks comparisons with a resolvable single-table column;
+/// word operators (IN/LIKE), unknown columns, and `$0`/out-of-range are skipped.
+fn sqlCheckParamTypes(sql: []const u8, tcols: anytype, param_cats: []const u8) !void {
+    var i: usize = 0;
+    while (i < sql.len) : (i += 1) {
+        if (sql[i] != '$') continue;
+        var j = i + 1;
+        var n: usize = 0;
+        var any = false;
+        while (j < sql.len and sql[j] >= '0' and sql[j] <= '9') : (j += 1) {
+            n = n * 10 + (sql[j] - '0');
+            any = true;
+        }
+        if (!any or n == 0 or n > param_cats.len) continue;
+        // Walk backward: whitespace, then a punctuation operator, then whitespace,
+        // then the column identifier.
+        var k = i;
+        while (k > 0 and sqlIsWs(sql[k - 1])) k -= 1;
+        var saw_op = false;
+        while (k > 0) {
+            const c = sql[k - 1];
+            if (c == '=' or c == '<' or c == '>' or c == '!') {
+                saw_op = true;
+                k -= 1;
+            } else break;
+        }
+        if (!saw_op) continue; // word operator (IN/LIKE/IS) or not a comparison -> skip
+        while (k > 0 and sqlIsWs(sql[k - 1])) k -= 1;
+        const id_end = k;
+        while (k > 0 and sqlIsIdentByte(sql[k - 1])) k -= 1;
+        if (k >= id_end) continue;
+        var col = sql[k..id_end];
+        if (std.mem.lastIndexOfScalar(u8, col, '.')) |d| col = col[d + 1 ..]; // strip table qualifier
+        if (col.len == 0) continue;
+        var col_type: ?[]const u8 = null;
+        var cit = tcols.iterator();
+        while (cit.next()) |e| {
+            if (sqlFoldEql(e.key_ptr.*, col)) {
+                col_type = e.value_ptr.*;
+                break;
+            }
+        }
+        if (col_type == null) continue; // unknown column -> skip (partial schema)
+        if (sqlCatIncompatible(sqlTypeCat(col_type.?), param_cats[n - 1])) {
+            std.debug.print("\x1b[1m\x1b[31merror:\x1b[0m\x1b[1m SQL parameter ${d} (a {s} value) is not type-compatible with column '{s}' ({s})\x1b[0m\n  in: {s}\n(compilation failed)\n", .{ n, sqlCatName(param_cats[n - 1]), col, col_type.?, sql });
+            return error.SqlCheckFailed;
+        }
+    }
+}
+
+fn sqlCatName(c: u8) []const u8 {
+    return switch (c) {
+        'i' => "integer",
+        'f' => "numeric",
+        'b' => "bool",
+        't' => "text",
+        else => "?",
+    };
+}
+
 /// Parse `CREATE TABLE` statements from the loaded schema bytes into
 /// `self.sql_schema` (table -> col -> SQL type word). One-time; slices reference
 /// `sql_schema_src`, which outlives the map.
@@ -6138,6 +6211,34 @@ fn ensureSqlSchema(self: *LlvmCompiler) !void {
     if (self.sql_schema_loaded) return;
     self.sql_schema_loaded = true;
     const src = self.sql_schema_src orelse return;
+    // Blank out SQL comments in place (the bytes are owned + persistent) so a
+    // `-- comment` after a column definition cannot swallow the next column.
+    // `--` runs to end of line; `/* */` spans; string literals are respected.
+    {
+        var s: usize = 0;
+        var in_str = false;
+        while (s < src.len) : (s += 1) {
+            if (in_str) {
+                if (src[s] == '\'') in_str = false;
+                continue;
+            }
+            if (src[s] == '\'') {
+                in_str = true;
+            } else if (src[s] == '-' and s + 1 < src.len and src[s + 1] == '-') {
+                while (s < src.len and src[s] != '\n') : (s += 1) src[s] = ' ';
+            } else if (src[s] == '/' and s + 1 < src.len and src[s + 1] == '*') {
+                src[s] = ' ';
+                src[s + 1] = ' ';
+                s += 2;
+                while (s + 1 < src.len and !(src[s] == '*' and src[s + 1] == '/')) : (s += 1) src[s] = ' ';
+                if (s + 1 < src.len) {
+                    src[s] = ' ';
+                    src[s + 1] = ' ';
+                    s += 1;
+                }
+            }
+        }
+    }
     var i: usize = 0;
     while (sqlCiFindWord(src, i, "create")) |cpos| {
         i = cpos + 6;
@@ -6203,7 +6304,7 @@ fn ensureSqlSchema(self: *LlvmCompiler) !void {
 
 const SqlSelCol = struct { source: ?[]const u8, output: []const u8 };
 
-fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []const u8) !void {
+fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []const u8, param_cats: ?[]const u8) !void {
     const sd = self.structs.get(struct_name) orelse return;
     const trimmed = sqlTrim(sql);
     // Only plain SELECT statements.
@@ -6312,6 +6413,10 @@ fn checkSelectCoverage(self: *LlvmCompiler, struct_name: []const u8, sql: []cons
     if (sqlCiFindWord(from_clause, 0, "join") != null) return; // joins -> skip
     const tcols = self.sql_schema.get(table) orelse return; // unknown table -> skip (partial schema)
 
+    // Bound-parameter type checks (tagged-template form only, where the param types
+    // are statically known): `col OP $N` must compare compatible types.
+    if (param_cats) |pcats| try sqlCheckParamTypes(sql, tcols, pcats);
+
     for (sel.items) |sc| {
         const source = sc.source orelse continue;
         // existence
@@ -6370,21 +6475,37 @@ pub fn checkSqlQuery(self: *LlvmCompiler, gc: anytype) !void {
         .ident => |n| n,
         else => return,
     };
-    try checkSelectCoverage(self, getStructBaseName(tname), sql);
+    try checkSelectCoverage(self, getStructBaseName(tname), sql, null);
 }
 
-/// Entry point for the method form `Repository<T>(conn, table).query("<literal>", params)`
-/// -- the common repository usage. `T` comes from the inline `Repository<T>(...)`
-/// receiver, so it needs no type inference.
+/// Resolves the element type `T` of a `Repository<T>` receiver expression, from
+/// EITHER an inline `Repository<T>(...)` construction OR a variable whose static
+/// type is `Repository<T>` (e.g. `let repo = Repository<Order>(...); repo.query(...)`).
+/// Returns the base type name, or null if the receiver is not a `Repository<...>`.
+fn sqlRepoElemType(self: *LlvmCompiler, obj: *const ast.Expression) !?[]const u8 {
+    if (obj.kind == .generic_call) {
+        const rgc = obj.kind.generic_call;
+        if (rgc.callee.kind == .ident and std.mem.eql(u8, rgc.callee.kind.ident, "Repository") and rgc.type_args.len == 1) {
+            return switch (rgc.type_args[0]) {
+                .ident => |n| getStructBaseName(n),
+                else => null,
+            };
+        }
+        return null;
+    }
+    const tn = (try self.resolveExpressionTypeName(obj)) orelse return null;
+    const pre = "Repository<";
+    if (!std.mem.startsWith(u8, tn, pre) or !std.mem.endsWith(u8, tn, ">")) return null;
+    return getStructBaseName(tn[pre.len .. tn.len - 1]);
+}
+
+/// Entry point for the method form `repo.query("<literal>", params)` where `repo`
+/// is a `Repository<T>` (inline construction OR a variable) -- the common
+/// repository usage. `T` is recovered from the receiver (see `sqlRepoElemType`).
 pub fn checkSqlMethodCall(self: *LlvmCompiler, call: anytype) !void {
     if (call.callee.kind != .field_access) return;
     const fa = call.callee.kind.field_access;
     if (!std.mem.eql(u8, fa.field, "query")) return;
-    // Receiver must be an inline Repository<T>(...) construction.
-    if (fa.object.kind != .generic_call) return;
-    const rgc = fa.object.kind.generic_call;
-    if (rgc.callee.kind != .ident or !std.mem.eql(u8, rgc.callee.kind.ident, "Repository")) return;
-    if (rgc.type_args.len != 1) return;
     if (call.args.len < 1) return; // (sql, params)
     const sql = switch (call.args[0].kind) {
         .literal => |l| switch (l) {
@@ -6393,12 +6514,9 @@ pub fn checkSqlMethodCall(self: *LlvmCompiler, call: anytype) !void {
         },
         else => return,
     };
+    const elem = (try sqlRepoElemType(self, fa.object)) orelse return;
     try checkPlaceholders(self, sql);
-    const tname = switch (rgc.type_args[0]) {
-        .ident => |n| n,
-        else => return,
-    };
-    try checkSelectCoverage(self, getStructBaseName(tname), sql);
+    try checkSelectCoverage(self, elem, sql, null);
 }
 
 // ---------------------------------------------------------------------------
@@ -6478,14 +6596,32 @@ fn sqlBuildTextForTemplate(self: *LlvmCompiler, te: anytype) !?[]const u8 {
 /// schema checks as `checkSqlQuery`, run over the rendered template text.
 pub fn checkSqlTemplate(self: *LlvmCompiler, gc: anytype) !void {
     if (!isQuerySqlTemplate(gc)) return;
-    const text = (try sqlBuildTextForTemplate(self, gc.args[1].kind.template_expr)) orelse return;
+    const te = gc.args[1].kind.template_expr;
+    const text = (try sqlBuildTextForTemplate(self, te)) orelse return;
     defer self.allocator.free(text);
     try checkPlaceholders(self, text);
     const tname = switch (gc.type_args[0]) {
         .ident => |n| n,
         else => return,
     };
-    try checkSelectCoverage(self, getStructBaseName(tname), text);
+    // Bound-parameter type categories, in `$1..$N` order -- the tagged template is
+    // the one form where the bind types are statically known, so `col OP $N`
+    // comparisons can be type-checked (see `sqlCheckParamTypes`). A non-string
+    // literal binds too; a `.literal .string` part is SQL text (skipped here).
+    var cats = std.ArrayList(u8).empty;
+    defer cats.deinit(self.allocator);
+    for (te.parts) |*part| {
+        const is_interp = switch (part.kind) {
+            .literal => |l| l != .string,
+            .block_expr => false,
+            else => true,
+        };
+        if (!is_interp) continue;
+        const pt = (try self.resolveExpressionTypeName(part)) orelse "string";
+        const cat = novaTypeCat(pt);
+        try cats.append(self.allocator, if (cat == '?') 't' else cat); // dbText fallback == text
+    }
+    try checkSelectCoverage(self, getStructBaseName(tname), text, cats.items);
 }
 
 fn sqlMkExpr(self: *LlvmCompiler, e: ast.Expression) !*ast.Expression {

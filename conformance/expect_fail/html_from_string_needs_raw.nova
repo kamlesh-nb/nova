@@ -1,0 +1,9 @@
+// EXPECT-FAIL: typecheck
+// `string` -> `Html` is not implicit: promoting an arbitrary string to trusted
+// markup must go through `raw(...)` (the XSS boundary). Passing a plain string
+// where an `Html` parameter is expected must be rejected at compile time.
+fn render(markup: Html): int { return 1; }
+fn handler(userInput: string): int {
+    return render(userInput);
+}
+fn main(): void {}

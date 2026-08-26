@@ -994,6 +994,13 @@ pub const TypeChecker = struct {
             if (intLiteralValue(args[i]) != null) continue;
             const at = self.resolveExprType(args[i]) orelse continue;
             if (at != .ident) continue;
+            // Directional `string`->`Html`: passing a plain `string` where an `Html`
+            // parameter is expected must be explicit (`raw(s)`), the XSS boundary.
+            if (std.mem.eql(u8, pt.ident, "Html") and std.mem.eql(u8, at.ident, "string")) {
+                const sp = if (args[i].span.line != 0) args[i].span else call_span;
+                self.addError(sp, "argument {d}: cannot pass 'string' where parameter '{s}: Html' expects trusted markup; wrap it with 'raw(...)' (this is the XSS boundary)", .{ i + 1, params[i].name });
+                continue;
+            }
             const acat = primCategory(at.ident);
             if (acat == .other) continue;
             if (acat != pcat) {
@@ -2510,11 +2517,13 @@ fn isTypeCompatible(from: ast.TypeRef, to: ast.TypeRef) bool {
                 return true;
             }
 
-            // `Html` is a nominal string: it coerces to/from `string` freely (same
-            // runtime representation), so views can flow into string-typed slots
-            // and `raw(s)` can wrap a string. The nominal distinction is used only
-            // for the NSX escape decision, not to gate assignment.
-            if (isHtmlOrStringName(c_from) and isHtmlOrStringName(c_to)) return true;
+            // `Html` is a nominal string with a ONE-WAY coercion: `Html` -> `string`
+            // is implicit (trusted markup is always a valid string), but `string` ->
+            // `Html` is NOT -- promoting an arbitrary string to trusted markup must
+            // be explicit via `raw(s)` (or an NSX `<...>` literal), which is the XSS
+            // boundary. `Html` -> `Html` and `string` -> `string` already matched
+            // above via the equal-name check.
+            if (std.mem.eql(u8, c_from, "Html") and std.mem.eql(u8, c_to, "string")) return true;
 
             return false;
         },

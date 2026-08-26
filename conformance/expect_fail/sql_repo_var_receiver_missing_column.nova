@@ -1,0 +1,16 @@
+// EXPECT-FAIL: codegen
+// The Repository<T> check also covers a VARIABLE receiver (not just an inline
+// `Repository<T>(...)` construction): `T` is recovered from the variable's static
+// type, so this typo (`naem` -> no column for field `name`) is still rejected.
+import data.db;
+import data.repository;
+import serde.json;
+import serde.source;
+import list;
+@serializable struct Product { pub id: int, pub name: string }
+async fn load(conn: db.Connection): void {
+    let repo = repository.Repository<Product>(conn, "products");
+    let p = list.List<db.DbValue>();
+    let _ = await repo.query("SELECT id, naem FROM products", p);
+}
+fn main(): void {}
