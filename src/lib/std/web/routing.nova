@@ -1,19 +1,3 @@
-//! HTTP path routing: pattern parsing, route matching, and request dispatch.
-//!
-//! This file turns a registered set of routes (method plus a path pattern such
-//! as `/users/{id:int}`) into a `Router` that can resolve an incoming request to
-//! either a mediator handler key (for the CQRS-style dispatch path, see
-//! `web.di`) or a directly attached closure (for controller-style routes). It
-//! also owns the small pattern language: literal segments, `{name}` string
-//! parameters, and `{name:type}` typed parameters (currently `int` is the only
-//! enforced type, checked with `request.isAllDigits`).
-//!
-//! `Router.serve` is the usual entry point for a running web app: it resolves
-//! the route, extracts path parameters into a `ParamSource`, merges them with
-//! the JSON request body via `CompositeSource`, and calls into the mediator to
-//! produce a `response.Response`. `Router.dispatch` is a lighter, string-in
-//! string-out variant used where only the rendered body is wanted.
-
 import string;
 import list;
 import map;
@@ -23,45 +7,30 @@ import web.response;
 import web.status;
 import web.di;
 
-
-/// A handler contract for mediator-style request processing: given a request
-/// value, asynchronously produce a response value.
 pub trait RequestHandler<TReq, TResp> {
-    async fn handle(self, req: TReq): TResp;
+    async fn handle(self: self, req: TReq): TResp;
 }
 
-/// Everything a direct route handler needs for one request: the raw request,
-/// the matched path parameters, and typed access to the incoming data. This is
-/// the axum/FastAPI/Flask `request`/extractor role, kept in one value the
-/// handler receives.
-///
-/// `bind<T>()` deserialises the request into a typed struct `T` from a single
-/// merged source: cookies (lowest precedence), then query string, then path
-/// params, then the body. The body is read per content type, so a hypermedia
-/// form POST (`application/x-www-form-urlencoded` or `multipart/form-data`)
-/// binds exactly like a JSON body would, which is what hypermedia clients send,
-/// not JSON. `query`/`param` fetch a single value directly.
 pub struct Context {
-    /// The raw HTTP request.
-    pub request: request.Request,
-    /// Path parameters captured from the route pattern (for example `{id}`).
+    pub request: Request,
     pub params: Map<string, string>,
 
-    init(req: request.Request, params: Map<string, string>) {
+    init(req: Request, params: Map<string, string>) {
         self.request = req;
         self.params = params;
     }
 
-    /// Builds the merged value source for this request: cookies, then query, then
-    /// path params, in front of a body source chosen by content type. For POST/
-    /// PUT/PATCH the body is read as a form (urlencoded or multipart) or, failing
-    /// that, JSON; other verbs use query/params only (plus the datastar signals
-    /// blob when present).
     pub fn source(self: Context): ValueSource {
         let merged = Map<string, string>(8, string.hash);
-        self.request.cookies.forEach((k, v) => { merged.set(k, v); });
-        self.request.query.forEach((k, v) => { merged.set(k, v); });
-        self.params.forEach((k, v) => { merged.set(k, v); });
+        self.request.cookies.forEach((k, v) => {
+            merged.set(k, v);
+        });
+        self.request.query.forEach((k, v) => {
+            merged.set(k, v);
+        });
+        self.params.forEach((k, v) => {
+            merged.set(k, v);
+        });
         let paramSrc = source.ParamSource(merged);
         let mth = self.request.method;
         if (string.eql(mth, "POST") || string.eql(mth, "PUT") || string.eql(mth, "PATCH")) {
@@ -81,52 +50,30 @@ pub struct Context {
         return paramSrc;
     }
 
-    /// Deserialises the request into a typed `T` from the merged source above.
     pub fn bind<T>(self: Context): T {
         return serde.bind<T>(self.source());
     }
 
-    /// A single query-string value, or `""` if absent.
     pub fn query(self: Context, key: string): string {
         return self.request.query.get(key) ?? "";
     }
 
-    /// A single path parameter, or `""` if absent.
     pub fn param(self: Context, key: string): string {
         return self.params.get(key) ?? "";
     }
 }
 
-/// A direct, Go/axum/Flask-style route handler: one uniform async method from a
-/// `Context` to a response. Handlers are plain structs that hold their own
-/// dependencies as fields (a repository, a connection pool) and are stored
-/// homogeneously as `RouteHandler` trait objects, then dispatched by trait
-/// method, with no mediator, no DI container, and no per-request downcast. This
-/// mirrors how `web.app`'s SSE handlers are already stored and dispatched.
 pub trait RouteHandler {
-    async fn serve(self: RouteHandler, ctx: Context): response.Response;
+    async fn serve(self: RouteHandler, ctx: Context): Response;
 }
 
-/// A middleware in the direct route pipeline (the Go/axum/Flask `Use` shape). It
-/// receives the request `Context` and a `Chain` cursor; it may run logic before
-/// and after calling `next.proceed(ctx)`, or return its own response without
-/// calling `next` to short-circuit (an auth guard, a rate limiter). Middlewares
-/// are registered with `App.use` and run in registration order, wrapping every
-/// direct route handler.
 pub trait RouteMiddleware {
-    async fn handle(self: RouteMiddleware, ctx: Context, next: Chain): response.Response;
+    async fn handle(self: RouteMiddleware, ctx: Context, next: Chain): Response;
 }
 
-/// Cursor over the middleware chain for one request. `proceed` advances to the
-/// next middleware, or to the route's `RouteHandler` once the chain is
-/// exhausted. A fresh `Chain` is built at each step, holding the index of the
-/// middleware still to run.
 pub struct Chain {
-    /// The full ordered middleware list, shared across every step of one request.
     pub mws: List<RouteMiddleware>,
-    /// Index of the next middleware in `mws` to invoke.
     pub idx: int,
-    /// The route handler to run once every middleware has called `proceed`.
     pub terminal: RouteHandler,
 
     init(mws: List<RouteMiddleware>, idx: int, terminal: RouteHandler) {
@@ -135,9 +82,7 @@ pub struct Chain {
         self.terminal = terminal;
     }
 
-    /// Runs the next middleware, or the terminal route handler once `idx` reaches
-    /// the end of `mws`.
-    pub async fn proceed(self: Chain, ctx: Context): response.Response {
+    pub async fn proceed(self: Chain, ctx: Context): Response {
         if (self.idx >= self.mws.size()) {
             return await self.terminal.serve(ctx);
         }
@@ -147,14 +92,9 @@ pub struct Chain {
     }
 }
 
-/// One parsed segment of a route pattern: either a literal path component or a
-/// named parameter (optionally typed).
 pub struct Seg {
-    /// True if this segment is a `{...}` parameter, false for a literal path component.
     pub is_param: bool,
-    /// The literal text for a non-parameter segment, or the parameter name for a parameter segment.
     pub text: string,
-    /// The declared parameter type (for example `"int"` or `"string"`); empty for non-parameter segments.
     pub ptype: string,
 
     init(is_param: bool, text: string, ptype: string) {
@@ -164,21 +104,14 @@ pub struct Seg {
     }
 }
 
-/// A single registered route: an HTTP method, its parsed path pattern, and how
-/// to handle a matching request.
 pub struct Route {
-    /// The HTTP method this route matches (for example `"GET"`), compared case-sensitively.
     pub method: string,
-    /// The path pattern, already split into literal and parameter segments by `parsePattern`.
     pub segs: List<Seg>,
-    /// The mediator dispatch key used to look up a handler when `isCtrl` is false; empty for controller routes.
     pub key: string,
-    /// The handler closure invoked directly when `isCtrl` is true; a placeholder 404 closure otherwise.
-    pub handler: (request.Request) -> response.Response,
-    /// True when this route was registered via `handle` (a direct controller closure) rather than `__addRoute` (mediator dispatch by key).
+    pub handler: (Request) -> Response,
     pub isCtrl: bool,
 
-    init(method: string, segs: List<Seg>, key: string, handler: (request.Request) -> response.Response, isCtrl: bool) {
+    init(method: string, segs: List<Seg>, key: string, handler: (Request) -> Response, isCtrl: bool) {
         self.method = method;
         self.segs = segs;
         self.key = key;
@@ -187,23 +120,12 @@ pub struct Route {
     }
 }
 
-/// The outcome of resolving a method and path against a `Router`'s routes.
-///
-/// Exactly one of `matched`, `typedBad`, or `methodNotAllowed` is true on a
-/// non-match result; all three are false only for a plain 404 (no route with a
-/// matching path shape exists at all).
 pub struct RouteMatch {
-    /// True when a route matched both the path shape and the HTTP method.
     pub matched: bool,
-    /// True when the path shape matched but a typed parameter (for example `{id:int}`) failed its type check.
     pub typedBad: bool,
-    /// True when the path shape matched some route but none of those routes accept this HTTP method.
     pub methodNotAllowed: bool,
-    /// Extracted path parameters, keyed by parameter name. Populated only when `matched` is true.
     pub params: Map<string, string>,
-    /// The matched route's mediator dispatch key. Empty unless `matched` is true.
     pub key: string,
-    /// The index of the matched route within `Router.routes`, or -1 when there is no match.
     pub routeIndex: int,
 
     init(matched: bool, typedBad: bool, methodNotAllowed: bool, params: Map<string, string>, key: string, routeIndex: int) {
@@ -216,12 +138,6 @@ pub struct RouteMatch {
     }
 }
 
-/// Splits a route pattern (for example `/users/{id:int}/posts/{slug}`) into its
-/// ordered `Seg` list, using `request.pathSegs` to break the path on `/`.
-///
-/// A segment wrapped in `{...}` becomes a parameter segment: a `name:type`
-/// form (split on the first `:`) sets `ptype` explicitly, otherwise `ptype`
-/// defaults to `"string"`. Any other segment is stored as a literal.
 pub fn parsePattern(path: string): List<Seg> {
     let segs = List<Seg>();
     let splits = request.pathSegs(path);
@@ -246,39 +162,21 @@ pub fn parsePattern(path: string): List<Seg> {
     return segs;
 }
 
-/// The route table for a web app: registers routes, matches an incoming
-/// request against them, and dispatches to the resolved handler.
-///
-/// Routes are matched in registration order and the first route whose segment
-/// count and literal/typed segments agree with the request wins, so more
-/// specific patterns should generally be registered before more general ones.
 pub struct Router {
-    /// The registered routes, in registration order; also the order in which `resolve` tries them.
     pub routes: List<Route>,
 
     init() {
         self.routes = List<Route>();
     }
 
-    /// Registers a mediator-dispatched route: matching requests are resolved by `key` and handled via `__mediator_dispatch_by_name`, not by an attached closure.
     pub fn __addRoute(self: Router, method: string, path: string, key: string): void {
-        self.routes.push(Route(method, parsePattern(path), key,
-            (req: request.Request) => response.Response(Status.NotFound, "Not Found"), false));
+        self.routes.push(Route(method, parsePattern(path), key, (req) => response.Response(Status.NotFound, "Not Found"), false));
     }
 
-    /// Registers a controller-style route: matching requests are handled directly by the given closure, bypassing mediator dispatch.
-    pub fn handle(self: Router, method: string, path: string, handler: (request.Request) -> response.Response): void {
+    pub fn handle(self: Router, method: string, path: string, handler: (Request) -> Response): void {
         self.routes.push(Route(method, parsePattern(path), "", handler, true));
     }
 
-    /// Matches `method` and `path` against the registered routes and reports the outcome.
-    ///
-    /// Tries every route whose segment count matches the path; a literal
-    /// mismatch fails that route silently, but a typed-parameter mismatch
-    /// (`typedBad`) short-circuits with a match-shaped failure as soon as the
-    /// method also agrees, even if a later route would otherwise have matched.
-    /// Falls back to `methodNotAllowed` when some route's path shape matched
-    /// but none had the right method, and to a plain no-match otherwise.
     pub fn resolve(self: Router, method: string, path: string): RouteMatch {
         let segs = request.pathSegs(path);
         let nseg = segs.size();
@@ -323,18 +221,14 @@ pub struct Router {
         return RouteMatch(false, false, false, Map<string, string>(1, string.hash), "", -1);
     }
 
-    /// Resolves `method` and `path` and returns the matched `Route`, or `undefined` when there is no match.
     pub fn matchRoute(self: Router, method: string, path: string): Route | undefined {
         let m = self.resolve(method, path);
-        if (m.matched) { return self.routes.at(m.routeIndex); }
+        if (m.matched) {
+            return self.routes.at(m.routeIndex);
+        }
         return undefined;
     }
 
-    /// Resolves and dispatches a request via the mediator, returning only the rendered response body as a string.
-    ///
-    /// Path parameters are merged with `body` through a `CompositeSource`. On a
-    /// non-match returns `"400"`, `"405"`, or `"404"` as a plain string rather
-    /// than a proper `response.Response`; prefer `serve` for real HTTP handling.
     pub fn dispatch(self: Router, method: string, path: string, body: ValueSource): string {
         let m = self.resolve(method, path);
         if (m.matched) {
@@ -343,12 +237,16 @@ pub struct Router {
             let resp = __mediator_dispatch_by_name(m.key, composite, provider);
             return resp.body;
         }
-        if (m.typedBad) { return "400"; }
-        if (m.methodNotAllowed) { return "405"; }
+        if (m.typedBad) {
+            return "400";
+        }
+        if (m.methodNotAllowed) {
+            return "405";
+        }
         return "404";
     }
 
-    pub fn serve(self: Router, req: request.Request): response.Response {
+    pub fn serve(self: Router, req: Request): Response {
         let m = self.resolve(req.method, req.path);
         if (m.matched) {
             let route = self.routes.at(m.routeIndex);
@@ -356,7 +254,7 @@ pub struct Router {
                 let h = route.handler;
                 return h(req);
             }
-            let jsonBody = req.body == "" ? "{}" : req.body;
+            let jsonBody = if (req.body == "") "{}" else req.body;
             let src = source.fromJson(jsonBody);
             let composite = CompositeSource(ParamSource(m.params), src);
             let provider = ServiceCollection().buildServiceProvider();
@@ -371,7 +269,7 @@ pub struct Router {
         return response.Response(Status.NotFound, "404");
     }
 
-    pub fn route(self: Router, req: request.Request): response.Response {
+    pub fn route(self: Router, req: Request): Response {
         return self.serve(req);
     }
 }

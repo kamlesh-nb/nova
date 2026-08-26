@@ -25,6 +25,7 @@ pub enum Status {
     Forbidden = 403,
     NotFound = 404,
     MethodNotAllowed = 405,
+    Conflict = 409,
     InternalServerError = 500,
     BadGateway = 502,
     ServiceUnavailable = 503,
@@ -46,6 +47,7 @@ pub enum Status {
             case Status.Forbidden: { return 403; }
             case Status.NotFound: { return 404; }
             case Status.MethodNotAllowed: { return 405; }
+            case Status.Conflict: { return 409; }
             case Status.InternalServerError: { return 500; }
             case Status.BadGateway: { return 502; }
             case Status.ServiceUnavailable: { return 503; }
@@ -72,6 +74,7 @@ pub enum Status {
             case Status.Forbidden: { return "Forbidden"; }
             case Status.NotFound: { return "Not Found"; }
             case Status.MethodNotAllowed: { return "Method Not Allowed"; }
+            case Status.Conflict: { return "Conflict"; }
             case Status.InternalServerError: { return "Internal Server Error"; }
             case Status.BadGateway: { return "Bad Gateway"; }
             case Status.ServiceUnavailable: { return "Service Unavailable"; }
@@ -98,6 +101,7 @@ pub enum Status {
         if (code == 403) return Status.Forbidden;
         if (code == 404) return Status.NotFound;
         if (code == 405) return Status.MethodNotAllowed;
+        if (code == 409) return Status.Conflict;
         if (code == 500) return Status.InternalServerError;
         if (code == 502) return Status.BadGateway;
         if (code == 503) return Status.ServiceUnavailable;

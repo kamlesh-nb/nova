@@ -197,6 +197,16 @@ pub struct File {
         return n == (content.length as long);
     }
 
+    /// Removes (unlinks) the file at `path`. Returns the underlying `unlink`
+    /// result: `0` on success, non-zero on failure (for example, no such file).
+    /// This unlinks a FILE; use `Dir.remove` for an (empty) directory.
+    pub fn remove(path: string): int {
+        let cp = sys.cstr(path);
+        let r = sys.unlink(cp);
+        bytes.free(cp);
+        return r;
+    }
+
     /// Appends `content` to `path`, creating the file if it does not exist.
     /// Fails silently if the file cannot be opened.
     pub fn appendText(path: string, content: string): void {
