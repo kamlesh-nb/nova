@@ -5892,11 +5892,17 @@ pub fn jsxAppendExpr(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const a
 /// `raw = false` and stay escaped, which is the XSS boundary for interpolated content.
 pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *const ast.Expression, raw: bool) !void {
     try self.jsxFlushLiteral(sb);
+    // A value-position `{expr}` is HTML-escaped by default (the XSS boundary for
+    // interpolated text), UNLESS it is already-safe markup: a literal element, a
+    // call to a view helper (a function that returns NSX), or an explicit `raw(...)`.
+    // This lets a view compose sub-views naturally -- `{productCard(p)}` -- without
+    // double-escaping, while `{order.name}` (a plain string) still escapes.
+    const eff_raw = raw or try self.nsxExprIsRaw(expr);
     const val = try self.compileExpression(expr.*);
     const type_name = try self.resolveExpressionTypeName(expr);
     if (type_name) |t| {
         if (std.mem.eql(u8, t, "string")) {
-            if (!raw) {
+            if (!eff_raw) {
                 // Escape via the ALWAYS-LINKED runtime `nova_html_escape` (i64 -> i64), not the
                 // stdlib `escapeHtmlInto`: the stdlib helper is demand-pruned if nothing else in
                 // the compile references it, which silently dropped escaping (an XSS hole). The
@@ -5912,7 +5918,7 @@ pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *cons
             try self.jsxAppendVal(sb, val);
             return;
         } else if (std.mem.eql(u8, t, "Str")) {
-            if (!raw) {
+            if (!eff_raw) {
                 if (self.getFunc("web_response_escapeHtmlIntoView")) |escView| {
                     const escView_t = core.LLVMGlobalGetValueType(escView);
                     var ea = [_]types.LLVMValueRef{ sb, val };
@@ -5930,6 +5936,72 @@ pub fn jsxAppendExprRaw(self: *LlvmCompiler, sb: types.LLVMValueRef, expr: *cons
         }
     }
     try self.jsxAppendVal(sb, val);
+}
+
+/// Whether a return statement (recursively) returns an NSX `<jsx>` element, used
+/// to classify a function as a view helper for JSX interpolation.
+fn stmtReturnsJsx(stmt: *const ast.Statement) bool {
+    switch (stmt.*) {
+        .return_stmt => |r| {
+            if (r.value) |v| return v.kind == .jsx_element;
+            return false;
+        },
+        .block => |b| {
+            for (b.statements) |*s| if (stmtReturnsJsx(s)) return true;
+            return false;
+        },
+        .if_stmt => |i| {
+            if (stmtReturnsJsx(i.then_branch)) return true;
+            if (i.else_branch) |eb| return stmtReturnsJsx(eb);
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// Lazily record the base names of free functions whose body returns NSX markup
+/// (view helpers). Scanned once on first JSX interpolation.
+pub fn ensureNsxReturning(self: *LlvmCompiler) !void {
+    if (self.nsx_returning_done) return;
+    self.nsx_returning_done = true;
+    for (self.program.declarations) |decl| {
+        switch (decl) {
+            .fn_decl => |fd| {
+                for (fd.body.statements) |*s| {
+                    if (stmtReturnsJsx(s)) {
+                        try self.nsx_returning.put(fd.name, {});
+                        break;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Whether a JSX value-position `{expr}` is already-safe markup that should be
+/// inserted RAW rather than HTML-escaped: a literal `<jsx>` element, a call to a
+/// view helper (returns NSX), or an explicit `raw(...)`.
+pub fn nsxExprIsRaw(self: *LlvmCompiler, expr: *const ast.Expression) !bool {
+    switch (expr.kind) {
+        .jsx_element => return true,
+        .call => |c| {
+            switch (c.callee.kind) {
+                .ident => |n| {
+                    if (std.mem.eql(u8, n, "raw")) return true;
+                    try self.ensureNsxReturning();
+                    return self.nsx_returning.contains(n);
+                },
+                .field_access => |fa| {
+                    if (std.mem.eql(u8, fa.field, "raw")) return true;
+                    try self.ensureNsxReturning();
+                    return self.nsx_returning.contains(fa.field);
+                },
+                else => return false,
+            }
+        },
+        else => return false,
+    }
 }
 
 /// Recursively serialises a JSX element tree into a `StringBuilder`, emitting
