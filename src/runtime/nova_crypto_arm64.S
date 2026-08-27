@@ -10,6 +10,39 @@
 #if defined(__aarch64__) || defined(__arm64__)
 .arch armv8.2-a+crypto+aes+sha3   // +sha3 enables the ARMv8.2 SHA-512 instructions (FEAT_SHA512)
 
+// Address a local constant pool entry, spelled for the OBJECT FORMAT rather than the CPU.
+//
+// Materialising a nearby address on AArch64 is always the same two instructions, ADRP (page base)
+// then ADD (page offset). What is NOT portable is how the assembler is told which half it wants:
+// Mach-O writes `sym@PAGE` / `sym@PAGEOFF`, while ELF and COFF write the low half as `:lo12:sym`
+// and the page base as the bare symbol. Encodings are identical; only the syntax differs.
+//
+// This file used the Mach-O spelling unconditionally, which is why it assembled on macOS and
+// NOWHERE else -- `error: invalid variant 'PAGE'` on both aarch64-linux-gnu and
+// aarch64-windows-msvc. That is not a cosmetic limitation: crypto.cpp compiles NO portable
+// fallback under `__aarch64__` and `nova_has_asm_crypto()` returns 1 unconditionally there, so an
+// arm64 build without this file produces an archive that promises hardware crypto while defining
+// none of the entry points -- an undefined-symbol failure at the FINAL link of any Nova program
+// that touches crypto, far from the cause.
+#if defined(__APPLE__)
+#  define CPOOL_PAGE(sym)    sym@PAGE
+#  define CPOOL_LO12(sym)    sym@PAGEOFF
+#else
+#  define CPOOL_PAGE(sym)    sym
+#  define CPOOL_LO12(sym)    :lo12:sym
+#endif
+
+// ---- Symbol naming ------------------------------------------------------------------------------------
+// Mach-O prefixes C symbols with an underscore; ELF and COFF-arm64 do not. Same macro, and same reason,
+// as nova_crypto_amd64.S. Without it this file exported `_nova_aes_encrypt_block` on every platform, so
+// an ELF or COFF build ASSEMBLED CLEANLY and still left every entry point undefined under the name C
+// actually calls -- a failure that surfaces only at the final link, and looks nothing like its cause.
+#if defined(__APPLE__)
+#  define SYM(n) _##n
+#else
+#  define SYM(n) n
+#endif
+
 .text
 
 // The AArch64 PCS requires the LOW 64 bits of v8..v15 (d8..d15) to be preserved across a call. All the
@@ -34,9 +67,9 @@
 // ARM AESE(d,k) = ShiftRows(SubBytes(d EOR k)); AESMC = MixColumns. So the sequence is
 //   AESE(k0);AESMC; AESE(k1);AESMC; ... ; AESE(k_{nr-1}) [no MC]; EOR k_nr.
 // This one-block routine is the correctness anchor for the mechanism (matches encBlock / FIPS-197 KAT 377).
-.global _nova_aes_encrypt_block
+.global SYM(nova_aes_encrypt_block)
 .align 4
-_nova_aes_encrypt_block:
+SYM(nova_aes_encrypt_block):
     ld1     {v0.16b}, [x2]          // state = in
     mov     x4, x0                  // rk cursor
     sub     w5, w1, #1              // nr-1 rounds carry MixColumns
@@ -83,9 +116,9 @@ _nova_aes_encrypt_block:
     eor  v19.16b, v19.16b, \kf\().16b
 .endm
 
-.global _nova_aes_ctr
+.global SYM(nova_aes_ctr)
 .align 4
-_nova_aes_ctr:
+SYM(nova_aes_ctr):
     SAVE_D8_D15
     ldr     w9, [x2, #12]           // native low-32 counter (stored big-endian)
     rev     w9, w9
@@ -322,9 +355,9 @@ _nova_aes_ctr:
     eor     v1.16b, v1.16b, v14.16b
 .endm
 
-.global _nova_ghash
+.global SYM(nova_ghash)
 .align 4
-_nova_ghash:
+SYM(nova_ghash):
     SAVE_D8_D15
     ld1     {v0.16b}, [x0]              // H (standard order)
     ld1     {v1.16b}, [x3]             // Y (standard order)
@@ -443,9 +476,9 @@ _nova_ghash:
     eor     v25.16b, v25.16b, v23.16b
 .endm
 
-.global _nova_gcm_seal
+.global SYM(nova_gcm_seal)
 .align 4
-_nova_gcm_seal:
+SYM(nova_gcm_seal):
     SAVE_D8_D15
     ldr     w9, [x3, #12]
     rev     w9, w9
@@ -575,15 +608,15 @@ _nova_gcm_seal:
     eor \b\().16b, \b\().16b, \c\().16b
     CC_ROTL \b, 7
 .endm
-.global _nova_chacha20_xor
+.global SYM(nova_chacha20_xor)
 .align 4
-_nova_chacha20_xor:
+SYM(nova_chacha20_xor):
     SAVE_D8_D15
     sub     sp, sp, #256               // initial-state save area
-    adrp    x8, Lcc_const@PAGE
-    add     x8, x8, Lcc_const@PAGEOFF
-    adrp    x9, Lcc_incr@PAGE
-    add     x9, x9, Lcc_incr@PAGEOFF
+    adrp    x8, CPOOL_PAGE(Lcc_const)
+    add     x8, x8, CPOOL_LO12(Lcc_const)
+    adrp    x9, CPOOL_PAGE(Lcc_incr)
+    add     x9, x9, CPOOL_LO12(Lcc_incr)
     ld1     {v20.4s}, [x9]             // [0,1,2,3] for per-lane counter
 1:
     cmp     w4, #0
@@ -851,9 +884,9 @@ Lfin_\name:
 // accumulator. state is 8 u64: [r0,r1,r2,s1,s2,h0,h1,h2] at offsets 0,8,16,24,32,40,48,56. h is updated
 // in place; r/s are read-only. Callers do clamp (create) and finalize (final) themselves. This is the hot
 // path: the AEAD ciphertext is absorbed here, ~one call per record.
-.global _nova_poly1305_blocks
+.global SYM(nova_poly1305_blocks)
 .align 4
-_nova_poly1305_blocks:
+SYM(nova_poly1305_blocks):
     stp     x19, x20, [sp, #-96]!
     stp     x21, x22, [sp, #16]
     stp     x23, x24, [sp, #32]
@@ -952,9 +985,9 @@ Lblk_done:
 // void nova_poly1305_finish(state, tail, taillen, out16, pad_lo, pad_hi)
 // state = [r0,r1,r2,s1,s2,h0,h1,h2]. If taillen>0 absorb the padded final block (0x01 after the bytes,
 // hibit=0). Then fully carry, constant-time g-select, serialize, add the 128-bit pad, write 16 bytes.
-.global _nova_poly1305_finish
+.global SYM(nova_poly1305_finish)
 .align 4
-_nova_poly1305_finish:
+SYM(nova_poly1305_finish):
     stp     x19, x20, [sp, #-96]!
     stp     x21, x22, [sp, #16]
     stp     x23, x24, [sp, #32]
@@ -1100,9 +1133,9 @@ Lfinish_reduce:
     ret
 
 // void nova_poly1305(key, msg, len, out16)
-.global _nova_poly1305
+.global SYM(nova_poly1305)
 .align 4
-_nova_poly1305:
+SYM(nova_poly1305):
     stp     x19, x20, [sp, #-96]!
     stp     x21, x22, [sp, #16]
     stp     x23, x24, [sp, #32]
@@ -1181,14 +1214,14 @@ _nova_poly1305:
     .endif
 .endm
 
-.global _nova_sha256_blocks
+.global SYM(nova_sha256_blocks)
 .align 4
-_nova_sha256_blocks:
+SYM(nova_sha256_blocks):
     ld1     {v0.4s, v1.4s}, [x0]           // state: ABCD, EFGH
     rev32   v0.16b, v0.16b                // Nova stores H0..H7 BIG-ENDIAN; convert to native u32
     rev32   v1.16b, v1.16b
-    adrp    x3, Lsha256_k@PAGE
-    add     x3, x3, Lsha256_k@PAGEOFF
+    adrp    x3, CPOOL_PAGE(Lsha256_k)
+    add     x3, x3, CPOOL_LO12(Lsha256_k)
 1:
     cmp     w2, #0
     b.le    9f
@@ -1289,17 +1322,17 @@ Lsha256_k:
     sha512h2  q\i3, q\i1, v\i0\().2d
 .endm
 
-.global _nova_sha512_blocks
+.global SYM(nova_sha512_blocks)
 .align 4
-_nova_sha512_blocks:
+SYM(nova_sha512_blocks):
     SAVE_D8_D15
     ld1     {v8.2d, v9.2d, v10.2d, v11.2d}, [x0]   // digest: {H0,H1} {H2,H3} {H4,H5} {H6,H7}
     rev64   v8.16b, v8.16b                          // Nova stores H big-endian; convert to native u64
     rev64   v9.16b, v9.16b
     rev64   v10.16b, v10.16b
     rev64   v11.16b, v11.16b
-    adrp    x3, Lsha512_k@PAGE
-    add     x3, x3, Lsha512_k@PAGEOFF
+    adrp    x3, CPOOL_PAGE(Lsha512_k)
+    add     x3, x3, CPOOL_LO12(Lsha512_k)
 Lsha512_loop:
     cmp     w2, #0
     b.le    Lsha512_done
