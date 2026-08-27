@@ -58,7 +58,17 @@ pub const EPOLLRDHUP: int = 8192;
 /// After delivering one event, disables the descriptor until it is explicitly re-armed with `EPOLL_CTL_MOD`.
 pub const EPOLLONESHOT: int = 1073741824;
 /// Requests edge-triggered rather than level-triggered notification.
-pub const EPOLLET: int = 2147483648;
+///
+/// Spelled as the SIGNED 32-bit bit pattern of `0x80000000`, not as `2147483648`.
+/// The kernel's `events` mask is a `uint32_t`, but Nova's `int` is 32-bit SIGNED,
+/// so the top bit cannot be written as a positive literal: `2147483648` does not
+/// fit, and the compiler carries such a constant at 64 bits instead of truncating
+/// it. `EPOLLIN | EPOLLET` then folded to `2147483649`, while reading the same
+/// mask back out of an event buffer correctly sign-extended to `-2147483647` —
+/// the two disagreed even though both describe `0x80000001`. Written this way the
+/// constant, the fold, and the round trip all agree, and `setEvent`'s
+/// `write_i32` still puts `0x80000000` on the wire. Conformance 189.
+pub const EPOLLET: int = -2147483648;
 
 /// `epoll_create1` flag: set the close-on-exec flag on the returned epoll descriptor.
 pub const EPOLL_CLOEXEC: int = 524288;
