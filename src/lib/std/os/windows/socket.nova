@@ -186,6 +186,53 @@ pub fn connectBlocking(host: string, port: int): int {
     if (r != 0) { closeSock(fd); return -1; }
     return fd;
 }
+/// Winsock address family constant for IPv6. Note this is 23 on Windows, where
+/// POSIX uses 10 (Linux) or 30 (Darwin) — the one sockaddr constant that differs
+/// on all three platforms, so it cannot be shared.
+pub const AF_INET6: int = 23;
+
+/// Creates a new IPv6 TCP socket, initialising Winsock first if needed.
+pub fn newTcp6(): int {
+    winsock.startup();
+    return winsock.socket(AF_INET6, winsock.SOCK_STREAM, winsock.IPPROTO_TCP) as int;
+}
+
+/// Builds a 28-byte `sockaddr_in6` for `port` (host byte order) and `addr16`
+/// (a raw 16-byte IPv6 address). Caller owns and must free the returned buffer.
+///
+/// The layout matches POSIX byte for byte — family at 0 as a 2-byte native
+/// integer, big-endian port at 2, flowinfo at 4, the address at 8, scope id at
+/// 24 — because Windows `SOCKADDR_IN6` leads with a `USHORT` family field, the
+/// same shape as Linux `sockaddr_in6`. Only the family VALUE differs. (Darwin
+/// is the odd one out with its 1-byte `sin6_len` prefix, which is why the POSIX
+/// module branches here and this one does not.)
+pub fn makeSockaddrIn6(port: int, addr16: ptr): ptr {
+    let sa = bytes.alloc(28);
+    let i = 0;
+    while (i < 28) { bytes.write_byte(sa, i, 0); i = i + 1; }
+    bytes.write_byte(sa, 0, AF_INET6 & 0xff);
+    bytes.write_byte(sa, 1, (AF_INET6 >> 8) & 0xff);
+    bytes.write_byte(sa, 2, (port >> 8) & 0xff);
+    bytes.write_byte(sa, 3, port & 0xff);
+    let j = 0;
+    while (j < 16) { bytes.write_byte(sa, 8 + j, bytes.read_byte(addr16, j)); j = j + 1; }
+    return sa;
+}
+
+/// Opens a new blocking IPv6 TCP socket and connects it to the raw address
+/// `addr16` (16 bytes) and `port`. Returns the connected socket handle, or `-1`
+/// on failure. Counterpart of the POSIX `connectBlocking6`, which `net/dial`
+/// calls for any host that parses as an IPv6 literal.
+pub fn connectBlocking6(addr16: ptr, port: int): int {
+    let fd = newTcp6();
+    if (fd < 0) { return -1; }
+    let sa = makeSockaddrIn6(port, addr16);
+    let r = connectSock(fd, sa, 28);
+    bytes.free(sa);
+    if (r != 0) { closeSock(fd); return -1; }
+    return fd;
+}
+
 /// Sets both send and receive timeouts (`SO_SNDTIMEO`/`SO_RCVTIMEO`) to `ms`
 /// milliseconds. A non-positive `ms` is clamped to `0` (no timeout).
 pub fn setTimeout(fd: int, ms: int): int {

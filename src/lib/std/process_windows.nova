@@ -65,7 +65,12 @@ fn buildCommandLine(cmd: string, args: list.List<string>): string {
     let line = quoteArg(cmd);
     let i = 0;
     while (i < args.size()) {
-        line = line + " " + quoteArg(args.get(i));
+        // `List.get` is `T | undefined`, and `quoteArg` takes a plain `string`, so the
+        // optional has to be made present before the call. The POSIX module gets away
+        // without this only because it concatenates the element instead of passing it
+        // as an argument. `i` is bounded by `size()`, so the default is unreachable.
+        let a = args.get(i) ?? "";
+        line = line + " " + quoteArg(a);
         i = i + 1;
     }
     return line;
