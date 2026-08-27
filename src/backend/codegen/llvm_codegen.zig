@@ -2017,6 +2017,36 @@ pub const LlvmCompiler = struct {
         return self.isValueStructName(base);
     }
 
+    /// Whether a FIELD declared with `type_ref` occupies its full inline payload in
+    /// the enclosing struct, rather than the single 8-byte pointer slot.
+    ///
+    /// Store and load paths must ask THIS, not [`fieldStoredInline`] on the base
+    /// name, because the two disagree for a generic struct field.
+    /// [`LlvmCompiler.getTypeSize`] sizes a `.generic` field as a bare pointer no
+    /// matter how value-like the base struct is — the generic DECLARATION cannot be
+    /// laid out, since a field of the bare type parameter has no size until the
+    /// instantiation — while the base name still answers "value struct, store it
+    /// inline". A path that trusted the base name therefore copied
+    /// `structPayloadSize` bytes into a slot [`LlvmCompiler.getFieldOffset`] had
+    /// reserved 8 bytes for, running straight over the following field.
+    ///
+    /// That is what broke `ActorCell<M> { mbox: Mailbox<M>, behavior: Behavior<M> }`:
+    /// the inline copy of the 16-byte `Mailbox` wrote its `signal` word on top of
+    /// `behavior`, and the next assignment to `behavior` released that word as the
+    /// field's previous value. `signal` holds a raw `nova_chan_new` pointer, which
+    /// has no ARC header, so the release read the refcount 8 bytes before a plain
+    /// malloc block. Conformance 118, located by `--asan`.
+    ///
+    /// Phrased against `getTypeSize` itself rather than re-deriving the rule, so
+    /// the layout stays the single authority and the two cannot drift apart again.
+    pub fn fieldStoredInlineRef(self: *LlvmCompiler, type_ref: ast.TypeRef) bool {
+        const rendered = self.typeRefToString(type_ref) catch return false;
+        const base = types_mod.getStructBaseName(rendered);
+        if (!self.structs.contains(base)) return false;
+        if (!self.fieldStoredInline(base)) return false;
+        return self.getTypeSize(type_ref, true) == self.getTypeSize(type_ref, false);
+    }
+
     /// Computes the byte alignment of a type. Primitives use their natural
     /// alignment; a value struct takes the maximum alignment of its fields
     /// (computed recursively); everything else is pointer-aligned (8).

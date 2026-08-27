@@ -2055,7 +2055,7 @@ pub fn initDefaultContainerFields(self: *LlvmCompiler, struct_name: []const u8, 
         const addr = core.LLVMBuildAdd(self.builder, instance_ptr, offset_val, "cf_addr");
         const f_tstr = self.typeRefToString(f.type_name) catch "";
         const ftbase = getStructBaseName(f_tstr);
-        if (self.structs.contains(ftbase) and self.fieldStoredInline(ftbase)) {
+        if (self.structs.contains(ftbase) and self.fieldStoredInlineRef(f.type_name)) {
             const fsz = self.getTypeSize(f.type_name, false);
             _ = try self.buildValueStructCopyInto(addr, fv, fsz);
         } else {
@@ -2697,7 +2697,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                                 {
                                     const fw_base = getStructBaseName(f_type_str);
-                                    if (self.structs.contains(fw_base) and self.fieldStoredInline(fw_base)) {
+                                    if (self.structs.contains(fw_base) and self.fieldStoredInlineRef(field_type_ref)) {
                                         const fsz = self.getTypeSize(field_type_ref, false);
                                         _ = try self.buildValueStructCopyInto(addr, r_val, fsz);
                                         const is_r_borrow = (bin.right.kind == .ident or bin.right.kind == .field_access or bin.right.kind == .index);
@@ -4782,9 +4782,28 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
 
                 const addr = core.LLVMBuildAdd(self.builder, struct_ptr_val, offset_val, "field_addr");
                 const fbase = getStructBaseName(f_type_str);
-                if (!widened_field and self.structs.contains(fbase) and self.fieldStoredInline(fbase)) {
+                if (!widened_field and self.structs.contains(fbase) and self.fieldStoredInlineRef(field_type_ref)) {
                     const fsz = self.getTypeSize(field_type_ref, false);
                     _ = try self.buildValueStructCopyInto(addr, field_val, fsz);
+                    // The byte copy duplicates the inline payload WITHOUT touching refcounts, so
+                    // ownership has to be settled here or the copy dangles. Same split as
+                    // `takeOwnedElement` (and as the field-assign path above): a borrow leaves the
+                    // source owning its payloads, so the copy needs its own deep retain; a
+                    // temporary hands its payloads over, so it must stop being drained as a
+                    // pending temp instead.
+                    //
+                    // Neither happened before, which is what broke a value struct holding a
+                    // container when it was written as a NESTED LITERAL — `Outer{ inner: Inner{
+                    // items: List<string>() } }`. The `Inner` temporary was still queued for
+                    // release, so at the end of the statement it destroyed the very list `Outer`
+                    // had just copied a pointer to, and the next `push` wrote through freed
+                    // memory. Binding it to a variable first happened to survive only because the
+                    // `let` copy added a retain of its own. Conformance 42.
+                    if (namesExistingOwner(f_init.value.kind)) {
+                        try self.retainValueStructOwnedFields(addr, f_type_str);
+                    } else {
+                        self.consumeTemporary(field_val);
+                    }
                 } else {
                     const llvm_field_type = self.toLLVMType(field_type_ref);
                     const ptr = core.LLVMBuildIntToPtr(self.builder, addr, core.LLVMPointerType(llvm_field_type, 0), "field_ptr");
@@ -4945,7 +4964,7 @@ fn compileExpressionInner(self: *LlvmCompiler, expr: ast.Expression) anyerror!ty
             const offset_val = core.LLVMConstInt(self.val_type, offset, 0);
             const addr = core.LLVMBuildAdd(self.builder, obj_ptr, offset_val, "field_addr");
             const ftbase = getStructBaseName(try self.typeRefToString(field_type_ref));
-            if (self.structs.contains(ftbase) and self.fieldStoredInline(ftbase)) {
+            if (self.structs.contains(ftbase) and self.fieldStoredInlineRef(field_type_ref)) {
                 return addr;
             }
             const llvm_field_type = self.toLLVMType(field_type_ref);
