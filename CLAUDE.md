@@ -29,9 +29,37 @@ nova init web|desktop --name X  # scaffold an app
 conformance/run.sh              # the corpus — run BEFORE and AFTER any change
 conformance/run.sh -j           # SAME corpus, run in parallel (cores-1 workers) — ~5x faster (~2min vs >10min)
 conformance/run.sh --asan       # AddressSanitizer gate (catches UAF/double-free). Requires NOVA_ASAN=1 build first.
-conformance/run.sh --arc        # ARC leak gate (baseline-gated)
+conformance/run.sh --arc        # ARC leak gate (baseline-gated — currently NOISE, see its section)
 NOVA_ARC_AUDIT=1 nova test f    # per-run ARC audit ("ARC audit: clean" or survivors)
+
+scripts/build-archives.sh       # runtime archives for all 4 shipping targets (see below)
 ```
+
+### Runtime archives for the shipping targets (`scripts/build-archives.sh`)
+
+Builds `libnovacore.a` for {x86_64, aarch64} × {linux-gnu, windows-msvc} into
+`zig-out/archives/<triple>/`, each WITH its integrated-assembly crypto. This is separate from
+`zig build`, which produces the archive for the HOST only.
+
+**Use `zig c++`, not `clang++`.** Cross-compiling `runtime.cpp` needs the target's libc headers, and a
+bare clang has no sysroot for them: every Linux target fails at `<cstdio>` from a Windows host, and from
+Linux the aarch64 target needs `libc6-dev-arm64-cross` installed. Zig ships those headers for every
+target it knows, so three of the four need nothing installed. The exception is **aarch64-windows-msvc**,
+where zig reports `failed to find libc installation: LibCStdLibHeaderNotFound` because that libc really
+does come from the Visual Studio install — `clang++` finds it through the same MSVC toolchain that builds
+the native compiler, so that one target uses clang++.
+
+`asmCryptoFor()` in `build.zig` deliberately returns null for a cross build, so `zig build` never puts
+assembly in a cross archive; this script assembles it explicitly per target instead. Verify a produced
+archive before trusting it — the arm64 failure mode is silent (see the crypto section):
+
+```bash
+llvm-objdump -f zig-out/archives/<triple>/novacore.o | grep 'file format'
+llvm-nm --defined-only zig-out/archives/<triple>/libnovacore.a | grep nova_aes_encrypt_block
+```
+
+Windows note: the `.a` is a convenience only — `link.exe` cannot read llvm-ar's GNU archive, so the
+Windows link path names the bare `novacore.o` + `nova_crypto.o`, which are kept beside it.
 
 ### Running the corpus in parallel (`-j`)
 
@@ -144,6 +172,35 @@ failure is a platform gap without checking the other host. The five that were re
   owned, and a `??` fast path trusted the wrong predicate. Precisely the class of bug the ASAN gate
   exists for: invisible to a passing test, located exactly by ASAN.
 
+### `--arc` is currently NOISE — read this before believing a leak regression
+
+The gate reports **304 failures out of 818** on a green tree. That is not a tree full of leaks; the
+BASELINE is stale. `arc-baseline.txt` holds **109 entries against 374 positive cases**, so roughly
+**280 cases report `no baseline entry`** — an earlier note in this file claimed the gap was only
+"244, 344, 440-444", which was wrong by two orders of magnitude. Do not repeat that number without
+counting the file.
+
+Worse, ~12 cases have an explicit `0` entry while genuinely leaking, so they report as
+`(+N LEAK REGRESSION)` on a tree nobody touched: `52_decimal_arith` +24, `94_decimal_conv` +11,
+`50_decimal`/`98_serde_json_yaml_coimport`/`99_serde_struct_decimal`/`106_resilient_pool` +6,
+`63_db_seam` +4, `51_bson_decimal`/`64_db_connection`/`96_serde_decimal_json` +2,
+`97_serde_decimal_yaml`/`104_conn_pool` +1. A `0` in that file means "never measured", NOT "was clean".
+
+**How to tell a real regression from the stale baseline: A/B the compiler, do not reason about it.**
+Check out the pre-change commit, `zig build -Doptimize=ReleaseFast`, run `run.sh --arc <filter>` on the
+flagged cases, and compare live counts. `run.sh` takes a substring filter, so `--arc decimal` covers a
+whole cluster in one go. Done once already for the value-struct work above: 12 of the 13 flagged cases
+were byte-identical before and after, which is what proved the retains it added leak nothing.
+
+The 13th is a real new number and worth chasing: **`118_actor` now leaks 12 objects.** It is not a
+regression — the case used to CRASH before reaching the audit, so its `0` was never a measurement —
+but fixing the corruption exposed a leak that was hiding underneath it.
+
+**Windows: kill orphaned `nova.exe` before rebuilding.** A `--arc`/`--asan` run killed by a timeout can
+leave `~/.nova/bin/nova` running, and the next `zig build` then dies in its install step with
+`Copy-Item : The process cannot access the file ... because it is being used by another process`. That
+reads like a build-script bug and is a file lock: `taskkill //F //IM nova.exe //T`, then rebuild.
+
 Three Windows-host build breakages were fixed to get here, all Zig/UCRT drift rather than design:
 `w.WINAPI` and `w.kernel32.GetCurrentProcess` no longer exist and `w.BOOL` became a distinct type
 (`src/backend/codegen/declarations.zig`), and `SIGUSR1` does not exist in the UCRT, so the ARC
@@ -167,6 +224,25 @@ covering the new x86_64 assembly) is ASAN-clean.
 ```bash
 nova app.nova --target windows-x86_64      # real PE32+ .exe; adds -lws2_32 -lmswsock -lbcrypt
 ```
+Accepted switches are `linux-x86_64`, `linux-arm64`, `windows-x86_64`, `windows-arm64`, `macos-x86_64`,
+`macos-arm64` (`builder.zig`); anything else is `Unsupported target switch`. All four linux/windows
+targets are link-verified against a crypto-using program. Two bugs made that not the case until
+recently, BOTH invisible to the corpus because the corpus only ever builds for the host:
+
+- **arm64 targets failed with `undefined symbol: nova_sha256_blocks`** (and every other kernel) for any
+  program touching crypto — i.e. all of TLS and hashing. `crossLinkViaZig` linked only
+  `novacore_<triple>.o`, and on arm64 there is no fallback to fall back to: crypto.cpp compiles no
+  portable C under `__aarch64__`. It now also cross-assembles `nova_crypto_<triple>.o`, cached the same
+  way. This was unfixable until `nova_crypto_arm64.S` stopped being Darwin-only (see the crypto section).
+- **`linux-x86_64` failed with `undefined symbol: __cpu_model`**, referenced from `nova_cpu_has_aes`.
+  That branch used `__builtin_cpu_supports()`, which pulls compiler-rt's `__cpu_model`; zig's musl link
+  does not provide it. The CPUID probe that the assembly dispatch already uses was gated behind
+  `NOVA_ASM_CRYPTO_X86` and so unavailable on a cross build, which never defines it. The probe is now
+  guarded on the ARCHITECTURE and `nova_cpu_has_aes` reads it directly — same answer, no runtime dep.
+
+x86_64 cross builds still compile `runtime.cpp` WITHOUT `-DNOVA_ASM_CRYPTO_X86` and so use the portable
+C crypto, which is correct but not the fast path. Turning that on is a perf change needing its own
+validation (the single CPUID gate promises every entry point works), not a link fix.
 
 **Windows internals worth knowing** (the port is Nova-over-Win32-FFI, not C++ shims; the
 target-conditional file rule `targetVariantPath` swaps whole modules so shared callers are unchanged):
@@ -407,6 +483,28 @@ miscompare) while leaving `nova_cpu_has_aes()` truthful, so the fallback is Nova
 bitsliced software.
 
 Things that bite, recorded so they are not rediscovered:
+- **`nova_crypto_arm64.S` was Darwin-ONLY, and failed in two different ways.** It was written on an
+  arm64 Mac and had never been assembled for another object format. Both problems are pure syntax —
+  the instruction stream is identical everywhere — but they fail at opposite ends of the build:
+  (1) it addressed its constant pools with Mach-O `sym@PAGE`/`sym@PAGEOFF`, where ELF and COFF spell
+  the low half `:lo12:sym`, which is a LOUD failure (`error: invalid variant 'PAGE'`); and (2) it
+  declared its entry points as `_nova_*`, the Mach-O underscore convention that ELF and COFF-arm64
+  do not use, which is a SILENT one — the file assembles perfectly and simply exports names no C
+  caller ever looks up. Now conditional via `CPOOL_PAGE`/`CPOOL_LO12` and `SYM()`, the last being
+  the same macro `nova_crypto_amd64.S` already had for the same reason.
+  Verified non-regressive rather than assumed: the Darwin object is byte-identical to the previous
+  file (same size, identical `llvm-objdump -d`, same `_nova_*` symbols), and the ELF/Mach-O
+  relocation pairs land at identical offsets (`R_AARCH64_ADR_PREL_PG_HI21`/`ADD_ABS_LO12_NC` against
+  `ARM64_RELOC_PAGE21`/`PAGEOFF12`). Not silicon-tested — there is no arm64 host here — so it stands
+  exactly where SHA-NI does: encoding verified, execution unexercised.
+- **An arm64 archive built WITHOUT that file is actively dangerous, not merely slow.** crypto.cpp
+  compiles no portable C under `__aarch64__` (`#if !(defined(__aarch64__) ...)`) and its
+  `nova_has_asm_crypto()` returns 1 unconditionally there. So dropping the asm yields an archive that
+  PROMISES hardware crypto while defining none of `nova_aes_encrypt_block`, `nova_sha256_blocks`,
+  `nova_ghash` … — an undefined-symbol failure at the FINAL link of any Nova program that touches
+  crypto, arbitrarily far from the cause. This is the exact inverse of the trap `asmCryptoFor`'s
+  comment describes for x86 (define without object); on arm64 there is no "just omit it" option.
+  Always check with `llvm-nm --defined-only <archive> | grep nova_aes_encrypt_block`.
 - **A Nova buffer is NEVER 16-byte aligned.** `bytes.alloc(n)` is `malloc(n+8)+8` for the object header,
   so it is 16-byte aligned *plus 8*. Legacy-SSE memory operands require 16-byte alignment and fault
   otherwise — and that includes the implicit one in `pclmulqdq $0,(%rdx),%xmm4` or `paddd (%rsi),%xmm0`.
@@ -417,10 +515,15 @@ Things that bite, recorded so they are not rediscovered:
   it to SysV so each body is written once. The stack-argument offsets in `PROLOG_5/6` are only valid
   before any other push, which is why the 8-argument `nova_gcm_seal_aesni` spells its prologue out by
   hand rather than using a macro.
-- **Windows links the runtime as a bare COFF object**, not the archive (link.exe cannot read llvm-ar's
-  GNU archive), so `nova_crypto.o` must be named explicitly on the link line —
-  `pipeline.appendRuntimeLink`, gated on the `has_asm_crypto_obj` build option. On macOS/Linux it simply
-  rides along inside `libnovacore.a`. Forgetting this is an unresolved-symbol error, not a silent miss.
+- **Windows links the runtime as a bare COFF object**, not the archive, so `nova_crypto.o` must be
+  named explicitly on the link line — `pipeline.appendRuntimeLink`, gated on the `has_asm_crypto_obj`
+  build option. On macOS/Linux it simply rides along inside `libnovacore.a`. Forgetting this is an
+  unresolved-symbol error, not a silent miss.
+  The reason is narrower than "link.exe cannot read an archive": it cannot read **llvm-ar's GNU**
+  archive. `llvm-lib` writes the COFF archive format link.exe does accept, and a `novacore.lib` built
+  that way links an executable fine (verified in `scripts/build-archives.sh`). So the bare-object
+  workaround is a consequence of the ARCHIVER chosen in `build.zig`, not a hard platform limit — worth
+  knowing before anyone designs around the stronger claim.
 - **x86 has no per-byte bit reverse.** GHASH's "standard order" reflection is a single `RBIT` on arm64;
   here it is `BREV8`, two `PSHUFB` nibble-table lookups.
 - **x86 has no SHA-512 instruction** on any mainstream part, and no SHA-256 one before Ice Lake, so both
@@ -510,8 +613,9 @@ Depends on **NovaDB** (separate repo); pairs with **nls** (LSP) + the VSCode **e
 
    Still open: **repair the driver's leak gate** (~12k live allocations across dozens of sites, so
    `zig build` + `run.sh` is red on Debug everywhere, not just Windows — almost certainly Zig-0.16 std
-   drift); fill in `arc-baseline.txt`, which is missing entries for cases added since it was
-   written (244, 344, 440-444) so `--arc` reports them as `no baseline entry`; and decide what an
+   drift); **regenerate `arc-baseline.txt`, which is far staler than previously recorded** (see the
+   `--arc` section below — it is 109 entries against 374 cases, not the handful of missing ones this
+   file used to claim, and the gate is currently noise); and decide what an
    **out-of-range `int` constant** should do (see `189_epoll_event_layout` above — `const X: int =
    2147483648` is today neither truncated nor rejected, it is silently carried at 64 bits, so the
    constant disagrees with its own 32-bit round trip). That last one is a spec question first.
