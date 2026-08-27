@@ -59,7 +59,35 @@ llvm-nm --defined-only zig-out/archives/<triple>/libnovacore.a | grep nova_aes_e
 ```
 
 Windows note: the `.a` is a convenience only — `link.exe` cannot read llvm-ar's GNU archive, so the
-Windows link path names the bare `novacore.o` + `nova_crypto.o`, which are kept beside it.
+Windows link path names the bare `novacore.o` + `nova_crypto.o`, which are kept beside it. (It CAN read
+llvm-lib's COFF archive; the script emits `novacore.lib` for Windows targets and link-verifies it.)
+
+### The compiler itself (`scripts/build-dist.sh`) — and why it is HOST-ONLY
+
+`build-archives.sh` produces what a program LINKS against. `build-dist.sh` produces what you INVOKE:
+`zig-out/dist/<host-triple>/` with `bin/nova` plus the `nova-home/` tree it resolves at run time
+(`std/`, `lib/`, `src/runtime/`, `deps/`), and an `INSTALL.txt`. Both distributions here were verified
+by installing into a CLEAN `HOME` and compiling + running a crypto-using `.nova` file — not by
+checking the binary exists.
+
+It takes no target argument, because **`nova` links LLVM itself** (LLVM-C, or the static component
+libs, out of `NOVA_LLVM_PREFIX`). Cross-building it needs LLVM built FOR THE TARGET, not merely a cross
+C++ toolchain, and `zig build -Dtarget=x86_64-linux-gnu` says so plainly:
+
+```
+error: unable to find dynamic system library 'LLVM' ... searched:
+       C:\LLVM\lib\libLLVM.so   C:\LLVM\lib\libLLVM.a
+```
+
+Zig can synthesise a libc for any target; it cannot synthesise LLVM. So each host builds its own
+compiler — x86_64-windows-msvc natively, x86_64-linux-gnu in WSL, and an arm64 host would need an
+arm64 LLVM and a native build there.
+
+**This does NOT block producing arm64 binaries.** `nova app.nova --target linux-arm64` (or
+`windows-arm64`) cross-compiles from an x86_64 host and is verified working from the distribution
+itself — the cross path builds and caches the per-target runtime object, and since the fixes above it
+also assembles the per-target crypto. What needs a native arm64 build is RUNNING the compiler on
+arm64, which is a packaging question, not a portability one: nothing in the tree is x86-specific.
 
 ### Running the corpus in parallel (`-j`)
 
