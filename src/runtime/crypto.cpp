@@ -42,7 +42,14 @@ extern "C" void nova_getrandom(char *buf, long long n) {
 // Lake. So the x86 integrated-assembly path (nova_crypto_amd64.S) is dispatched per feature at runtime,
 // and this is the single cached probe every decision below reads. CPUID is issued once, on first use;
 // the function-local static gives thread-safe initialisation without a separate init hook.
-#if defined(NOVA_ASM_CRYPTO_X86)
+// Guarded on the ARCHITECTURE, not on NOVA_ASM_CRYPTO_X86, even though the assembly dispatch is this
+// probe's main consumer. A plain CPUID read costs nothing to compile without the asm, and
+// `nova_cpu_has_aes()` below needs an answer on every x86_64 build — including the CROSS ones, where the
+// asm is absent. It used to reach for `__builtin_cpu_supports()` there, which pulls in compiler-rt's
+// `__cpu_model`; zig's musl link does not provide that, so `nova <app> --target linux-x86_64` died with
+// `undefined symbol: __cpu_model` referenced from `nova_cpu_has_aes`. Issuing CPUID directly removes the
+// runtime dependency entirely and gives the identical answer.
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 #include <cpuid.h>
 namespace {
 struct NovaX86Features {
@@ -100,9 +107,12 @@ const NovaX86Features &nova_x86() {
     return (nova_x86().aes && nova_x86().pclmul) ? 1 : 0;
   }
 #elif (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+  // Same CPUID probe as the NOVA_ASM_CRYPTO_X86 branch above — this arm is reached on an x86_64 build
+  // WITHOUT the assembly (notably every cross build), where the answer still matters because it selects
+  // hardware AES-GCM in the pure-Nova crypto. Deliberately not `__builtin_cpu_supports`: see the note on
+  // the probe's guard about `__cpu_model` and the cross link.
   extern "C" int nova_cpu_has_aes(void) {
-    __builtin_cpu_init();
-    return (__builtin_cpu_supports("aes") && __builtin_cpu_supports("pclmul")) ? 1 : 0;
+    return (nova_x86().aes && nova_x86().pclmul) ? 1 : 0;
   }
 #else
   extern "C" int nova_cpu_has_aes(void) { return 0; }

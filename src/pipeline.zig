@@ -277,6 +277,35 @@ pub fn crossLinkViaZig(
         }
     }
 
+    // An arm64 cross target MUST also get the assembly crypto object, because on arm64 there is no
+    // fallback to fall back to: crypto.cpp compiles no portable C under `__aarch64__` and its
+    // `nova_has_asm_crypto()` returns 1 unconditionally there. Linking only `novacore_<triple>.o`
+    // therefore failed with `undefined symbol: nova_sha256_blocks` (and every other kernel) for ANY
+    // program that touches crypto — which is all of TLS and hashing, so effectively any real program.
+    //
+    // x86_64 cross targets are deliberately left alone: there `runtime.cpp` is built without
+    // `-DNOVA_ASM_CRYPTO_X86`, so crypto.cpp DOES compile the portable C, defines every entry point
+    // itself, and answers `nova_has_asm_crypto() == 0`. That path is correct as it stands; switching it
+    // onto the assembly is a performance change needing its own validation (the single CPUID gate
+    // promises that EVERY entry point works), not a link fix, so it is not bundled in here.
+    const arm_target = std.mem.indexOf(u8, target.zig, "aarch64") != null;
+    const crypto_obj: ?[]const u8 = if (!arm_target) null else blk: {
+        const obj = try std.fmt.allocPrint(allocator, "{s}/lib/nova_crypto_{s}.o", .{ shared_nova, target.zig });
+        if (Io.Dir.access(.cwd(), io, obj, .{})) |_| break :blk obj else |_| {}
+        const src = try std.fmt.allocPrint(allocator, "{s}/src/runtime/nova_crypto_arm64.S", .{shared_nova});
+        std.debug.print("[T1] cross-assembling the crypto kernels for {s} (one-time) ...\n", .{target.zig});
+        const ca = [_][]const u8{ "zig", "c++", "-target", target.zig, "-O2", "-c", src, "-o", obj };
+        var ch = try std.process.spawn(io, .{ .argv = &ca });
+        switch (try ch.wait(io)) {
+            .exited => |code| if (code != 0) {
+                std.debug.print("[T1] crypto cross-assemble failed for {s} (code {d})\n", .{ target.zig, code });
+                return error.LinkFailed;
+            },
+            else => return error.LinkFailed,
+        }
+        break :blk obj;
+    };
+
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(allocator);
     try args.appendSlice(allocator, &.{ "zig", "c++", "-target", target.zig });
@@ -284,6 +313,7 @@ pub fn crossLinkViaZig(
     if (is_release) try args.append(allocator, "-O3");
     for (objs) |o| try args.append(allocator, o);
     try args.append(allocator, rt_obj);
+    if (crypto_obj) |c| try args.append(allocator, c);
 
     if (std.mem.indexOf(u8, target.zig, "windows") != null)
         try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
