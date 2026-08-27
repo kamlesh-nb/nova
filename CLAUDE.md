@@ -147,6 +147,51 @@ regression in the cases. Repairing the leak gate itself is separate outstanding 
 Note that readiness cases 192/194/195, listed as open in an earlier revision of this file, now PASS —
 `iocp.nova` grew `armZeroByte`.
 
+### Releasing a static, DLL-free Windows `nova.exe`
+
+macOS and Linux ship a static `nova` by globbing the OS LLVM's `libLLVM*.a` (brew/apt provide the full
+static component set). Windows has no such artifact: Chocolatey and the official LLVM-C Windows drop
+ship only `LLVM-C.dll` + its import lib + clang, NOT the static components (`LLVMCore.lib`,
+`LLVMX86CodeGen.lib`, …). That is the ONLY reason Windows was ever dynamic. The fix is a **self-hosted
+prebuilt static LLVM**, built once per arch and pointed at by `NOVA_LLVM_PREFIX`; `release.yml`'s
+Windows leg downloads it (repo variable `WIN_STATIC_LLVM_X64_URL`) and builds
+`zig build archive -Dstatic-llvm=true`. No `LLVM-C.dll` is bundled.
+
+**Only Windows x86_64 is shipped.** windows-arm64 is dropped from CI and the release matrix: there is
+no arm64 Windows LLVM to build nova natively on a `windows-11-arm` runner, and Nova has no
+cross-build-LLVM pipeline (the way Zig does — Zig cross-BUILDS LLVM for the target with `zig c++` and
+cross-links with bundled LLD, so it needs no native arm64 box; Nova's build still expects a native
+`NOVA_LLVM_PREFIX` per host). The x64 instructions below carry over to arm64 (`-A ARM64`,
+`WIN_STATIC_LLVM_ARM64_URL`, add the matrix cell back) if that pipeline is ever built.
+
+**How `build.zig` links it:** the `-Dstatic-llvm` glob branch, when `os_tag == .windows`, enumerates
+`<prefix>/lib/LLVM*.lib` (skipping `LLVM-C.lib`, whose presence would drag the DLL back in) and adds the
+Win32 system libs LLVM's own CMake needs (`ntdll ole32 oleaut32 uuid psapi shell32 advapi32 version`)
+from the runner's Windows SDK. So the prebuilt's `lib/` contents ARE the link line — they must match.
+
+**Build the prebuilt (once per arch, on a Windows box with VS + CMake + Ninja).** The flags matter,
+because `build.zig` links ONLY the Win32 libs above — anything else LLVM depends on must be turned OFF
+or the final link fails with unresolved symbols:
+
+```
+cmake -S llvm -B build -G Ninja -A <x64|ARM64> ^
+  -DCMAKE_BUILD_TYPE=Release -DLLVM_USE_CRT_RELEASE=MT ^
+  -DBUILD_SHARED_LIBS=OFF -DLLVM_BUILD_LLVM_DYLIB=OFF -DLLVM_BUILD_LLVM_C_DYLIB=OFF ^
+  -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF ^
+  -DLLVM_TARGETS_TO_BUILD=X86;AArch64 -DLLVM_INCLUDE_TESTS=OFF
+cmake --build build --target install --config Release   # installs prefix/{lib,include,bin}
+```
+
+Then tar the install prefix, publish it (a release asset works), and set the repo variable to its URL.
+Pin the LLVM MAJOR version to whatever `deps/llvm-zig` expects (22) — a mismatch is a link/ABI error.
+`LLVM_USE_CRT_RELEASE=MT` static-links the MSVC CRT so users need no VC++ redistributable either.
+
+**Still NOT self-contained after this — and deliberately out of scope here:** the shipped `nova.exe`
+no longer needs `LLVM-C.dll`, but it still shells out to `link.exe` to link the USER's programs (same
+as every native host). Making it linker-free too means in-process LLD — and `addInprocessLld` currently
+links `lldMachO/Wasm/ELF/Common` but **no `lldCOFF`**, so that is a separate piece of work. DLL-free
+(this section) and linker-free (lldCOFF) are two different goals; only the first is done.
+
 ### Corpus status, measured on three hosts (ReleaseFast, `run.sh -j 3`)
 
 | Gate | Windows / IOCP | Linux / epoll (WSL2, Ubuntu 24.04) | macOS / kqueue (arm64) |

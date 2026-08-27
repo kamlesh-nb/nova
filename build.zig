@@ -35,11 +35,23 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: 
         defer dir.close(io);
         var it = dir.iterate();
         while (it.next(io) catch null) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, "libLLVM")) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".a")) continue;
-            const comp = entry.name["lib".len .. entry.name.len - ".a".len];
-            m.linkSystemLibrary(b.dupe(comp), .{ .preferred_link_mode = .static, .use_pkg_config = .no });
-            count += 1;
+            if (os_tag == .windows) {
+                // Windows/MSVC static components are `LLVMCore.lib`, not `libLLVMCore.a`. Skip the
+                // dynamic C-API import lib if the prebuilt ships one -- linking `LLVM-C.lib` would pull
+                // LLVM-C.dll back in and defeat the entire point of a static, DLL-free nova.exe.
+                if (!std.mem.startsWith(u8, entry.name, "LLVM")) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".lib")) continue;
+                if (std.mem.eql(u8, entry.name, "LLVM-C.lib")) continue;
+                const comp = entry.name[0 .. entry.name.len - ".lib".len];
+                m.linkSystemLibrary(b.dupe(comp), .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+                count += 1;
+            } else {
+                if (!std.mem.startsWith(u8, entry.name, "libLLVM")) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".a")) continue;
+                const comp = entry.name["lib".len .. entry.name.len - ".a".len];
+                m.linkSystemLibrary(b.dupe(comp), .{ .preferred_link_mode = .static, .use_pkg_config = .no });
+                count += 1;
+            }
         }
     } else {
         const llvm_libs = if (os_tag == .linux) llvm_libs_linux else llvm_libs_macos;
@@ -60,6 +72,14 @@ fn configureLlvmLink(b: *std.Build, m: *std.Build.Module, static: bool, os_tag: 
             b.pathJoin(&.{ llvmPrefix(b, static), "lib" });
         m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ stdcxx_dir, "libstdc++.so" }) });
         m.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ stdcxx_dir, "libgcc_s.so" }) });
+    } else if (os_tag == .windows) {
+        // Static LLVM on Windows pulls the Win32 system import libs LLVM's own CMake links; they come
+        // from the Windows SDK on the runner. The prebuilt static LLVM MUST be built with zlib / zstd /
+        // libxml2 / terminfo DISABLED (see the "Releasing a static, DLL-free Windows nova.exe" section
+        // in CLAUDE.md) so there are no extra external deps to resolve here -- only these OS libs. The
+        // MSVC C++ runtime is folded in by link.exe via the exe's own C++ objects, so no libc++ here.
+        for (&[_][]const u8{ "ntdll", "ole32", "oleaut32", "uuid", "psapi", "shell32", "advapi32", "version" }) |lib|
+            m.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
     } else {
         if (arch == .aarch64) {
             m.addLibraryPath(b.path("deps/zstd"));
@@ -512,8 +532,10 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
             \\# matching the Unix path -- skip only when the nls repo is not checked out.
             \\if ($env:NOVA_ARCHIVE_SKIP_NLS -eq "1") {{ Write-Host "archive: NOVA_ARCHIVE_SKIP_NLS=1 -- bundling without nls" }}
             \\else {{ Push-Location ../nls; zig build -Dnova-src=../lang/src/root.zig; Pop-Location; Copy-Item -Force "{[home]s}/.nova/bin/nls.exe" "$stage/bin/nls.exe" }}
-            \\# nova.exe dynamically links LLVM-C.dll on Windows; bundle it next to the exe so the
-            \\# archive is self-contained (the loader finds a DLL in the exe's own directory).
+            \\# A -Dstatic-llvm build (the release path) links LLVM into nova.exe and needs NO DLL -- the
+            \\# static prefix has no bin/LLVM-C.dll, so the copy below simply no-ops. It stays only to keep
+            \\# a legacy DYNAMIC build (`zig build archive` without -Dstatic-llvm) self-contained, where the
+            \\# loader must find LLVM-C.dll in the exe's own directory.
             \\if ($env:NOVA_LLVM_PREFIX) {{ Copy-Item -Force "$env:NOVA_LLVM_PREFIX/bin/LLVM-C.dll" "$stage/bin/" -ErrorAction SilentlyContinue }}
             \\Copy-Item -Force "{[home]s}/.nova/lib/libnovacore.a" "$stage/lib/"
             \\Copy-Item -Recurse -Force "{[home]s}/.nova/std" "$stage/std"

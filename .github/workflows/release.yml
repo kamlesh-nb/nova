@@ -1,18 +1,19 @@
 name: release
 
-# Build all 6 Nova toolchain bundles (macOS/Linux/Windows x {x86_64, arm64}) and publish them to a
-# GitHub Release.
+# Build the 5 Nova toolchain bundles -- macOS {arm64, x86_64}, Linux {x86_64, arm64}, Windows x86_64 --
+# and publish them to a GitHub Release. (Windows arm64 is NOT shipped; see the build-windows job.)
 #
-#   * LLVM 21 is installed from the OS package manager and the build is pointed at it via
-#     NOVA_LLVM_PREFIX. macOS/Linux static-link (build.zig globs the install's libLLVM*.a);
-#     Windows dynamic-links LLVM-C and bundles LLVM-C.dll next to nova.exe.
+#   * macOS/Linux: LLVM 21 from the OS package manager (build.zig globs the install's libLLVM*.a),
+#     pointed at via NOVA_LLVM_PREFIX, statically linked.
+#   * Windows x86_64: STATIC LLVM from a self-hosted prebuilt (build-windows job), so nova.exe carries
+#     no LLVM-C.dll. See the "Releasing a static, DLL-free Windows nova.exe" section in CLAUDE.md.
 #   * nls (the language server) IS bundled: each runner checks out the sibling `nls` repo and the
 #     archive step builds it from that source, pinned to THIS lang checkout via `-Dnova-src`. nls is
 #     pure-Zig (no LLVM link), so it builds on every runner without extra toolchain. If the `nls` repo
 #     is private, set the `NLS_TOKEN` secret to a PAT with read access (else the checkout falls back to
 #     the workflow's GITHUB_TOKEN, which only works when nls is in the same repo/owner and permitted).
 #     To ship a nova-only bundle, set the repo variable `SKIP_NLS=1`.
-#   * NOTE: arm64 Linux/Windows runners are BILLED on private repos.
+#   * NOTE: the arm64 Linux runner is BILLED on private repos.
 #
 # Trigger: push a tag `v*`, or run manually (Actions -> release -> Run workflow) with a version.
 
@@ -118,7 +119,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ windows-latest, windows-11-arm ]   # x86_64, arm64
+        include:
+          - { runner: windows-latest, arch: x64 }     # x86_64
+          # windows-arm64 is NOT shipped: no arm64 Windows LLVM exists to build nova natively there,
+          # and Nova has no cross-build-LLVM pipeline (the way Zig does) to produce it from another host.
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -133,33 +137,47 @@ jobs:
           token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
-      - name: Ensure LLVM (with C-API dev libs) and point the build at it
+      # A static, DLL-free nova.exe links the STATIC LLVM component libs (LLVM*.lib), which Chocolatey
+      # and the official LLVM-C Windows drop do NOT ship -- they ship only LLVM-C.dll + its import lib.
+      # So we fetch a self-hosted prebuilt static LLVM (build it once locally per arch; see the
+      # "Releasing a static, DLL-free Windows nova.exe" section in CLAUDE.md), pointed at by these repo
+      # variables. Cached across runs on the extraction dir so the ~1GB download happens once per URL.
+      - name: Cache static LLVM
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm-static
+          key: winllvm-${{ matrix.arch }}-${{ hashFiles('build.zig.zon') }}-${{ vars.WIN_STATIC_LLVM_X64_URL }}${{ vars.WIN_STATIC_LLVM_ARM64_URL }}
+      - name: Fetch prebuilt static LLVM and point the build at it
         shell: pwsh
+        env:
+          URL_X64: ${{ vars.WIN_STATIC_LLVM_X64_URL }}
+          URL_ARM64: ${{ vars.WIN_STATIC_LLVM_ARM64_URL }}
         run: |
-          # Prefer a preinstalled LLVM (windows-latest ships one with LLVM-C.lib). If it is missing or
-          # lacks the C-API import lib (e.g. the arm64 image), install via Chocolatey.
-          function Find-Prefix {
-            if (Test-Path "C:/Program Files/LLVM/lib/LLVM-C.lib") { return "C:/Program Files/LLVM" }
-            $clang = Get-Command clang.exe -ErrorAction SilentlyContinue
-            if ($clang) {
-              $p = Split-Path (Split-Path $clang.Source)
-              if (Test-Path "$p/lib/LLVM-C.lib") { return $p }
+          $dest = "C:\llvm-static"
+          $existing = Get-ChildItem -Path $dest -Recurse -Filter LLVMCore.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $existing) {
+            $url = if ("${{ matrix.arch }}" -eq "arm64") { $env:URL_ARM64 } else { $env:URL_X64 }
+            if (-not $url) {
+              Write-Error "No prebuilt static LLVM URL for ${{ matrix.arch }}. Set repo variable WIN_STATIC_LLVM_$(('${{ matrix.arch }}').ToUpper())_URL to a static LLVM 22 build (BUILD_SHARED_LIBS=OFF; zlib/zstd/libxml2/terminfo OFF). See CLAUDE.md."
+              exit 1
             }
-            return $null
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            $file = "$env:RUNNER_TEMP\llvm-static" + [System.IO.Path]::GetExtension($url)
+            Write-Host "Downloading static LLVM: $url"
+            Invoke-WebRequest -Uri $url -OutFile $file
+            if ($file -match '\.zip$') { Expand-Archive -Force -Path $file -DestinationPath $dest }
+            else { tar -xf $file -C $dest }   # tar ships with Windows and reads .tar.xz / .tar.gz
+            $existing = Get-ChildItem -Path $dest -Recurse -Filter LLVMCore.lib -ErrorAction SilentlyContinue | Select-Object -First 1
           }
-          $prefix = Find-Prefix
-          if (-not $prefix) {
-            Write-Host "No LLVM with LLVM-C.lib found; installing via Chocolatey..."
-            choco install llvm --no-progress -y
-            $prefix = Find-Prefix
-            if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
-          }
+          if (-not $existing) { Write-Error "extracted archive has no lib/LLVMCore.lib -- not a static LLVM build"; exit 1 }
+          $prefix = $existing.Directory.Parent.FullName   # <prefix>/lib/LLVMCore.lib -> <prefix>
           echo "NOVA_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
-          Write-Host "LLVM prefix: $prefix"
-          Write-Host ("LLVM-C.lib: " + (Test-Path "$prefix/lib/LLVM-C.lib") + " | LLVM-C.dll: " + (Test-Path "$prefix/bin/LLVM-C.dll"))
-      - name: Build archive (dynamic LLVM-C; bundles LLVM-C.dll)
+          Write-Host "NOVA_LLVM_PREFIX=$prefix"
+          # A pure static build has NO LLVM-C.lib/.dll; warn if one leaked in (the build.zig glob skips it).
+          Write-Host ("LLVM-C.lib present (expected absent): " + (Test-Path "$prefix/lib/LLVM-C.lib"))
+      - name: Build archive (static LLVM; self-contained, no LLVM-C.dll)
         working-directory: lang
-        run: zig build archive   # NOT -Dstatic-llvm: Windows uses the dynamic LLVM-C path
+        run: zig build archive -Dstatic-llvm=true
       - uses: actions/upload-artifact@v4
         with:
           name: nova-windows-${{ matrix.runner }}
