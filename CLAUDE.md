@@ -95,26 +95,50 @@ Note that readiness cases 192/194/195, listed as open in an earlier revision of 
 
 | Gate | Windows / IOCP | Linux / epoll (WSL2, Ubuntu 24.04) |
 |---|---|---|
-| positive corpus | **437/444** | **440/444** |
-| `--asan` | crypto subset clean | **440/444** |
+| positive corpus | **442/444** | **443/444** |
+| `--asan` | crypto subset clean | **443/444** |
 
-Running BOTH is what makes the failure list interpretable, because "fails on Windows" turned out to
-mean four different things. Do not assume a failure is a platform gap without checking the other host:
+Both hosts are at their ceiling: the only remaining failures are the two cases that cannot LINK off
+their own platform. `188_kqueue_readiness` needs macOS (`kqueue`/`kevent`), and
+`189_epoll_event_layout` needs Linux (`epoll_ctl`) — mirror images, both `LNK2019`-class failures
+that never reach a test. Full per-case history in `win-lin-failures.md`.
 
-- **Inapplicable by design (1 each):** `188_kqueue_readiness` needs macOS (`kqueue`/`kevent` do not
-  link elsewhere).
-- **Genuine Windows stdlib gaps (3), all failing before they run, and all PASSING on Linux:**
-  `163_process` type-checks a possibly-`undefined` string the POSIX module narrows and the Windows one
-  does not; `256_dns_ipv6` wants `socket.connectBlocking6`, which `os/windows/socket` never
-  implemented; `413_file_write_ok` asserts a write succeeds and it does not.
-- **A genuine LINUX bug**, which only a Linux run could show: `189_epoll_event_layout` fails on Linux
-  with `Expected 2147483649, got -2147483647`. Same 32-bit pattern (`0x80000001` = `EPOLLET|EPOLLIN`)
-  read back signed — a signedness bug in the epoll event accessor, not a layout mismatch.
-- **Cross-platform compiler/ARC bugs (2), failing on BOTH hosts:** `42_nested_owned_aggregates`
-  NULL-derefs in `RawBuffer_string_push` (a `List<string>` nested in a struct literal inside another
-  struct literal gets a NULL backing buffer), and `118_actor` takes a heap-buffer-overflow READ inside
-  `nova_release` from `ActorCell_i32_init` — releasing something that was never a refcounted heap
-  object, the "ARC guessed from the type name and freed it" failure described under ARC above.
+Running BOTH hosts is what made the earlier list interpretable, because "fails on Windows" turned out
+to mean four different things and three of the seven were not Windows problems at all. Do not assume a
+failure is a platform gap without checking the other host. The five that were real, all now fixed:
+
+- **`42_nested_owned_aggregates` (both hosts) — value-struct copy settled no ownership.**
+  `buildValueStructCopyInto` copies inline bytes without touching refcounts and REQUIRES the caller to
+  follow up; every call site did except the struct-literal field loop, which did neither that nor
+  `consumeTemporary`. So `Outer{ inner: Inner{ items: List<string>() } }` let the `Inner` temporary
+  release the very list `Outer` had copied a pointer to. Binding the inner literal to a variable first
+  survived only because the `let` copy added a retain of its own — which is what made it look like a
+  nesting bug. Now uses the same borrow-vs-temporary split as `takeOwnedElement`.
+- **`118_actor` (both hosts) — a generic field's LAYOUT and its STORE PATH disagreed.**
+  `getTypeSize(t, true)` sizes a `.generic` field as 8 bytes unconditionally (a generic *declaration*
+  cannot be laid out — a field of the bare type parameter has no size until instantiation), but the
+  store paths asked `fieldStoredInline(baseName)`, which only sees `"Mailbox"` and says "value struct,
+  inline it". `ActorCell<M>` reserved 8 bytes for `mbox: Mailbox<M>` and copied 16, so `mbox.signal`
+  physically overwrote `behavior`; the next assignment then released that word as the field's previous
+  value. `signal` holds a raw `nova_chan_new` pointer with NO ARC header, hence ASAN's read 8 bytes
+  before a plain malloc block. NOT the "ARC guessed from the type name" failure it was first recorded
+  as — ownership was decided correctly; the bytes were in the wrong place. Fixed with
+  `fieldStoredInlineRef(type_ref)`, phrased as `getTypeSize(t,true) == getTypeSize(t,false)` so the
+  store decision is DERIVED from the layout and the two cannot drift apart again.
+- **Windows stdlib gaps (2), both passing on Linux:** `163_process` passed a `T | undefined` from
+  `List.get` to a `string` parameter (the POSIX module escapes it only by concatenating rather than
+  passing as an argument); `256_dns_ipv6` wanted `socket.connectBlocking6`, which `os/windows/socket`
+  never implemented. Note `AF_INET6` is 23 on Windows vs 10 Linux / 30 Darwin — the one sockaddr
+  constant that differs on all three.
+- **`413_file_write_ok` was a TEST bug, not a stdlib gap:** it hardcoded `/tmp/...`, which on Windows
+  resolves against the current drive root (`C:\tmp\`). `dir.Dir.tempDir()` is the portable spelling.
+- **`189_epoll_event_layout` — an `int` constant that does not fit an `int`.** Recorded earlier as "a
+  signedness bug in the epoll event accessor"; that was WRONG and blamed the innocent side. `evEvents`
+  correctly sign-extends `0x80000001` to `-2147483647`. The wrong side was the constant expression:
+  `EPOLLET` was declared `int = 2147483648`, which does not fit 32-bit signed, so `EPOLLIN | EPOLLET`
+  folded to `2147483649`. Now spelled as the signed bit pattern `-2147483648`. **Still open:** the
+  compiler neither truncates nor rejects an out-of-range `int` constant — a language-semantics call
+  (truncate like C, or error) that wants a spec change rather than a quiet edit.
 - **Found ONLY by `--asan` (FIXED):** `123_any_container` passed the plain corpus while
   double-releasing. See the `any` note under Gotchas — it is the one type that is both "primitive" and
   owned, and a `??` fast path trusted the wrong predicate. Precisely the class of bug the ASAN gate
@@ -243,7 +267,7 @@ administratively (`/proc/sys/kernel/io_uring_disabled`).
 ### Conformance across backends
 
 epoll and io_uring have IDENTICAL failure lists — every reachable case passes on both. Windows/IOCP
-trails by a few readiness cases (see below).
+now trails only by `189_epoll_event_layout`, which cannot link there (see the corpus status table).
 
 Run the corpora ONE AT A TIME. Running two concurrently on a 4-core box starves the app/server cases
 past the per-case timeout and invents phantom failures (they report a timeout, which is how to
@@ -480,7 +504,14 @@ Depends on **NovaDB** (separate repo); pairs with **nls** (LSP) + the VSCode **e
      the way the `-j` worker already did. That is also why the `-j` corpus was reliable while every
      sequential gate looked broken.
 
+   The corpus itself is DONE on both hosts: Windows 442/444, Linux 443/444, the only failures being
+   the two cases that cannot link off their own platform. See `win-lin-failures.md` for the per-case
+   history and the five real bugs that were fixed to get there.
+
    Still open: **repair the driver's leak gate** (~12k live allocations across dozens of sites, so
    `zig build` + `run.sh` is red on Debug everywhere, not just Windows — almost certainly Zig-0.16 std
-   drift), and fill in `arc-baseline.txt`, which is missing entries for cases added since it was
-   written (244, 344, 440-444) so `--arc` reports them as `no baseline entry`.
+   drift); fill in `arc-baseline.txt`, which is missing entries for cases added since it was
+   written (244, 344, 440-444) so `--arc` reports them as `no baseline entry`; and decide what an
+   **out-of-range `int` constant** should do (see `189_epoll_event_layout` above — `const X: int =
+   2147483648` is today neither truncated nor rejected, it is silently carried at 64 bits, so the
+   constant disagrees with its own 32-bit round trip). That last one is a spec question first.
