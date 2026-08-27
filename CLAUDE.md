@@ -147,17 +147,26 @@ regression in the cases. Repairing the leak gate itself is separate outstanding 
 Note that readiness cases 192/194/195, listed as open in an earlier revision of this file, now PASS —
 `iocp.nova` grew `armZeroByte`.
 
-### Corpus status, measured on both hosts (ReleaseFast, `run.sh -j 3`)
+### Corpus status, measured on three hosts (ReleaseFast, `run.sh -j 3`)
 
-| Gate | Windows / IOCP | Linux / epoll (WSL2, Ubuntu 24.04) |
-|---|---|---|
-| positive corpus | **442/444** | **443/444** |
-| `--asan` | crypto subset clean | **443/444** |
+| Gate | Windows / IOCP | Linux / epoll (WSL2, Ubuntu 24.04) | macOS / kqueue (arm64) |
+|---|---|---|---|
+| positive corpus | **442/444** | **443/444** | **444/444** |
+| `--asan` | crypto subset clean | **443/444** | crypto subset clean (445) |
 
-Both hosts are at their ceiling: the only remaining failures are the two cases that cannot LINK off
-their own platform. `188_kqueue_readiness` needs macOS (`kqueue`/`kevent`), and
+Windows and Linux are each at their ceiling: their only remaining failures are the two cases that
+cannot LINK off their own platform. `188_kqueue_readiness` needs macOS (`kqueue`/`kevent`) and
 `189_epoll_event_layout` needs Linux (`epoll_ctl`) — mirror images, both `LNK2019`-class failures
-that never reach a test. Full per-case history in `win-lin-failures.md`.
+that never reach a test off-platform. macOS clears the whole 444: it links `kqueue` natively AND
+`189` (which only asserts the epoll event struct's layout/constants, needing no `epoll_ctl` link),
+so it is the one host with no platform-excluded case. Full Windows/Linux per-case history in
+`win-lin-failures.md`.
+
+macOS is the host that finally exercised the arm64 ChaCha20 kernel's store path at the ABI boundary
+(`445`), which is what surfaced the `;`-as-comment assembler bug fixed in the crypto section — a bug
+that assembled and ran fine on Linux/Windows and was invisible there. The lesson the three-host table
+encodes: a green corpus on two hosts is not proof for the third, especially for hand-written
+per-architecture assembly.
 
 Running BOTH hosts is what made the earlier list interpretable, because "fails on Windows" turned out
 to mean four different things and three of the seven were not Windows problems at all. Do not assume a
@@ -525,6 +534,19 @@ Things that bite, recorded so they are not rediscovered:
   relocation pairs land at identical offsets (`R_AARCH64_ADR_PREL_PG_HI21`/`ADD_ABS_LO12_NC` against
   `ARM64_RELOC_PAGE21`/`PAGEOFF12`). Not silicon-tested — there is no arm64 host here — so it stands
   exactly where SHA-NI does: encoding verified, execution unexercised.
+- **`;` is a STATEMENT SEPARATOR on GNU/ELF but a COMMENT START on the Apple/Mach-O clang integrated
+  assembler.** The ChaCha20 store block wrote three ops per source line, `ldr q16,[x3]; eor …; str
+  q,[x5]`. On Linux/WSL (where this file was developed and gated) all three assembled; on macOS the
+  assembler dropped everything after the first `;`, so the keystream was LOADED and never XORed or
+  stored — `nova_chacha20_xor` produced all-zero output, silently, on macOS ONLY. It went unseen
+  because the pure-Nova ChaCha KATs (219/220/370) drive short inputs that never reach the ≥256-byte
+  fused asm path, and `445` — the first KAT straight at the ABI boundary — was added on the very
+  branch that had only ever been run on Linux. Fixed by putting one instruction per line; the
+  instruction stream is identical everywhere. Two lessons: (a) never use `;` to pack asm statements —
+  newline-separate; (b) the "Darwin object is byte-identical" check above proves a CHANGE didn't alter
+  codegen, but cannot catch a bug that predates the change and lives on Darwin all along — only an
+  EXECUTION KAT on each host can, which is why 445 exists and why it must be run on macOS too, not
+  just Linux/Windows. (`grep` for a `;` that precedes any `//` on a line to audit for more.)
 - **An arm64 archive built WITHOUT that file is actively dangerous, not merely slow.** crypto.cpp
   compiles no portable C under `__aarch64__` (`#if !(defined(__aarch64__) ...)`) and its
   `nova_has_asm_crypto()` returns 1 unconditionally there. So dropping the asm yields an archive that

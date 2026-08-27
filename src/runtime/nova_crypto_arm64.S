@@ -721,22 +721,58 @@ SYM(nova_chacha20_xor):
     zip2 v15.4s, v17.4s, v19.4s
     // Now: block j's four rows are v0/v4/v8/v12 (j=0), v1/v5/v9/v13 (j=1), v2/v6/v10/v14 (j=2), v3/v7/v11/v15 (j=3).
     // Block j occupies out[j*64 .. j*64+64]: row0 at +0, row1 at +16, row2 at +32, row3 at +48.
-    ldr q16, [x3, #0];   eor v0.16b,  v0.16b,  v16.16b; str q0,  [x5, #0]
-    ldr q16, [x3, #16];  eor v4.16b,  v4.16b,  v16.16b; str q4,  [x5, #16]
-    ldr q16, [x3, #32];  eor v8.16b,  v8.16b,  v16.16b; str q8,  [x5, #32]
-    ldr q16, [x3, #48];  eor v12.16b, v12.16b, v16.16b; str q12, [x5, #48]
-    ldr q16, [x3, #64];  eor v1.16b,  v1.16b,  v16.16b; str q1,  [x5, #64]
-    ldr q16, [x3, #80];  eor v5.16b,  v5.16b,  v16.16b; str q5,  [x5, #80]
-    ldr q16, [x3, #96];  eor v9.16b,  v9.16b,  v16.16b; str q9,  [x5, #96]
-    ldr q16, [x3, #112]; eor v13.16b, v13.16b, v16.16b; str q13, [x5, #112]
-    ldr q16, [x3, #128]; eor v2.16b,  v2.16b,  v16.16b; str q2,  [x5, #128]
-    ldr q16, [x3, #144]; eor v6.16b,  v6.16b,  v16.16b; str q6,  [x5, #144]
-    ldr q16, [x3, #160]; eor v10.16b, v10.16b, v16.16b; str q10, [x5, #160]
-    ldr q16, [x3, #176]; eor v14.16b, v14.16b, v16.16b; str q14, [x5, #176]
-    ldr q16, [x3, #192]; eor v3.16b,  v3.16b,  v16.16b; str q3,  [x5, #192]
-    ldr q16, [x3, #208]; eor v7.16b,  v7.16b,  v16.16b; str q7,  [x5, #208]
-    ldr q16, [x3, #224]; eor v11.16b, v11.16b, v16.16b; str q11, [x5, #224]
-    ldr q16, [x3, #240]; eor v15.16b, v15.16b, v16.16b; str q15, [x5, #240]
+    // NOTE: one instruction per line. `;` is a STATEMENT SEPARATOR on the GNU/ELF assembler but a
+    // COMMENT START on the Apple/Mach-O clang integrated assembler, which silently dropped every
+    // eor+str after the first ldr on each line -- the keystream was loaded and never XORed or stored,
+    // so ChaCha20 produced zero output on macOS while assembling fine on Linux. (445 KAT catches it.)
+    ldr q16, [x3, #0]
+    eor v0.16b,  v0.16b,  v16.16b
+    str q0,  [x5, #0]
+    ldr q16, [x3, #16]
+    eor v4.16b,  v4.16b,  v16.16b
+    str q4,  [x5, #16]
+    ldr q16, [x3, #32]
+    eor v8.16b,  v8.16b,  v16.16b
+    str q8,  [x5, #32]
+    ldr q16, [x3, #48]
+    eor v12.16b, v12.16b, v16.16b
+    str q12, [x5, #48]
+    ldr q16, [x3, #64]
+    eor v1.16b,  v1.16b,  v16.16b
+    str q1,  [x5, #64]
+    ldr q16, [x3, #80]
+    eor v5.16b,  v5.16b,  v16.16b
+    str q5,  [x5, #80]
+    ldr q16, [x3, #96]
+    eor v9.16b,  v9.16b,  v16.16b
+    str q9,  [x5, #96]
+    ldr q16, [x3, #112]
+    eor v13.16b, v13.16b, v16.16b
+    str q13, [x5, #112]
+    ldr q16, [x3, #128]
+    eor v2.16b,  v2.16b,  v16.16b
+    str q2,  [x5, #128]
+    ldr q16, [x3, #144]
+    eor v6.16b,  v6.16b,  v16.16b
+    str q6,  [x5, #144]
+    ldr q16, [x3, #160]
+    eor v10.16b, v10.16b, v16.16b
+    str q10, [x5, #160]
+    ldr q16, [x3, #176]
+    eor v14.16b, v14.16b, v16.16b
+    str q14, [x5, #176]
+    ldr q16, [x3, #192]
+    eor v3.16b,  v3.16b,  v16.16b
+    str q3,  [x5, #192]
+    ldr q16, [x3, #208]
+    eor v7.16b,  v7.16b,  v16.16b
+    str q7,  [x5, #208]
+    ldr q16, [x3, #224]
+    eor v11.16b, v11.16b, v16.16b
+    str q11, [x5, #224]
+    ldr q16, [x3, #240]
+    eor v15.16b, v15.16b, v16.16b
+    str q15, [x5, #240]
     add     x3, x3, #256
     add     x5, x5, #256
     add     w1, w1, #4                 // 4 blocks consumed
