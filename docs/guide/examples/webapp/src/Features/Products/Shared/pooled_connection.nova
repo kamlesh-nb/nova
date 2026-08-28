@@ -1,126 +1,84 @@
 import list;
 import data.db;
-import data.sql.pool;
-import web.di;
+import pool;
 import novadb;
 
-
-pub class NovaPool impl Service {
-    pool: pool.Pool,
-    seeded: bool,
+// A `Connection` backed by a connection POOL. This is what `main_novadb.nova` passes to the repository
+// instead of the in-memory connection, so the SAME repository code runs against a real database.
+//
+// Why a pool and not a single eager connection: opening a connection is async, and driving an async
+// call to completion from the synchronous `main` (before the event loop starts) is not supported. A
+// `pool.Pool` is built synchronously and opens its connections LAZILY, inside a request, where the
+// handler is already `await`-ing. So we construct this adapter at composition time with no I/O, and
+// the first real connect happens on the first `acquire` during a request. The pool also gives you
+// concurrency (many in-flight requests) and connection reuse for free.
+//
+// Each call acquires a connection, runs the statement, and releases it. That is correct for the
+// single-statement queries this app issues. A multi-statement TRANSACTION must run on ONE connection,
+// so for that you acquire a connection explicitly and pass it to a `Repository<T>` (see chapter 20).
+pub struct PooledConnection impl Connection {
+    p: pool.Pool,
 
     init(dsn: string, size: int) {
-        self.pool = pool.Pool(NovaDriver(), dsn, size);
-        self.pool.configure(size, 0, false);
-        self.seeded = false;
+        self.p = pool.Pool(NovaDriver(), dsn, size);
+        self.p.configure(size, 0, false);
     }
 
-    pub async fn acquireSeeded(self: NovaPool): Connection {
-        let c = await self.pool.acquire();
-        if (!self.seeded) {
-            let _ = await c.exec("CREATE TABLE IF NOT EXISTS products (id INT PRIMARY KEY, name TEXT, price INT)", List<DbValue>());
-            await self.seedRow(c, 1, "Keyboard", 4500);
-            await self.seedRow(c, 2, "Mouse", 1800);
-            await self.seedRow(c, 3, "Monitor", 22000);
-            self.seeded = true;
-        }
-        return c;
+    async fn query(self: PooledConnection, sql: string, params: List<DbValue>): ResultSet {
+        let c = await self.p.acquire();
+        let rs = await c.query(sql, params);
+        self.p.release(c);
+        return rs;
     }
 
-    async fn seedRow(self: NovaPool, c: Connection, id: int, name: string, price: int): void {
-        let key = List<DbValue>();
-        key.push(db.dbInt(id));
-        let rs = await c.query("SELECT id FROM products WHERE id = $1", key);
-        if (rs.rows.size() > 0) { return; }
-        let p = List<DbValue>();
-        p.push(db.dbInt(id));
-        p.push(db.dbText(name));
-        p.push(db.dbInt(price));
-        let _ = await c.exec("INSERT INTO products (id, name, price) VALUES ($1, $2, $3)", p);
-    }
-
-    pub fn release(self: NovaPool, c: Connection): void { self.pool.release(c); }
-}
-
-pub class RequestConnection impl Connection, Service {
-    np: NovaPool,
-    pinned: Connection | undefined,
-    inTx: bool,
-
-    init(np: NovaPool) {
-        self.np = np;
-        self.pinned = undefined;
-        self.inTx = false;
-    }
-
-    async fn pin(self: RequestConnection): Connection {
-        let ex = self.pinned;
-        if (ex != undefined) { return ex; }
-        let c = await self.np.acquireSeeded();
-        self.pinned = c;
-        return c;
-    }
-
-    async fn query(self: RequestConnection, sql: string, params: List<DbValue>): ResultSet {
-        if (self.inTx) { let c = await self.pin(); return await c.query(sql, params); }
-        let c = await self.np.acquireSeeded();
-        let r = await c.query(sql, params);
-        self.np.release(c);
-        return r;
-    }
-
-    async fn exec(self: RequestConnection, sql: string, params: List<DbValue>): ExecResult {
-        if (self.inTx) { let c = await self.pin(); return await c.exec(sql, params); }
-        let c = await self.np.acquireSeeded();
+    async fn exec(self: PooledConnection, sql: string, params: List<DbValue>): ExecResult {
+        let c = await self.p.acquire();
         let r = await c.exec(sql, params);
-        self.np.release(c);
+        self.p.release(c);
         return r;
     }
 
-    async fn queryWire(self: RequestConnection, sql: string, params: List<DbValue>): WireRows {
-        if (self.inTx) { let c = await self.pin(); return await c.queryWire(sql, params); }
-        let c = await self.np.acquireSeeded();
-        let r = await c.queryWire(sql, params);
-        self.np.release(c);
+    async fn queryWire(self: PooledConnection, sql: string, params: List<DbValue>): WireRows {
+        let c = await self.p.acquire();
+        let w = await c.queryWire(sql, params);
+        self.p.release(c);
+        return w;
+    }
+
+    // Prepared statements and transactions are per-connection state; a pooled adapter that acquires a
+    // fresh connection per call cannot span them. This app uses neither, so these acquire, delegate,
+    // and release for completeness. For real transactions, acquire a connection yourself.
+    async fn prepare(self: PooledConnection, sql: string): int {
+        let c = await self.p.acquire();
+        let s = await c.prepare(sql);
+        self.p.release(c);
+        return s;
+    }
+    async fn queryPrepared(self: PooledConnection, stmt: int, params: List<DbValue>): ResultSet {
+        let c = await self.p.acquire();
+        let rs = await c.queryPrepared(stmt, params);
+        self.p.release(c);
+        return rs;
+    }
+    async fn execPrepared(self: PooledConnection, stmt: int, params: List<DbValue>): ExecResult {
+        let c = await self.p.acquire();
+        let r = await c.execPrepared(stmt, params);
+        self.p.release(c);
         return r;
     }
-
-    async fn begin(self: RequestConnection): ExecResult {
-        let c = await self.pin();
-        self.inTx = true;
-        return await c.begin();
+    async fn begin(self: PooledConnection): ExecResult {
+        let c = await self.p.acquire();
+        let r = await c.begin(); self.p.release(c); return r;
+    }
+    async fn commit(self: PooledConnection): ExecResult {
+        let c = await self.p.acquire();
+        let r = await c.commit(); self.p.release(c); return r;
+    }
+    async fn rollback(self: PooledConnection): ExecResult {
+        let c = await self.p.acquire();
+        let r = await c.rollback(); self.p.release(c); return r;
     }
 
-    async fn commit(self: RequestConnection): ExecResult {
-        let c = await self.pin();
-        let r = await c.commit();
-        self.np.release(c);
-        self.pinned = undefined;
-        self.inTx = false;
-        return r;
-    }
-
-    async fn rollback(self: RequestConnection): ExecResult {
-        let c = await self.pin();
-        let r = await c.rollback();
-        self.np.release(c);
-        self.pinned = undefined;
-        self.inTx = false;
-        return r;
-    }
-
-    fn close(self: RequestConnection): void {
-        let ex = self.pinned;
-        if (ex != undefined) { self.np.release(ex); self.pinned = undefined; self.inTx = false; }
-    }
-
-    fn setTimeout(self: RequestConnection, ms: int): int { return 0; }
-
-    async fn prepare(self: RequestConnection, sql: string): int { return 0; }
-    async fn queryPrepared(self: RequestConnection, stmt: int, params: List<DbValue>): ResultSet {
-        return await self.query("", params);
-    }
-    async fn execPrepared(self: RequestConnection, stmt: int, params: List<DbValue>): ExecResult {
-        return await self.exec("", params);
-    }
+    fn close(self: PooledConnection): void {}
+    fn setTimeout(self: PooledConnection, ms: int): int { return 0; }
 }

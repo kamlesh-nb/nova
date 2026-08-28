@@ -1,8 +1,0 @@
-import web.response;
-
-pub fn productCard(name: string, price: int): string {
-    return <div class="card">
-        <h3>{name}</h3>
-        <p class="price">{price}</p>
-    </div>;
-}

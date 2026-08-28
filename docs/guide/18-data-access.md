@@ -118,7 +118,7 @@ repository runs against the in-memory database, NovaDB, or any other driver.
 import data.db;
 import data.orm;
 
-pub struct ProductRepository impl Service {
+pub struct ProductRepository {
     conn: Connection,                       // the trait, not a concrete type
     init(conn: Connection) { self.conn = conn; }
 
@@ -143,56 +143,107 @@ pub struct ProductRepository impl Service {
 This is the whole repository from `examples/webapp`. It is written once and never changes, whichever
 database backs it.
 
+## The generic `Repository<T>`
+
+When a repository is a thin wrapper over one table, the stdlib gives you a ready one:
+`data.repository.Repository<T>`. Bind it to an entity type and a table, and it maps rows to `T` by name
+for you, so a slice never writes bind code:
+
+```nova
+import data.db;
+import data.repository;
+
+let repo = Repository<Product>(conn, "products");
+let all  = await repo.all();                                  // Rows<Product>: SELECT * FROM products
+let one  = await repo.findBy("id", db.dbInt(7));              // Rows<Product> filtered by a column
+let rows = await repo.query(                                   // your own SQL, still bound to Product
+    "SELECT id, name, price FROM products WHERE price > $1", params);
+let _r   = await repo.add(product);                           // INSERT every field of the entity
+```
+
+`Repository<T>` also offers `update`, `remove`, and the projection helpers `listAs<D>`/`oneAs<D>` for
+reading into a DTO that differs from the table entity. The reads return a buffer-owning `Rows<T>`, which
+is the sound path. There is also a lower-level `orm.queryAs<T>` that binds without owning the buffer, so
+its `str.Str` fields dangle once the buffer is freed; prefer `queryRows<T>` or `Repository<T>` unless you
+know the buffer outlives the rows.
+
+One nicety worth knowing: a **literal** `SELECT` in `db.query<T>`, `orm.queryRows<T>`, `Repository.query`,
+or a `querySql` tagged template is checked at COMPILE TIME. If the selected columns do not cover every
+plain field of `T`, or the `$N` placeholders are not contiguous from `$1`, the build fails. A typo like
+`naem` is a compile error, not a runtime surprise. The check skips `SELECT *` and computed expressions,
+where it cannot know the shape.
+
 ## Swapping the web app onto NovaDB
 
-Chapter 17's app registered an `InMemoryConnection`. `InMemoryConnection` implements the same
-`Connection` trait NovaDB does, which is why the repository never needed to know the difference. To move
-the app onto a real database, change the composition root and nothing else.
+Chapter 17's app built an `InMemoryConnection` in its composition root. `InMemoryConnection` implements
+the same `Connection` trait NovaDB does, which is why the repository never needed to know the difference.
+To move the app onto a real database, change the composition root and nothing else. There is no container
+and no downcast: you construct a different `Connection` and pass it to the same `ProductRepository`.
 
-`examples/webapp/src/main.nova` (the default, in-memory build) registers the connection under the
-`Connection` seam key. The composition root knows the concrete type, so it downcasts to it; the
-repository constructor then widens that concrete value into its `Connection` field:
+`examples/webapp/src/main.nova` (the default, in-memory build):
 
 ```nova
-services.addSingleton("Connection", (sp) => { return InMemoryConnection(); });
-services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("Connection") as InMemoryConnection); });
+let conn = InMemoryConnection();
+let repo = ProductRepository(conn);
+registerProducts(app, repo);
 ```
 
-`examples/webapp/src/main_novadb.nova` is the same app with a live NovaDB. It registers the same key with
-a NovaDB-backed connection, and the factory downcasts to that concrete type:
+`examples/webapp/main_novadb.nova` is the same app with a live NovaDB. The only change is the connection:
 
 ```nova
-services.addSingleton("Connection", (sp) => { return NovaDbConnection("novadb://admin@127.0.0.1:3009?db=nova"); });
-services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("Connection") as NovaDbConnection); });
+let conn = PooledConnection(dsn, poolSize);   // a Connection backed by a NovaDB pool
+let repo = ProductRepository(conn);
+registerProducts(app, repo);
 ```
 
-There is one rule that shapes `NovaDbConnection`: **do not open the socket in `main`.** Connecting is
-asynchronous and must run on the reactor, which only exists once `app.run` starts; block-driving a
-connect from a cold `main` crashes. So `NovaDbConnection` connects **lazily**, on its first query, which
-is always inside an async request handler where the reactor is live:
+There is one rule that shapes `PooledConnection`: **do not open a socket in `main`.** Connecting is
+asynchronous, and you cannot drive an asynchronous call to completion from the synchronous `main` before
+the event loop starts. So `PooledConnection` wraps a `pool.Pool(NovaDriver(), dsn, size)`, which is
+constructed synchronously and opens its connections LAZILY, inside a request, where the handler is already
+awaiting:
 
 ```nova
-// Features/Products/Shared/novadb_connection.nova (a Connection that opens itself on first use)
-async fn ensure(self: NovaDbConnection): Connection {
-    let existing = self.conn;
-    if (existing != undefined) { return existing; }
-    let c = await self.driver.connect(self.dsn);   // on the reactor, inside a request
-    // create the schema once (NovaDB supports CREATE TABLE IF NOT EXISTS), then reuse the connection
-    return c;
+// Features/Products/Shared/pooled_connection.nova (a Connection over a pool)
+pub struct PooledConnection impl Connection {
+    p: pool.Pool,
+    init(dsn: string, size: int) {
+        self.p = pool.Pool(NovaDriver(), dsn, size);
+        self.p.configure(size, 0, false);
+    }
+    async fn query(self: PooledConnection, sql: string, params: List<DbValue>): ResultSet {
+        let c = await self.p.acquire();          // opens on first use, reuses thereafter
+        let rs = await c.query(sql, params);
+        self.p.release(c);
+        return rs;
+    }
+    // exec / queryWire / ... delegate the same way; close / setTimeout are synchronous.
 }
 ```
 
-Everything else, the features, handlers, DTOs, validators, behaviours, routes, and views, is shared
-between the two builds without a single change. That is the payoff of writing the repository against the
-seam. Build it with `nova build --file src/main_novadb.nova` (the app imports the `novadb` package, so
-the project needs `packages/` reachable; `run-live.sh` sets that up for you).
+Everything else, the features, handlers, DTOs, validators, routes, and views, is shared between the two
+builds without a single change. That is the payoff of writing the repository against the seam. Because
+`main_novadb.nova` imports the `novadb` package, the project needs that dependency and the driver
+reachable; `run-live.sh` wires it up and builds it for you.
 
 ## Transactions
 
-The `Connection` seam exposes `begin`, `commit`, and `rollback`. In the web app they are wired as a
-behaviour (`TransactionBehavior` in `examples/webapp`): the mediator pipeline opens a transaction around
-every command, commits when the handler returns normally, and rolls back if it reports an error. Your
-handler code stays free of transaction plumbing, exactly as validation and logging do.
+The `Connection` seam exposes `begin`, `commit`, and `rollback`. A transaction must run on ONE
+connection, so you acquire a connection from the pool, run `begin`, do the writes on that same
+connection (a `Repository<T>` built over it, or direct `exec` calls), then `commit` or `rollback`, and
+release it:
+
+```nova
+let c = await pool.acquire();
+let _ = await c.begin();
+let repo = Repository<Order>(c, "orders");
+// ... writes on repo / c ...
+let _ = await c.commit();     // or c.rollback() on failure
+pool.release(c);
+```
+
+The `PooledConnection` adapter above acquires a fresh connection per call, which is correct for the
+single-statement queries the demo issues but cannot span a transaction. For transactional work, hold a
+connection explicitly as shown here.
 
 ## Streaming large result sets
 
@@ -509,7 +560,7 @@ MongoDB driver, and vice versa.
 ## Where to go next
 
 - Chapter 17 for the web framework the repository plugs into.
-- Chapter 21 for deploying this NovaDB-backed app under the orchestrator (service, orchd, orchctl).
+- Chapter 19 for package management: how you add a driver dependency with `nova get`.
+- Chapter 20 for the database drivers, each with its intro, package deployment, and connection string.
+- Chapter 23 for deploying this NovaDB-backed app under the orchestrator (service, orchd, orchctl).
 - Chapter 16 for `@serializable`, which powers both JSON responses and the ORM binder.
-- The database driver packages (`nova-postgres`, `nova-mysql`, `nova-mssql`, `nova-mongodb`,
-  `nova-novadb`) for the connection-string options each one accepts.

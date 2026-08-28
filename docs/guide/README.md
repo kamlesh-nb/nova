@@ -1,8 +1,12 @@
 # The Nova Language Guide
 
-A hands-on, example-driven tour of Nova, where every construct is shown with a **complete, runnable
-program**. Each example lives under [`examples/`](examples/) as a real `.nova` file that compiles and
-runs; the output shown in each chapter is the program's actual output.
+A hands-on, example-driven tour of Nova, a statically-typed language built for **hypermedia web
+applications**: the server renders HTML that the browser swaps in. Your whole service compiles to a
+single native binary, with the runtime, web framework, TLS, and database drivers all coming from one
+toolchain. It pairs with **NovaDB**, a database built for the same stack and deployed as its own service,
+and a native orchestrator to run it in production. Every construct here is shown with a **complete,
+runnable program**. Each example lives under [`examples/`](examples/) as a real `.nova` file that
+compiles and runs; the output shown in each chapter is the program's actual output.
 
 For the terse, citation-backed reference, see [`../language-specification.md`](../language-specification.md).
 This guide is the *learning path*; the spec is the *contract*.
@@ -37,11 +41,14 @@ functions run with `nova test <file>.nova`.
 | 14 | [Modules & visibility](14-modules.md) | `import`, `pub`, the `platform` module |
 | 15 | [Concurrency](15-concurrency.md) | `async`/`await`/`spawn`, futures, channels |
 | 16 | [Serialization](16-serialization.md) | `@serializable`, JSON/BSON |
-| 17 | [Building a web service](17-web.md) | request/response, routing, the capstone |
-| 18 | [Data access & NovaDB](18-data-access.md) | the `db` seam, the drivers, connection strings, the micro-ORM, backing the web app with NovaDB |
-| 19 | [How Nova works: architecture](19-architecture.md) | the compiler pipeline, ARC memory, the concurrency engine, self-contained delivery |
-| 20 | [Building & distributing](20-building-and-distribution.md) | `nova build`, cross-compiling programs, packaging toolchain bundles + checksums |
-| 21 | [Deploying with the orchestrator](21-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
+| 17 | [Web applications](17-web.md) | vertical slices, `RouteHandler`, `ctx.bind`, NSX views, the composition root |
+| 18 | [Data access & the ORM](18-data-access.md) | the `db` seam, `DbValue`, the micro-ORM, `Repository<T>`, connection strings, backing the web app with NovaDB |
+| 19 | [Package management](19-package-management.md) | `project.json`, `nova get`, the lockfile, `nova init`, import resolution |
+| 20 | [Database drivers](20-database-drivers.md) | NovaDB, PostgreSQL, MySQL, SQL Server, MongoDB: intro, package deployment, connect, and notes |
+| 21 | [How Nova works: architecture](21-architecture.md) | the compiler pipeline, ARC memory, the concurrency engine, self-contained delivery |
+| 22 | [Building & distributing](22-building-and-distribution.md) | `nova build`, cross-compiling programs, packaging toolchain bundles + checksums |
+| 23 | [Deploying with the orchestrator](23-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
+| 24 | [Artifact delivery: the blob store](24-blob-store.md) | content-addressed `artifactd`, sha PUT/GET, Bearer auth, deploy by digest |
 
 > **Version:** tracks `nova version` (Beta 0.1.0). Syntax may still change per
 > [`../STABILITY.md`](../STABILITY.md).

@@ -1,132 +1,189 @@
-# 17. Building a web service
+# 17. Building a web application
 
-This is the capstone. Nova ships an ASP.NET style web framework, and `nova init web` scaffolds a
-project around it. The design has three ideas working together:
+Nova ships a small, direct web framework in the standard library. There is no
+mediator, no dependency-injection container, and no annotation magic in the
+request path. A route maps a URL to a handler object, the handler reads its
+typed input from the request and returns a response, and you wire the handlers
+together in a plain composition root that you can read top to bottom.
 
-1. **A request type per operation.** Each thing a client can ask for is a small `@serializable`
-   struct, for example `GetProductById { id: int }`. Its response is another `@serializable` struct.
-2. **A typed handler per request.** A handler implements `RequestHandler<TRequest, TResponse>`. Its
-   `handle` method receives the request already deserialised and returns the response value. There is
-   no `ValueSource` and no manual field reading: the framework binds the request for you and
-   serialises the response to JSON.
-3. **Routes, and a runtime mediator.** You map a route to a request type with `app.get<TReq>(path)` or
-   `app.post<TReq>(path)`. On a request the framework binds it and calls the mediator's `send`, which
-   picks the handler by request type, opens a per-request dependency-injection scope, runs the
-   behaviour pipeline (validation, transactions, logging), and returns the response. The handler is
-   discovered by its `RequestHandler<TReq, _>` impl, so the route is the only thing you register. This
-   is the .NET MediatR pattern: the mediator lives in the framework, not the compiler.
+The framework is built for **hypermedia** applications: handlers return HTML
+fragments that the browser swaps into the page, so most features need no
+client-side JavaScript. It works just as well for JSON APIs; the only
+difference is what a handler puts in the response body.
 
-This keeps each operation in its own small slice, easy to read, test, and grow. A real project puts
-each slice under `Features/`, and that is exactly what the scaffold gives you.
+The running example for this chapter is the project the toolchain scaffolds
+with `nova init web`. The full source lives in
+[`examples/webapp`](examples/webapp), builds offline, and its tests pass with
+`nova test`. Every snippet below is taken from it.
+
+## Vertical slices
+
+The project is organised by **feature**, not by technical layer. Everything one
+use case needs (its input type, its handler, its view, its validation) lives in
+one folder under `Features/`. This is vertical slice architecture: to change
+"create a product" you open one folder, not four parallel `controllers/`,
+`models/`, `views/` trees.
+
+```
+src/
+  main.nova                         composition root
+  Domain/
+    Entities/Product.nova           the business object (persistence-agnostic)
+    Dtos/ProductDto.nova            the shape returned to clients
+    Dtos/CreateProductDto.nova
+  Features/
+    Products/
+      routes.nova                   this feature's route table
+      CreateProduct/
+        command.nova                the write input (a @serializable struct)
+        handler.nova                the RouteHandler
+        validator.nova              input checks
+      GetProductById/
+        query.nova                  the read input
+        handler.nova
+      Shared/
+        repository.nova             data access for the feature
+        database.nova               an in-memory Connection (the default)
+      views/product_card.nsx        an NSX view
+  wwwroot/                          static assets
+```
 
 ## Scaffolding the project
 
-```
-nova init web --name webapp
-```
-
-This lays out a vertical-slice project:
-
-```
-webapp/
-  project.json
-  src/
-    main.nova                         # composition root: routes, static files, run
-    Features/Products/
-      CreateProduct/
-        command.nova                  # the request struct
-        response.nova                 # the response DTO
-        validator.nova                # a plain validation function
-        handler.nova                  # RequestHandler<CreateProduct, ...>
-      GetProductById/
-        query.nova
-        response.nova
-        handler.nova
-    Domain/entities/product.nova      # the domain object
-  tests/features/products_test.nova
-  wwwroot/index.html
+```bash
+nova init web --name shop
+cd shop
+nova build
+./build/debug/bin/shop      # serves on http://127.0.0.1:8080
 ```
 
-Build it with `nova build` and run the tests with `nova test tests/features/products_test.nova`.
+`nova init web` writes two manifests, and it is worth knowing which is which:
 
-## A request and its typed handler
+- **`project.json`** is the Nova manifest. It carries the project name,
+  version, and the list of package dependencies the compiler resolves. This is
+  the one the build reads. Chapter 19, Package management, covers it in full.
+- **`package.json`** is only for the Tailwind CSS command-line tool (an npm
+  dev dependency). The Nova build ignores it. If you do not use Tailwind you can
+  delete it.
 
-A read operation is a request struct, a response DTO, and a handler. The `id` is bound from the route
-parameter `{id:int}`, so the handler receives a fully formed `GetProductById`.
+## A read slice: get a product by id
+
+A slice starts with its **input type**. For a read that is a `query`: a plain
+`@serializable` struct whose fields the framework fills from the request.
 
 ```nova
-// src/Features/Products/GetProductById/query.nova
-import web.mediator;
-
-// The query: fetch a product by id. Bound from the route param `{id:int}`. `impl Message` opts the
-// request into the mediator: the framework binds it and `send`s it to the handler by request type.
-@serializable pub struct GetProductById impl Message {
+// Features/Products/GetProductById/query.nova
+@serializable pub struct GetProductById {
     pub id: int,
+    init() { self.id = 0; }
 }
 ```
 
-```nova
-// src/Features/Products/GetProductById/response.nova
-@serializable pub struct ProductDto {
-    pub id: int,
-    pub name: string,
-}
-```
+The **handler** implements the `RouteHandler` trait from `web.routing`. A
+`RouteHandler` is a plain struct that holds its dependencies as fields and
+exposes exactly one method, `serve(ctx)`. It reads its typed input with
+`ctx.bind<T>()`, does its work, and returns a `Response`.
 
 ```nova
-// src/Features/Products/GetProductById/handler.nova
+// Features/Products/GetProductById/handler.nova
 import web.routing;
-import serde.json;
+import web.response;
+import web.status;
 import Features.Products.GetProductById.query;
-import Features.Products.GetProductById.response;
+import Features.Products.Shared.repository;
+import Features.Products.views.product_card;
+import Domain.Dtos.ProductDto;
 
-// Handles GetProductById. `id` is bound from the route param `{id:int}`. A handler that cannot fail
-// simply returns its DTO, which the framework serialises as 200 JSON.
-pub struct GetProductByIdHandler impl RequestHandler<GetProductById, ProductDto> {
-    async fn handle(self: GetProductByIdHandler, q: GetProductById): ProductDto {
-        // (load from a repository; stubbed here)
-        return ProductDto{ id: q.id, name: "Sample Product" };
+pub struct GetProductByIdHandler impl RouteHandler {
+    repo: ProductRepository,
+    init(repo: ProductRepository) { self.repo = repo; }
+
+    async fn serve(self: GetProductByIdHandler, ctx: Context): Response {
+        let q = ctx.bind<GetProductById>();
+        let found = await self.repo.findById(q.id);
+        if (found == undefined) {
+            return response.Response(Status.NotFound, "product not found");
+        }
+        let product = found ?? ProductDto{ id: 0, name: "", price: 0 };
+        let html = productCard(product.name, product.price);
+        return response.Response(Status.Ok, html)
+            .setHeader("Content-Type", "text/html; charset=utf-8");
     }
 }
 ```
 
-The handler is pure: a typed request in, a typed response out. The `{id:int}` segment is a typed path
-parameter. The framework parses it and binds it into `q.id`; a non integer where `int` is expected
-becomes a `400 Bad Request` before your handler ever runs.
+`ctx.bind<GetProductById>()` fills `id` from the route parameter `{id:int}`.
+The repository returns `ProductDto | undefined`, so a missing id is a plain 404;
+there is nothing to catch and no exception to model.
 
-## A handler that can fail: `TResp | HttpError`
+## `ctx.bind`, and where the fields come from
 
-A write operation often needs to reject bad input. A handler that can fail returns
-`TResp | HttpError`. The framework serialises the ok DTO as a 200 JSON response, and an `HttpError` as
-its status code with the message as the body. Success and failure are both ordinary typed return
-values, so there is no manual status juggling.
+`ctx.bind<T>()` deserialises `T` from ONE merged view of the request, so a
+handler never parses a URL or a body by hand. The `Context` builds that view
+from, in order:
+
+- cookies,
+- the query string,
+- path parameters (`{id:int}` and friends),
+- and, for `POST`/`PUT`/`PATCH`, the request body: `multipart/form-data`,
+  `x-www-form-urlencoded`, or JSON, chosen by the `Content-Type`.
+
+Later sources win over earlier ones, so a path parameter overrides a query
+parameter of the same name. Two smaller accessors exist for when you want a
+single raw value instead of a bound struct:
 
 ```nova
-// src/Features/Products/CreateProduct/command.nova
-import web.mediator;
+let raw = ctx.query("q");     // one query-string value, or ""
+let ids = ctx.param("id");    // one path parameter, or ""
+```
 
-// The command: what the client sends to create a product. @serializable lets the framework bind
-// this struct from the request body (@fromBody), so the handler receives it already deserialised.
-// `impl Message` opts it into the mediator, dispatched to its handler by request type.
-@serializable pub struct CreateProduct impl Message {
+Because a hypermedia form POSTs `application/x-www-form-urlencoded`, the SAME
+`ctx.bind<T>()` reads a submitted form with no extra work.
+
+## Views: NSX
+
+View code lives in `.nsx` files. NSX is the same language as `.nova`, just
+filed apart so markup stays separate from logic. An NSX element is a `string`,
+so views compose directly and expressions embed with `{...}`.
+
+```nova
+// Features/Products/views/product_card.nsx
+pub fn productCard(name: string, price: int): Html {
+    return <div class="rounded-lg border border-slate-200 p-4 shadow-sm">
+        <h3 class="font-semibold text-slate-800">{name}</h3>
+        <p class="mt-1 text-sm text-slate-500">{price}</p>
+    </div>;
+}
+```
+
+A `{expr}` interpolation is **HTML-escaped automatically**, so user text like a
+product name is safe by default and you never call an escaper. To insert an
+already-rendered fragment unescaped (one view composing another), wrap it in
+`response.raw(fragment)` from `web.response`. That one boundary, escaped by
+default and explicit `raw` when you mean it, is what keeps the views free of
+cross-site-scripting holes.
+
+## A write slice: create a product
+
+The write input is a `command`, again a plain `@serializable` struct. Command
+means write intent (a `POST`/`PUT`/`DELETE`); query means read intent. They are
+the same kind of object, named for what they express.
+
+```nova
+// Features/Products/CreateProduct/command.nova
+@serializable pub struct CreateProduct {
     pub name: string,
     pub price: int,
+    init() { self.name = ""; self.price = 0; }
 }
 ```
 
-```nova
-// src/Features/Products/CreateProduct/response.nova
-@serializable pub struct CreateProductResponse {
-    pub id: int,
-    pub name: string,
-}
-```
+Validation is a plain function that returns "" when the input is good, or the
+error text otherwise. There is no validator trait to implement and no framework
+to register it with; the handler calls it.
 
 ```nova
-// src/Features/Products/CreateProduct/validator.nova
-import Features.Products.CreateProduct.command;
-
-// Validate a command before the handler runs. Returns "" when valid, else the error.
+// Features/Products/CreateProduct/validator.nova
 pub fn validateCreateProduct(cmd: CreateProduct): string {
     if (cmd.name.length == 0) { return "name is required"; }
     if (cmd.price < 0) { return "price must be >= 0"; }
@@ -134,60 +191,65 @@ pub fn validateCreateProduct(cmd: CreateProduct): string {
 }
 ```
 
-```nova
-// src/Features/Products/CreateProduct/handler.nova
-import web.response;
-import web.routing;
-import serde.json;
-import Features.Products.CreateProduct.command;
-import Features.Products.CreateProduct.response;
-import Features.Products.CreateProduct.validator;
+The handler binds the command, validates it, does the work, and returns the new
+product's card. Because this is hypermedia, the 201 body is the HTML fragment
+the browser swaps in; for a JSON API you would `serde.json.stringify` a DTO
+instead.
 
-// Handles CreateProduct. The request arrives already deserialised (bound from the JSON body). The
-// handler returns `CreateProductResponse | HttpError`: the framework serialises the ok DTO as 200
-// JSON, and an HttpError as its status code with the message as the body. No ValueSource, no manual
-// field reads, no manual status juggling.
-pub struct CreateProductHandler impl RequestHandler<CreateProduct, CreateProductResponse | HttpError> {
-    async fn handle(self: CreateProductHandler, cmd: CreateProduct): CreateProductResponse | HttpError {
+```nova
+// Features/Products/CreateProduct/handler.nova
+pub struct CreateProductHandler impl RouteHandler {
+    repo: ProductRepository,
+    init(repo: ProductRepository) { self.repo = repo; }
+
+    async fn serve(self: CreateProductHandler, ctx: Context): Response {
+        let cmd = ctx.bind<CreateProduct>();
         let err = validateCreateProduct(cmd);
         if (err.length != 0) {
-            return HttpError(400, err);
+            return response.Response(Status.BadRequest, err);
         }
-        // (persist here via a Shared/database repository, then return the new id)
-        return CreateProductResponse{ id: 1, name: cmd.name };
+        let _ = await self.repo.create(cmd.name, cmd.price);
+        let html = productCard(cmd.name, cmd.price);
+        return response.Response(Status.Created, html)
+            .setHeader("Content-Type", "text/html; charset=utf-8");
     }
 }
 ```
 
-`HttpError(status, message)` comes from `web.response`. Because the error side of `TResp | HttpError`
-is just a value, you can also build it once in a helper and return it from several branches, exactly
-like any other error union from chapter 11.
+## Wiring: routes and the composition root
 
-## Wiring the routes
-
-The composition root maps each route to its request type. Importing a slice's handler is what makes it
-discoverable, so there is no separate handler registration.
+Each feature owns a small `routes.nova` that binds its paths to handler
+instances. `app.get`/`app.post`/`app.put`/`app.delete`/`app.patch` each take a
+path and a handler INSTANCE, and you pass that handler its dependencies as plain
+constructor arguments.
 
 ```nova
-// src/main.nova
+// Features/Products/routes.nova
+pub fn registerProducts(app: App, repo: ProductRepository): void {
+    app.post("/api/products", CreateProductHandler(repo));
+    app.get("/api/products/{id:int}", GetProductByIdHandler(repo));
+}
+```
+
+`{id:int}` is a typed path parameter: a non-numeric id never reaches the
+handler, it is a 400 at the router. Plain `{name}` captures any single segment.
+
+`main.nova` is the composition root. It builds the shared dependencies ONCE and
+calls each feature's `register`. There is no container resolving things behind
+your back: you can see every dependency being constructed.
+
+```nova
+// main.nova
 import web.app;
-import web.request;
-import web.response;
-import web.routing;
-import serde.json;
-import Features.Products.CreateProduct.command;
-import Features.Products.CreateProduct.handler;
-import Features.Products.GetProductById.query;
-import Features.Products.GetProductById.handler;
+import Features.Products.Shared.database;
+import Features.Products.Shared.repository;
+import Features.Products.routes;
 
 fn buildApp(): App {
     let app = App();
-
-    // Products feature, one route per slice. The handlers are found by their impls.
-    app.post<CreateProduct>("/api/products");
-    app.get<GetProductById>("/api/products/{id:int}");
-
-    // Serve static assets (wwwroot/) for any unmatched GET.
+    let conn = InMemoryConnection();
+    let repo = ProductRepository(conn);
+    registerProducts(app, repo);
     app.useStatic("/", "./wwwroot");
     return app;
 }
@@ -199,88 +261,25 @@ fn main(): void {
 }
 ```
 
-## Route binding: `@fromRoute` and `@fromBody`
+As the app grows you add a feature folder with its own `register(app, deps...)`
+and one call here. That is the whole scaling story for structure.
 
-The request is bound from two sources, and both fill the same struct:
+## The data seam
 
-- **Route parameters** win first (think `@fromRoute`): `{id:int}` in the path fills `id`.
-- **The request body** fills the rest (think `@fromBody`): for a POST, PUT, or PATCH the JSON body is
-  parsed and its fields are bound. Form and multipart bodies are handled the same way.
-
-So a `GET /api/products/7` binds `GetProductById { id: 7 }` from the path, and a
-`POST /api/products` with `{"name":"Widget","price":9}` binds `CreateProduct { name: "Widget",
-price: 9 }` from the body. You never read fields by hand.
-
-## Testing it offline
-
-A live server calls `app.run(8080)`, which listens and blocks. For tests, `app.dispatch` runs the very
-same routing, binding, and handler path without a socket, so your tests exercise production code.
+The repository is the one place that knows SQL. Its connection field is the
+`Connection` **trait** from `data.db`, not a concrete database type, so the same
+repository runs over an in-memory connection in tests and over a real database
+in production with no change.
 
 ```nova
-// tests/features/products_test.nova
-@test
-fn test_get_product(): void {
-    let app = testApp();
-    let req = Request.fromString("GET /api/products/7 HTTP/1.1\r\nHost: x\r\n\r\n");
-    let res = app.dispatch(req);
-    assert.isTrue(string.indexOf(res.body, "\"id\":7") != -1);
-}
-
-@test
-fn test_create_product(): void {
-    let app = testApp();
-    let req = Request.fromString("POST /api/products HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"Widget\",\"price\":9}");
-    let res = app.dispatch(req);
-    assert.isTrue(string.indexOf(res.body, "Widget") != -1);
-}
-```
-
-Run them:
-
-```
-nova test tests/features/products_test.nova
-```
-
-```
-PASS  test_get_product
-PASS  test_create_product
-```
-
-The GET returns `200` with `{"id":7,"name":"Sample Product"}`, the valid POST returns `200` with the
-DTO, and a POST whose `name` is empty returns `400` with `name is required`, straight from the
-handler's `HttpError`.
-
-## A database-backed slice: repository, validator, and behaviours
-
-The slices above stub out storage and validate inline. A real feature does neither: it reads and writes
-through a repository, validates with a dedicated validator, and wraps the handler in cross-cutting
-behaviours. The guide ships a complete, runnable version of exactly this under
-[`examples/webapp/`](examples/webapp/). Build and test it the same way:
-
-```
-cd docs/guide/examples/webapp
-nova build
-nova test tests/features/products_test.nova
-```
-
-### The repository over the `Connection` seam
-
-Data access goes through a repository written against the `Connection` trait and the micro-ORM, never
-against a concrete driver. The example registers an `InMemoryConnection` that implements the same
-`Connection` seam the real drivers (`nova-postgres`, `nova-mysql`, `nova-novadb`, and the rest)
-implement, so swapping in a live database is a one-line change in `main.nova` and nothing in the
-repository or the handlers moves.
-
-```nova
-// src/Features/Products/Shared/repository.nova
-pub struct ProductRepository impl Service {
-    conn: InMemoryConnection,
-    init(conn: InMemoryConnection) { self.conn = conn; }
+// Features/Products/Shared/repository.nova
+pub struct ProductRepository {
+    conn: Connection,
+    init(conn: Connection) { self.conn = conn; }
 
     pub async fn findById(self: ProductRepository, id: int): ProductDto | undefined {
         let params = List<DbValue>();
         params.push(db.dbInt(id));
-        // Await the I/O here (the connection is async), then bind the rows with the sync ORM binder.
         let rs = await self.conn.query("SELECT id, name, price FROM products WHERE id = $1", params);
         return orm.bindOne<ProductDto>(rs);
     }
@@ -295,141 +294,96 @@ pub struct ProductRepository impl Service {
 }
 ```
 
-Two things are worth calling out. First, the repository methods are `async fn` and `await` the
-connection, because on the request path everything runs inside the event loop and a sync method that
-block-drove an async connection would deadlock. Second, the I/O and the binding are kept apart:
-`conn.query` returns a `ResultSet`, and `orm.bindOne<ProductDto>(rs)` maps its columns to the DTO by
-name. The binder is generic over the concrete `ProductDto` at the call site, which is what lets the
-compiler resolve the column mapping. `orm.bindAll<T>` does the same for a whole list.
+The starter ships a tiny `InMemoryConnection impl Connection` (in
+`Shared/database.nova`) so the app runs and its tests pass with no database
+server. Parameters are built with `db.dbInt`/`db.dbText`/`db.dbLong` and bound
+to `$1, $2, ...`; the micro-ORM (`orm.bindOne`/`orm.bindAll`) maps result rows
+onto `ProductDto` by column name. Chapter 18, Data access and the ORM, covers
+the seam, the `Repository<T>` helper, and connection strings in full.
 
-### Constructor injection
+## Testing offline
 
-The handler declares the repository as a constructor parameter, and the framework injects it from the
-per-request scope. The handler stays pure business logic.
-
-```nova
-// src/Features/Products/GetProductById/handler.nova
-pub struct GetProductByIdHandler impl RequestHandler<GetProductById, ProductDto | HttpError> {
-    repo: ProductRepository,
-    init(repo: ProductRepository) { self.repo = repo; }
-
-    async fn handle(self: GetProductByIdHandler, q: GetProductById): ProductDto | HttpError {
-        let found = await self.repo.findById(q.id);
-        if (found == undefined) {
-            return HttpError(404, "product not found");
-        }
-        return found ?? ProductDto{ id: 0, name: "" };
-    }
-}
-```
-
-### A typed validator and the validation behaviour
-
-Validation lives in its own type, `Validator<TReq>`, one per request that needs it. The compiler
-generates the erased adapter and the app auto-registers it, so the single generic `ValidationBehavior`
-runs the right validator before the handler and short-circuits with a `400` on failure. Rules live in
-the validator; the handler never checks input again.
+Handlers are objects, so a test builds the app the same way the composition
+root does and drives one request through `app.dispatch(req)` with no socket
+open. That makes feature tests fast and hermetic.
 
 ```nova
-// src/Features/Products/CreateProduct/validator.nova
-pub struct CreateProductValidator impl Validator<CreateProduct> {
-    fn validate(self: CreateProductValidator, cmd: CreateProduct): List<string> {
-        let errs = List<string>();
-        if (cmd.name.length == 0) { errs.push("name is required"); }
-        if (cmd.price < 0) { errs.push("price must be >= 0"); }
-        return errs;
-    }
-}
-```
-
-### Cross-cutting behaviours
-
-A behaviour implements `PipelineBehavior` and wraps every handler. It inspects the request, calls
-`await next.proceed(ctx)` to continue, and may short-circuit by returning a `Response` without calling
-`next`. The example ships two beyond validation: a logging behaviour that tags the response, and a
-transaction behaviour that opens a transaction on the request's scoped connection, the same instance the
-repository uses, and commits or rolls back by the outcome.
-
-```nova
-// src/Features/Products/Shared/behaviours.nova
-pub struct TransactionBehavior impl PipelineBehavior {
-    async fn handle(self: TransactionBehavior, ctx: RequestContext, next: Next): Response {
-        let conn = ctx.scope.require("InMemoryConnection") as InMemoryConnection;
-        let _ = await conn.begin();
-        let res = await next.proceed(ctx);
-        if (res.status.toCode() < 400) {
-            let _ = await conn.commit();
-        } else {
-            let _ = await conn.rollback();
-        }
-        return res;
-    }
-}
-```
-
-This is why `send` opens one dependency-injection scope per request: the behaviour and the handler's
-repository resolve the *same* scoped connection, so the transaction wraps the very writes the handler
-makes.
-
-### Composition root
-
-`main.nova` registers the connection as a singleton and the repository as a scoped service injected with
-it, then adds the behaviours outermost-first and maps the routes.
-
-```nova
-// src/main.nova
-fn configureServices(): ServiceCollection {
-    let services = ServiceCollection();
-    services.addSingleton("InMemoryConnection", (sp) => { return InMemoryConnection(); });
-    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("InMemoryConnection") as InMemoryConnection); });
-    return services;
-}
-
-fn buildApp(): App {
+// tests/features/products_test.nova
+fn testApp(): App {
+    let conn = InMemoryConnection();
+    let repo = ProductRepository(conn);
     let app = App();
-    app.useServices(configureServices());
+    app.post("/api/products", CreateProductHandler(repo));
+    app.get("/api/products/{id:int}", GetProductByIdHandler(repo));
+    return app;
+}
 
-    // Outermost first: log, then validate (short-circuiting bad input with a 400), then transaction.
-    app.useBehavior(LoggingBehavior{});
-    app.useBehavior(ValidationBehavior{});
-    app.useBehavior(TransactionBehavior{});
+@test
+fn test_get_missing_is_404(): void {
+    let app = testApp();
+    let req = Request.fromString("GET /api/products/999 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let res = app.dispatch(req);
+    assert.equalInt(res.status.toCode(), 404);
+}
+```
 
-    app.post<CreateProduct>("/api/products");
-    app.get<GetProductById>("/api/products/{id:int}");
+```bash
+nova test tests/features/products_test.nova
+```
+
+## The same app over a real database
+
+The example includes `main_novadb.nova` at the project root: the SAME app over a
+real NovaDB. Look at it beside `src/main.nova` and only the composition root
+differs. Every feature slice, the repository, the handlers, and the views are
+identical, because they depend on the `Connection` trait, never on a driver.
+
+```nova
+// main_novadb.nova  (excerpt)
+fn buildApp(dsn: string, poolSize: int): App {
+    let app = App();
+    let conn = PooledConnection(dsn, poolSize);   // built now; connects lazily, per request
+    let repo = ProductRepository(conn);
+    registerProducts(app, repo);
     app.useStatic("/", "./wwwroot");
     return app;
 }
 ```
 
-On a request, `send` picks the handler by request type, opens the scope, runs `LoggingBehavior` then
-`ValidationBehavior` then `TransactionBehavior`, and finally the handler, which reads and writes through
-its injected repository. A `POST` with an empty name never reaches the handler: the validation behaviour
-returns a `400` first. A `GET` for a missing id returns the handler's `404`. Everything else commits and
-comes back as `200` JSON.
+`PooledConnection` (in `Shared/pooled_connection.nova`) wraps a
+`pool.Pool(NovaDriver(), dsn, size)` and implements `Connection` by acquiring a
+connection per call, running the statement, and releasing it. The pool is built
+synchronously and opens its connections lazily inside a request, which is the
+pattern to reach for: opening a connection is asynchronous, and you cannot drive
+an asynchronous call to completion from the synchronous `main` before the event
+loop starts. Chapters 18 and 20 build this out with the ORM and the concrete
+drivers; the [`run-live.sh`](examples/run-live.sh) script runs the whole thing
+against a real NovaDB and then behind the orchestrator.
 
 ## What else the app gives you
 
-| Feature | How |
-|---------|-----|
-| More verbs | `app.put<TReq>`, `app.delete<TReq>`, `app.patch<TReq>`, alongside `get` and `post`. |
-| Static files | `app.useStatic("/", "./wwwroot")` serves assets for unmatched GET requests. |
-| Dependency injection | Register services in a `ServiceCollection` and give them to the app with `app.useServices(...)`; a handler declares its collaborators (a repository, a database connection) as constructor parameters and the framework injects them, as the scaffold's `ProductRepository` shows. |
-| Async handlers | A handler's `handle` is `async`, so it can `await` a database driver or another service. The framework awaits it on the request coroutine. |
-| Pipeline behaviours | `app.useBehavior(b)` wraps every handler with cross-cutting logic (logging, validation, auth, timing). A behaviour inspects the request, calls `await next.proceed(src)` to continue, and may short-circuit by returning a `Response` without calling `next`. |
-| TLS | `app.useTls(certPath, keyPath)` for HTTPS. |
+The framework in `web.*` covers the rest of a real application:
+
+- **Server-sent events** for live updates: `app.sse(path, handler)` and an
+  `EventBus` push HTML fragments to connected browsers (see `web.sse`).
+- **Sessions and cookies**: `web.session` and `web.cookie` for signed,
+  server-side sessions and cookie handling.
+- **Middleware**: `app.use(mw)` runs cross-cutting logic (a `RouteMiddleware`)
+  around every handler, and the library ships CORS, CSRF, rate limiting, a
+  request-id tagger, secure headers, and a body-size limit.
+- **Static files**: `app.useStatic(prefix, dir)`, as above.
+- **The client side**: `web.client` is an HTTP client for calling other
+  services, and TLS is built in (chapter 15 and the runtime crypto are pure
+  Nova, no OpenSSL).
 
 ## Where to go next
 
-You have now seen every core construct in Nova, from primitives to a working web service. This app keeps
-its products in memory; the next chapter points it at a real database. Good next steps:
-
-- [Chapter 18, Data access and NovaDB](18-data-access.md): the `db` seam and the drivers, and how to
-  move this exact web app onto a live NovaDB by changing one file.
-- [Chapter 21, Deploying with the orchestrator](21-deploying-with-the-orchestrator.md): run the app as
-  load-balanced replicas behind `service`, supervised by `orchd`.
-- The standard library packages. The database drivers (`nova-postgres`, `nova-mysql`, `nova-mssql`,
-  `nova-mongodb`, `nova-novadb`) plug into the same app through repositories. See
-  [`../packages.md`](../packages.md).
-- The [language specification](../language-specification.md) for the precise, citation backed
-  contract behind everything in this guide.
-- `nova init web --name myapp` to scaffold your own vertical-slice project and start building.
+- **Chapter 18, Data access and the ORM**, takes the `Connection` seam further:
+  `DbValue`, the micro-ORM, the generic `Repository<T>`, connection strings, and
+  backing this app with NovaDB.
+- **Chapter 19, Package management**, explains `project.json` and how the
+  compiler resolves a driver dependency.
+- **Chapter 20, Database drivers**, introduces each driver (NovaDB, PostgreSQL,
+  MySQL, SQL Server, MongoDB) and how to add it to a project.
+- **Chapter 23, Deploying with the orchestrator**, runs replicas of this app
+  behind a load balancer with a NovaDB-backed config store.

@@ -96,7 +96,7 @@ struct Doubler impl Handler<int, int> {
 }
 ```
 
-**Say:** Look at the two implementations of the same trait. `GetUserHandler` fills in `Handler<GetUser, UserDto>`, so its `handle` takes a `GetUser` and returns a `UserDto`. `Doubler` fills in `Handler<int, int>`, so its `handle` takes an int and returns an int. Same trait, two very different instantiations, each checked by substituting `Q` and `R` with the impl's arguments. This generic-trait pattern is actually the foundation for Nova's typed request and handler routing, the mediator.
+**Say:** Look at the two implementations of the same trait. `GetUserHandler` fills in `Handler<GetUser, UserDto>`, so its `handle` takes a `GetUser` and returns a `UserDto`. `Doubler` fills in `Handler<int, int>`, so its `handle` takes an int and returns an int. Same trait, two very different instantiations, each checked by substituting `Q` and `R` with the impl's arguments. This generic-trait pattern is what the web framework's typed handlers build on, which you will see in the web video.
 
 ## Segment: Putting it together in main (6:45)
 
@@ -212,7 +212,7 @@ nova test examples/geometry.nova
 - Calling a method through a trait-typed binding dispatches dynamically via a vtable.
 - A factory can return a trait type to hide the concrete type from callers.
 - You can downcast a trait value back to its concrete type with `as`.
-- Traits can be generic, checked by substituting the type parameters, and this is the base of Nova's mediator routing.
+- Traits can be generic, checked by substituting the type parameters, and this is what the web framework's typed handlers build on.
 
 ## Outro (11:00)
 

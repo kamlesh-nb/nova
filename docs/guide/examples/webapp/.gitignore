@@ -1,5 +1,6 @@
 build/
 *.o
+packages
+project.lock.json
 __nova_test
 __nova_test.ll
-packages

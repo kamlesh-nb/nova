@@ -29,8 +29,10 @@ Hello, Nova!
 | `nova build` | Build a project (reads `project.json`). Add `--release` for optimizations. |
 | `nova test <file>.nova` | Compile and run the `@test` functions in a file. |
 | `nova fmt` | Format source. |
-| `nova init web\|desktop --name X` | Scaffold a new app. |
-| `nova add` / `nova get` | Manage dependencies (packages). |
+| `nova init console\|web\|desktop --name X` | Scaffold a new project. |
+| `nova get <git-url>` | Add a package dependency (records it in `project.json`, resolves it). |
+| `nova restore` / `nova update` | Restore locked dependencies / refresh them. |
+| `nova add feature <name>` | Scaffold a new feature slice inside a project. |
 
 Nova compiles through LLVM to a real native binary; there is no interpreter and no VM. The default
 target is your host platform; cross-compilation and WASM are opt-in via `--target`.

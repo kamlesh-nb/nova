@@ -1,12 +1,12 @@
-# Video 21: Deploying with the orchestrator
+# Video 23: Deploying with the orchestrator
 
-- Chapter: [21-deploying-with-the-orchestrator.md](../21-deploying-with-the-orchestrator.md)
+- Chapter: [23-deploying-with-the-orchestrator.md](../23-deploying-with-the-orchestrator.md)
 - Estimated length: ~14 minutes
 - You will need: Nova installed, Zig (to build the NovaDB server), curl, and the guide's `examples/` folder. Watching Video 18 on data access first is essential, since we deploy that NovaDB-backed app.
 
 ## Hook (0:00)
 
-**Say:** You have a NovaDB-backed web service. In this video we run it the way you would in production: several replicas behind a load balancer, supervised and kept at their desired count, with configuration held in NovaDB. Nova ships a small orchestrator for exactly this, and it is split into three binaries that mirror the Kubernetes control-plane and data-plane split. By the end you will have curled your app through a real load balancer and operated its config store from the command line.
+**Say:** You have a NovaDB-backed web service. In this video we run it the way you would in production: several replicas behind a load balancer, supervised and kept at their desired count, with configuration held in NovaDB. Nova ships a small orchestrator for exactly this. The parts we use here are three binaries that mirror the Kubernetes control-plane and data-plane split, service, orchd, and orchctl; a fourth binary, artifactd, delivers the actual application binaries and is the subject of the final video. By the end of this one you will have curled your app through a real load balancer and operated its config store from the command line.
 
 ## What we will cover (0:30)
 
@@ -125,7 +125,7 @@ cd docs/guide/examples && ./run-live.sh
 
 **Say:** Let us recap.
 
-- The orchestrator is three binaries: service the data plane, orchd the control plane, orchctl the offline ops CLI.
+- The orchestrator's core is three binaries: service the data plane, orchd the control plane, orchctl the offline ops CLI. A fourth, artifactd, delivers binaries and is the next video.
 - service load-balances your app replicas with health checks and several strategies.
 - orchd keeps replicas at their desired count and can publish service discovery for service.
 - The config store lives in the same NovaDB as your app, addressed by the `novadb://` URL.
@@ -133,4 +133,9 @@ cd docs/guide/examples && ./run-live.sh
 
 ## Outro (14:00)
 
-**Say:** And that is the series. You have gone from your first `console.log` all the way to a NovaDB-backed web service running behind a real load balancer, supervised and configured through NovaDB. Everything you saw is one language, one toolchain, and one storage engine. The natural next step is to build your own thing: run `nova init web`, add a feature slice, back it with NovaDB, and deploy it. Thank you for watching the whole series. Now go and build something.
+**Say:** So far the manifest pointed at a binary already sitting on disk. In the final video we close that gap: how the binary gets to each node in the first place, with artifactd and the content-addressed blob store. See you there.
+
+**On screen:**
+```
+Next: Video 24, Artifact delivery: the blob store
+```

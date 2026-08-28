@@ -1,12 +1,8 @@
-import list;
-import web.mediator;
 import Features.Products.CreateProduct.command;
 
-pub struct CreateProductValidator impl Validator<CreateProduct> {
-    fn validate(self: CreateProductValidator, cmd: CreateProduct): List<string> {
-        let errs = List<string>();
-        if (cmd.name.length == 0) { errs.push("name is required"); }
-        if (cmd.price < 0) { errs.push("price must be >= 0"); }
-        return errs;
-    }
+// Validate a command before the handler runs. Returns "" when valid, else the error.
+pub fn validateCreateProduct(cmd: CreateProduct): string {
+    if (cmd.name.length == 0) { return "name is required"; }
+    if (cmd.price < 0) { return "price must be >= 0"; }
+    return "";
 }

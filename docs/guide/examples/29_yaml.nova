@@ -1,0 +1,45 @@
+// YAML in Nova: parse a document, read typed fields, and emit a value back to text.
+// The `serde.yaml` module parses YAML 1.2 (block and flow styles, sequences, nested maps) into a
+// `YamlValue` tree, with typed accessors that return `T | undefined` so a missing or wrong-typed field
+// is never a silent zero.
+import serde.yaml;
+import list;
+import assert;
+
+// Small helpers so the assertions read cleanly.
+fn strOf(v: yaml.YamlValue): string { return yaml.asString(v) ?? "<none>"; }
+fn numOf(v: yaml.YamlValue): long { return yaml.asNumber(v) ?? -1; }
+
+@test
+fn parse_a_config(): void {
+    // A typical config: scalars, a nested map, and a sequence.
+    let text = "name: shop\nport: 8080\ndb:\n  host: 127.0.0.1\n  pool: 16\ntags:\n  - web\n  - novadb\n";
+    let doc = yaml.parse(text);
+
+    assert.isTrue(strOf(yaml.get(doc, "name")) == "shop");
+    assert.equalInt(numOf(yaml.get(doc, "port")) as int, 8080);
+
+    // Nested map: get the "db" map, then a field inside it.
+    let db = yaml.get(doc, "db");
+    assert.isTrue(strOf(yaml.get(db, "host")) == "127.0.0.1");
+    assert.equalInt(numOf(yaml.get(db, "pool")) as int, 16);
+
+    // A sequence comes back as a List<YamlValue>.
+    let tags = yaml.asArray(yaml.get(doc, "tags")) ?? List<yaml.YamlValue>();
+    assert.equalInt(tags.size(), 2);
+    assert.isTrue(strOf(tags.at(0)) == "web");
+}
+
+@test
+fn flow_style_and_emit(): void {
+    // Flow style ({...} and [...]) parses the same as block style.
+    let doc = yaml.parse("point: {x: 1, y: 2}\nlist: [a, b, c]\n");
+    let point = yaml.get(doc, "point");
+    assert.equalInt(numOf(yaml.get(point, "x")) as int, 1);
+    assert.equalInt(numOf(yaml.get(point, "y")) as int, 2);
+
+    // Build a value and stringify it back to YAML text.
+    let n = yaml.number(42);
+    let out = yaml.stringify(n);
+    assert.isTrue(out.length > 0);
+}

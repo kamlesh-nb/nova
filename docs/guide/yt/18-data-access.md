@@ -128,28 +128,24 @@ pub struct ProductRepository impl Service {
 
 ## Segment: Swapping the web app onto NovaDB (9:15)
 
-**Say:** Here is the payoff. The web app from Video 17 registered an in-memory connection. That in-memory connection implements the same `Connection` trait NovaDB does, which is why the repository never noticed the difference. To move onto a real database we change the composition root and nothing else.
+**Say:** Here is the payoff. The web app from Video 17 built an in-memory connection in its composition root. That in-memory connection implements the same `Connection` trait NovaDB does, which is why the repository never noticed the difference. To move onto a real database we change the composition root and nothing else. There is no container and no downcast: we construct a different `Connection` and pass it to the same repository.
 
 **On screen:**
 ```nova
 // main.nova (in-memory, the default build)
-services.addSingleton("Connection", (sp) => { return InMemoryConnection(); });
-// main_novadb.nova (the same app, live NovaDB) — register a NovaDB-backed connection under the same key
-services.addSingleton("Connection", (sp) => { return NovaDbConnection("novadb://admin@127.0.0.1:3009?db=nova"); });
+let conn = InMemoryConnection();
+let repo = ProductRepository(conn);
 
-// NovaDbConnection connects LAZILY, on its first query, inside a request handler:
-async fn ensure(self: NovaDbConnection): Connection {
-    let existing = self.conn;
-    if (existing != undefined) { return existing; }
-    return await self.driver.connect(self.dsn);   // on the reactor, not in main()
-}
+// main_novadb.nova (the same app, live NovaDB): only the connection changes
+let conn = PooledConnection(dsn, poolSize);   // a Connection over a NovaDB pool
+let repo = ProductRepository(conn);
 ```
 
-**Say:** One rule matters here. Opening a connection is asynchronous and must run on the reactor, which only exists once `app.run` starts. So we do NOT connect in `main`, that would crash. Instead the NovaDB connection opens itself lazily, on its first query, which always happens inside an async request handler where the reactor is live. Everything else, the features, handlers, DTOs, validators, behaviours, and routes, is shared between the two builds unchanged. That is the whole point of writing the repository against the seam.
+**Say:** One rule matters here. Opening a connection is asynchronous, and you cannot drive an asynchronous call to completion from the synchronous `main` before the event loop starts. So `PooledConnection` wraps a pool that is built synchronously and opens its connections lazily, inside a request, where the handler is already awaiting. Everything else, the features, handlers, DTOs, validators, and routes, is shared between the two builds unchanged. That is the whole point of writing the repository against the seam.
 
 ## Segment: Transactions (11:30)
 
-**Say:** The seam also has begin, commit, and rollback. In the web app they are wired as a behaviour: the mediator pipeline opens a transaction around every command, commits when the handler returns, and rolls back if it reports an error. Your handler code stays free of transaction plumbing, exactly like validation and logging.
+**Say:** The seam also has begin, commit, and rollback. A transaction runs on one connection, so you acquire a connection from the pool, begin, do the writes on that same connection, then commit or roll back, and release it. The per-call pooled connection is fine for single statements; for a transaction you hold a connection explicitly.
 
 ## Segment: Running it live (12:30)
 

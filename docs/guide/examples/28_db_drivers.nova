@@ -3,7 +3,8 @@ import assert;
 import data.db;
 import data.orm;
 
-@serializable pub struct Product {
+@serializable
+pub struct Product {
     pub id: int,
     pub name: string,
 }
@@ -19,12 +20,10 @@ fn sampleRows(): ResultSet {
     let rs = ResultSet();
     rs.columns.push(Column("id", DbType.Int4));
     rs.columns.push(Column("name", DbType.Text));
-
     let a = Row();
     a.cells.push(db.dbInt(1));
     a.cells.push(db.dbText("Keyboard"));
     rs.rows.push(a);
-
     let b = Row();
     b.cells.push(db.dbInt(2));
     b.cells.push(db.dbText("Mouse"));
@@ -58,7 +57,6 @@ fn bind_one_or_undefined(): void {
     } else {
         assert.equalInt(one.id, 1);
     }
-
     let empty = ResultSet();
     empty.columns.push(Column("id", DbType.Int4));
     empty.columns.push(Column("name", DbType.Text));

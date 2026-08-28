@@ -1,4 +1,0 @@
-@serializable pub struct CreateProductResponse {
-    pub id: int,
-    pub name: string,
-}

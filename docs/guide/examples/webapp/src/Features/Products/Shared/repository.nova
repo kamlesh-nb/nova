@@ -1,14 +1,16 @@
 import list;
 import data.db;
 import data.orm;
-import web.di;
-import Features.Products.GetProductById.response;
+import Domain.Dtos.ProductDto;
 
-pub struct ProductRepository impl Service {
+// The repository is the ONE place that knows SQL. Handlers depend on it, never on a connection or a
+// driver. Its field is the `Connection` TRAIT, not a concrete type, so the same repository runs over
+// the in-memory connection (offline, in tests) and over a real NovaDB/Postgres connection with no
+// change. Parameters are built with `db.dbInt`/`db.dbText`/`db.dbLong` and bound to `$1,$2,...`; the
+// micro-ORM (`orm.bindOne`/`orm.bindAll`) maps result rows onto `ProductDto` by column name.
+pub struct ProductRepository {
     conn: Connection,
     init(conn: Connection) { self.conn = conn; }
-
-    pub fn connection(self: ProductRepository): Connection { return self.conn; }
 
     pub async fn findById(self: ProductRepository, id: int): ProductDto | undefined {
         let params = List<DbValue>();

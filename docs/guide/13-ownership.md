@@ -7,10 +7,11 @@ whenever a collector decides to run, and you never write a `free` call yourself.
 
 The model in four rules:
 
-- **Primitives are value types.** `int`, `long`, `float`, `bool` are copied, never owned; there is no
-  heap object to track.
-- **Everything else is a heap object:** `string`, `decimal`, `List`, `Map`, `Set`, structs, tuples, and
-  closures. Each is freed **exactly once**, when its last owner is dropped.
+- **Value types are copied, not tracked.** `int`, `long`, `float`, `bool`, a `struct`, and tuples are
+  copied on assignment; there is no shared object to reference-count. A value type can still OWN heap data
+  (a `struct` with a `List` field), and copying it copies that ownership.
+- **Reference types are the heap objects ARC tracks:** `string`, `decimal`, `List`, `Map`, `Set`,
+  closures, and any `class`. Each is freed **exactly once**, when its last owner is dropped.
 - **Function arguments are borrowed.** The callee may read an argument freely; if it wants to *keep* one
   (store it in an aggregate, or return it), it retains its own reference. The caller still owns the value
   after the call returns.
@@ -26,8 +27,8 @@ manual management.
 // Nova manages memory with deterministic ARC (automatic reference counting):
 // no garbage collector, no manual free. You never call `free`.
 //
-//   * Primitives (int, long, float, bool) are VALUE types: copied, never owned.
-//   * string / decimal / List / Map / Set / structs / tuples / closures are
+//   * Value types (int, long, float, bool, struct, tuple) are copied, not tracked.
+//   * string / decimal / List / Map / Set / closures / class are reference types:
 //     heap objects. Each is freed EXACTLY ONCE, when its last owner goes away.
 //   * Function arguments are BORROWED: the callee may read them and, if it keeps
 //     one (stores it, returns it), it retains its own reference.
@@ -102,8 +103,8 @@ size = 3
 
 | Rule | Consequence |
 |------|-------------|
-| Primitives are values | Copied, never owned; nothing to free |
-| `string`/`List`/`Map`/`Set`/structs/tuples/closures are heap | Freed exactly once, when the last owner drops |
+| Value types (primitives, `struct`, tuples) | Copied on assignment; nothing shared to free |
+| `string`/`decimal`/`List`/`Map`/`Set`/closures/`class` are reference types | Freed exactly once, when the last owner drops |
 | Arguments are borrowed | Caller keeps ownership; callee retains only what it stores/returns |
 | Aggregates own their contents | Dropping the aggregate drops everything inside it |
 | No GC, no manual `free` | Cleanup is deterministic and automatic |

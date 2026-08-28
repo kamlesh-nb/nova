@@ -1,8 +1,14 @@
 import list;
 import data.db;
-import web.di;
 
-pub struct InMemoryConnection impl Connection, Service {
+// A tiny in-memory `Connection`, so the starter runs and its tests pass with no database server.
+//
+// This is the whole point of the `data.db` seam: `Connection` is a trait, so the repository (and
+// therefore every feature slice) is written once against it and never names a concrete database.
+// Here we back it with a `List<Row>`; `main_novadb.nova` swaps in the real NovaDB driver and NOT ONE
+// line of feature or repository code changes. It only understands the three columns this app uses
+// (id, name, price); a real driver speaks full SQL.
+pub struct InMemoryConnection impl Connection {
     pub rows: List<Row>,
     pub nextId: int,
 
@@ -11,6 +17,7 @@ pub struct InMemoryConnection impl Connection, Service {
         self.nextId = 1;
     }
 
+    // INSERT: the demo passes (name, price) as $1,$2; we assign the id and store [id, name, price].
     async fn exec(self: InMemoryConnection, sql: string, params: List<DbValue>): ExecResult {
         let id = self.nextId;
         self.nextId = self.nextId + 1;
@@ -22,9 +29,10 @@ pub struct InMemoryConnection impl Connection, Service {
             i = i + 1;
         }
         self.rows.push(r);
-        return ExecResult(id, "INSERT");
+        return ExecResult(1, "INSERT");
     }
 
+    // SELECT: no params returns every row; one param filters by id ($1).
     async fn query(self: InMemoryConnection, sql: string, params: List<DbValue>): ResultSet {
         let rs = ResultSet();
         rs.columns.push(Column("id", DbType.Int8));
@@ -37,8 +45,7 @@ pub struct InMemoryConnection impl Connection, Service {
                 rs.rows.push(r);
             } else {
                 let want = (params.get(0) ?? db.dbNull()).asLong();
-                let idv = r.get(0).asLong();
-                if (idv == want) { rs.rows.push(r); }
+                if (r.get(0).asLong() == want) { rs.rows.push(r); }
             }
             i = i + 1;
         }
@@ -49,6 +56,8 @@ pub struct InMemoryConnection impl Connection, Service {
         return db.wireRowsFromResultSet(await self.query(sql, params));
     }
 
+    // The rest of the trait is boilerplate for an in-memory store: no prepared statements, no real
+    // transactions. A real driver implements all of these; the seam is the same either way.
     fn close(self: InMemoryConnection): void {}
     fn setTimeout(self: InMemoryConnection, ms: int): int { return 0; }
     async fn prepare(self: InMemoryConnection, sql: string): int { return 0; }

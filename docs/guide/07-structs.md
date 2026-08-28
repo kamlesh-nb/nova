@@ -91,4 +91,37 @@ There are two ways to build a struct value: calling the constructor `Account("Ad
 or a **struct literal** `UserDto{ id: 7, name: "Ada" }` that names each field directly; you will see the
 literal form in the enum and trait chapters.
 
+## `struct` is a value type; `class` is a reference type
+
+A `struct` has **value semantics**: assigning it, or passing it to a function, makes an independent copy.
+Change the copy and the original is untouched. This is like `int` or a tuple, just with named fields.
+
+```nova
+let a = Account("Ada", 100);
+let b = a;            // b is a COPY of a
+b.deposit(50);        // changes b only
+// a is still 100, b is 150
+```
+
+When you want the opposite, a single object that several holders SHARE, declare a `class` instead of a
+`struct`. A `class` has **reference semantics**: assigning it hands out another handle to the same
+object, so a change through one handle is visible through all of them. Both are managed by ARC, and both
+are freed automatically; the only difference is copy versus share.
+
+```nova
+class Counter {
+    pub n: int,
+    init() { self.n = 0; }
+    pub fn bump(self: Counter): void { self.n = self.n + 1; }
+}
+
+let x = Counter();
+let y = x;      // y refers to the SAME Counter as x
+y.bump();       // x.n is now 1 as well
+```
+
+Reach for a `struct` by default: value semantics are easier to reason about, because nothing changes
+under you through an alias. Use a `class` when you deliberately want shared, mutable state, for example a
+cache or a connection pool that the whole app talks to through one instance.
+
 Next: [Enums](08-enums.md)

@@ -1,8 +1,15 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Nova Web App</title></head>
-<body style="font-family:system-ui;max-width:40rem;margin:4rem auto">
-  <h1>Nova Web App</h1>
-  <p>Vertical-slice API. Try <code>GET /api/products/1</code>.</p>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nova Web App</title>
+  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
+       Run `npm install` once, then `npm run css:watch` while developing. -->
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
+  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+  <p class="mt-2 text-slate-600">Vertical-slice API. Try <code class="rounded bg-slate-100 px-1.5 py-0.5">GET /api/products/1</code>.</p>
 </body>
 </html>

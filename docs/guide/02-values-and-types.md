@@ -102,9 +102,14 @@ a = 1, b = 2
 
 ## Value vs reference
 
-Primitives (`int`/`long`/`float`/`bool`/`ptr`/enums) are **value types** on the stack. `string`,
-`decimal`, `List`/`Map`/`Set`, structs, tuples, and closures are **reference types**: heap objects
-managed by automatic reference counting (ARC). The syntax is the same; the type decides. You never call
-`free`; see [Ownership & memory](13-ownership.md).
+Nova has two kinds of type. **Value types** are copied when you assign or pass them: primitives
+(`int`/`long`/`float`/`bool`/`ptr`/enums), a `struct`, and tuples. **Reference types** are shared, and
+managed by automatic reference counting (ARC): a `class`, plus the built-in heap types `string`,
+`decimal`, `List`/`Map`/`Set`, and closures.
+
+The difference that matters day to day: assigning a `struct` gives you an independent copy, while
+assigning a `class` (or a `List`, `Map`, ...) gives you another handle to the same object, so a change
+through one is visible through the other. Chapter 7 shows the `struct` versus `class` choice, and you
+never call `free` either way; see [Ownership & memory](13-ownership.md).
 
 Next: [Strings](03-strings.md)

@@ -1,0 +1,6 @@
+// Read DTO (Domain/Dtos): the shape returned to clients and bound from query rows.
+@serializable pub struct ProductDto {
+    pub id: int,
+    pub name: string,
+    pub price: int,
+}

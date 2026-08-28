@@ -1,37 +1,26 @@
+// main.nova, the composition root. It constructs the app-wide dependencies ONCE, then hands them to
+// each feature's `register(...)` so the feature can wire its own routes. A route maps a path to a
+// handler INSTANCE that implements `RouteHandler` (one uniform `async serve(ctx): Response` method)
+// and holds its dependencies as fields. There is no mediator and no DI container: dependencies are
+// plain constructor arguments, resolved right here where you can see them.
+//
+// This default build uses an in-memory Connection so it runs and its tests pass with no database.
+// `main_novadb.nova` is the SAME app over a real NovaDB connection; only this file changes.
 import web.app;
-import web.di;
-import web.request;
-import web.response;
-import web.routing;
-import web.mediator;
-import serde.json;
 import Features.Products.Shared.database;
 import Features.Products.Shared.repository;
-import Features.Products.Shared.behaviours;
-import Features.Products.CreateProduct.command;
-import Features.Products.CreateProduct.handler;
-import Features.Products.CreateProduct.validator;
-import Features.Products.GetProductById.query;
-import Features.Products.GetProductById.handler;
-
-fn configureServices(): ServiceCollection {
-    let services = ServiceCollection();
-    services.addSingleton("Connection", (sp) => { return InMemoryConnection(); });
-    services.addScoped("ProductRepository", (sp) => { return ProductRepository(sp.require("Connection") as InMemoryConnection); });
-    return services;
-}
+import Features.Products.routes;
 
 fn buildApp(): App {
     let app = App();
-    app.useServices(configureServices());
 
-    app.useBehavior(LoggingBehavior{});
-    app.useBehavior(ValidationBehavior{});
-    app.useBehavior(TransactionBehavior{});
+    // Build the shared dependencies once. The repository takes any `Connection`; here that is the
+    // in-memory one. Then let each feature register its routes against them.
+    let conn = InMemoryConnection();
+    let repo = ProductRepository(conn);
+    registerProducts(app, repo);
 
-    app.post<CreateProduct>("/api/products");
-    app.get<GetProductById>("/api/products/{id:int}");
-
+    // Serve static assets (wwwroot/) for any unmatched GET.
     app.useStatic("/", "./wwwroot");
     return app;
 }

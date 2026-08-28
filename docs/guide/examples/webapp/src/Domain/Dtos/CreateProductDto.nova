@@ -1,0 +1,6 @@
+// Create response DTO (Domain/Dtos). DTOs are the request/response shapes the
+// feature slices bind and return; entities (Domain/Entities) model the rows.
+@serializable pub struct CreateProductDto {
+    pub id: int,
+    pub name: string,
+}

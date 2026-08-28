@@ -1,19 +1,28 @@
 import web.routing;
 import web.response;
-import serde.json;
+import web.status;
 import Features.Products.GetProductById.query;
-import Features.Products.GetProductById.response;
 import Features.Products.Shared.repository;
+import Features.Products.views.product_card;
+import Domain.Dtos.ProductDto;
 
-pub struct GetProductByIdHandler impl RequestHandler<GetProductById, ProductDto | HttpError> {
+// Handles GET /api/products/{id:int}. `ctx.bind<GetProductById>()` fills `id` from the route
+// parameter, the injected repository loads the product over the `Connection` seam, and the NSX view
+// renders it as an HTML fragment. The repository returns `ProductDto | undefined`, so a missing id is
+// a plain 404. One `serve(ctx): Response` shape covers reads and writes alike.
+pub struct GetProductByIdHandler impl RouteHandler {
     repo: ProductRepository,
     init(repo: ProductRepository) { self.repo = repo; }
 
-    async fn handle(self: GetProductByIdHandler, q: GetProductById): ProductDto | HttpError {
+    async fn serve(self: GetProductByIdHandler, ctx: Context): Response {
+        let q = ctx.bind<GetProductById>();
         let found = await self.repo.findById(q.id);
         if (found == undefined) {
-            return HttpError(404, "product not found");
+            return response.Response(Status.NotFound, "product not found");
         }
-        return found ?? ProductDto{ id: 0, name: "" };
+        let product = found ?? ProductDto{ id: 0, name: "", price: 0 };
+        let html = productCard(product.name, product.price);
+        return response.Response(Status.Ok, html)
+            .setHeader("Content-Type", "text/html; charset=utf-8");
     }
 }

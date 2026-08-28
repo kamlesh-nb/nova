@@ -1,0 +1,44 @@
+// The SAME app as src/main.nova, but backed by a real NovaDB instead of the in-memory connection.
+//
+// This file lives at the project root, not under src/, so the offline build (which compiles src/ and
+// its in-memory default) is unaffected. `run-live.sh` copies it over src/main.nova, adds the
+// nova-novadb dependency, seeds the schema, and builds+runs it against a live server. Compare it with
+// src/main.nova: only the composition root changes. Every feature slice, the repository, the handlers,
+// and the views are byte-for-byte identical, because they depend on the `Connection` trait, never on a
+// driver. Here the Connection is a pooled NovaDB connection instead of the in-memory one.
+import web.app;
+import string;
+import env;
+import Features.Products.Shared.pooled_connection;
+import Features.Products.Shared.repository;
+import Features.Products.routes;
+
+fn buildApp(dsn: string, poolSize: int): App {
+    let app = App();
+
+    // PooledConnection is built synchronously (no I/O here) and opens NovaDB connections lazily, inside
+    // requests, where the handler is already awaiting. The repository takes it as a plain `Connection`,
+    // exactly like the in-memory one in src/main.nova. The schema is created out of band (run-live.sh
+    // seeds it, or run a migration); a production app does not create tables from request code.
+    let conn = PooledConnection(dsn, poolSize);
+    let repo = ProductRepository(conn);
+    registerProducts(app, repo);
+
+    app.useStatic("/", "./wwwroot");
+    return app;
+}
+
+fn main(): void {
+    let dsn = env.get("NOVA_DB_DSN");
+    if (string.eql(dsn, "")) { dsn = "novadb://admin@127.0.0.1:3009?db=nova"; }
+    let poolSize = 16;
+    let ps = env.get("NOVA_DB_POOL");
+    if (!string.eql(ps, "")) { poolSize = string.parseI64(ps) as int; }
+
+    let app = buildApp(dsn, poolSize);
+
+    let pe = env.get("NOVA_PORT");
+    let port = if (string.eql(pe, "")) 8080 else string.parseI64(pe) as int;
+    console.log(`Listening on http://127.0.0.1:${port} (NovaDB store, pool=${poolSize})`);
+    app.run(port);
+}

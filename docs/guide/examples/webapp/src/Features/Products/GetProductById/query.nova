@@ -1,5 +1,10 @@
-import web.mediator;
-
-@serializable pub struct GetProductById impl Message {
+// The query: fetch a product by id. `ctx.bind<GetProductById>()` populates `id` from the route
+// parameter `{id:int}` (path/query/body are merged into one source before binding), so the handler
+// reads a typed field rather than parsing the URL itself.
+@serializable pub struct GetProductById {
     pub id: int,
+
+    init() {
+        self.id = 0;
+    }
 }

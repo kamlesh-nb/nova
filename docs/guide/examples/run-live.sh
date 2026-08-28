@@ -61,9 +61,22 @@ note "seeded products 1..3 via the SQL endpoint"
 
 # ---------------------------------------------------------------------------------------------------
 say "2/5  build the NovaDB-backed web app (main_novadb.nova)"
-ln -sfn "$REPO/packages" "$WEBAPP/packages"           # so `import novadb` resolves
-( cd "$WEBAPP" && "$NOVA" build --file src/main_novadb.nova -o "$WORK/webapp" ) \
+# main_novadb.nova lives at the project root so it never clashes with the in-memory src/main.nova.
+# Build it in a throwaway copy: swap it in as src/main.nova, wire the nova-novadb dependency, and point
+# packages/ at the monorepo so `import novadb` resolves with no network.
+BUILDDIR="$WORK/webapp-src"
+cp -r "$WEBAPP" "$BUILDDIR"; ( cd "$BUILDDIR" && rm -rf build packages )
+mv "$BUILDDIR/main_novadb.nova" "$BUILDDIR/src/main.nova"
+python3 - "$BUILDDIR/project.json" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p))
+d["dependencies"]=["https://github.com/kamlesh-nb/nova-novadb"]
+json.dump(d,open(p,"w"),indent=2)
+PY
+ln -sfn "$REPO/packages" "$BUILDDIR/packages"           # so `import novadb` resolves
+( cd "$BUILDDIR" && "$NOVA" build -o "$WORK/webapp" ) \
   || { note "web app build failed"; exit 1; }
+WEBAPP="$BUILDDIR"                                       # replicas below run from here (static assets)
 note "built $WORK/webapp"
 
 say "     start two replicas (NOVA_PORT) on 8080 and 8081"
@@ -117,4 +130,4 @@ printf 'workloads/web\treplicas=2\n'       >> "$WORK/store.dump"
 
 say "done  (in production, orchd would supervise the replicas, persist membership/workloads to NovaDB via"
 note "storeConnectionString's novadb:// URL, and write the discovery file service reads instead of static"
-note "backends. See lang/docs/guide/21-deploying-with-the-orchestrator.md.)"
+note "backends. See lang/docs/guide/23-deploying-with-the-orchestrator.md.)"

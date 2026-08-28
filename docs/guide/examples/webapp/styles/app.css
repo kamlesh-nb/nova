@@ -1,0 +1,5 @@
+@import "tailwindcss";
+
+/* The content globs (which files Tailwind scans for class names, including the `.nsx` views) live in
+   tailwind.config.js at the project root, loaded here. */
+@config "../tailwind.config.js";
