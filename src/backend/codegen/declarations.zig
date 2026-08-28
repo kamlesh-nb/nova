@@ -318,26 +318,6 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     compiler.current_collecting_instantiation = null;
     compiler.current_collecting_instantiation_id = null;
 
-    if (t6_split) {
-        var by_file = std.StringHashMap(usize).init(allocator);
-        defer by_file.deinit();
-        var uncategorized: usize = 0;
-        for (compiler.functions.items) |func| {
-            if (func.source_file.len == 0) {
-                uncategorized += 1;
-                continue;
-            }
-            const gop = try by_file.getOrPut(func.source_file);
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* += 1;
-        }
-        std.debug.print("[T6] function partition: {d} files, {d} functions ({d} uncategorized)\n", .{ by_file.count(), compiler.functions.items.len, uncategorized });
-        var it = by_file.iterator();
-        while (it.next()) |e| {
-            std.debug.print("[T6]   {d:>4}  {s}\n", .{ e.value_ptr.*, std.fs.path.basename(e.key_ptr.*) });
-        }
-    }
-
     try compiler.collectStringLiterals(program);
     for (compiler.functions.items) |func| {
         try compiler.collectStringsFromBlock(func.body);
@@ -1107,13 +1087,30 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     }
 
     memPhase("before body emit");
-    for (compiler.functions.items) |func| {
+    // Per-module build progress: an in-place dot bar during body codegen, shown only on a TTY so
+    // piped builds and the conformance harness stay free of carriage-return noise. It updates when
+    // the source file changes, so it reads as one line per module. Replaces the old [T6] per-file dump.
+    const cg_tty = std.c.isatty(2) != 0;
+    const cg_total = compiler.functions.items.len;
+    var cg_last_file: []const u8 = "\x00";
+    for (compiler.functions.items, 0..) |func, fi| {
         const fn_val = compiler.func_map.get(func.name).?;
 
         const is_rawbuf_backing = std.mem.startsWith(u8, func.name, "RawBuffer_");
         if (func.erased_generic and !is_rawbuf_backing and core.LLVMGetFirstUse(fn_val) == null) continue;
 
         if (func.erased_generic and !t6_split) core.LLVMSetLinkage(fn_val, types.LLVMLinkage.LLVMInternalLinkage);
+
+        if (cg_tty and !std.mem.eql(u8, func.source_file, cg_last_file)) {
+            cg_last_file = func.source_file;
+            const base = if (func.source_file.len == 0) "core" else std.fs.path.basename(func.source_file);
+            const bar_w: usize = 22;
+            const filled: usize = if (cg_total == 0) bar_w else @min(bar_w, ((fi + 1) * bar_w) / cg_total);
+            var bar: [22]u8 = undefined;
+            var bi: usize = 0;
+            while (bi < bar_w) : (bi += 1) bar[bi] = if (bi < filled) '.' else ' ';
+            std.debug.print("\r\x1b[36m  compiling\x1b[0m {s:<26} {s}\x1b[K", .{ base, bar[0..bar_w] });
+        }
 
         compiler.current_function_name = func.name;
         compiler.current_local_types = compiler.function_local_types.getPtr(func.name).?;
@@ -1473,6 +1470,7 @@ fn compileSplitEmit(
             }
         }
     }
+    if (std.c.isatty(2) != 0) std.debug.print("\r\x1b[K", .{}); // clear the codegen progress line
 
     if (!flags.split_per_file) {
         const app_name = std.fs.path.stem(output_path);
@@ -1632,9 +1630,6 @@ fn compileSplitEmit(
         misses += 1;
         try emitModule(compiler, allocator, clone, obj_path, false, is_release, null);
         try objs.append(allocator, obj_path);
-    }
-    if (cache_dir != null) {
-        std.debug.print("[T6] per-file objects: {d} total, {d} reused (mtime), {d} rebuilt\n", .{ idx, hits, misses });
     }
 }
 

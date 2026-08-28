@@ -307,7 +307,6 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         .declarations = filtered_decls.items,
         .span = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = file_path },
     };
-    std.debug.print("Parsed {d} top-level declaration(s).\n", .{program.declarations.len});
 
     try sema_alpha.run(allocator, program);
 

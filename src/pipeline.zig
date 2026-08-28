@@ -1693,18 +1693,12 @@ pub fn generateMediatorDispatch(allocator: std.mem.Allocator, declarations: *std
         }
     }
 
-    var has_router = false;
-    for (declarations.items) |decl| {
-        if (decl != .struct_decl) continue;
-        for (decl.struct_decl.methods) |m| {
-            if (std.mem.eql(u8, m.decl.name, "__addRoute")) {
-                has_router = true;
-                break;
-            }
-        }
-        if (has_router) break;
-    }
-    if (src.items.len == 0 and !has_router) return;
+    // The mediator dispatch glue is only needed when actual mediator handlers exist. The web
+    // framework now dispatches routes directly to `RouteHandler.serve` (see web/app.nova), so a
+    // router-only app needs none of this. Historically this also fired for any app whose router
+    // declared `__addRoute`, which emitted a dead `<mediator-generated>` module on every web
+    // build; there are no mediator handlers left in the stdlib, so gate purely on their presence.
+    if (src.items.len == 0) return;
 
     try serdeAppendf(&src, allocator, "async fn __mediator_dispatch_by_name(__name: string, src: ValueSource, __provider: ServiceProvider): Response {{\n", .{});
     for (qs.items) |q| {
@@ -1902,18 +1896,10 @@ pub fn generateRuntimeMediator(allocator: std.mem.Allocator, declarations: *std.
         }
     }
 
-    var has_router = false;
-    for (declarations.items) |decl| {
-        if (decl != .struct_decl) continue;
-        for (decl.struct_decl.methods) |m| {
-            if (std.mem.eql(u8, m.decl.name, "__addRoute")) {
-                has_router = true;
-                break;
-            }
-        }
-        if (has_router) break;
-    }
-    if (!found and !has_router) return;
+    // Only emit the runtime-mediator registration/dispatch when real `Message`/handler pairs exist.
+    // A router-only app (the modern default) has none, so this now emits nothing instead of a dead
+    // `<rmediator-generated>` module. See the note in generateMediatorDispatch above.
+    if (!found) return;
 
     try serdeAppendf(&src, allocator, "fn __registerHandlers(m: Mediator): void {{\n", .{});
     try src.appendSlice(allocator, reg.items);

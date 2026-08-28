@@ -250,7 +250,6 @@ fn compileProgram(
             .file = file_path,
         },
     };
-    std.debug.print("Parsed {d} top-level declaration(s).\n", .{program.declarations.len});
 
     try sema_alpha.run(allocator, program);
 
