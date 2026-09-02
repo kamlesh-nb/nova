@@ -674,8 +674,10 @@ shell harnesses are manual and non-gating.
 # Stream 6: Orchestrator / control plane
 
 Read first: the offline gate tests ALGORITHMS OVER IN-PROCESS FAKES (shared in-memory store, virtual replicas,
-a `FakeConn`); the real cross-process/cross-node paths are only in manual, non-gating tests. And the offline
-gate does not currently reproduce green on this checkout (see the two UNSOUND rows).
+a `FakeConn`); the real cross-process/cross-node paths are only in manual, non-gating tests. The offline
+gate now reproduces green on this checkout after the fixes recorded below: the two rows that were UNSOUND
+in an earlier revision (`185_sqlconfig` not compiling, and the `181`/`188` teardown crashes) are fixed and
+marked SOUND, so `185` (8/8), `186` (11/11), `181` (8/8), `188` (6/6), `192` and `193` all pass.
 
 ### proxyd data plane (LB, pool, discovery) ; SOUND ; case
 
@@ -822,7 +824,7 @@ gate does not currently reproduce green on this checkout (see the two UNSOUND ro
 
 ---
 
-## The unmet-criteria worklist (the UNSOUND rows and the biggest gaps)
+## The unmet-criteria worklist (the biggest remaining gaps)
 
 Ordered with the language stream first (the priority).
 

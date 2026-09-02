@@ -84,6 +84,37 @@ leaks its box and elements (`28_tuple_return_heap` = 68 live, `29_http_request_p
 syntactic on `v.kind == .tuple`, so it only fires for a tuple *literal* in return position).
 Full detail: `docs/route-handling-via-mediator.md` §8.D.
 
+## Null-coalesce present-path type reinterpret (`opt ?? Fallback().field`)
+
+**Re-confirmed still latent 2026-09-02** by running the exact shape below with the shipped
+`nova` binary: it compiles, and the PRESENT branch returns the optional's payload (a heap
+pointer) reinterpreted as the fallback branch's type, with no type error.
+
+```nova
+class Box { pub v: int, init(x: int) { self.v = x; } }
+fn present(): Box | undefined { return Box(7); }
+fn fb(): Box { return Box(99); }
+@test
+fn coalesce_field_reinterpret(): void {
+    let opt: Box | undefined = present();   // PRESENT
+    // parses as `opt ?? (fb().v)`: present branch is Box (a pointer), fallback
+    // branch is int. Should be a TYPE ERROR (mismatched `??` branch types).
+    let n: int = opt ?? fb().v;
+    // observed: n == a heap address (e.g. 4381662584), NOT 7 — the Box pointer
+    // read as an int. Different value every run (classic pointer-as-int UB).
+}
+```
+
+Two defects in one: (1) `.field`/`.method()` binds to the FALLBACK only (`opt ?? (fb().v)`),
+so the accessor never applies to the unwrapped optional; (2) the type checker does not reject
+`optional<T> ?? U` when `T != U`, so the present path silently reinterprets the payload.
+The correct spelling parenthesises the unwrap: `(opt ?? fb()).v` — verified to return `7`
+deterministically, so that is the workaround until the checker rejects the mismatched form.
+
+When the check lands, move this into `expect_fail/` as a real case with
+`// EXPECT-FAIL: typecheck`. Do NOT add it to `cases/` today — it compiles and mis-runs, so it
+would make the corpus red. Ties the same pointer-as-primitive reinterpret class as `any`.
+
 ## Private field access from outside the struct (F1 stage 4)
 ```nova
 struct Secret { hidden: i32, init() { self.hidden = 5; } }

@@ -4,10 +4,12 @@ name: CI
 # (arm64, x86_64) and Windows x86_64. One matrix, one job per cell, no allow-fail masking: a red cell
 # is a real signal. The per-OS LLVM setup mirrors the release workflow.
 #
-# The full conformance corpus and the --asan / --shadow gates DO NOT run here -- they are local gates
-# (see the "Build nova" step comment + CLAUDE.md). CI's job is the build; the Windows cell additionally
-# smoke-runs a program. Deep Windows runtime verification is owned by the dedicated `windows` workflow
-# (cross-compile on Linux, execute on a Windows runner). windows-arm64 is off (no arm64 Windows LLVM).
+# build-corpus proves nova BUILDS on every host; the Windows cell additionally smoke-runs a program.
+# The correctness-gate job (Linux only, below) proves it is still CORRECT: it builds ReleaseFast and
+# runs the positive corpus (run.sh -j) plus the --shadow ownership-engine gate. The heavier local
+# gates (--asan / --arc / --tsan / --wasm) still DO NOT run here (see CLAUDE.md). Deep Windows runtime
+# verification is owned by the dedicated `windows` workflow (cross-compile on Linux, execute on a
+# Windows runner). windows-arm64 is off (no arm64 Windows LLVM).
 
 on:
   push:
@@ -127,9 +129,10 @@ jobs:
       - name: Build nova
         run: zig build
 
-      # NO corpus / --asan / --shadow here: those are LOCAL gates (they need a ReleaseFast compiler,
-      # some need live services, and they want real multi-core hardware -- on a hosted runner they took
-      # hours and went red on passing tests). See CLAUDE.md. CI proves the compiler BUILDS on each host.
+      # This matrix cell only BUILDS (plus a Windows smoke run). The corpus + --shadow gate runs once,
+      # on Linux, in the separate correctness-gate job below (a ReleaseFast build is required for it).
+      # The heavier --asan / --arc / --tsan gates stay LOCAL (live services + real multi-core hardware;
+      # on a hosted runner they took hours and went red on passing tests). See CLAUDE.md.
 
       # Windows cells: build is the cross-platform proof; smoke-run a program to confirm the produced
       # nova.exe compiles and executes. (The `windows` workflow owns the full runtime test suite.)
@@ -148,3 +151,74 @@ jobs:
           NOVA
           "$NOVA" hello.nova -o hello.exe
           ./hello.exe
+
+  # Correctness gate (Linux only). The build-corpus job above proves nova BUILDS on every host;
+  # this job proves it is still CORRECT. Before ea5ff90 the corpus/shadow gates ran in CI; they were
+  # dropped when the matrix was slimmed to a build-only smoke, which let behavioural regressions
+  # through. This restores a real gate on one host (Linux/epoll) where it is cheapest to run.
+  #
+  # What runs here, and why this subset:
+  #   * The build is -Doptimize=ReleaseFast, which the gates REQUIRE: a Debug compiler installs a
+  #     leak-detecting allocator that exits 1 on the driver's own (unrelated) leaks, so every case
+  #     reports FAIL with passing output. See CLAUDE.md "Build -Doptimize=ReleaseFast".
+  #   * conformance/run.sh -j — the positive corpus, the canonical timeout-protected parallel runner
+  #     (per-case temp dir + per-case timeout, so a blocking reactor case fails instead of stalling).
+  #   * conformance/run.sh --shadow — the F5-2 migration-invariant gate (the string vs TypeId ownership
+  #     engines MUST agree on every case); catches "ownership decided by name-matching" creeping back.
+  # NOT run here: --asan (needs a separate NOVA_ASAN=1 build + is slow), --arc (baseline is being
+  # regenerated; still noisy), --tsan, --wasm. Those stay local gates. 188_kqueue_readiness is macOS
+  # -only (kqueue/kevent do not link on Linux), so it is moved aside before the run; everything else
+  # is expected green on Linux. If 195_multicore_reactors flakes under -j on a small runner, re-run.
+  correctness-gate:
+    name: correctness-gate (linux-x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Cache Zig build cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zigcache-gate-releasefast-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'deps/**/*.zig') }}
+          restore-keys: |
+            zigcache-gate-releasefast-
+
+      - name: Cache apt LLVM debs (Linux)
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-llvm-cache
+          key: apt-llvm-gate-21
+
+      - name: Install LLVM 21 + Boost (Linux)
+        run: |
+          sudo apt-get update
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          mkdir -p ~/apt-llvm-cache
+          sudo cp -n ~/apt-llvm-cache/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+          sudo apt-get install -y llvm-21-dev libclang-21-dev clang-21 \
+            libboost-all-dev cmake zlib1g-dev libzstd-dev libxml2-dev liblzma-dev
+          cp -u /var/cache/apt/archives/*.deb ~/apt-llvm-cache/ 2>/dev/null || true
+          sudo ln -sf "$(command -v clang++-21)" /usr/local/bin/clang++
+          echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+          echo "BOOST_PREFIX=/usr" >> "$GITHUB_ENV"
+          /usr/lib/llvm-21/bin/llvm-config --version
+
+      - name: Build nova (ReleaseFast — required by the gates)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Exclude macOS-only cases (do not link on Linux)
+        run: |
+          mkdir -p /tmp/platform-excluded
+          mv conformance/cases/188_kqueue_readiness.nova /tmp/platform-excluded/ 2>/dev/null || true
+
+      - name: Positive corpus (run.sh -j)
+        run: conformance/run.sh -j
+
+      - name: Shadow gate (string vs TypeId ownership engines must agree)
+        run: conformance/run.sh --shadow
