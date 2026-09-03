@@ -355,11 +355,12 @@ pub fn linkWasmInProcess(allocator: std.mem.Allocator, obj_path: []const u8, out
 
 /// Append the arguments that link the Nova C++ runtime into `args`.
 ///
-/// On Windows `link.exe` cannot read llvm-ar's GNU archive, so the runtime is
-/// pulled in as its raw COFF object (`<shared_nova>/lib/<lib_name>.o`) together
-/// with `-rtlib=compiler-rt` (for the 128-bit integer helpers) and the Winsock/
-/// bcrypt import libs. Every other host uses the normal `-L<lib>/ -l<lib_name>`
-/// pair plus homebrew's lib dir.
+/// On Windows the runtime ships as a COFF `.lib` (`<shared_nova>/lib/<lib_name>.lib`,
+/// written by llvm-lib at install time), which MSVC's `link.exe` reads directly, so
+/// it is linked as one archive together with `-rtlib=compiler-rt` (for the 128-bit
+/// integer helpers) and the Winsock/bcrypt import libs. The integrated-assembly crypto
+/// object is bundled INSIDE that same `.lib`, so it needs no separate mention here.
+/// Every other host uses the normal `-L<lib>/ -l<lib_name>` pair plus homebrew's lib dir.
 pub fn appendRuntimeLink(
     args: *std.ArrayList([]const u8),
     allocator: std.mem.Allocator,
@@ -367,14 +368,7 @@ pub fn appendRuntimeLink(
     lib_name: []const u8,
 ) !void {
     if (builtin.target.os.tag == .windows) {
-        try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/lib/{s}.o", .{ shared_nova, lib_name }));
-        // The integrated-assembly crypto kernel is a separate object. On macOS/Linux it rides along
-        // inside libnovacore.a, but this path links the runtime as a BARE COFF OBJECT (link.exe cannot
-        // read llvm-ar's GNU archive), so the crypto object has to be named here or its symbols go
-        // unresolved. `has_asm_crypto_obj` is set by the same build.zig decision that assembled it.
-        if (build_options.has_asm_crypto_obj) {
-            try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/lib/nova_crypto.o", .{shared_nova}));
-        }
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "{s}/lib/{s}.lib", .{ shared_nova, lib_name }));
         try args.append(allocator, "-rtlib=compiler-rt");
         try args.appendSlice(allocator, &.{ "-lws2_32", "-lmswsock", "-lbcrypt" });
         return;
@@ -2059,7 +2053,8 @@ pub fn getFileMtime(io: Io, path: []const u8) !i96 {
 pub fn linkLibsStamp(allocator: std.mem.Allocator, init: std.process.Init) u64 {
     const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
     const libs = [_][]const u8{
-        "/.nova/lib/libnovacore.a",
+        // Windows ships the runtime as a COFF `.lib` (llvm-lib); every other host as a GNU `.a` (llvm-ar).
+        if (builtin.target.os.tag == .windows) "/.nova/lib/novacore.lib" else "/.nova/lib/libnovacore.a",
         "/.nova/bin/nova",
     };
     var acc: u64 = 0;

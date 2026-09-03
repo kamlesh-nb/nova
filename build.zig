@@ -363,25 +363,27 @@ fn addNovaInstall(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
             \\Copy-Item -Recurse -Force src/lib/std/* "{[std]s}/"
             \\Copy-Item -Recurse -Force src/runtime/* "{[home]s}/.nova/src/runtime/"
             \\Copy-Item -Recurse -Force deps/* "{[home]s}/.nova/deps/"
-            \\Write-Host "Building libnovacore.a (Windows; reactor runtime + Win32 syscall shims) ..."
+            \\Write-Host "Building novacore.lib (Windows; reactor runtime + Win32 syscall shims) ..."
             \\{[asm_cmd]s}
             \\{[cxx]s} -std=c++20 -O2 -DNOVA_DROP_ARENA {[asm_def]s} -c src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore.o"
-            \\llvm-ar rcs "{[home]s}/.nova/lib/libnovacore.a" "{[home]s}/.nova/lib/novacore.o" {[asm_obj]s}
+            \\# Archive as a COFF .lib via llvm-lib, NOT a GNU .a via llvm-ar: MSVC's link.exe (which the
+            \\# shipped toolchain drives to link user programs) cannot read llvm-ar's GNU archive, but it
+            \\# reads llvm-lib's COFF archive fine. So on Windows the runtime ships as novacore.lib and
+            \\# appendRuntimeLink links it directly (the crypto object rides inside the same .lib).
+            \\llvm-lib "-out:{[home]s}/.nova/lib/novacore.lib" "{[home]s}/.nova/lib/novacore.o" {[asm_obj]s}
             \\# NOVA_ASAN=1: additionally build an AddressSanitizer runtime, so `conformance/run.sh --asan`
             \\# works here too. clang's ASAN is fully functional on Windows against the MSVC runtime; what
             \\# it needs is clang_rt.asan_dynamic-x86_64.dll on PATH at RUN time (it lives in
             \\# <llvm>/lib/clang/<ver>/lib/windows, NOT in bin), or the instrumented binary dies with
             \\# "error while loading shared libraries" before main. Same class of trap as LLVM-C.dll.
-            \\# Note the archive is a convenience only: appendRuntimeLink names the bare .o on Windows,
-            \\# because link.exe cannot read llvm-ar's GNU archive.
             \\if ($env:NOVA_ASAN -eq "1") {{
-            \\  Write-Host "Building libnovacore_asan.a (AddressSanitizer) ..."
+            \\  Write-Host "Building novacore_asan.lib (AddressSanitizer) ..."
             \\  {[cxx]s} -std=c++20 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DNOVA_DROP_ARENA {[asm_def]s} -c src/runtime/runtime.cpp -o "{[home]s}/.nova/lib/novacore_asan.o"
-            \\  llvm-ar rcs "{[home]s}/.nova/lib/libnovacore_asan.a" "{[home]s}/.nova/lib/novacore_asan.o" {[asm_obj]s}
+            \\  llvm-lib "-out:{[home]s}/.nova/lib/novacore_asan.lib" "{[home]s}/.nova/lib/novacore_asan.o" {[asm_obj]s}
             \\  Write-Host "ASAN runtime built. Use: NOVA_ASAN=1 nova test <file>"
             \\}}
             \\Write-Host "Installed compiler to {[bin]s}/nova.exe"
-            \\Write-Host "Prebuilt libnovacore.a; synced std/runtime/deps to {[home]s}/.nova/"
+            \\Write-Host "Prebuilt novacore.lib; synced std/runtime/deps to {[home]s}/.nova/"
             \\
         , .{
             .bin = bin_dest,
@@ -537,9 +539,9 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
             \\# a legacy DYNAMIC build (`zig build archive` without -Dstatic-llvm) self-contained, where the
             \\# loader must find LLVM-C.dll in the exe's own directory.
             \\if ($env:NOVA_LLVM_PREFIX) {{ Copy-Item -Force "$env:NOVA_LLVM_PREFIX/bin/LLVM-C.dll" "$stage/bin/" -ErrorAction SilentlyContinue }}
-            \\Copy-Item -Force "{[home]s}/.nova/lib/libnovacore.a" "$stage/lib/"
+            \\Copy-Item -Force "{[home]s}/.nova/lib/novacore.lib" "$stage/lib/"
             \\Copy-Item -Recurse -Force "{[home]s}/.nova/std" "$stage/std"
-            \\# NOTE: src/runtime + deps are NOT bundled -- the prebuilt libnovacore.a covers
+            \\# NOTE: src/runtime + deps are NOT bundled -- the prebuilt novacore.lib covers
             \\# host-target compilation. They are only needed to cross-compile the runtime to OTHER
             \\# targets (nova build --target) or to build webview FFI apps; add them back if the
             \\# shipped toolchain must do that.

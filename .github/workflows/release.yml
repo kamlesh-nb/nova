@@ -37,9 +37,6 @@ env:
 
 jobs:
   build-macos:
-    # TEMP: disabled until the Windows release leg is green (focus + cost). Flip back to `true`
-    # (or delete this line) to re-enable macOS in the release. Do the same for build-linux below.
-    if: false
     # Apple Silicon only. macOS Intel (x86_64) is not shipped.
     runs-on: macos-14
     steps:
@@ -73,8 +70,6 @@ jobs:
             lang/zig-out/nova-*-macos-*.tar.gz.sha256
 
   build-linux:
-    # TEMP: disabled until the Windows release leg is green (see build-macos above). Flip to re-enable.
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -202,9 +197,7 @@ jobs:
   # and archives (the bundles are downloadable as workflow artifacts); it does not cut a release.
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    # TEMP: only build-windows while macOS/Linux are disabled above. Restore
-    # `[ build-macos, build-linux, build-windows ]` when they are re-enabled.
-    needs: [ build-windows ]
+    needs: [ build-macos, build-linux, build-windows ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
