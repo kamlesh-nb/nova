@@ -156,7 +156,7 @@ jobs:
             if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
           }
           echo "NOVA_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
-          "$prefix/bin/llvm-config.exe" --version
+          & "$prefix/bin/llvm-config.exe" --version
       - name: Build archive (dynamic LLVM-C)
         working-directory: lang
         run: zig build archive
