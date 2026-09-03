@@ -1,8 +1,5 @@
-// The command: what the client sends to create a product. `@serializable` is what lets
-// `ctx.bind<CreateProduct>()` in the handler populate this struct from the request (the form or
-// JSON body for a POST, merged with any path/query params), so the handler works with typed fields
-// instead of reading the body by hand.
-@serializable pub struct CreateProduct {
+@serializable
+pub struct CreateProduct {
     pub name: string,
     pub price: int,
 

@@ -84,36 +84,20 @@ leaks its box and elements (`28_tuple_return_heap` = 68 live, `29_http_request_p
 syntactic on `v.kind == .tuple`, so it only fires for a tuple *literal* in return position).
 Full detail: `docs/route-handling-via-mediator.md` §8.D.
 
-## Null-coalesce present-path type reinterpret (`opt ?? Fallback().field`)
+## ✅ Null-coalesce present-path type reinterpret (`opt ?? Fallback().field`) — CHECK LANDED 2026-09-03
 
-**Re-confirmed still latent 2026-09-02** by running the exact shape below with the shipped
-`nova` binary: it compiles, and the PRESENT branch returns the optional's payload (a heap
-pointer) reinterpreted as the fallback branch's type, with no type error.
+Now enforced: `expect_fail/null_coalesce_scalar_reinterpret.nova`. The type checker rejects a
+`??` whose unwrapped-present type and fallback type are a scalar-vs-heap-aggregate mismatch (the
+pointer-as-scalar reinterpret shape), e.g. `Box | undefined ?? int`, with a diagnostic that also
+points at the usual cause: `.field`/`.method()` binding to the FALLBACK
+(`opt ?? fb().field` parses as `opt ?? (fb().field)`; parenthesise as `(opt ?? fb()).field`).
 
-```nova
-class Box { pub v: int, init(x: int) { self.v = x; } }
-fn present(): Box | undefined { return Box(7); }
-fn fb(): Box { return Box(99); }
-@test
-fn coalesce_field_reinterpret(): void {
-    let opt: Box | undefined = present();   // PRESENT
-    // parses as `opt ?? (fb().v)`: present branch is Box (a pointer), fallback
-    // branch is int. Should be a TYPE ERROR (mismatched `??` branch types).
-    let n: int = opt ?? fb().v;
-    // observed: n == a heap address (e.g. 4381662584), NOT 7 — the Box pointer
-    // read as an int. Different value every run (classic pointer-as-int UB).
-}
-```
-
-Two defects in one: (1) `.field`/`.method()` binds to the FALLBACK only (`opt ?? (fb().v)`),
-so the accessor never applies to the unwrapped optional; (2) the type checker does not reject
-`optional<T> ?? U` when `T != U`, so the present path silently reinterprets the payload.
-The correct spelling parenthesises the unwrap: `(opt ?? fb()).v` — verified to return `7`
-deterministically, so that is the workaround until the checker rejects the mismatched form.
-
-When the check lands, move this into `expect_fail/` as a real case with
-`// EXPECT-FAIL: typecheck`. Do NOT add it to `cases/` today — it compiles and mis-runs, so it
-would make the corpus red. Ties the same pointer-as-primitive reinterpret class as `any`.
+The guard (`type_checker.zig`, `nullish_coalesce` case in `resolveExprType` +
+`isScalarReinterpretMismatch`) is deliberately narrow to avoid false positives from the
+best-effort resolver: it fires ONLY on scalar<->heap-aggregate pairs (numeric<->numeric,
+text<->text, trait<->struct are all left alone), and ONLY when the left operand is resolved
+through a reliable path (`leftTypeIsReliableForNc` excludes bare-name free-function calls, whose
+flat by-name table mis-resolves `parse(x)` across modules). Full corpus stayed 444/444.
 
 ## Private field access from outside the struct (F1 stage 4)
 ```nova

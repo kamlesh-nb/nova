@@ -41,6 +41,7 @@ import map;
 import bytes;
 import assert;
 import env;
+import web.config;
 
 
 
@@ -109,6 +110,13 @@ pub class App {
     /// Registered with `use`. See `web.routing.RouteMiddleware`.
     pub middlewares: List<routing.RouteMiddleware>,
 
+    /// The application's configuration, loaded ONCE by the framework at construction from the app's
+    /// manifest (app.yaml, or the `--config` path the orchestrator passes) via `web.config`. The app
+    /// never loads config itself: read it here, e.g. `app.config.bind<DbConfig>("db")` for a typed
+    /// section or `app.config.port(8080)` for the listen port. No environment variables are involved.
+    /// A missing manifest yields an empty config, so `App()` still works with zero configuration.
+    pub config: AppConfig,
+
     init() {
         self.static_mounts = List<static_content.StaticMount>();
         self.cache = Map<string, string>(16, string.hash);
@@ -126,6 +134,7 @@ pub class App {
         self.routeRouter = routing.Router();
         self.routeHandlers = List<routing.RouteHandler>();
         self.middlewares = List<routing.RouteMiddleware>();
+        self.config = config.load();
     }
 
     /// Registers a middleware that wraps every direct route handler, in

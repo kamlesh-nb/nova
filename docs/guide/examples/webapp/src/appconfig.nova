@@ -1,0 +1,26 @@
+// config.nova, the app's configuration surface. It reads settings from the process ENVIRONMENT, which is
+// exactly where the orchestrator delivers a workload manifest's `config:` block: orchd injects each
+// config entry as an env var into every replica at spawn. So the SAME manifest that tells orch how to run
+// the app also configures the app, with no second config file. Run locally (no orchestrator) and the
+// plain process env or the defaults below apply, so the app still works with zero config.
+import env;
+import string;
+
+pub struct AppConfig {
+    init() {}
+
+    // The listen port. orchd injects NOVA_PORT per replica (its distinct port); fall back to 8080 for a
+    // plain local run.
+    pub fn port(self: AppConfig): int {
+        let p = env.get("NOVA_PORT");
+        if (string.eql(p, "")) { return 8080; }
+        return string.parseInt(p) ?? 8080;
+    }
+
+    // Any config key, with a default when it is not set in the environment.
+    pub fn get(self: AppConfig, key: string, fallback: string): string {
+        let v = env.get(key);
+        if (string.eql(v, "")) { return fallback; }
+        return v;
+    }
+}
