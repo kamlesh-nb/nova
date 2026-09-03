@@ -123,6 +123,10 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
     const files = [_]f{
         .{ .rel = "src/main.nova", .content = templates.web_main_sample },
 
+        // app.yaml: the project-root manifest -- app config (read into `app.config`) and, when deployed,
+        // the orchestrator workload manifest, in one file. Fixed name, always at the project root.
+        .{ .rel = "app.yaml", .content = templates.web_app_yaml_sample },
+
         .{ .rel = "src/Features/Products/routes.nova", .content = templates.web_routes_sample },
 
         .{ .rel = "src/Features/Products/CreateProduct/command.nova", .content = templates.web_create_command_sample },

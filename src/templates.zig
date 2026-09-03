@@ -95,9 +95,45 @@ pub const web_main_sample =
     \\
     \\fn main(): void {
     \\    let app = buildApp();
-    \\    console.log("Listening on http://127.0.0.1:8080");
-    \\    app.run(8080);
+    \\    // Configuration lives in app.yaml at the project root and is loaded for you into `app.config`
+    \\    // when `App()` is constructed -- you never load config by hand, and there are no environment
+    \\    // variables (they collide when several apps share a machine). The listen port comes from
+    \\    // `--port N` if the orchestrator passed one, else `config.port` in app.yaml, else the 8080
+    \\    // default here. For a typed section, add an `@serializable` struct and read it with
+    \\    // `app.config.bind<MyConfig>("mysection")`.
+    \\    let port = app.config.port(8080);
+    \\    console.log("Listening on http://127.0.0.1:" + `${port}`);
+    \\    app.run(port);
     \\}
+;
+
+/// `app.yaml`: the project-root manifest. It is BOTH the app's configuration (read by the framework
+/// into `app.config`) and, when deployed, the orchestrator's workload manifest -- one file, two readers
+/// that ignore each other's sections.
+pub const web_app_yaml_sample =
+    \\# app.yaml -- this app's manifest and configuration, in one file.
+    \\#
+    \\# The framework reads the `config:` section into `app.config` at startup (never environment
+    \\# variables, which collide when several apps share a machine). A local run reads this file from the
+    \\# project root; a deployed replica is pointed at its own copy by the orchestrator via `--config`.
+    \\config:
+    \\  # The listen port. `--port N` on the command line overrides this (the orchestrator sets it per
+    \\  # replica, so co-located replicas never clash).
+    \\  port: 8080
+    \\
+    \\  # Add your own typed sections here and read each with `app.config.bind<T>("name")` from an
+    \\  # @serializable struct. For example, a database section:
+    \\  # db:
+    \\  #   dsn: "novadb://127.0.0.1:3009?db=app"
+    \\  #   poolSize: 16
+    \\
+    \\# The sections below are read by the ORCHESTRATOR when you deploy this app (it ignores `config:`
+    \\# above, just as the app ignores these). They are commented out so a local `nova build && run`
+    \\# needs nothing. Uncomment and fill in when you deploy -- see the "Deploying with the orchestrator"
+    \\# guide chapter.
+    \\# metadata: { name: my-app }
+    \\# workload: { binary: ./bin/my-app, args: [], restartPolicy: always }
+    \\# replicas: { min: 1, max: 3 }
 ;
 
 /// The Products feature's route table: maps each path to a handler instance, injecting the repository.

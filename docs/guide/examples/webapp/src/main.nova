@@ -10,7 +10,6 @@ import web.app;
 import Features.Products.Shared.database;
 import Features.Products.Shared.repository;
 import Features.Products.routes;
-import appconfig;
 
 fn buildApp(): App {
     let app = App();
@@ -27,11 +26,12 @@ fn buildApp(): App {
 }
 
 fn main(): void {
-    // Configuration comes from the environment, which is where the orchestrator injects the manifest's
-    // `config:` block (and the per-replica NOVA_PORT). The same manifest runs AND configures the app.
-    let cfg = AppConfig();
-    let port = cfg.port();
-    console.log(`Listening on http://127.0.0.1:${port} (log level ${cfg.get("LOG_LEVEL", "info")})`);
     let app = buildApp();
+    // Configuration is read by the framework from app.yaml at the project root into `app.config` when
+    // `App()` is constructed (no environment variables -- they collide when several apps share a machine).
+    // The port comes from `--port N` if the orchestrator passed one, else `config.port` in app.yaml, else
+    // 8080. A typed section binds with `app.config.bind<T>("name")`.
+    let port = app.config.port(8080);
+    console.log("Listening on http://127.0.0.1:" + `${port}`);
     app.run(port);
 }

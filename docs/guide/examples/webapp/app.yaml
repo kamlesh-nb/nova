@@ -1,0 +1,19 @@
+# app.yaml -- this app's manifest and configuration, in one file.
+#
+# The framework reads the `config:` section into `app.config` at startup (never environment variables,
+# which collide when several apps share a machine). A local run reads this file from the project root;
+# a deployed replica is pointed at its own copy by the orchestrator via `--config`.
+config:
+  # The listen port. `--port N` on the command line overrides this (the orchestrator sets it per replica).
+  port: 8080
+
+  # Add typed sections here and read each with `app.config.bind<T>("name")` from an @serializable struct.
+  # db:
+  #   dsn: "novadb://127.0.0.1:3009?db=shop"
+  #   poolSize: 16
+
+# Read by the ORCHESTRATOR when deployed (it ignores `config:` above; the app ignores these). Commented
+# so a local build needs nothing. See the "Deploying with the orchestrator" guide chapter.
+# metadata: { name: webapp }
+# workload: { binary: ./bin/webapp, args: [], restartPolicy: always }
+# replicas: { min: 1, max: 3 }
