@@ -2016,6 +2016,39 @@ pub const TypeChecker = struct {
         return false;
     }
 
+    /// True when exactly one of `a`/`b` is an inline scalar (a numeric or `bool`
+    /// value) and the other is a heap/aggregate type (a declared struct, class,
+    /// enum, or a generic/tuple/func). That is the shape where a `??` type
+    /// mismatch is a memory-safety hazard rather than a mere mismatch: the
+    /// present path hands back the aggregate's heap pointer reinterpreted as the
+    /// scalar (or vice versa). It deliberately does NOT fire for numeric<->numeric
+    /// (compatible), text<->text, or trait<->struct pairings, so no sound `??` is
+    /// rejected.
+    fn isScalarReinterpretMismatch(self: *TypeChecker, a: ast.TypeRef, b: ast.TypeRef) bool {
+        const a_scalar = self.isInlineScalar(a);
+        const b_scalar = self.isInlineScalar(b);
+        const a_agg = self.isHeapAggregate(a);
+        const b_agg = self.isHeapAggregate(b);
+        return (a_scalar and b_agg) or (b_scalar and a_agg);
+    }
+
+    fn isInlineScalar(self: *TypeChecker, t: ast.TypeRef) bool {
+        _ = self;
+        if (t != .ident) return false;
+        if (isNumericTypeName(t.ident)) return true;
+        return std.mem.eql(u8, canonicalizeTypeName(t.ident), "bool");
+    }
+
+    /// A type held behind a heap pointer whose bit pattern must never be read as a
+    /// scalar: a declared struct/class/enum, or a generic/tuple/func type.
+    fn isHeapAggregate(self: *TypeChecker, t: ast.TypeRef) bool {
+        return switch (t) {
+            .generic, .tuple, .func => true,
+            .ident => |n| self.structs.contains(n) or self.unions.contains(n) or self.enums.contains(n),
+            else => false,
+        };
+    }
+
     fn resolveExprType(self: *TypeChecker, expr: ast.Expression) ?ast.TypeRef {
         switch (expr.kind) {
             .ident => |name| {
@@ -2242,6 +2275,43 @@ pub const TypeChecker = struct {
                 }
                 return ast.TypeRef{ .tuple = types_buf };
             },
+            .nullish_coalesce => |nc| {
+                // Resolve both operands (this also fires any nested diagnostics,
+                // e.g. a private-field access inside either branch).
+                const lt = self.resolveExprType(nc.left.*);
+                const rt = self.resolveExprType(nc.right.*);
+
+                // The value of `a ?? b` is `a` unwrapped when present, so its type
+                // is the element type when the left is statically an optional, and
+                // the left's own type otherwise.
+                const result: ?ast.TypeRef = if (lt) |t|
+                    (if (t == .optional) t.optional.* else t)
+                else
+                    null;
+
+                // Soundness guard: the fallback must be assignable to the unwrapped
+                // present type. If it is not, codegen currently returns the present
+                // payload REINTERPRETED as the fallback's type with no diagnostic --
+                // a heap pointer read as an int, say (see expect_fail/PENDING.md,
+                // "Null-coalesce present-path type reinterpret"). We reject only the
+                // dangerous pointer-as-scalar shape: exactly one side is a numeric or
+                // bool scalar and the other is a heap/aggregate type. That leaves
+                // numeric<->numeric, same-type, and trait/struct pairings untouched,
+                // so no legitimate `??` is rejected. The usual cause is the accessor
+                // binding to the fallback -- `opt ?? fb().field` parses as
+                // `opt ?? (fb().field)`; parenthesise as `(opt ?? fb()).field`.
+                if (result) |unwrapped| {
+                    if (rt) |r| {
+                        if (leftTypeIsReliableForNc(nc.left.*) and
+                            !isTypeCompatible(r, unwrapped) and !isTypeCompatible(unwrapped, r) and
+                            self.isScalarReinterpretMismatch(unwrapped, r))
+                        {
+                            self.addError(nc.span, "the `??` fallback has type '{s}' but the value on the left unwraps to '{s}'; both sides of `??` must share a type. If you meant to read a member of the unwrapped value, parenthesise the unwrap: `(x ?? fallback).member`", .{ typeRefName(r), typeRefName(unwrapped) });
+                        }
+                    }
+                }
+                return result;
+            },
             else => return null,
         }
     }
@@ -2460,6 +2530,27 @@ fn typesAreEqual(a: ast.TypeRef, b: ast.TypeRef) bool {
             return true;
         },
     }
+}
+
+/// Whether the LEFT operand of a `??` is resolved reliably enough to trust its
+/// type for the scalar-reinterpret diagnostic. `resolveExprType` is a best-effort
+/// structural pass, and its ONE genuinely unsound shape here is a bare-name free
+/// function call: functions live in a flat by-name table, so `parse(x)` resolves
+/// to whichever module's `parse` was registered last (datetime vs uuid vs yaml),
+/// giving a wrong return type. That misfires the diagnostic on sound code like
+/// `datetime.parse(s) ?? 0`. Every other shape (a local variable, a field, a
+/// method call whose receiver resolves, an awaited/spawned form of those) is name
+/// resolved through a scope or a struct and is safe to trust. Method calls go
+/// through a field-access callee, so only the bare-ident-callee call/generic_call
+/// is excluded.
+fn leftTypeIsReliableForNc(expr: ast.Expression) bool {
+    return switch (expr.kind) {
+        .call => |c| c.callee.kind != .ident,
+        .generic_call => |gc| gc.callee.kind != .ident,
+        .await_expr => |aw| leftTypeIsReliableForNc(aw.operand.*),
+        .go_expr => |g| leftTypeIsReliableForNc(g.operand.*),
+        else => true,
+    };
 }
 
 fn isNumericTypeName(name: []const u8) bool {
