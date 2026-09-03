@@ -54,6 +54,19 @@
 /// Zig standard library: allocators, hashing, `std.Io` for filesystem stat/mtime
 /// during the T6 object cache, and `std.debug.print` for `[MEM]`/`[T6]` diagnostics.
 const std = @import("std");
+
+/// Is stderr a terminal? Used to gate the in-place codegen progress bar so piped
+/// builds and the conformance harness stay free of carriage-return noise. On POSIX
+/// `std.c.isatty` takes an int fd (2 = stderr). On Windows that same symbol wants a
+/// `HANDLE`, not an int, so `isatty(2)` does not even type-check there; the progress
+/// bar is cosmetic, so Windows simply skips it (returns false) rather than pulling in
+/// a `GetConsoleMode` FFI that std does not expose and that drifts between releases.
+fn stderrIsTty() bool {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return false;
+    return std.c.isatty(2) != 0;
+}
+
 /// Nova's abstract syntax tree. Provides [`ast.Program`], [`ast.Statement`], and
 /// the declaration variants ([`ast.fn_decl`]/`struct_decl`/`enum_decl`) that
 /// [`compile`] walks to drive emission.
@@ -1090,7 +1103,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     // Per-module build progress: an in-place dot bar during body codegen, shown only on a TTY so
     // piped builds and the conformance harness stay free of carriage-return noise. It updates when
     // the source file changes, so it reads as one line per module. Replaces the old [T6] per-file dump.
-    const cg_tty = std.c.isatty(2) != 0;
+    const cg_tty = stderrIsTty();
     const cg_total = compiler.functions.items.len;
     var cg_last_file: []const u8 = "\x00";
     for (compiler.functions.items, 0..) |func, fi| {
@@ -1470,7 +1483,7 @@ fn compileSplitEmit(
             }
         }
     }
-    if (std.c.isatty(2) != 0) std.debug.print("\r\x1b[K", .{}); // clear the codegen progress line
+    if (stderrIsTty()) std.debug.print("\r\x1b[K", .{}); // clear the codegen progress line
 
     if (!flags.split_per_file) {
         const app_name = std.fs.path.stem(output_path);
