@@ -531,7 +531,7 @@ fn addNovaArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
             \\# nls: PURE ZIG (no LLVM link), built from the sibling repo unless NOVA_ARCHIVE_SKIP_NLS=1,
             \\# matching the Unix path -- skip only when the nls repo is not checked out.
             \\if ($env:NOVA_ARCHIVE_SKIP_NLS -eq "1") {{ Write-Host "archive: NOVA_ARCHIVE_SKIP_NLS=1 -- bundling without nls" }}
-            \\else {{ Push-Location ../nls; zig build -Dnova-src=../lang/src/root.zig; Pop-Location; Copy-Item -Force "{[home]s}/.nova/bin/nls.exe" "$stage/bin/nls.exe" }}
+            \\else {{ Push-Location ../nls; zig build "-Dnova-src=../lang/src/root.zig"; Pop-Location; Copy-Item -Force "{[home]s}/.nova/bin/nls.exe" "$stage/bin/nls.exe" }}
             \\# A -Dstatic-llvm build (the release path) links LLVM into nova.exe and needs NO DLL -- the
             \\# static prefix has no bin/LLVM-C.dll, so the copy below simply no-ops. It stays only to keep
             \\# a legacy DYNAMIC build (`zig build archive` without -Dstatic-llvm) self-contained, where the
