@@ -1,10 +1,11 @@
 name: release
 
-# Build the Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows x86_64 (+ Windows arm64
-# BEST-EFFORT / non-blocking) -- and publish them to a GitHub Release. (macOS Intel is NOT shipped. The
-# orchestrator ships from its own repo's release workflow, since it needs a built `nova` to compile.)
-# Windows arm64 is a known WIP: the native `zig build` on windows-11-arm currently crashes silently and
-# is under investigation, so its leg is continue-on-error and does not block the release.
+# Build the 4 Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows x86_64 -- and publish
+# them to a GitHub Release. (macOS Intel and Windows arm64 are NOT shipped; the orchestrator ships from
+# its own repo's release workflow, since it needs a built `nova` to compile.)
+# Windows arm64 is dropped: the native `zig build` on windows-11-arm crashes with an access violation
+# (0xC0000005) in Zig 0.16's build system before Nova ever compiles -- an upstream Zig aarch64-windows
+# issue, not a Nova one. See lang/CLAUDE.md.
 #
 #   * macOS/Linux: LLVM 21 from the OS package manager (build.zig globs the install's libLLVM*.a),
 #     pointed at via NOVA_LLVM_PREFIX, statically linked.
@@ -42,7 +43,6 @@ env:
 
 jobs:
   build-macos:
-    if: false   # TEMP: disabled while diagnosing the windows-arm64 native build
     # Apple Silicon only. macOS Intel (x86_64) is not shipped.
     runs-on: macos-14
     steps:
@@ -76,7 +76,6 @@ jobs:
             lang/zig-out/nova-*-macos-*.tar.gz.sha256
 
   build-linux:
-    if: false   # TEMP: disabled while diagnosing the windows-arm64 native build
     strategy:
       fail-fast: false
       matrix:
@@ -118,14 +117,11 @@ jobs:
             lang/zig-out/nova-*-linux-*.tar.gz.sha256
 
   build-windows:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # TEMP: x64 disabled while diagnosing the arm64 native build.
-          # - { runner: windows-latest, arch: x64 }
-          - { runner: windows-11-arm, arch: arm64 }    # aarch64: LLVM.org clang+llvm arm64 drop (below)
-    runs-on: ${{ matrix.runner }}
+    # x86_64 only. windows-arm64 is NOT shipped: the native `zig build` on windows-11-arm crashes with an
+    # access violation (0xC0000005) while evaluating build.zig -- a Zig-0.16 aarch64-windows build-system
+    # bug (zig version/env work; the Nova compiler never even builds). Parked; needs upstream Zig or local
+    # debugging on an arm64 box, not a workflow change.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
@@ -139,15 +135,11 @@ jobs:
           token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
-      # DYNAMIC Windows build: link the LLVM C API (LLVM-C.dll) rather than a self-hosted static LLVM.
-      # The resulting nova.exe needs LLVM-C.dll at run time, so the bundling step below drops that DLL
-      # next to nova.exe inside the archive.
-      #   * x64   -> Chocolatey's LLVM package (installs to C:/Program Files/LLVM).
-      #   * arm64 -> the LLVM.org `clang+llvm-<v>-aarch64-pc-windows-msvc` drop, which (unlike the
-      #     LLVM-C-only Windows drop) is a FULL install tree and DOES ship bin/LLVM-C.dll + lib/LLVM-C.lib.
-      #     Pin the MAJOR version to what deps/llvm-zig targets (22) -- a major mismatch is an ABI error.
-      # (The DLL-free static path -- zig build archive -Dstatic-llvm=true against a prebuilt static LLVM
-      # via WIN_STATIC_LLVM_{X64,ARM64}_URL -- is the eventual upgrade; see CLAUDE.md.)
+      # DYNAMIC Windows build: link the LLVM C API (LLVM-C.dll) that Chocolatey ships, rather than a
+      # self-hosted static LLVM. The resulting nova.exe needs LLVM-C.dll at run time, so the bundling step
+      # below drops that DLL next to nova.exe inside the archive. (The DLL-free static path -- zig build
+      # archive -Dstatic-llvm=true against a prebuilt static LLVM via WIN_STATIC_LLVM_X64_URL -- is the
+      # eventual upgrade; see CLAUDE.md.)
       - name: Install LLVM (dynamic LLVM-C)
         shell: pwsh
         run: |
@@ -160,29 +152,11 @@ jobs:
             }
             return $null
           }
-          if ("${{ matrix.arch }}" -eq "arm64") {
-            # ALWAYS fetch our pinned LLVM 22 aarch64 drop -- do NOT trust Find-Prefix here: the
-            # windows-11-arm image ships a preinstalled LLVM that is the wrong arch and/or the wrong major
-            # version, and linking arm64 nova.exe against it fails. Override with WIN_LLVM_ARM64_URL.
-            $url = "${{ vars.WIN_LLVM_ARM64_URL }}"
-            if (-not $url) { $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-aarch64-pc-windows-msvc.tar.xz" }
-            Write-Host "Downloading arm64 LLVM: $url"
-            curl.exe -sSL -o "$env:RUNNER_TEMP/llvm.tar.xz" $url
-            New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/llvm" | Out-Null
-            # Windows' bundled bsdtar (tar.exe) handles .tar.xz.
-            tar -xf "$env:RUNNER_TEMP/llvm.tar.xz" -C "$env:RUNNER_TEMP/llvm"
-            $prefix = (Get-ChildItem "$env:RUNNER_TEMP/llvm" -Directory | Select-Object -First 1).FullName
-            # The archive step calls clang++ and llvm-lib by BARE name, and nova.exe loads LLVM-C.dll at
-            # run time. All three live in the drop's bin/. Chocolatey adds its bin to PATH on x64; here we
-            # must do it ourselves, or `zig build archive` fails (clang++/llvm-lib not found, DLL missing).
-            "$prefix\bin" >> $env:GITHUB_PATH
-          } else {
+          $prefix = Find-Prefix
+          if (-not $prefix) {
+            choco install llvm --no-progress -y
             $prefix = Find-Prefix
-            if (-not $prefix) {
-              choco install llvm --no-progress -y
-              $prefix = Find-Prefix
-              if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
-            }
+            if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
           }
           echo "NOVA_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
           # The dynamic build needs exactly two files: lib/LLVM-C.lib to link nova.exe against and
@@ -193,19 +167,9 @@ jobs:
           if (-not (Test-Path $lib)) { Write-Error "LLVM-C.lib not found at $lib"; exit 1 }
           if (-not (Test-Path $dll)) { Write-Error "LLVM-C.dll not found at $dll"; exit 1 }
           Write-Host "LLVM prefix=$prefix (LLVM-C.lib + LLVM-C.dll present)"
-      # TEMP DIAGNOSTIC: `zig build archive` was exiting in ~4s with NO output on arm64-Windows. Run a
-      # plain `zig build` (verbose) plus a zig sanity check so the actual error / crash code surfaces.
-      - name: Diagnose zig build (arm64-Windows)
-        shell: pwsh
+      - name: Build archive (dynamic LLVM-C)
         working-directory: lang
-        run: |
-          Write-Host "=== zig version ==="
-          zig version
-          Write-Host "=== zig env ==="
-          zig env
-          Write-Host "=== plain: zig build --summary all --verbose ==="
-          zig build --summary all --verbose
-          Write-Host "zig build exit code: $LASTEXITCODE"
+        run: zig build archive
       - name: Bundle LLVM-C.dll into the Windows archive
         shell: pwsh
         run: |
@@ -227,7 +191,7 @@ jobs:
           Write-Host "bundled LLVM-C.dll beside nova.exe; sha256=$sha"
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-windows-${{ matrix.runner }}
+          name: nova-windows-x64
           path: |
             lang/zig-out/nova-*-windows-*.zip
             lang/zig-out/nova-*-windows-*.zip.sha256
