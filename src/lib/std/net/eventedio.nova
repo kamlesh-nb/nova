@@ -340,7 +340,24 @@ pub async fn reactorAccept(listenFd: int, kq: int): ReactorStream {
     coroSuspend();
     let c = eventloop.opResult(op);
     nova_op_free(op);
-    if (c >= 0) { let _ = socket.setTcpNoDelay(c); }
+    if (c >= 0) {
+        // The accepted socket MUST be non-blocking: every read path here (recvInto, recvIntoDeadline)
+        // begins with an optimistic `recvSock` and only suspends when it reports EAGAIN. On a blocking
+        // descriptor that first call never returns, and because it is reached from inside a coroutine
+        // resume, it takes the reactor's driving thread down with it -- the loop that would have
+        // completed the very operation it is waiting for never runs again.
+        //
+        // epoll never showed this because it performs the accept ITSELF and calls setNonBlock on the
+        // result (see the OP_ACCEPT arm of Poller.poll). io_uring accepts in the KERNEL via
+        // IORING_OP_ACCEPT and hands back a plain descriptor with no such flag, so the fd arrived
+        // blocking and the process slept in `wait_woken` at 0% CPU forever. That is the whole of
+        // conformance 201/202/203 timing out under NOVA_REACTOR=uring.
+        //
+        // Done here rather than in the io_uring drain so it holds for ANY backend that returns a raw
+        // accepted fd. Re-applying it on epoll is harmless.
+        let _ = socket.setNonBlock(c);
+        let _ = socket.setTcpNoDelay(c);
+    }
     return ReactorStream(c, kq);
 }
 
