@@ -31,8 +31,19 @@ fn solSocket(): int { return if (platform.isLinux) 1 else 65535; }
 fn soErrorOpt(): int { return if (platform.isLinux) 4 else 4103; }
 /// setsockopt option name for SO_REUSEPORT.
 fn soReusePort(): int { return if (platform.isLinux) 15 else 512; }
-// SO_REUSEADDR happens to share the same numeric value on both platforms.
-const SO_REUSEADDR: int = 4;
+/// setsockopt option name for SO_REUSEADDR.
+///
+/// It does NOT share a value across platforms, contrary to what this line asserted for a long time:
+/// Linux is 2 (asm-generic/socket.h) and BSD/Darwin is 0x0004. Hardcoding 4 meant every Linux build
+/// was setting option 4, which on Linux is SO_ERROR — read-only, so `setsockopt` rejected it with
+/// ENOPROTOOPT (errno 92) and SO_REUSEADDR was NEVER set on the platform this language primarily
+/// targets. `setReuseAddr` duly returned -1 and every caller ignored it.
+///
+/// The visible symptom is a server that cannot restart: with client connections still in TIME_WAIT,
+/// `listenAny` fails and the process reports a plain "bind failed", which reads like the port being
+/// held by another process rather than a missing socket option. Found while re-binding :8099 after a
+/// 300-request benchmark had left 305 TIME_WAIT entries behind.
+fn soReuseAddr(): int { return if (platform.isLinux) 2 else 4; }
 
 /// Creates a new blocking IPv4 TCP socket. Returns the file descriptor, or a
 /// negative value on failure (see `sys.errno()`).
@@ -69,7 +80,7 @@ pub fn setNonBlock(fd: int): int { return sys.setNonBlocking(fd); }
 pub fn setReuseAddr(fd: int): int {
     let one = bytes.alloc(4);
     bytes.write_i32(one, 0, 1);
-    let r = sys.setsockopt(fd, solSocket(), SO_REUSEADDR, one, 4);
+    let r = sys.setsockopt(fd, solSocket(), soReuseAddr(), one, 4);
     bytes.free(one);
     return r;
 }
