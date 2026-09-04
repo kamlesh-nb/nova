@@ -1,12 +1,14 @@
 name: release
 
-# Build the 4 Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows x86_64 -- and
-# publish them to a GitHub Release. (macOS Intel and Windows arm64 are NOT shipped.)
+# Build the 5 Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows {x86_64, arm64} --
+# and publish them to a GitHub Release. (macOS Intel is NOT shipped.)
 #
 #   * macOS/Linux: LLVM 21 from the OS package manager (build.zig globs the install's libLLVM*.a),
 #     pointed at via NOVA_LLVM_PREFIX, statically linked.
 #   * Windows x86_64: DYNAMIC LLVM (Chocolatey LLVM-C); the build-windows job bundles LLVM-C.dll beside
-#     nova.exe. The DLL-free static path (WIN_STATIC_LLVM_X64_URL) is a later upgrade; see CLAUDE.md.
+#     nova.exe. Windows arm64: DYNAMIC LLVM from the LLVM.org clang+llvm aarch64-windows drop (LLVM 22),
+#     built natively on a windows-11-arm runner and bundled the same way. The DLL-free static path
+#     (WIN_STATIC_LLVM_{X64,ARM64}_URL) is a later upgrade; see CLAUDE.md.
 #   * nls (the language server) IS bundled: each runner checks out the sibling `nls` repo and the
 #     archive step builds it from that source, pinned to THIS lang checkout via `-Dnova-src`. nls is
 #     pure-Zig (no LLVM link), so it builds on every runner without extra toolchain. If the `nls` repo
@@ -115,9 +117,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: windows-latest, arch: x64 }     # x86_64
-          # windows-arm64 is NOT shipped: no arm64 Windows LLVM exists to build nova natively there,
-          # and Nova has no cross-build-LLVM pipeline (the way Zig does) to produce it from another host.
+          - { runner: windows-latest, arch: x64 }      # x86_64: Chocolatey LLVM-C
+          - { runner: windows-11-arm, arch: arm64 }    # aarch64: LLVM.org clang+llvm arm64 drop (below)
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -132,11 +133,15 @@ jobs:
           token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
-      # DYNAMIC Windows build: link the LLVM C API (LLVM-C.dll) that Chocolatey / the official LLVM
-      # Windows drop ship, rather than a self-hosted static LLVM. The resulting nova.exe needs LLVM-C.dll
-      # at run time, so the bundling step below drops that DLL next to nova.exe inside the archive.
+      # DYNAMIC Windows build: link the LLVM C API (LLVM-C.dll) rather than a self-hosted static LLVM.
+      # The resulting nova.exe needs LLVM-C.dll at run time, so the bundling step below drops that DLL
+      # next to nova.exe inside the archive.
+      #   * x64   -> Chocolatey's LLVM package (installs to C:/Program Files/LLVM).
+      #   * arm64 -> the LLVM.org `clang+llvm-<v>-aarch64-pc-windows-msvc` drop, which (unlike the
+      #     LLVM-C-only Windows drop) is a FULL install tree and DOES ship bin/LLVM-C.dll + lib/LLVM-C.lib.
+      #     Pin the MAJOR version to what deps/llvm-zig targets (22) -- a major mismatch is an ABI error.
       # (The DLL-free static path -- zig build archive -Dstatic-llvm=true against a prebuilt static LLVM
-      # via WIN_STATIC_LLVM_X64_URL -- is the eventual upgrade; see CLAUDE.md.)
+      # via WIN_STATIC_LLVM_{X64,ARM64}_URL -- is the eventual upgrade; see CLAUDE.md.)
       - name: Install LLVM (dynamic LLVM-C)
         shell: pwsh
         run: |
@@ -150,6 +155,19 @@ jobs:
             return $null
           }
           $prefix = Find-Prefix
+          if (-not $prefix -and "${{ matrix.arch }}" -eq "arm64") {
+            # No Chocolatey arm64 LLVM; fetch the official aarch64-windows drop. Override the exact
+            # release with the repo variable WIN_LLVM_ARM64_URL (keep it on LLVM 22.x).
+            $url = "${{ vars.WIN_LLVM_ARM64_URL }}"
+            if (-not $url) { $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-aarch64-pc-windows-msvc.tar.xz" }
+            Write-Host "Downloading arm64 LLVM: $url"
+            curl.exe -sSL -o "$env:RUNNER_TEMP/llvm.tar.xz" $url
+            New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/llvm" | Out-Null
+            # Windows' bundled bsdtar (tar.exe) handles .tar.xz.
+            tar -xf "$env:RUNNER_TEMP/llvm.tar.xz" -C "$env:RUNNER_TEMP/llvm"
+            $root = (Get-ChildItem "$env:RUNNER_TEMP/llvm" -Directory | Select-Object -First 1).FullName
+            if (Test-Path "$root/lib/LLVM-C.lib") { $prefix = $root }
+          }
           if (-not $prefix) {
             choco install llvm --no-progress -y
             $prefix = Find-Prefix
