@@ -333,6 +333,46 @@ int nova_uring_op_poll_add(void){ return IORING_OP_POLL_ADD; }
 int nova_uring_op_poll_remove(void) { return IORING_OP_POLL_REMOVE; }
 int nova_uring_op_async_cancel(void) { return IORING_OP_ASYNC_CANCEL; }
 
+// Submit, then wait for a completion OR for `ms` milliseconds -- the timed counterpart of
+// nova_uring_submit_and_wait, which waits forever.
+//
+// A ring has no timeout argument of its own, so a bounded wait is expressed as an extra
+// IORING_OP_TIMEOUT SQE submitted alongside. Without this, the reactor's `poll(timeoutMs)` silently
+// became "block until something happens" on io_uring: waitReady dropped the timeout on the floor and
+// called submit_and_wait(ring, 1). An idle descriptor then hung the caller forever, where epoll would
+// have returned 0 events. That is why the connect/accept cases (201/202/203) time out under
+// NOVA_REACTOR=uring while passing on epoll, and why an idle armed fd never comes back (case 446).
+//
+// `off` is the completion COUNT, and setting it to `wait_nr` rather than 0 is what keeps this safe to
+// call in a loop: the timeout SQE is satisfied as soon as that many other completions post, so it
+// always resolves within the same wait instead of lingering in the kernel. A pure time-only timeout
+// (count 0) would stay outstanding whenever real I/O arrived first, and the next call would then
+// overwrite the timespec the kernel still had a pointer to. The timespec is thread-local because a
+// ring is driven by exactly one thread.
+//
+// The completion is tagged NOVA_URING_WAIT_TIMEOUT_DATA so the drain can drop it: it is bookkeeping,
+// not an event any caller asked for. It carries -ETIME when the time expired.
+// Reserved user_data for that SQE. -1 is already taken by the cross-reactor wake eventfd
+// (WAKE_DATA on the Nova side), so this is -2; neither can collide with an op-record pointer.
+#define NOVA_URING_WAIT_TIMEOUT_DATA (-2LL)
+long long nova_uring_wait_timeout_data(void) { return NOVA_URING_WAIT_TIMEOUT_DATA; }
+
+int nova_uring_submit_and_wait_ms(long long ring, int wait_nr, long long ms) {
+    if (ms < 0) return nova_uring_submit_and_wait(ring, wait_nr);
+    static thread_local struct __kernel_timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    // If the ring is too full to take the timeout, flush and retry once; failing that, fall back to
+    // an untimed wait rather than not waiting at all.
+    if (nova_uring_prep(ring, IORING_OP_TIMEOUT, -1, (long long)(intptr_t)&ts, 1,
+                        (long long)(wait_nr > 0 ? wait_nr : 1), NOVA_URING_WAIT_TIMEOUT_DATA) != 0) {
+        nova_uring_submit_and_wait(ring, 0);
+        nova_uring_prep(ring, IORING_OP_TIMEOUT, -1, (long long)(intptr_t)&ts, 1,
+                        (long long)(wait_nr > 0 ? wait_nr : 1), NOVA_URING_WAIT_TIMEOUT_DATA);
+    }
+    return nova_uring_submit_and_wait(ring, wait_nr);
+}
+
 // IORING_POLL_ADD_MULTI travels in the SQE's `len` and makes the poll MULTISHOT: it stays armed and
 // reports every edge, instead of being consumed by the first one. That is what makes POLL_ADD a
 // faithful stand-in for kqueue's EV_ADD (persistent) rather than EV_ADD|EV_ONESHOT.

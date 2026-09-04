@@ -170,15 +170,37 @@ fn armPoll(fd: int, token: long, kind: int): int {
     return stageUring(nova_uring_current(), op);
 }
 
-// Cancels the outstanding io_uring poll-emulation SQE for `fd`, if any, and marks it not-armed.
+// Cancels the outstanding io_uring poll-emulation SQE for `fd` and EVICTS the record from the per-fd
+// arm map, handing ownership to the drain.
+//
+// The eviction is the point. `cancelRead` means "I am done with this descriptor" -- every caller
+// closes it immediately afterwards -- and the arm map is keyed by FILE DESCRIPTOR NUMBER, which the
+// kernel recycles aggressively (always the lowest free one). Leaving the record mapped meant the next
+// accepted or handed-off socket, which reliably gets the SAME number back, inherited the previous
+// connection's arm record and re-armed it instead of arming itself. That is precisely the hazard the
+// IOCP path documents for `g_iocp_associated` ("the memo must be cleared the moment a socket closes")
+// and that epoll clears via `nova_epoll_clear_registered`; io_uring was the one backend with no
+// equivalent. Observed on the fd-handoff worker, where every request came back as fd 5.
+//
+// The record itself is NOT freed here: the kernel still holds it as the POLL_ADD's user_data until
+// the cancellation lands. It is marked OP_ABANDONED, and `uringWaitReady` frees it when that poll
+// completes with -ECANCELED. Note the POLL_REMOVE is deliberately submitted with user_data 0 rather
+// than `op`, so exactly ONE completion carries the record and there is no double free.
 fn dropArm(fd: int): void {
     let op = nova_reactor_arm_get(fd);
     if (op == (0 as long)) { return; }
     let ring = nova_uring_current();
-    if (ring != (0 as long)) {
+    let wasArmed = opArmed(op);
+    nova_reactor_arm_set(fd, 0);
+    if (wasArmed != 0 && ring != (0 as long)) {
+        bytes.write_i32(op, 20, OP_ABANDONED as long);
         nova_uring_prep(ring, nova_uring_op_poll_remove(), -1, op, 0, 0, 0);
+        return;
     }
+    // Never submitted (or no ring to cancel against): nothing in the kernel refers to it, so the
+    // record is ours to release right now.
     setArmed(op, 0);
+    nova_op_free(op);
 }
 
 /// Arms readiness notification for readability on `fd`, tagged with `token`. On epoll this is a
@@ -215,10 +237,14 @@ fn slotSeen(eventBuf: long, written: int, raw: long): bool {
 }
 
 // io_uring implementation of waitReady: flushes any pending re-arms, submits and waits for at least
-// one completion, then drains the completion queue into eventBuf. Filters out poll-emulation
-// completions that were re-armed rather than surfaced (a POLLIN wait with none of the interesting
-// bits set gets pushed back onto the pending queue instead of being reported).
-fn uringWaitReady(eventBuf: long, maxEvents: int): int {
+// one completion OR for `timeoutMs`, then drains the completion queue into eventBuf. Filters out
+// poll-emulation completions that were re-armed rather than surfaced (a POLLIN wait with none of the
+// interesting bits set gets pushed back onto the pending queue instead of being reported).
+//
+// `timeoutMs` used to be dropped here, which quietly turned every `poll(ms)` into an unbounded wait
+// on this backend -- correct-looking whenever traffic happened to arrive, and a permanent hang on an
+// idle descriptor. A negative value still means "wait indefinitely", matching epoll_wait.
+fn uringWaitReady(eventBuf: long, maxEvents: int, timeoutMs: int): int {
     let ring = nova_uring_current();
     if (ring == (0 as long)) { return 0; }
     let pending = nova_reactor_rearm_pop();
@@ -234,7 +260,7 @@ fn uringWaitReady(eventBuf: long, maxEvents: int): int {
         }
         pending = nova_reactor_rearm_pop();
     }
-    nova_uring_submit_and_wait(ring, 1);
+    nova_uring_submit_and_wait_ms(ring, 1, timeoutMs as long);
     let ready = nova_uring_cq_ready(ring);
     let ud = bytes.alloc(8);
     let res = bytes.alloc(4);
@@ -246,9 +272,32 @@ fn uringWaitReady(eventBuf: long, maxEvents: int): int {
         let slot = eventBuf + ((written * EVENT_SIZE) as long);
         let raw = bytes.read_ptr(ud, 0);
         if (raw == WAKE_DATA) { nova_uring_wake_drain(); }
+        // The bounded-wait timeout SQE staged by nova_uring_submit_and_wait_ms. It is bookkeeping,
+        // not an event anyone asked for, so consume it without reporting; carries -ETIME on expiry.
+        if (raw == nova_uring_wait_timeout_data()) {
+            consumed = consumed + 1;
+            continue;
+        }
         let drop = false;
+        // A zero user_data belongs to no operation the caller can act on -- it is what `dropArm`
+        // submits its POLL_REMOVE with. Reporting it wrote a slot whose data word was 0, so the
+        // caller read back readyFd == -1, tried to read from it, and got EBADF. `pollUring` already
+        // guards this with its `tok == 0` check; this path did not, and the bogus event surfaced as
+        // a "readable" descriptor that could not be read. Consume it and move on.
+        if (raw == (0 as long)) {
+            consumed = consumed + 1;
+            continue;
+        }
         if (isOpRecordWord(raw)) {
             let r = bytes.read_i32(res, 0) as int;
+            // An abandoned record's fd is gone (see `dropArm`). This completion is the cancellation
+            // landing, and it is the LAST reference the kernel holds, so free it here. It must never
+            // be re-armed: that would arm whatever socket has since inherited the descriptor number.
+            if (opDone(raw) == OP_ABANDONED) {
+                nova_op_free(raw);
+                consumed = consumed + 1;
+                continue;
+            }
             if (opKind(raw) == OP_POLL_IN || opKind(raw) == OP_POLL_OUT) {
                 setArmed(raw, 0);
                 if (r >= 0 && opKind(raw) == OP_POLL_IN
@@ -284,7 +333,7 @@ fn uringWaitReady(eventBuf: long, maxEvents: int): int {
 /// least one event is ready, writes up to `maxEvents` entries into `eventBuf`, and returns the count
 /// written. Dispatches to `epoll_wait` or the io_uring drain depending on the active backend.
 pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
-    if (usingUring()) { return uringWaitReady(eventBuf, maxEvents); }
+    if (usingUring()) { return uringWaitReady(eventBuf, maxEvents, timeoutMs); }
     return epoll.epoll_wait(kq, eventBuf, maxEvents, timeoutMs);
 }
 
@@ -330,6 +379,10 @@ pub extern("c") fn nova_uring_fd(ring: long): int;
 pub extern("c") fn nova_uring_prep(ring: long, op: int, fd: int, addr: long, len: int, off: long, userData: long): int;
 /// Submits all staged SQEs and waits for at least `waitNr` completions.
 pub extern("c") fn nova_uring_submit_and_wait(ring: long, waitNr: int): int;
+/// Submit, then wait for a completion or for `ms` milliseconds; `ms < 0` waits indefinitely.
+pub extern("c") fn nova_uring_submit_and_wait_ms(ring: long, waitNr: int, ms: long): int;
+/// The reserved user_data carried by the bounded-wait timeout SQE, so the drain can drop it.
+pub extern("c") fn nova_uring_wait_timeout_data(): long;
 /// Returns how many completions are currently ready on the completion queue.
 pub extern("c") fn nova_uring_cq_ready(ring: long): int;
 /// Reads the user_data and result of completion queue entry `i` without consuming it.
@@ -503,7 +556,7 @@ pub class Poller impl EventLoop {
     /// (issuing the actual `recv`/`send`/`accept`/`connect` syscall for it) before recording its
     /// token in `compBuf`. On io_uring, delegates to `pollUring` instead. Returns `nComp`.
     fn poll(self: Poller, timeoutMs: int): int {
-        if (self.ring != (0 as long)) { return self.pollUring(); }
+        if (self.ring != (0 as long)) { return self.pollUring(timeoutMs); }
         let n = epoll.epoll_wait(self.kq, self.eventBuf, self.maxEvents, timeoutMs);
         self.nComp = 0;
         let i = 0;
@@ -567,15 +620,26 @@ pub class Poller impl EventLoop {
     /// io_uring backend for `poll`: submits and waits for at least one completion, then drains the
     /// completion queue into `compBuf`, freeing any `OP_ABANDONED` record it encounters instead of
     /// reporting it. Returns `nComp`.
-    fn pollUring(self: Poller): int {
+    fn pollUring(self: Poller, timeoutMs: int): int {
         self.nComp = 0;
-        nova_uring_submit_and_wait(self.ring, 1);
+        // Bounded, like the epoll branch this stands in for. Waiting untimed here is what hung the
+        // completion-driven cases (201/202/203) under NOVA_REACTOR=uring: a connect or accept that
+        // never completes has no other way back out, so `poll(timeoutMs)` never returned and the
+        // caller's own deadline logic never got to run.
+        nova_uring_submit_and_wait_ms(self.ring, 1, timeoutMs as long);
         let ready = nova_uring_cq_ready(self.ring);
         let i = 0;
         while (i < ready && self.nComp < self.maxEvents) {
             nova_uring_peek(self.ring, i, self.udBuf, self.resBuf);
             let ud = bytes.read_ptr(self.udBuf, 0);
             let res = bytes.read_i32(self.resBuf, 0) as int;
+            // Reserved words first: neither is an op-record pointer, and the branches below would
+            // dereference them as one.
+            if (ud == nova_uring_wait_timeout_data() || ud == WAKE_DATA) {
+                if (ud == WAKE_DATA) { nova_uring_wake_drain(); }
+                i = i + 1;
+                continue;
+            }
             let tok = nova_reactor_event_token(ud);
             if (ud != tok || tok == (0 as long)) {
                 if (tok != (0 as long)) {
