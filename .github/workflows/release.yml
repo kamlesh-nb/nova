@@ -1,8 +1,10 @@
 name: release
 
-# Build the 5 Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows {x86_64, arm64} --
-# and publish them to a GitHub Release. (macOS Intel is NOT shipped. The orchestrator ships from its own
-# repo's release workflow, since it needs a built `nova` to compile.)
+# Build the Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows x86_64 (+ Windows arm64
+# BEST-EFFORT / non-blocking) -- and publish them to a GitHub Release. (macOS Intel is NOT shipped. The
+# orchestrator ships from its own repo's release workflow, since it needs a built `nova` to compile.)
+# Windows arm64 is a known WIP: the native `zig build` on windows-11-arm currently crashes silently and
+# is under investigation, so its leg is continue-on-error and does not block the release.
 #
 #   * macOS/Linux: LLVM 21 from the OS package manager (build.zig globs the install's libLLVM*.a),
 #     pointed at via NOVA_LLVM_PREFIX, statically linked.
@@ -121,6 +123,11 @@ jobs:
           - { runner: windows-latest, arch: x64 }      # x86_64: Chocolatey LLVM-C
           - { runner: windows-11-arm, arch: arm64 }    # aarch64: LLVM.org clang+llvm arm64 drop (below)
     runs-on: ${{ matrix.runner }}
+    # arm64 is NON-BLOCKING: nova has never been built natively on arm64-Windows, and the first attempt
+    # shows `zig build archive` exiting with NO output in ~4s -- a silent toolchain crash that cannot be
+    # diagnosed from CI and needs interactive debugging on a real windows-11-arm box. Until then the arm64
+    # bundle is best-effort and does not block the release of the other four. Track: arm64-windows native build.
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
