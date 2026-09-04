@@ -167,6 +167,10 @@ jobs:
             # Windows' bundled bsdtar (tar.exe) handles .tar.xz.
             tar -xf "$env:RUNNER_TEMP/llvm.tar.xz" -C "$env:RUNNER_TEMP/llvm"
             $prefix = (Get-ChildItem "$env:RUNNER_TEMP/llvm" -Directory | Select-Object -First 1).FullName
+            # The archive step calls clang++ and llvm-lib by BARE name, and nova.exe loads LLVM-C.dll at
+            # run time. All three live in the drop's bin/. Chocolatey adds its bin to PATH on x64; here we
+            # must do it ourselves, or `zig build archive` fails (clang++/llvm-lib not found, DLL missing).
+            "$prefix\bin" >> $env:GITHUB_PATH
           } else {
             $prefix = Find-Prefix
             if (-not $prefix) {
