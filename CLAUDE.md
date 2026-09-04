@@ -147,22 +147,27 @@ regression in the cases. Repairing the leak gate itself is separate outstanding 
 Note that readiness cases 192/194/195, listed as open in an earlier revision of this file, now PASS —
 `iocp.nova` grew `armZeroByte`.
 
-### Releasing a static, DLL-free Windows `nova.exe`
+### Windows release: what ships now, and the static DLL-free upgrade
 
-macOS and Linux ship a static `nova` by globbing the OS LLVM's `libLLVM*.a` (brew/apt provide the full
-static component set). Windows has no such artifact: Chocolatey and the official LLVM-C Windows drop
-ship only `LLVM-C.dll` + its import lib + clang, NOT the static components (`LLVMCore.lib`,
-`LLVMX86CodeGen.lib`, …). That is the ONLY reason Windows was ever dynamic. The fix is a **self-hosted
-prebuilt static LLVM**, built once per arch and pointed at by `NOVA_LLVM_PREFIX`; `release.yml`'s
-Windows leg downloads it (repo variable `WIN_STATIC_LLVM_X64_URL`) and builds
-`zig build archive -Dstatic-llvm=true`. No `LLVM-C.dll` is bundled.
+**Both Windows x86_64 AND arm64 are shipped** (dynamic LLVM-C). `release.yml` builds `nova.exe` on a
+`windows-latest` (x64) and a `windows-11-arm` (arm64) runner, linking `LLVM-C.dll` and bundling that DLL
+beside `nova.exe`. x64 gets LLVM-C from Chocolatey; arm64 downloads the LLVM.org
+`clang+llvm-<v>-aarch64-pc-windows-msvc` drop (repo variable `WIN_LLVM_ARM64_URL`, pinned to LLVM 22 to
+match `deps/llvm-zig`). The earlier claim that "no arm64 Windows LLVM exists" was wrong: that full
+`clang+llvm` drop is a complete install tree, and combined with GitHub's `windows-11-arm` runners it is
+all that was needed to build nova natively for arm64.
 
-**Only Windows x86_64 is shipped.** windows-arm64 is dropped from CI and the release matrix: there is
-no arm64 Windows LLVM to build nova natively on a `windows-11-arm` runner, and Nova has no
-cross-build-LLVM pipeline (the way Zig does — Zig cross-BUILDS LLVM for the target with `zig c++` and
-cross-links with bundled LLD, so it needs no native arm64 box; Nova's build still expects a native
-`NOVA_LLVM_PREFIX` per host). The x64 instructions below carry over to arm64 (`-A ARM64`,
-`WIN_STATIC_LLVM_ARM64_URL`, add the matrix cell back) if that pipeline is ever built.
+The **static, DLL-free** path is the eventual upgrade (a `nova.exe` that needs no `LLVM-C.dll`). macOS
+and Linux already ship static by globbing the OS LLVM's `libLLVM*.a`; on Windows the
+`-Dstatic-llvm` glob enumerates the `LLVM*.lib` static components instead. Worth knowing: the full
+`clang+llvm` Windows drop DOES ship those static components too (verified: 147 `LLVM*.lib`, native
+arm64/x64 COFF, not LTO bitcode — so no `llc` conversion like the macOS-22 drop needs), alongside
+`LLVM-C.dll`. So the drop can drive EITHER path. The reason the static path is still future work is the
+CRT + feature flags: the drop is built with the dynamic MSVC CRT and may enable zlib/zstd/libxml, whereas
+`build.zig`'s static-Windows link line adds only a fixed Win32 lib set and expects an `MT`-CRT build with
+those features OFF (see the CMake recipe below). Point `NOVA_LLVM_PREFIX` at such a prebuilt (repo vars
+`WIN_STATIC_LLVM_{X64,ARM64}_URL`) and build `zig build archive -Dstatic-llvm=true`; no `LLVM-C.dll` is
+bundled. The x64 recipe below carries over to arm64 (`-A ARM64`).
 
 **How `build.zig` links it:** the `-Dstatic-llvm` glob branch, when `os_tag == .windows`, enumerates
 `<prefix>/lib/LLVM*.lib` (skipping `LLVM-C.lib`, whose presence would drag the DLL back in) and adds the
