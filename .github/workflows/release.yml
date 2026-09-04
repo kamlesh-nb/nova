@@ -155,10 +155,10 @@ jobs:
             }
             return $null
           }
-          $prefix = Find-Prefix
-          if (-not $prefix -and "${{ matrix.arch }}" -eq "arm64") {
-            # No Chocolatey arm64 LLVM; fetch the official aarch64-windows drop. Override the exact
-            # release with the repo variable WIN_LLVM_ARM64_URL (keep it on LLVM 22.x).
+          if ("${{ matrix.arch }}" -eq "arm64") {
+            # ALWAYS fetch our pinned LLVM 22 aarch64 drop -- do NOT trust Find-Prefix here: the
+            # windows-11-arm image ships a preinstalled LLVM that is the wrong arch and/or the wrong major
+            # version, and linking arm64 nova.exe against it fails. Override with WIN_LLVM_ARM64_URL.
             $url = "${{ vars.WIN_LLVM_ARM64_URL }}"
             if (-not $url) { $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-aarch64-pc-windows-msvc.tar.xz" }
             Write-Host "Downloading arm64 LLVM: $url"
@@ -166,13 +166,14 @@ jobs:
             New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/llvm" | Out-Null
             # Windows' bundled bsdtar (tar.exe) handles .tar.xz.
             tar -xf "$env:RUNNER_TEMP/llvm.tar.xz" -C "$env:RUNNER_TEMP/llvm"
-            $root = (Get-ChildItem "$env:RUNNER_TEMP/llvm" -Directory | Select-Object -First 1).FullName
-            if (Test-Path "$root/lib/LLVM-C.lib") { $prefix = $root }
-          }
-          if (-not $prefix) {
-            choco install llvm --no-progress -y
+            $prefix = (Get-ChildItem "$env:RUNNER_TEMP/llvm" -Directory | Select-Object -First 1).FullName
+          } else {
             $prefix = Find-Prefix
-            if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
+            if (-not $prefix) {
+              choco install llvm --no-progress -y
+              $prefix = Find-Prefix
+              if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
+            }
           }
           echo "NOVA_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
           # The dynamic build needs exactly two files: lib/LLVM-C.lib to link nova.exe against and
@@ -227,6 +228,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: kamlesh-nb/nova-orchestrator
+          # The active branch (default branch `main` does not yet carry build.sh / the current tree).
+          ref: orchestrator-production-design
           path: packages/nova-orchestrator
           token: ${{ secrets.NOVA_TOKEN || github.token }}
       - uses: actions/checkout@v4
@@ -284,6 +287,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: kamlesh-nb/nova-orchestrator
+          # The active branch (default branch `main` does not yet carry build.sh / the current tree).
+          ref: orchestrator-production-design
           path: packages/nova-orchestrator
           token: ${{ secrets.NOVA_TOKEN || github.token }}
       - uses: actions/checkout@v4
