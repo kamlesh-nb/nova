@@ -1,7 +1,8 @@
 name: release
 
-# Build the 5 Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows {x86_64, arm64} --
-# and publish them to a GitHub Release. (macOS Intel is NOT shipped.)
+# Build the Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows {x86_64, arm64} --
+# AND the orchestrator bundles (nova-orchestrator-*) for the same targets, and publish them all to one
+# GitHub Release. (macOS Intel is NOT shipped.)
 #
 #   * macOS/Linux: LLVM 21 from the OS package manager (build.zig globs the install's libLLVM*.a),
 #     pointed at via NOVA_LLVM_PREFIX, statically linked.
@@ -211,11 +212,119 @@ jobs:
             lang/zig-out/nova-*-windows-*.zip
             lang/zig-out/nova-*-windows-*.zip.sha256
 
+  # The orchestrator (service/orchd/orchctl/artifactd) is Nova code, so these jobs build a ReleaseFast
+  # `nova` first (a Debug nova's leak gate exits 1 on every `nova build`), then compile it. nova
+  # cross-compiles APPLICATIONS from any host, so one Linux runner covers the four linux/windows targets
+  # and a mac runner builds macos-arm64 natively (macOS cannot be cross-produced off a Mac). Bundles are
+  # named nova-orchestrator-<ver>-<os>-<arch>, so the release job's nova-* globs already pick them up.
+  # Windows orchestrator bundles BUILD but are best-effort at runtime: the fd-handoff data plane
+  # (service/orchd) is POSIX-only by design; orchctl and artifactd do not use it. See the orch CLAUDE.md.
+  build-orchestrator-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: lang }
+      - uses: actions/checkout@v4
+        with:
+          repository: kamlesh-nb/nova-orchestrator
+          path: packages/nova-orchestrator
+          token: ${{ secrets.NOVA_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: kamlesh-nb/nova-novadb
+          path: packages/nova-novadb
+          token: ${{ secrets.NOVA_TOKEN || github.token }}
+      - uses: mlugg/setup-zig@v2
+        with: { version: 0.16.0 }
+      - name: Install LLVM 21 (apt)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          sudo apt-get install -y llvm-21-dev libclang-21-dev clang-21 zlib1g-dev libzstd-dev libxml2-dev liblzma-dev
+          sudo ln -sf "$(command -v clang++-21)" /usr/local/bin/clang++
+          echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+      - name: Build the Nova toolchain (ReleaseFast)
+        working-directory: lang
+        run: zig build -Doptimize=ReleaseFast
+      - name: Cross-build the orchestrator (linux/windows targets)
+        working-directory: packages/nova-orchestrator
+        run: |
+          export PATH="$HOME/.nova/bin:$PATH"
+          for t in linux-x86_64 linux-arm64 windows-x86_64 windows-arm64; do
+            echo "== orchestrator: $t =="; ./build.sh --release --target "$t"
+          done
+      - name: Package the four bundles
+        working-directory: packages/nova-orchestrator
+        run: |
+          root="$PWD"; mkdir -p out
+          for t in linux-x86_64 linux-arm64 windows-x86_64 windows-arm64; do
+            d="build/release/$t/bin"; if [ ! -d "$d" ]; then echo "missing $d"; exit 1; fi
+            base="nova-orchestrator-${NOVA_VERSION}-${t}"
+            case "$t" in
+              windows-*) ( cd "$d" && zip -q -r "$root/out/${base}.zip" . )
+                         ( cd out && sha256sum "${base}.zip" > "${base}.zip.sha256" ) ;;
+              *)         tar -C "$d" -czf "out/${base}.tar.gz" .
+                         ( cd out && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256" ) ;;
+            esac
+          done
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-orchestrator-cross
+          path: |
+            packages/nova-orchestrator/out/*.tar.gz
+            packages/nova-orchestrator/out/*.tar.gz.sha256
+            packages/nova-orchestrator/out/*.zip
+            packages/nova-orchestrator/out/*.zip.sha256
+
+  build-orchestrator-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: lang }
+      - uses: actions/checkout@v4
+        with:
+          repository: kamlesh-nb/nova-orchestrator
+          path: packages/nova-orchestrator
+          token: ${{ secrets.NOVA_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: kamlesh-nb/nova-novadb
+          path: packages/nova-novadb
+          token: ${{ secrets.NOVA_TOKEN || github.token }}
+      - uses: mlugg/setup-zig@v2
+        with: { version: 0.16.0 }
+      - name: Install LLVM 21 (Homebrew)
+        run: |
+          brew install llvm@21 || brew install llvm
+          echo "NOVA_LLVM_PREFIX=$(brew --prefix llvm@21 2>/dev/null || brew --prefix llvm)" >> "$GITHUB_ENV"
+      - name: Build the Nova toolchain (ReleaseFast)
+        working-directory: lang
+        run: zig build -Doptimize=ReleaseFast
+      - name: Build the orchestrator (native arm64)
+        working-directory: packages/nova-orchestrator
+        run: |
+          export PATH="$HOME/.nova/bin:$PATH"
+          ./build.sh --release
+      - name: Package the macOS arm64 bundle
+        working-directory: packages/nova-orchestrator
+        run: |
+          mkdir -p out; d="build/release/bin"; if [ ! -d "$d" ]; then echo "missing $d"; exit 1; fi
+          base="nova-orchestrator-${NOVA_VERSION}-macos-arm64"
+          tar -C "$d" -czf "out/${base}.tar.gz" .
+          ( cd out && shasum -a 256 "${base}.tar.gz" > "${base}.tar.gz.sha256" )
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-orchestrator-macos-arm64
+          path: |
+            packages/nova-orchestrator/out/*.tar.gz
+            packages/nova-orchestrator/out/*.tar.gz.sha256
+
   # Publish a GitHub Release ONLY on a real version tag. A manual `workflow_dispatch` run just builds
   # and archives (the bundles are downloadable as workflow artifacts); it does not cut a release.
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [ build-macos, build-linux, build-windows ]
+    needs: [ build-macos, build-linux, build-windows, build-orchestrator-cross, build-orchestrator-macos ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
