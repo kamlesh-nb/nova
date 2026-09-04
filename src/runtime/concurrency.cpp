@@ -250,6 +250,8 @@ extern "C" long long nova_uring_create(int entries);
 extern "C" void nova_uring_destroy(long long ring);
 extern "C" int nova_uring_prep(long long ring, int op, int fd, long long addr, int len, long long off, long long ud);
 extern "C" int nova_uring_submit_and_wait(long long ring, int wait_nr);
+extern "C" int nova_uring_submit_and_wait_ms(long long ring, int wait_nr, long long ms);
+extern "C" long long nova_uring_wait_timeout_data(void);
 extern "C" int nova_uring_cq_ready(long long ring);
 extern "C" int nova_uring_peek(long long ring, int i, long long *ud, int *res);
 extern "C" void nova_uring_advance(long long ring, int n);
@@ -1137,7 +1139,14 @@ void nova_run_root(long long root) {
             nova_reactor_resume(root);
             int uidle = 0;
             while (!raw_coro_done(root)) {
-                nova_uring_submit_and_wait(ring, 1);
+                // 20ms tick, matching the epoll branch below. The bound is what makes the idle
+                // counter reachable: waiting untimed (as this did) blocks until SOMETHING completes,
+                // so `ready` was never <= 0, `uidle` never advanced, and the ~15s lost-wakeup cap
+                // could never fire. A root coroutine parked on an operation that never completes --
+                // a connect to a peer that never accepts, say -- hung the whole process instead of
+                // breaking out. That is why 201/202/203 timed out under NOVA_REACTOR=uring while
+                // passing on epoll: same loop, same counter, only this wait unbounded.
+                nova_uring_submit_and_wait_ms(ring, 1, 20);
                 int ready = nova_uring_cq_ready(ring);
                 if (ready <= 0) {
                     if (++uidle > 750) break;
@@ -1148,6 +1157,11 @@ void nova_run_root(long long root) {
                 for (int i = 0; i < ready; ++i) {
                     long long ud = 0; int res = 0;
                     nova_uring_peek(ring, i, &ud, &res);
+                    // The tick's own timeout completion is bookkeeping, not an event. It must be
+                    // skipped BEFORE the timer-tag test: as a small negative it has the high bits
+                    // set, so it would otherwise be mistaken for a tagged timer handle and then
+                    // dispatched as an op record.
+                    if (ud == nova_uring_wait_timeout_data()) continue;
                     if ((uint64_t)ud & NOVA_EPOLL_TIMER_TAG)
                         uring_timer_release((long long)((uint64_t)ud & ~NOVA_EPOLL_TIMER_TAG));
                     uring_dispatch(ud, res);

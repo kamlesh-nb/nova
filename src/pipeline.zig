@@ -1917,9 +1917,26 @@ pub fn loadProgram(allocator: std.mem.Allocator, init: std.process.Init, file_pa
     if (visiting.contains(file_path)) return error.CyclicImport;
     if (visited.contains(file_path)) return;
 
+    // Ownership of `visiting_key` transfers to the map on a successful `put`, and exactly one
+    // cleanup path may free it. It previously had TWO overlapping ones -- a bare
+    // `errdefer allocator.free(visiting_key)` plus the fetchRemove block below -- and on any error
+    // after the put they BOTH ran (errdefers unwind in reverse): the block removed the key from the
+    // map and freed it, then the bare errdefer freed the same pointer again.
+    //
+    // Any failed import reached that path, so the compiler answered a plain missing file with
+    //
+    //     Failed to read file 'x.nova': error.FileNotFound
+    //     free(): double free detected in tcache 2      <- then SIGABRT, core dumped
+    //
+    // turning a clean diagnostic into a crash. Reproducible from a two-line file importing a module
+    // that does not exist; found via a package whose source tree was incomplete, where the crash
+    // completely obscured which file was actually missing.
     const visiting_key = try allocator.dupe(u8, file_path);
-    errdefer allocator.free(visiting_key);
-    try visiting.put(visiting_key, {});
+    visiting.put(visiting_key, {}) catch |err| {
+        // Still ours: the map never took it.
+        allocator.free(visiting_key);
+        return err;
+    };
     errdefer {
         const kv = visiting.fetchRemove(visiting_key);
         if (kv) |k| {
