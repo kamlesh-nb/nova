@@ -340,7 +340,7 @@ pub fn waitReady(kq: int, eventBuf: long, maxEvents: int, timeoutMs: int): int {
 // Reads the raw user_data/epoll-data word for event slot `i`, backend-appropriate.
 fn evRaw(eventBuf: long, i: int): long {
     if (usingUring()) {
-        return bytes.read_ptr(eventBuf + ((i * epoll.EPOLL_EVENT_SIZE) as long), URING_EV_DATA_OFF);
+        return bytes.read_ptr(eventBuf + ((i * epoll.EPOLL_EVENT_SIZE()) as long), URING_EV_DATA_OFF);
     }
     return epoll.evData(eventBuf, i);
 }
@@ -534,7 +534,7 @@ pub class Poller impl EventLoop {
             self.resBuf = bytes.alloc(4);
         } else {
             self.kq = epoll.epoll_create1(0);
-            self.eventBuf = bytes.alloc(maxEvents * epoll.EPOLL_EVENT_SIZE);
+            self.eventBuf = bytes.alloc(maxEvents * epoll.EPOLL_EVENT_SIZE());
             self.udBuf = 0;
             self.resBuf = 0;
         }
@@ -591,7 +591,7 @@ pub class Poller impl EventLoop {
                 } else if (kind == OP_SEND) {
                     let w = socket.sendSock(fd, buf, len);
                     if (w < 0 && socket.wouldBlock()) {
-                        let ev = bytes.alloc(epoll.EPOLL_EVENT_SIZE);
+                        let ev = bytes.alloc(epoll.EPOLL_EVENT_SIZE());
                         epoll.setEvent(ev, 0, epoll.EPOLLOUT | epoll.EPOLLONESHOT, op);
                         epoll.epoll_ctl(self.kq, epoll.EPOLL_CTL_MOD, fd, ev);
                         bytes.free(ev);
