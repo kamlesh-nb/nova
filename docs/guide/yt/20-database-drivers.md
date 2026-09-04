@@ -62,7 +62,7 @@ p.release(conn);
 
 ## Segment: NovaDB (5:00)
 
-**Say:** NovaDB is Nova's own embedded engine: B-tree, MVCC, write-ahead log, a SQL front end over a compact binary protocol. It is the default for a Nova service and it is what the orchestrator's config store runs on.
+**Say:** NovaDB is Nova's own embedded engine: B-tree, MVCC, write-ahead log, a SQL front end over a compact binary protocol. It is the default for a Nova service's application data. The orchestrator does not run on it, it keeps its small control-plane state in artifactd, not a database.
 
 **On screen:**
 ```

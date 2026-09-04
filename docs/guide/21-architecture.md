@@ -67,6 +67,23 @@ vtable is the destructor, which is how the runtime cleans up a trait object with
 concrete type. Dynamic dispatch is a load from the vtable and an indirect call; there is no runtime
 type reflection beyond this.
 
+## Errors are values, not thrown
+
+A fallible function returns `T | E`, and that is exactly what it is at runtime: an ordinary value the
+caller inspects, carrying either the ok payload or the error. There is no thrown exception, no unwinder,
+and no separate error path baked into the machine's exception tables. `try` compiles to a branch: look
+at the returned value, and if it is on the error side, return it from the current function; otherwise
+carry on with the ok value. That is why `try` is cheap on the success path (a compare and a
+not-taken branch) and why a fallible call that never fails costs almost nothing, there is no
+zero-cost-exceptions machinery to set up and no stack to walk when something does go wrong.
+
+The error type `E` is usually an `exception`, a tagged union: a small tag that says which variant, plus
+that variant's payload, with a mandatory `message()`. `T | E | undefined` composes the two orthogonal
+outcomes, absence (`undefined`) and failure (`E`), and reads as `(T | undefined) | E`: you narrow away
+`undefined` and handle `E` separately, so "not found" and "the query failed" never collapse into one
+ambiguous null. When the ok type and the error type would be the same shape, the tag still distinguishes
+them, so `int | SomeIntLikeError` is never ambiguous about which side you are holding.
+
 ## Memory management: ARC, not a garbage collector
 
 Nova manages memory with **automatic reference counting** (ARC), decided at compile time, not with a
@@ -92,6 +109,23 @@ The consequences are the ones you would expect from deterministic cleanup:
 Underneath, pages come from the operating system through `mmap`, and the allocator hands out honestly
 reference-counted blocks (there is no hidden per-thread arena that would confuse ownership across
 cores).
+
+### Reference cycles
+
+Reference counting has one well-known limit, and Nova does not hide it: a **cycle** of strong
+references is not collected. If object A holds a strong reference to B and B holds one back to A, their
+counts never reach zero, so the pair leaks when the rest of the program lets go of them. A tracing
+garbage collector would find and free such a cycle; ARC will not, because it only ever looks at a single
+object's count.
+
+Nova does not currently have a `weak` or `unowned` reference to break a cycle for you, so the
+responsibility is yours by construction. In practice this is rarely a problem for the workloads Nova
+targets, because the data has a clear owner: a request owns its handlers, a connection owns its buffers,
+a tree owns its nodes. The pattern is to keep ownership a one-way tree (parent owns child), and where a
+child needs to refer back up, hold the parent by something that is not a strong reference to a Nova
+object, an id, an index, or a value it can look the parent up by, rather than a second strong pointer
+that would close the loop. This is a real constraint, not a solved one, and it is called out here rather
+than left for you to discover.
 
 ## The concurrency model
 
@@ -119,10 +153,38 @@ runtime then does the transfer. On a completion backend (IOCP, io_uring) the run
 the operation and is told when it has finished. The runtime hides this difference so the same Nova code
 runs on all of them; the design notes in the repository record the traps that live at that seam.
 
+On Linux the runtime carries **both** backends in the one `libnovacore.a`, and picks between them once
+per process at start-up: `epoll` is the default, and `io_uring` is opt-in via the `NOVA_REACTOR=uring`
+environment variable. Even when you ask for `io_uring` the runtime still probes the running kernel first
+(the header being present says nothing about whether the kernel supports it, or whether it has been
+switched off administratively), and falls back to `epoll` if it is not available. Most deployments stay
+on the `epoll` default, which runs everywhere Nova runs.
+
 On top of coroutines and the reactor sit the higher-level tools you actually reach for: `when_all` and
 `selectAny` to combine futures, channels to pass values between tasks, and an actor style built on
 channels and coroutines. The runtime can run on multiple cores, with a share-nothing arrangement of one
 reactor per core for server workloads.
+
+### What thread-per-core costs
+
+Share-nothing, one-reactor-per-core is fast because it never locks a shared run queue and keeps a
+connection's work on one core's cache. It also has two costs worth naming rather than being caught out
+by:
+
+- **Load can sit unevenly.** A connection is pinned to the core that accepted it, so if the accept
+  distribution is skewed, or a few connections are far busier than the rest, one reactor can be hot
+  while others idle. There is no work-stealing to even it out. For many small hypermedia requests this
+  averages out; for a workload with a few very heavy long-lived connections it may not, and the honest
+  answer is to scale out with more instances behind the proxy rather than expect one process to
+  rebalance internally.
+- **A CPU-bound handler blocks its core's reactor.** The reactor is cooperative: it makes progress at
+  `await` points. A handler that spends a long time computing without awaiting holds its core and delays
+  every other connection on that core until it yields. There is no preemptive scheduler to slice it out,
+  the way Go's runtime would. The remedy is to keep request handlers I/O-shaped and push genuinely heavy
+  CPU work off the reactor (a separate task or a queue), so the event loop keeps turning.
+
+Both are inherent to the model, and both are the price of not paying for a work-stealing scheduler and
+its synchronisation on the common path.
 
 ## The runtime library and self-contained delivery
 
@@ -137,11 +199,13 @@ one machine can build them for another architecture.
 
 If you want to read the implementation, the shape is:
 
-- `src/` is the compiler: the lexer and parser, `sema/` (the authoritative typed-IR passes: infer,
-  monomorphise, ownership, lower), and `codegen/` (the LLVM lowering).
+- `src/frontend/` is the compiler front end: the lexer and parser, and `sema/` (the authoritative
+  typed-IR passes: infer, monomorphise, ownership, lower).
+- `src/backend/` is the back end, including `codegen/` (the LLVM lowering).
 - `src/runtime/` is the C++ runtime (the scheduler and reactor, the memory primitives).
-- `src/std/` is the standard library, in Nova.
-- `packages/` holds the concrete database drivers, which plug into the standard library's database seam.
+- `src/lib/std/` is the standard library, in Nova.
+- `packages/` (at the repository root, beside `lang/`) holds the concrete database drivers, which plug
+  into the standard library's database seam.
 
 ## Where to go next
 

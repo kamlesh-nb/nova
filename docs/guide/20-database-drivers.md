@@ -90,8 +90,9 @@ Now the drivers, one at a time.
 ## NovaDB
 
 NovaDB is Nova's own embedded storage engine: a B-tree based, MVCC database with a write-ahead log and a
-SQL front end, spoken over a compact binary protocol. It is the default choice for a Nova service, and it
-is what the orchestrator's config store runs on.
+SQL front end, spoken over a compact binary protocol. It is the default choice for a Nova service's
+application data. (The orchestrator does not run on it: it keeps its small control-plane state in
+`artifactd`, not a database. See Chapters 23 and 25.)
 
 ### Add it to your project
 
@@ -517,3 +518,5 @@ a `Repository`. `str.Str.toOwned()` promotes a view to an owned string when a va
   changing one file. It also covers the full MongoDB document API.
 - The Deploying chapter runs a NovaDB-backed service under the orchestrator, which itself stores its
   desired state in NovaDB over this same driver.
+- Chapter 25 documents NovaDB the database itself: the storage engine behind this driver, its SQL and
+  document modes, running the server, and its `db.json` configuration.

@@ -47,8 +47,9 @@ functions run with `nova test <file>.nova`.
 | 20 | [Database drivers](20-database-drivers.md) | NovaDB, PostgreSQL, MySQL, SQL Server, MongoDB: intro, package deployment, connect, and notes |
 | 21 | [How Nova works: architecture](21-architecture.md) | the compiler pipeline, ARC memory, the concurrency engine, self-contained delivery |
 | 22 | [Building & distributing](22-building-and-distribution.md) | `nova build`, cross-compiling programs, packaging toolchain bundles + checksums |
-| 23 | [Deploying with the orchestrator](23-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
+| 23 | [Deploying with the orchestrator](23-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on artifactd |
 | 24 | [Artifact delivery: the blob store](24-blob-store.md) | content-addressed `artifactd`, sha PUT/GET, Bearer auth, deploy by digest |
+| 25 | [NovaDB: the database itself](25-novadb.md) | the embedded B-tree/MVCC engine, WAL durability, SQL and document surfaces, the binary protocol |
 
 > **Version:** tracks `nova version` (Beta 0.1.0). Syntax may still change per
 > [`../STABILITY.md`](../STABILITY.md).

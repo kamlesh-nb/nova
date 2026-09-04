@@ -248,9 +248,9 @@ connection explicitly as shown here.
 ## Streaming large result sets
 
 `query` buffers the whole result in memory, which is fine for a page of rows but not for a report over
-millions. Each SQL driver's concrete connection (from `postgres.open` / `mysql.open` / `mssql.open`, the
-same way `mongodb.open` returns the concrete Mongo connection) offers `queryStream`, which returns an
-async cursor that pulls rows from the server in batches so the full set never materialises:
+millions. Each SQL driver's concrete connection (from `postgres.open` / `mysql.open` / `mssql.open`)
+offers `queryStream`, which returns an async cursor that pulls rows from the server in batches so the
+full set never materialises:
 
 ```nova
 import postgres;
@@ -263,10 +263,12 @@ while (let row = await cur.next()) {      // fetches the next 500-row batch only
 let _ = await cur.close();               // release the server-side cursor if you stop early
 ```
 
-The API is identical across the drivers; only the wire mechanism differs (Postgres portals, MySQL a
-server-side cursor, SQL Server the TDS token stream, MongoDB `getMore`). The batch size is the third
-argument. Always `close()` the cursor when you finish, especially if you break out early, so the
-server-side cursor is released and the connection returns to a clean state for reuse.
+The API is identical across the three SQL drivers; only the wire mechanism differs (Postgres portals,
+MySQL a server-side cursor, SQL Server the TDS token stream). The batch size is the third argument.
+Always `close()` the cursor when you finish, especially if you break out early, so the server-side
+cursor is released and the connection returns to a clean state for reuse. MongoDB does not use
+`queryStream`: it streams through the lazy `find()` cursor shown below (backed by `getMore`), which
+pulls documents in batches the same way.
 
 ## Running it live
 
@@ -563,4 +565,6 @@ MongoDB driver, and vice versa.
 - Chapter 19 for package management: how you add a driver dependency with `nova get`.
 - Chapter 20 for the database drivers, each with its intro, package deployment, and connection string.
 - Chapter 23 for deploying this NovaDB-backed app under the orchestrator (service, orchd, orchctl).
+- Chapter 25 for NovaDB itself: the engine on the other end of the connection, its SQL and document modes,
+  and how to run and configure the server.
 - Chapter 16 for `@serializable`, which powers both JSON responses and the ORM binder.

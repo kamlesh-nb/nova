@@ -205,8 +205,10 @@ What differs is the source tree:
   the composition root, a `src/Features/Products/` slice (routes plus
   `CreateProduct` and `GetProductById` handlers), a shared repository, an `.nsx`
   view, domain entities and DTOs under `src/Domain/`, a `wwwroot/index.html`,
-  and a feature test. It also drops `package.json`, `tailwind.config.js` and a
-  `styles/` folder for styling (see the Tailwind aside at the end).
+  and a feature test. It also writes an `app.yaml` at the project root (the
+  file-based config the app reads through `app.config`; see Chapter 18), and
+  drops `package.json`, `tailwind.config.js` and a `styles/` folder for styling
+  (see the Tailwind aside at the end).
 - **`desktop`** lays down just `src/main.nova`.
 
 The default source file a project build compiles is `src/main.nova`, which is why

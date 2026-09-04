@@ -114,4 +114,10 @@ released exactly once, at a point you can predict from the code. That is the who
 memory safety of a managed language with the determinism of manual management, and none of the ceremony of
 either.
 
+One honest limit to know: reference counting does not reclaim a **cycle** of strong references (A owns B
+and B owns A), and Nova has no `weak` reference to break one for you, so such a cycle leaks. Keep
+ownership a one-way tree and, where a child must refer back to its parent, hold it by an id or index
+rather than a second strong reference. The mechanism, and why this is the one case ARC cannot handle, is
+in [Chapter 21](21-architecture.md#reference-cycles).
+
 Next: [Modules & visibility](14-modules.md)

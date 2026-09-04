@@ -54,8 +54,12 @@ Two rules to keep in mind:
 
 - Both sides of a `catch` must have the same type. If the ok value is an `int`, the default after
   `catch` must also be an `int`.
-- `catch` takes an expression, not a block. `f() catch (e) { ... }` is a parse error. To turn the error
-  into a value, call a method or function that returns what you want, as `e.message()` does below.
+- `catch` takes an expression, not a block. `f() catch (e) { ... }` is a parse error. The reason is
+  what `catch` *is*: it produces the replacement value to use when the call failed, so its right-hand
+  side is that value, not a sequence of statements. There is no thrown exception to run a block of
+  recovery code around, the error is already a value in your hand. When recovery genuinely needs several
+  steps, put them in a small named function or method that returns what you want and call it on the
+  error side (`f() catch (e) recover(e)`), which keeps the failure path a value like everything else.
 - The enclosing function of a `try` must itself return an error union, because `try` may return the
   error from it. At the top, `main` returns `void`, so you finish an error union there with `catch`.
 
@@ -67,6 +71,10 @@ Two rules to keep in mind:
 `parsePort` really parses the digits of a string, and returns a different typed error for each way the
 input can be wrong. `buildUrl` then uses `try parsePort(...)`: on success it gets the unwrapped port,
 and on failure it stops and hands the very same error back to its own caller.
+
+> It parses the digits by hand on purpose, so the error paths are visible. In real code you would reach
+> for the stdlib's `string.parseI64` for the number and add just the range check; the point here is the
+> `T | E` and `try` mechanics, not a hand-rolled integer parser.
 
 ```nova
 // examples/17_errors.nova
@@ -363,6 +371,14 @@ import exception;
 // inside a handler or a message() method:
 let trace = exception.stackTrace();
 ```
+
+`stackTrace()` is not free, so treat it as a diagnostic, not something to call on the hot path. It walks
+the live call frames and turns their return addresses into text, and the quality of that text depends on
+what symbol information the binary carries: an unstripped build names the functions, while a stripped
+release build may give you addresses without names. Because Nova is compiled and optimised, frames that
+were inlined do not appear as separate lines, an aggressively optimised build shows a shorter, flatter
+trace than the source would suggest. It is exactly what you want when logging a genuine failure, and not
+something to put in a tight loop.
 
 `exception` is a contextual keyword: it is special only at the start of a declaration, so
 `import exception;` and ordinary identifiers named `exception` still work. The usual `catch` rule

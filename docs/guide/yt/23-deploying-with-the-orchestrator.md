@@ -6,7 +6,7 @@
 
 ## Hook (0:00)
 
-**Say:** You have a NovaDB-backed web service. In this video we run it the way you would in production: several replicas behind a load balancer, supervised and kept at their desired count, with configuration held in NovaDB. Nova ships a small orchestrator for exactly this. The parts we use here are three binaries that mirror the Kubernetes control-plane and data-plane split, service, orchd, and orchctl; a fourth binary, artifactd, delivers the actual application binaries and is the subject of the final video. By the end of this one you will have curled your app through a real load balancer and operated its config store from the command line.
+**Say:** You have a NovaDB-backed web service. In this video we run it the way you would in production: several replicas behind a load balancer, supervised and kept at their desired count. Nova ships a small orchestrator for exactly this. The parts we use here are three binaries that mirror the Kubernetes control-plane and data-plane split, service, orchd, and orchctl; a fourth binary, artifactd, delivers the actual application binaries and hosts the orchestrator's own config store. By the end of this one you will have curled your app through a real load balancer and operated its config store from the command line.
 
 ## What we will cover (0:30)
 
@@ -21,7 +21,7 @@
 
 ## Segment: The shape of a deployment (1:00)
 
-**Say:** Here is the picture. Two replicas of your app, a proxy in front of them, a control-plane agent keeping them alive, and one NovaDB holding both your application data and the orchestrator's own configuration.
+**Say:** Here is the picture. Two replicas of your app, a proxy in front of them, a control-plane agent keeping them alive, NovaDB holding your application data, and artifactd holding the orchestrator's own config store.
 
 **On screen:**
 ```
@@ -29,12 +29,14 @@
                 /     \
   app replica A (:8080)  app replica B (:8081)     <- your NovaDB-backed web app
                 \     /
-                 NovaDB (:3009)                     <- app data AND orchestrator config
+                 NovaDB (:3009)                     <- your app's data (products table)
                    ^
                  orchd  (reconciles replicas, writes the discovery file service reads)
+                   |
+                 artifactd (:8135)                  <- deploy blobs + the orchestrator config store
 ```
 
-**Say:** Notice the same NovaDB holds two things: your products table, and the orchestrator's config store, its cluster membership and workload definitions. That is why the config store speaks the same `novadb://` connection string you learned in the last video.
+**Say:** Notice the split: NovaDB holds your products table, and artifactd holds the orchestrator's config store, its cluster membership and workload definitions, over a small `/cfg/*` HTTP surface snapshotted to a `config.snap` file. The orchestrator does not run a database of its own.
 
 ## Segment: The three binaries (2:15)
 
@@ -78,11 +80,11 @@ service service.json             # serve
 {
   "manifestsDir": "manifests", "reconcileMs": 2000, "nodeId": "node-1",
   "discoveryFile": "discovery.txt", "metricsFile": "metrics.prom",
-  "store": { "enabled": true, "addr": "127.0.0.1:3009", "user": "admin", "dbname": "nova" }
+  "store": { "enabled": true, "addr": "127.0.0.1:8135", "token": "", "tls": false }
 }
 ```
 
-**Say:** That `store` block becomes a NovaDB connection string through the orchestrator's `storeConnectionString` helper, which produces exactly the `novadb://user:password@host:port?db=...` URL the driver parses. With a discovery file configured, orchd writes lines like `web=127.0.0.1:8080,127.0.0.1:8081`, and a service set to that service load-balances across whatever replicas orchd currently has healthy. Scale up or lose a replica, and the pool reshapes without editing service's config.
+**Say:** That `store` block points orchd at artifactd's config store. The `storeBaseUrl` helper turns it into the base URL `http://127.0.0.1:8135`, and `HttpConfigStore` appends the `/cfg/*` routes; `addr` is artifactd's host and port, `token` is the same deploy bearer token artifactd guards its routes with, and `tls` selects https. With a discovery file configured, orchd writes lines like `web=127.0.0.1:8080,127.0.0.1:8081`, and a service set to that discovery file load-balances across whatever replicas orchd currently has healthy. Scale up or lose a replica, and the pool reshapes without editing service's config.
 
 ## Segment: orchctl, operating the store (7:45)
 
@@ -128,7 +130,7 @@ cd docs/guide/examples && ./run-live.sh
 - The orchestrator's core is three binaries: service the data plane, orchd the control plane, orchctl the offline ops CLI. A fourth, artifactd, delivers binaries and is the next video.
 - service load-balances your app replicas with health checks and several strategies.
 - orchd keeps replicas at their desired count and can publish service discovery for service.
-- The config store lives in the same NovaDB as your app, addressed by the `novadb://` URL.
+- The config store lives in artifactd, over its `/cfg/*` HTTP routes and a `config.snap` snapshot, not in a database. Your app's own data stays in NovaDB.
 - orchctl inspects and repairs that store and plans safe rolling upgrades, all offline.
 
 ## Outro (14:00)

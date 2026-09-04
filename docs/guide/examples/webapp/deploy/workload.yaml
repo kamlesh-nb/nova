@@ -1,8 +1,10 @@
-# The FINALISED manifest for this Nova web app: one file, the single source of truth. It tells the
-# orchestrator how to run the app (binary by hash, replicas, load balancing, health, exposure) AND
-# configures the app itself (the `config:` block, injected into every replica as environment variables
-# that src/appconfig.nova reads back). Commit this in your repo; the deploy action fills in the artifact
-# digest and writes it to the orchestrator, which reconciles from it.
+# The FINALISED deploy manifest for this Nova web app. It tells the orchestrator how to RUN the app
+# (binary by hash, replicas, load balancing, health, exposure). It does NOT carry the app's own
+# configuration: Nova keeps that file-based and outside the orchestrator. The app reads its settings from
+# an `app.yaml` at the project root through `app.config` (see Chapter 18); orchd never injects config as
+# environment variables, because co-located apps would collide on the same names. Commit this in your
+# repo; the deploy action fills in the artifact digest and writes it to the orchestrator, which
+# reconciles from it.
 apiVersion: nova/v1
 kind: App
 metadata:
@@ -11,6 +13,11 @@ workload:
   # The deploy action replaces the placeholder below with the digest of the binary it just uploaded, so
   # the manifest names the exact bytes orchd should pull and run. For a local path instead, use `binary:`.
   artifact: sha256:__ARTIFACT__
+  # Operational arguments orchd passes to each replica. `--config <profile>` selects the app.yaml profile
+  # the app loads; the port is injected per replica (see network.portFlag below).
+  args:
+    - --config
+    - prod
   restartPolicy: always
 replicas:
   min: 2
@@ -20,7 +27,7 @@ lb:
   handoff: false
 network:
   expose: public
-  portBase: 8080          # replica i binds 8080 + i; orchd injects NOVA_PORT per replica
+  portBase: 8080          # replica i binds 8080 + i; orchd passes the port per replica
   portFlag: --port
   servicePort: 8090       # the front port `service` load-balances on
 health:
@@ -29,9 +36,3 @@ health:
   timeoutMs: 1000
   rise: 2
   fall: 3
-# App configuration, env-file style (KEY=VALUE). Each entry becomes an environment variable in every
-# replica; the app reads them via AppConfig (src/appconfig.nova). This is the "same manifest configures
-# the app" half. Split on the first '=', so a value may itself contain '='.
-config:
-  - LOG_LEVEL=info
-  - DB_URL=novadb://127.0.0.1:8135?db=shop

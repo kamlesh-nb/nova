@@ -171,4 +171,4 @@ cd docs/guide/examples && ./run-live.sh
 
 ## Outro (15:00)
 
-**Say:** Your web app now reads and writes a real database. In the next video we run it in production shape: several replicas behind a load balancer, supervised and kept alive, with configuration held in NovaDB. That is the orchestrator. See you in Video 21.
+**Say:** Your web app now reads and writes a real database. In the next video we run it in production shape: several replicas behind a load balancer, supervised and kept alive. That is the orchestrator. See you in Video 21.

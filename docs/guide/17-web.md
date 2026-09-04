@@ -256,8 +256,11 @@ fn buildApp(): App {
 
 fn main(): void {
     let app = buildApp();
-    console.log("Listening on http://127.0.0.1:8080");
-    app.run(8080);
+    // The port is read from app.yaml (config.port) via app.config, or --port if the orchestrator passed
+    // one, else the default. See Chapter 18 for the config seam; app config is file-based, not env vars.
+    let port = app.config.port(8080);
+    console.log("Listening on http://127.0.0.1:" + `${port}`);
+    app.run(port);
 }
 ```
 

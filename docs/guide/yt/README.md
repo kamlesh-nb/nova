@@ -44,7 +44,7 @@ The timestamps are a guide, not a rule. Speak at your own pace and adjust.
 | 18 | [Data access and the ORM](18-data-access.md) | The `db` seam, `DbValue`, the micro-ORM, `Repository<T>`, connection strings, backing the web app with NovaDB |
 | 19 | [Package management](19-package-management.md) | `project.json`, `nova get`, the lockfile, `nova init`, import resolution, publishing |
 | 20 | [Database drivers](20-database-drivers.md) | NovaDB, PostgreSQL, MySQL, SQL Server, MongoDB: add, import, connect |
-| 23 | [Deploying with the orchestrator](23-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on NovaDB |
+| 23 | [Deploying with the orchestrator](23-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on artifactd |
 | 24 | [Artifact delivery: the blob store](24-blob-store.md) | content-addressed `artifactd`, sha PUT/GET, Bearer auth, deploy by digest |
 
 ## Suggested recording order

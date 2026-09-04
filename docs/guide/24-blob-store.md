@@ -11,6 +11,11 @@ Everything here lives in `packages/nova-orchestrator`, in `src/artifacts/` (the 
 `src/orch/artifact.nova` (the client). It is a stopgap that lives inside the orchestrator repository; see
 "Current status and future direction" at the end for exactly what that means.
 
+`artifactd` wears a second hat, covered in Chapter 23: alongside the content-addressed blobs it also
+hosts the orchestrator's small key-value **config store** (workload specs, the leader lease, cluster
+membership) on its `/cfg/*` routes. That is why the control plane needs no database of its own. This
+chapter is about the blob half; the config-store half is in Chapter 23.
+
 ## Why content-addressed delivery
 
 A content-addressed store keys each blob by the SHA-256 hash of its own bytes. The name of a binary is
