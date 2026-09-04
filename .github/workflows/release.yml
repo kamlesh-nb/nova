@@ -42,6 +42,7 @@ env:
 
 jobs:
   build-macos:
+    if: false   # TEMP: disabled while diagnosing the windows-arm64 native build
     # Apple Silicon only. macOS Intel (x86_64) is not shipped.
     runs-on: macos-14
     steps:
@@ -75,6 +76,7 @@ jobs:
             lang/zig-out/nova-*-macos-*.tar.gz.sha256
 
   build-linux:
+    if: false   # TEMP: disabled while diagnosing the windows-arm64 native build
     strategy:
       fail-fast: false
       matrix:
@@ -120,14 +122,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: windows-latest, arch: x64 }      # x86_64: Chocolatey LLVM-C
+          # TEMP: x64 disabled while diagnosing the arm64 native build.
+          # - { runner: windows-latest, arch: x64 }
           - { runner: windows-11-arm, arch: arm64 }    # aarch64: LLVM.org clang+llvm arm64 drop (below)
     runs-on: ${{ matrix.runner }}
-    # arm64 is NON-BLOCKING: nova has never been built natively on arm64-Windows, and the first attempt
-    # shows `zig build archive` exiting with NO output in ~4s -- a silent toolchain crash that cannot be
-    # diagnosed from CI and needs interactive debugging on a real windows-11-arm box. Until then the arm64
-    # bundle is best-effort and does not block the release of the other four. Track: arm64-windows native build.
-    continue-on-error: ${{ matrix.arch == 'arm64' }}
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
@@ -195,9 +193,19 @@ jobs:
           if (-not (Test-Path $lib)) { Write-Error "LLVM-C.lib not found at $lib"; exit 1 }
           if (-not (Test-Path $dll)) { Write-Error "LLVM-C.dll not found at $dll"; exit 1 }
           Write-Host "LLVM prefix=$prefix (LLVM-C.lib + LLVM-C.dll present)"
-      - name: Build archive (dynamic LLVM-C)
+      # TEMP DIAGNOSTIC: `zig build archive` was exiting in ~4s with NO output on arm64-Windows. Run a
+      # plain `zig build` (verbose) plus a zig sanity check so the actual error / crash code surfaces.
+      - name: Diagnose zig build (arm64-Windows)
+        shell: pwsh
         working-directory: lang
-        run: zig build archive
+        run: |
+          Write-Host "=== zig version ==="
+          zig version
+          Write-Host "=== zig env ==="
+          zig env
+          Write-Host "=== plain: zig build --summary all --verbose ==="
+          zig build --summary all --verbose
+          Write-Host "zig build exit code: $LASTEXITCODE"
       - name: Bundle LLVM-C.dll into the Windows archive
         shell: pwsh
         run: |
