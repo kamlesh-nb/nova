@@ -15,6 +15,8 @@
 
 import bytes;
 import os.backend;
+import platform;
+import string;
 
 /// Reads the calling thread's C `errno` value, as last set by a failed libc call.
 pub extern("c") fn nova_ffi_errno(): int;
@@ -143,8 +145,16 @@ pub const S_IFREG: int = 32768;
 /// `stat` mode file-type bit for a symbolic link.
 pub const S_IFLNK: int = 40960;
 
-/// Byte offset of the `st_mode` field within the raw `stat` struct, which differs across platforms and is resolved through `os.backend`.
-pub fn STAT_MODE_OFF(): int { return backend.STAT_MODE_OFFSET; }
+/// Byte offset of the `st_mode` field within the raw `stat` struct. It differs across platforms AND, on
+/// Linux, across architectures: glibc's `struct stat` puts `st_mode` at offset 24 on x86_64 (an 8-byte
+/// `st_nlink` precedes it) but at 16 on aarch64 (`st_mode` follows `st_ino` directly). `os.backend` is
+/// selected per-OS, not per-arch, so it carries the x86_64/darwin value; correct it for linux-aarch64
+/// here. Getting this wrong reads `st_uid` instead of `st_mode`, so `pathIsDir` wrongly returns false --
+/// which silently emptied every `Dir.exists`-guarded directory scan on arm64 Linux.
+pub fn STAT_MODE_OFF(): int {
+    if (platform.isLinux && string.eql(platform.arch, "aarch64")) { return 16; }
+    return backend.STAT_MODE_OFFSET;
+}
 /// Byte offset of the file-name field within the raw `dirent` struct, which differs across platforms and is resolved through `os.backend`.
 pub fn DIRENT_NAME_OFF(): int { return backend.DIRENT_NAME_OFFSET; }
 
