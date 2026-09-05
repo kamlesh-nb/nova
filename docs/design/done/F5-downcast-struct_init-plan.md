@@ -18,7 +18,7 @@ scope-release is *exactly* what consumes the struct literal's construction ref, 
 not also a temp. Add `.struct_init` as a temp and you introduce a THIRD release → use-after-free via
 `__destruct_trait`.
 
-**Minimal repro** (scratchpad `probe/13c_downcast.nova`): struct literal → trait arg → `let m = msg as
+**Minimal repro** (scratchpad `probe/13c_downcast.ky`): struct literal → trait arg → `let m = msg as
 Doubling`. Clean today; UAF with `.struct_init` as a temp. `--asan` catches it; **`--arc` reports it
 CLEAN** (object ends at rc 0, nothing "live at exit"). Simple trait-arg coercion *without* a downcast
 (constructor or literal, single dispatch — probes 13a/13b) is already clean under `.struct_init`-temp.
@@ -93,7 +93,7 @@ and numeric cast results too. The registration is inline here, scoped to the tra
 
 ## Verification matrix (gate hard on `--asan` — `--arc` is blind to these UAFs)
 
-Build both runtimes (`zig build`, `NOVA_ASAN=1 zig build`). Every row must pass `--arc` AND `--asan`.
+Build both runtimes (`zig build`, `KYTE_ASAN=1 zig build`). Every row must pass `--arc` AND `--asan`.
 
 Fixes (must flip from broken→clean):
 - probe 13c (downcast of a struct-literal trait arg) — was UAF under the naive change.

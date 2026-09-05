@@ -7,8 +7,8 @@ A leaf self-time profile on the same M1 machine put about 88 percent of per-requ
 inside memory management: malloc and free around 34 to 40 percent, ARC retain and release
 27 percent, memset 11 percent, arena alloc 9 percent. Actual I/O was about 2 percent.
 
-The root cause is architectural, not a hot-loop micro-bug. Every Nova `struct` today is a
-reference type: `struct_init` lowers to `nova_bytes_alloc` plus an atomic refcount header.
+The root cause is architectural, not a hot-loop micro-bug. Every Kyte `struct` today is a
+reference type: `struct_init` lowers to `kyte_bytes_alloc` plus an atomic refcount header.
 So ordinary value-shaped data (a `ProductView`, a `DbValue`, a request context) pays a heap
 allocation and an atomic refcount on every construction and every drop. That single fact
 produces both the 40 percent malloc and the 27 percent ARC in the profile.
@@ -23,19 +23,19 @@ Legend: ☐ not started · ◐ in progress · ✅ done · ⏸ parked · ✗ drop
 | ID | Refinement | Status | Notes |
 |----|-----------|--------|-------|
 | **Architectural (the root fix)** | | | |
-| M-1 | Value-type `struct` (inline, copied, no heap, no ARC) | ✅ | DEFAULT ON (`NOVA_VALUE_STRUCTS_OFF` reverts). Stack alloca, no ARC, copy-on-assign, owned-fields incl. grow, inline in `List` (M-10). Escape channels (return-construction incl. closures, field/type-param, tuple/error-union/optional slot, @serializable, trait-impl, colliding scoped name, any-box heap-promote) keep unsafe shapes on the heap; corpus + ASAN green under the flip |
+| M-1 | Value-type `struct` (inline, copied, no heap, no ARC) | ✅ | DEFAULT ON (`KYTE_VALUE_STRUCTS_OFF` reverts). Stack alloca, no ARC, copy-on-assign, owned-fields incl. grow, inline in `List` (M-10). Escape channels (return-construction incl. closures, field/type-param, tuple/error-union/optional slot, @serializable, trait-impl, colliding scoped name, any-box heap-promote) keep unsafe shapes on the heap; corpus + ASAN green under the flip |
 | M-2 | Reference-type `class` (heap, ARC, identity, shared) | ✅ | keyword + plumbing; 7 collections + `App`, `ServiceProvider`/`ServiceCollection`, `TcpListener`/`TcpStream`/`TcpClient`, `TlsStream`/`AsyncStream`/`ReactorStream`, `Pool`/`ResilientPool` marked `class` (identity/aliased-mutation types) |
 | M-3 | ARC only on heap/reference fields | ✅ | inherent in M-1: `retainValueStructOwnedFields` + the drop loop gate on `isOwnedDeclaredType`, so a value struct's copy/drop touches ONLY reference fields; scalars get zero ARC |
 | M-4 | Non-atomic refcount on the single-thread reactor | ✅ | corpus+ASAN green; flips to atomic before any 2nd thread |
-| M-5 | ARC elision (expand the borrowed-field prototype) | ✅ | borrowed-field prototype ON by default + `elideRedundantPairsInFn`: a `nova_retain(v)` whose next use of `v` in the block is `nova_release(v)` (nothing references `v` between) is a net-zero pair and both are removed -- covers pass-through / borrowed-call-arg shapes the prototype missed. Provably balance-preserving (the +1 is unobservable when nothing reads `v` in the span); `NOVA_ARC_ELIDE_OFF` disables |
+| M-5 | ARC elision (expand the borrowed-field prototype) | ✅ | borrowed-field prototype ON by default + `elideRedundantPairsInFn`: a `kyte_retain(v)` whose next use of `v` in the block is `kyte_release(v)` (nothing references `v` between) is a net-zero pair and both are removed -- covers pass-through / borrowed-call-arg shapes the prototype missed. Provably balance-preserving (the +1 is unobservable when nothing reads `v` in the span); `KYTE_ARC_ELIDE_OFF` disables |
 | M-6 | Per-coroutine region arena + escape analysis | ◐ | Per-coroutine GROWABLE arena delivered + ARC-clean (case 318): `io/arena.Arena` is a per-instance object (each handler holds its own in its coroutine frame -> concurrent requests never share a cursor, the crux that sank the reverted shared-thread-arena), grows by chaining blocks on overflow instead of failing (no fixed-32MB starvation), and reclaims a whole request's scratch with one O(1) `reset` that settles back to one block. Remaining: AUTOMATIC escape-analysis routing of request allocations into the active arena (needs a per-coroutine active-arena carried across awaits + codegen routing) -- explicit use works today |
 | **Native resource lifetime** | | | |
-| M-7 | Owned-handle type (`Fd`/`Socket`) + RAII destructor | ✅ | `os/handle.nova` `Fd` single-owner `class`: its `delete` destructor hook (the compiler already calls `<Type>_delete` at last release) closes the fd exactly once; idempotent `close()` for the error path; composition via owned-field release. No `move` keyword needed -- a `class` is never value-copied, so one owner, one close. Proven (case 316): a real socket fd is closed on destruction (second close = EBADF) and explicit close is idempotent. Adoption into connection/stream/bio fields is the follow-on |
+| M-7 | Owned-handle type (`Fd`/`Socket`) + RAII destructor | ✅ | `os/handle.ky` `Fd` single-owner `class`: its `delete` destructor hook (the compiler already calls `<Type>_delete` at last release) closes the fd exactly once; idempotent `close()` for the error path; composition via owned-field release. No `move` keyword needed -- a `class` is never value-copied, so one owner, one close. Proven (case 316): a real socket fd is closed on destruction (second close = EBADF) and explicit close is idempotent. Adoption into connection/stream/bio fields is the follow-on |
 | M-8 | Singleton lifetime via root ownership + borrow | ✅ | singletons are `class` (M-2) owned by the DI container → `App` → `main`; `app.run()` never returns, so the chain lives for the process. Handlers borrow by reference (single-reactor, no per-request retain on the shared object) |
 | **Data-shape slimming** | | | |
 | M-9 | `DbValue` slimming | ✅ | `arr` lazy + 16-byte `dec` field removed (reconstructed from text); corpus+ASAN green |
 | **Collections and buffers** | | | |
-| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline COMPLETE (default, ARC-clean, case 317): scalar + owned-field value structs inline at real slot width. NOW IN PROGRESS: FULL retirement of the `.storage` intrinsic, Swift-grounded (`__ContiguousArrayStorage` = a `class` + `UnsafeMutablePointer` + `MemoryLayout.stride`). Split the two roles Nova's `.storage` conflates -> (P1) typed-element intrinsics `mem/witness.{sizeOf,copyElem,dropElem}<T>` = value witnesses, lowered to the struct field-walk's copy/drop [DONE, builds]; (P2) pure-Nova `class RawBuffer<T>` on them [DONE]; (P3) `List` on `RawBuffer` [DONE, corpus 319/320 + ASAN green: needed mono-worklist-follows-backing, a value-optional element ABI fix, and a closure-capture-vs-method-name fix]; (P4) `Map`/`Set` on it, then DELETE `.storage` + `isOwnedStorageElem` + `buildStorageDestructor` (~52 touchpoints -> 3 intrinsics), buffer becomes uniquely-owned (no buffer refcount). See the "Full retirement" subsection below. (Map/Set inline-of-value-optional + a pre-existing `Map<K,struct-with-owned-field>` leak remain, logged in the backlog.) |
+| M-10 | Retire `Storage` bespoke ARC + fixed 8-byte slot | ◐ | `List<value-struct>` inline COMPLETE (default, ARC-clean, case 317): scalar + owned-field value structs inline at real slot width. NOW IN PROGRESS: FULL retirement of the `.storage` intrinsic, Swift-grounded (`__ContiguousArrayStorage` = a `class` + `UnsafeMutablePointer` + `MemoryLayout.stride`). Split the two roles Kyte's `.storage` conflates -> (P1) typed-element intrinsics `mem/witness.{sizeOf,copyElem,dropElem}<T>` = value witnesses, lowered to the struct field-walk's copy/drop [DONE, builds]; (P2) pure-Kyte `class RawBuffer<T>` on them [DONE]; (P3) `List` on `RawBuffer` [DONE, corpus 319/320 + ASAN green: needed mono-worklist-follows-backing, a value-optional element ABI fix, and a closure-capture-vs-method-name fix]; (P4) `Map`/`Set` on it, then DELETE `.storage` + `isOwnedStorageElem` + `buildStorageDestructor` (~52 touchpoints -> 3 intrinsics), buffer becomes uniquely-owned (no buffer refcount). See the "Full retirement" subsection below. (Map/Set inline-of-value-optional + a pre-existing `Map<K,struct-with-owned-field>` leak remain, logged in the backlog.) |
 | **Shipped micro-optimizations** | | | |
 | S-1 | `escapeHtml` scan-and-run (no alloc when clean) | ✅ | corpus+ASAN green |
 | S-2 | `bytes.copy` (memcpy) in StringBuilder + string.slice | ✅ | corpus+ASAN green |
@@ -44,9 +44,9 @@ Legend: ☐ not started · ◐ in progress · ✅ done · ⏸ parked · ✗ drop
 | S-5 | Zero-copy postgres decode (PgFrame/PgCursor view) | ✅ | driver-side |
 | S-6 | Lazy `DbValue.arr` (optional, guarded) | ✅ | part of M-9 |
 | S-7 | `g_waiters` thread_local (drop multi-core lock) | ✅ | corpus green |
-| S-8 | Multi-core reactor spawn (`nova_run_reactors`) | ✅ | opt-in |
+| S-8 | Multi-core reactor spawn (`kyte_run_reactors`) | ✅ | opt-in |
 | S-9 | Response cache in the web layer | ✅ | opt-in |
-| S-10 | gzip off by default | ✅ | pure-Nova DEFLATE too costly |
+| S-10 | gzip off by default | ✅ | pure-Kyte DEFLATE too costly |
 
 ---
 
@@ -62,8 +62,8 @@ this detail; when a row's status changes, update the table cell only.
 assignment and on pass-by-value, and it carries no heap allocation and no refcount header.
 `class` (M-2) becomes the reference type for anything that needs identity or sharing.
 
-**Why.** This is the root fix. Nova's structs are currently reference types: codegen lowers
-`.struct_init` to `compileAlloc(struct_size)`, i.e. `nova_bytes_alloc` plus the 8-byte ARC
+**Why.** This is the root fix. Kyte's structs are currently reference types: codegen lowers
+`.struct_init` to `compileAlloc(struct_size)`, i.e. `kyte_bytes_alloc` plus the 8-byte ARC
 header (refcount at offset -8, length at -4). Every `ProductView(...)`, every `DbValue`,
 every small request-scoped record therefore pays a heap allocation on construction and an
 atomic decrement on drop. That is the mechanism behind both the 40 percent malloc and the
@@ -85,7 +85,7 @@ syntax beyond choosing `struct` vs `class`.
   identity (they become `class`), plus corpus and ASAN as the gate. Expect this to be the
   largest single change and the one that moves the profile the most.
 
-**Default-flip: driven to 313/316 under `NOVA_VALUE_STRUCTS_ALL` (2026-08-10), kept opt-in.**
+**Default-flip: driven to 313/316 under `KYTE_VALUE_STRUCTS_ALL` (2026-08-10), kept opt-in.**
 The full flip (value-by-default, `class` only for heap/shared-identity types) was implemented and
 hardened. Steps that landed:
   - The 7 collection containers (`List`/`Map`/`Set`/`Deque`/`OrderedMap`/`Heap`/`StringBuilder`)
@@ -112,7 +112,7 @@ it to be **value in one place and reference in another (per-use duality)** -- i.
 ownership/borrow model, or inline storage + inline copy/drop in EVERY aggregate (tuple, `any`-box,
 closure environment, async frame), the way `List`/`Storage` now inline. Either is a substantial,
 soundness-critical slice. So the flip stays **opt-in** (default OFF -> all-reference, corpus
-315/316); under `NOVA_VALUE_STRUCTS_ALL` it is 313/316. The value-struct machinery, the
+315/316); under `KYTE_VALUE_STRUCTS_ALL` it is 313/316. The value-struct machinery, the
 `List<value-struct>` inline win, and the return/field/container/trait/scalar escape channels are
 all done and verified. The remaining work for a *default-on* flip, in order: (1) uniform inline
 value-struct storage in the other aggregates (tuple, `any`, closure, async) OR a per-use borrow
@@ -129,7 +129,7 @@ clean for value structs with `int`+`string` fields (e.g. a `ProductView`-shape) 
   - `retainValueStructOwnedFields` retains a struct's owned fields after a byte-copy (copy / container-insert);
   - `dropValueStruct` calls the struct's destructor DIRECTLY at scope/temp end to release owned fields with NO free (it is a stack alloca) -- wired into `releaseLocalByName`, the temp drain, and owned-field-value-struct locals are registered for scope drop;
   - the `Storage` destructor gained an inline-element loop (`buildInlineValueStructStorageLoop`) that releases each inline element's owned fields in place;
-  - `buildValueStructStorage` now ZERO-inits the alloca, so an owned field's init "release the old value" sees null (a fresh raw alloca is garbage -> that first release would nova_release a junk pointer, SIGSEGV -- fixed);
+  - `buildValueStructStorage` now ZERO-inits the alloca, so an owned field's init "release the old value" sees null (a fresh raw alloca is garbage -> that first release would kyte_release a junk pointer, SIGSEGV -- fixed);
   - the scalar-only fail-safe was relaxed to also allow `string` fields.
 GROW DOUBLE-FREE -- FIXED. The bug was that `newData.set(i, self.data.get(i))` in `grow()` treats
 `self.data.get(i)` (a value struct BORROW -- the old buffer slot address) as an OWNED temporary and
@@ -139,7 +139,7 @@ a droppable temp ONLY when it is a CONSTRUCTION, not a borrow (`compileExpressio
 several grows, ASAN clean AND ARC-audit clean. Owned-field value structs are now sound for locals,
 copies, and GROWING containers.
 
-REMAINING (exposed by the full flip): with `string` fields allowed, `NOVA_VALUE_STRUCTS_ALL` drops
+REMAINING (exposed by the full flip): with `string` fields allowed, `KYTE_VALUE_STRUCTS_ALL` drops
 from 313/316 to 304/316 -- nine new failures in **serde-binding, `try`/error-union, `??` coalesce,
 and async** contexts (`13_serde`, `159_micro_orm`, `309_generic_async_serde_bind`, `45_try_returns_owned`,
 `78_coalesce_owned_default`, `269_async_try_propagate`, ...). So a string-field value struct that flows
@@ -152,7 +152,7 @@ value structs are complete and verified. The DEFAULT gate stays OFF, corpus 315/
 `retainValueStructOwnedFields(structAddr, name)` walks a value struct's fields and retains each
 owned (reference) field after a byte-copy, so `let b = a` for an owned-field value struct gives
 `b` its own refs. The DROP half is a value struct calling its destructor DIRECTLY at scope end
-(release owned fields, NO nova_release/free -- it is a stack alloca). But wiring these to actually
+(release owned fields, NO kyte_release/free -- it is a stack alloca). But wiring these to actually
 enable owned-field value structs hits the same wall as the aggregates: a value struct entering a
 CONTAINER needs MOVE semantics (memcpy, no retain, source consumed), and `list.push(Foo(...))`
 (a temp) is a move while `list.push(existingFoo)` (a live var) is a copy -- a per-USE distinction
@@ -164,14 +164,14 @@ default flip; it is a substantial, soundness-critical slice, not a same-session 
 copy-retain helper is landed as its foundation.
 
 **Progress (foundation, gated).** The core mechanism works end to end behind a per-type
-rollout gate (`NOVA_VALUE_TYPES=A,B` or `NOVA_VALUE_STRUCTS_ALL`; default off, so codegen is
+rollout gate (`KYTE_VALUE_TYPES=A,B` or `KYTE_VALUE_STRUCTS_ALL`; default off, so codegen is
 unchanged and the corpus stays 315/316). A gated `struct` (is_reference==false) is:
   - stored inline via a stack `alloca` at all struct construction sites (`buildValueStructStorage`
     replaces `compileAlloc` at the field-literal path plus the three constructor-call paths), and
   - treated as NOT owned by `isOwnedTypeId` (a `.struct_` arm consulting `isValueStructName` /
     `isValueStructTid`), so the whole ownership machinery emits no retain/release/free for it.
 Verified: `Point{x:int,y:int}` lowers to an 8-byte stack alloca (`Point_init(%vstruct_addr,...)`,
-no `nova_bytes_alloc`, no `nova_retain`/`nova_release`), returns correct results, and is ASAN
+no `kyte_bytes_alloc`, no `kyte_retain`/`kyte_release`), returns correct results, and is ASAN
 clean; the default-off corpus is unchanged at 315/316. Two traps banked: (1) `renderLegacy`
 returns a BORROWED/interned string — never free it, or sema's name cache corrupts and method
 resolution breaks; (2) struct construction has FOUR codegen sites, all of which must be gated.
@@ -186,7 +186,7 @@ container). The initial rollout is all-primitive, non-escaping local value struc
 that escapes its constructing frame would be a use-after-free: `fn make(a,b): Point { return
 Point(a,b); }` lowered to a stack alloca does `ret i64 %vstruct_addr`, returning the address of a
 slot freed on return. (This does NOT trip the ASAN gate — ASAN instruments the C++ runtime, not
-nova-generated code, and the read usually finds stale-but-intact bytes, so it passes by luck and
+kyte-generated code, and the read usually finds stale-but-intact bytes, so it passes by luck and
 corrupts only under stack reuse.) This is now handled by a **whole-program escape exclusion**
 (`computeValueEscapeSet`, consulted by `isValueStructName`): a struct that appears as a function/
 method return type, a struct field type, or a container element / generic arg is NOT
@@ -199,10 +199,10 @@ that is an optimisation on top of a now-safe base, not a prerequisite for safety
 
 **Copy-on-assign (done for `let b = a`).** Value semantics require `let b = a` to give `b` its
 own storage with `a`'s bytes copied in, not to alias `a`. Implemented via `buildValueStructCopy`
-(fresh stack storage + `nova_bytes_copy`), triggered in the let path only when the target is a
+(fresh stack storage + `kyte_bytes_copy`), triggered in the let path only when the target is a
 value struct and the RHS is a plain variable (a fresh `Point(...)` construction already yields
 distinct storage). Verified: `let a = Point(1,2); let b = a; b.setX(99)` leaves `a.x == 1` and
-`b.x == 99`, with one `nova_bytes_copy` emitted, ASAN clean, default-off corpus 315/316. Still
+`b.x == 99`, with one `kyte_bytes_copy` emitted, ASAN clean, default-off corpus 315/316. Still
 open on the copy side: **argument-passing copy** (`foo(p)` still passes p's address = a borrow;
 fine for read-only or mutate-locally callees, but not yet a value copy) and plain
 **reassignment** (`b = a` as a statement). These are lower priority than container-inline (M-10),
@@ -217,7 +217,7 @@ is exactly today's struct behaviour, kept but renamed and made opt-in.
 **Why.** Some things genuinely need reference semantics: the connection pool, a live socket
 wrapper, DI singletons, the `App`, anything shared across handlers or mutated through several
 aliases. Splitting value `struct` from reference `class` is the idiomatic C#/Swift model and
-fits Nova's TypeScript and C# flavour. It gives the user a clear, familiar lever: pick
+fits Kyte's TypeScript and C# flavour. It gives the user a clear, familiar lever: pick
 `struct` for data, `class` for shared/identity objects.
 
 **How (sketch).**
@@ -243,7 +243,7 @@ than just moving the cost around.
 
 **How (sketch).**
 - The copy and drop routines generated per type walk the field list and emit
-  `nova_retain`/`nova_release` only where `isOwned(TypeId)` is true (the machinery from the
+  `kyte_retain`/`kyte_release` only where `isOwned(TypeId)` is true (the machinery from the
   F5 TypeId migration already answers this).
 - Value structs embedded in value structs recurse; reference fields get one retain on copy,
   one release on drop, as now.
@@ -271,14 +271,14 @@ cost that survives M-1/M-3.
 - Conservative default: atomic unless proven single-thread, so correctness never depends on
   getting the analysis complete. Start by flagging the obvious request-scoped allocations
   on the reactor path.
-- Runtime: two code paths in `nova_retain`/`nova_release`, or a header bit that selects the
+- Runtime: two code paths in `kyte_retain`/`kyte_release`, or a header bit that selects the
   path. Keep the header layout (rc@-8, len@-4) unchanged.
 
 **Shipped.** `alloc.cpp` carries a process-wide `g_arc_multithreaded` flag (starts false).
-`nova_retain`/`nova_release` take a plain non-atomic integer path while it is false and the
-existing atomic path once it is true. `nova_arc_go_multithreaded()` flips it to true, called
+`kyte_retain`/`kyte_release` take a plain non-atomic integer path while it is false and the
+existing atomic path once it is true. `kyte_arc_go_multithreaded()` flips it to true, called
 just before every OS-thread creation in the runtime: the multi-reactor spawn
-(`nova_run_reactors`), the debug I/O watchdog, and the Windows IOCP timer-queue arm. Thread
+(`kyte_run_reactors`), the debug I/O watchdog, and the Windows IOCP timer-queue arm. Thread
 creation is the happens-before edge, so a `false` reading is only ever observed while the
 process is genuinely single-threaded, and an object straddling the transition stays consistent
 (its non-atomic writes precede the flip, which precedes the first other thread). Verified:
@@ -293,10 +293,10 @@ only borrowed for the duration of a call and its refcount is provably stable. Gr
 existing prototype from the single borrowed-field pattern to the general case.
 
 **Why.** Even with non-atomic RC, the cheapest refcount op is the one you do not emit.
-Swift's optimiser elides ARC aggressively; Nova has the scaffolding but it is switched off.
+Swift's optimiser elides ARC aggressively; Kyte has the scaffolding but it is switched off.
 
 **How (sketch).**
-- The prototype lives in `arc.zig` as `elideBorrowedArc`, gated by `NOVA_ARC_ELIDE` with
+- The prototype lives in `arc.zig` as `elideBorrowedArc`, gated by `KYTE_ARC_ELIDE` with
   `elide_enabled = false`. It currently only handles the borrowed-field read pattern.
 - Extend to: borrowed call arguments (callee does not store the arg), pass-through returns,
   and retain/release pairs with no escaping use between them.
@@ -304,11 +304,11 @@ Swift's optimiser elides ARC aggressively; Nova has the scaffolding but it is sw
   ASAN. Turn it on by default only once the corpus and ASAN gates stay green with it.
 
 **Shipped (prototype on by default).** The borrowed-field prototype (`elideBorrowedArc` in
-`arc.zig`, a conservative peephole that removes a `nova_retain` together with its paired
-`nova_release`(s) when a local only ever holds a value copied out of a borrowed parameter's
-field and never escapes) is now enabled by default in `main.zig`; `NOVA_ARC_ELIDE_OFF`
+`arc.zig`, a conservative peephole that removes a `kyte_retain` together with its paired
+`kyte_release`(s) when a local only ever holds a value copied out of a borrowed parameter's
+field and never escapes) is now enabled by default in `main.zig`; `KYTE_ARC_ELIDE_OFF`
 disables it for debugging. Verified balance-preserving: corpus 315/316 (only `189` off-Linux),
-ASAN clean, and a differential `NOVA_ARC_AUDIT` check on 12 ARC-heavy cases (collections,
+ASAN clean, and a differential `KYTE_ARC_AUDIT` check on 12 ARC-heavy cases (collections,
 maps, closures, owned aggregates, try-returns-owned) reported `ARC audit: clean` identically
 with elision off and on, so no release was wrongly dropped. Note: the full sequential `--arc`
 gate hangs in this environment on a reactor/server case, so the differential per-case audit is
@@ -327,7 +327,7 @@ A per-request region turns thousands of frees into one reset. This is the classi
 allocation strategy.
 
 **Status and the trap (why it is parked).** A first attempt used the *shared thread-arena*
-(`nova_arena_mark`/`nova_arena_reset`) and reset it per request in `handleConn`. That failed
+(`kyte_arena_mark`/`kyte_arena_reset`) and reset it per request in `handleConn`. That failed
 and was reverted: under `c=50` there are about 50 requests in flight on one reactor, their
 allocations interleave, so a single shared arena has no LIFO discipline to mark and reset
 against, and roughly 50 concurrent requests times about 1MB overflowed the 32MB
@@ -356,7 +356,7 @@ automatically when the owner is destroyed. Provide an explicit, idempotent `clos
 for the error path, with the destructor as the safety net.
 
 **Why.** A socket or fd is a native resource with a lifetime that must end exactly once.
-Nova's ARC is deterministic, so a destructor tied to the last release closes the resource at
+Kyte's ARC is deterministic, so a destructor tied to the last release closes the resource at
 a known point, which is strictly better than Go's non-deterministic GC finalizers (which can
 leak fds under load) and matches Rust `Drop`, Swift `deinit`, C++ destructors, and C#
 `Dispose` plus finalizer. Tying the close to the type, not to hand-written cleanup at every
@@ -437,7 +437,7 @@ real per-element slot width instead of a fixed 8 bytes. The collection backbone 
 block) becomes a value type that uniquely owns its buffer; the buffer stops being a
 refcounted "persistent" object and becomes a uniquely-owned run freed by a destructor.
 
-**Why (what `Storage` is today).** `Storage<T>` is not Nova source; it is a first-class
+**Why (what `Storage` is today).** `Storage<T>` is not Kyte source; it is a first-class
 `.storage` kind special-cased in codegen. `Storage<T>(n)` allocates `n * 8` bytes on the
 malloc heap (`compileAllocPersistent`, with the refcount header). Every slot is **8 bytes
 regardless of `T`**. `.get`/`.set` are raw `base + i*8` load/stores; when the element is a
@@ -504,24 +504,24 @@ Swift's array is `Array<T>` (value, copy-on-write) -> `_ContiguousArrayBuffer` -
 copy/drop), and `MemoryLayout<Element>.stride` (real slot width). Element cleanup is the storage
 class's `deinit` calling the element type's value witness.
 
-Nova's `.storage` conflates two roles Swift keeps apart: the **buffer object** (a `class` + a
+Kyte's `.storage` conflates two roles Swift keeps apart: the **buffer object** (a `class` + a
 `ptr`/`cap` field can be this -- `bytes.alloc` already gives the run) and the **typed element
-witness** (copy/drop/stride for `T`, which Nova buries in `isOwnedStorageElem` +
+witness** (copy/drop/stride for `T`, which Kyte buries in `isOwnedStorageElem` +
 `buildStorageDestructor`). Split them:
 
-1. **Typed-element intrinsics = Nova's value witnesses. [P1 -- LANDED (commit 231762f), builds.]**
-   `mem/witness.nova` declares `sizeOf<T>(): int`, `copyElem<T>(dst, src)` and `dropElem<T>(addr)`;
+1. **Typed-element intrinsics = Kyte's value witnesses. [P1 -- LANDED (commit 231762f), builds.]**
+   `mem/witness.ky` declares `sizeOf<T>(): int`, `copyElem<T>(dst, src)` and `dropElem<T>(addr)`;
    codegen (`compileElemWitness` in `expressions.zig`, intercepted at the top of the `.generic_call`
    arm) lowers each call to exactly the typed copy/drop the struct field-walk (M-3) already emits --
-   no new ownership logic, just exposed to Nova source. Slot model: a value struct occupies its real
+   no new ownership logic, just exposed to Kyte source. Slot model: a value struct occupies its real
    width inline (`copyElem` = `buildValueStructCopyInto` + `retainValueStructOwnedFields`; `dropElem`
    = the value-struct destructor); everything else is one 8-byte slot (load/store the value/pointer;
    `compileRetain`/`compileRelease` when `ownedByName`). Bodies are dead fallbacks so sema resolves +
-   monomorphizes per `T`. These are Nova's `UnsafeMutablePointer.initialize`/`.deinitialize` +
+   monomorphizes per `T`. These are Kyte's `UnsafeMutablePointer.initialize`/`.deinitialize` +
    `MemoryLayout.stride`. STILL TO ADD for P2: value-in / value-out witnesses (`store`/`load`), since
    `copyElem` is slot-to-slot (addresses) but a collection pushes/reads a `T` in its native
    representation (address for a value struct, an 8-byte value for a scalar/reference).
-2. **Pure-Nova `class RawBuffer<T>` [P2 -- LANDED (commit 9020fa8), ARC-clean case 319].** Holds
+2. **Pure-Kyte `class RawBuffer<T>` [P2 -- LANDED (commit 9020fa8), ARC-clean case 319].** Holds
    `data`/`cap`/`len`; push/at/set/pop/insertAt/removeAt/clear go through the witnesses (incl.
    `store`/`storeOver`/`load`/`moveElem`/`moveOut`), grow MOVES the live prefix wholesale, `delete()`
    (the M-7 hook) drops every live element then frees the run. Uniquely owned -> no buffer refcount.
@@ -529,7 +529,7 @@ witness** (copy/drop/stride for `T`, which Nova buries in `isOwnedStorageElem` +
 3. **Rebuild `List` on `RawBuffer<T>` [P3 -- DONE, corpus 319/320 + ASAN green].**
    `List`'s backing is now `data: RawBuffer<T>`, not `data: Storage<T>`. Getting there needed three
    codegen fixes, each a real defect the intrinsic `.storage` had hidden by never being a genuine
-   generic Nova class:
+   generic Kyte class:
    - **Mono worklist follows the backing chain.** In erased / default-ctor / nested-generic contexts
      `List<T>` referenced the ERASED `RawBuffer_init`/`RawBuffer_delete` (undefined at link) because
      the worklist did not instantiate `RawBuffer<X>` for every `List<X>` (same class as the B4 Set
@@ -596,10 +596,10 @@ safe across a later grow). Two traps fixed along the way: (1) `return undefined`
 literals were mis-classified as constructions -- the borrow whitelist now includes literals,
 reads, arithmetic, casts, and non-constructor calls, with everything else conservatively
 excluded (fail-safe); (2) a value-struct construction was being registered as an ARC temporary
-and `nova_release`d at end of statement -- freeing a stack alloca (SIGBUS) -- so value structs
+and `kyte_release`d at end of statement -- freeing a stack alloca (SIGBUS) -- so value structs
 are no longer registered as temporaries. Verified: `List<Point>` push/at/field-access/method
-round-trips with the elements stored INLINE in the buffer (one `nova_bytes_copy` per push, zero
-`nova_release`, zero per-element `nova_bytes_alloc`), ASAN clean, default-off corpus 315/316.
+round-trips with the elements stored INLINE in the buffer (one `kyte_bytes_copy` per push, zero
+`kyte_release`, zero per-element `kyte_bytes_alloc`), ASAN clean, default-off corpus 315/316.
 Remaining for M-10: `Map`/`Set` inline (only `List` exercised so far), value-struct elements
 larger than a pointer or with owned (reference) fields, and finally retiring the bespoke
 `isOwnedStorageElem` path for the reference-element case.
@@ -616,13 +616,13 @@ complete and nobody re-does them.
 `escapeHtml` now scans the input first and returns the input string unchanged when there is
 nothing to escape, instead of always building a new buffer. Most rendered text is clean, so
 this removes an allocation and a copy from the common render path.
-(`lang/src/std/web/response.nova`.)
+(`lang/src/std/web/response.ky`.)
 
 ### S-2 `bytes.copy` in StringBuilder and string.slice
-Added a `bytes.copy(dst, src, len)` intrinsic backed by `nova_bytes_copy` (memmove).
+Added a `bytes.copy(dst, src, len)` intrinsic backed by `kyte_bytes_copy` (memmove).
 `StringBuilder.append`/`toString`/`ensureCapacity` and `string.slice()` now use it instead of
 byte-by-byte loops. `string.slice` is `bytes.copy(ptr as long, (s as long)+start, len)`.
-(`string_builder.nova`, `string.nova`, `alloc.cpp`, `expressions.zig`.)
+(`string_builder.ky`, `string.ky`, `alloc.cpp`, `expressions.zig`.)
 
 ### S-3 Single-StringBuilder JSX tree render
 JSX/NSX rendering was refactored to `emitJsxInto` with `jsxAppendVal`/`jsxAppendLiteral`/
@@ -640,11 +640,11 @@ The postgres driver decodes rows as views over the receive buffer: `PgFrame{ftyp
 off,len}` for a 'D' message and a `PgCursor(buf,start,end)` that reads raw bytes via a
 `bufSlice` memcpy, with `decodeDataRow(buf,off,len,cols)`. Avoids per-cell allocation while
 parsing the wire protocol.
-(`~/.nova/cache/nova-postgres/src/{proto,codec,postgres,auth}.nova`.)
+(`~/.kyte/cache/nova-postgres/src/{proto,codec,postgres,auth}.ky`.)
 
 ### S-6 Lazy `DbValue.arr`
 See M-9: `arr` is optional, initialised `undefined`, accessors guarded. Scalar cells no longer
-allocate an array. (`db.nova`.)
+allocate an array. (`db.ky`.)
 
 ### S-7 `g_waiters` thread_local
 `g_waiters` in the concurrency runtime was made `thread_local` and the seven
@@ -652,18 +652,18 @@ allocate an array. (`db.nova`.)
 serialization point. (`concurrency.cpp`.)
 
 ### S-8 Multi-core reactor spawn
-`runReactors(n, worker)` maps to `nova_run_reactors`, which spawns `n` reactor threads
-(`std::vector<std::thread>`). Opt-in via `NOVA_WEB_WORKERS`; single-reactor stays the default.
-(`poller.nova`, `concurrency.cpp`, `app.nova`.)
+`runReactors(n, worker)` maps to `kyte_run_reactors`, which spawns `n` reactor threads
+(`std::vector<std::thread>`). Opt-in via `KYTE_WEB_WORKERS`; single-reactor stays the default.
+(`poller.ky`, `concurrency.cpp`, `app.ky`.)
 
 ### S-9 Response cache
 The web layer can cache a rendered response (`cache`/`cacheable`/`enableCache`/`cachedCopy`)
 so identical responses are not re-rendered. Opt-in; stale-on-write handled by the caller.
-(`app.nova`.)
+(`app.ky`.)
 
 ### S-10 gzip off by default
-gzip is off by default because the pure-Nova DEFLATE was measured using about 60 percent more
-CPU, which dominated the response path. Kept available, opt-in. (`app.nova`.)
+gzip is off by default because the pure-Kyte DEFLATE was measured using about 60 percent more
+CPU, which dominated the response path. Kept available, opt-in. (`app.ky`.)
 
 ---
 
@@ -686,5 +686,5 @@ CPU, which dominated the response path. Kept available, opt-in. (`app.nova`.)
    result-set path. Do it after M-1/M-3 are stable.
 
 Gate every code change with the corpus (`conformance/run.sh -j`) and ASAN
-(`NOVA_ASAN=1 zig build` then `conformance/run.sh --asan`). Verify memory with `--asan`, not
+(`KYTE_ASAN=1 zig build` then `conformance/run.sh --asan`). Verify memory with `--asan`, not
 `--arc`.

@@ -1,6 +1,6 @@
 # 2. Values & types
 
-Nova is statically typed. The scalar types are `int` (32-bit signed), `long` (64-bit), `float` (a.k.a.
+Kyte is statically typed. The scalar types are `int` (32-bit signed), `long` (64-bit), `float` (a.k.a.
 `f64`/`double`, IEEE-754), `bool`, and `string`. There is also `decimal` (exact base-10, see
 [chapter 12](12-decimal.md)) and `ptr` (an opaque machine word for low-level code).
 
@@ -8,14 +8,14 @@ Nova is statically typed. The scalar types are `int` (32-bit signed), `long` (64
 
 ## Primitives, operators, and casts
 
-```nova
-// examples/02_primitives.nova
+```kyte
+// examples/02_primitives.ky
 fn main(): void {
     let i: int = 42;              // 32-bit signed
     let big: long = 10000000000;  // 64-bit
     let pi: float = 3.14159;      // IEEE-754 double
     let ok: bool = true;
-    let name: string = "Nova";
+    let name: string = "Kyte";
 
     console.log(`int:    ${i}`);
     console.log(`long:   ${big}`);
@@ -46,7 +46,7 @@ int:    42
 long:   10000000000
 float:  3.14159
 bool:   true
-string: Nova
+string: Kyte
 7 / 2   = 3
 7 % 2   = 1
 2 ** via mul 2*2*2 = 8
@@ -70,8 +70,8 @@ There are exactly two binding keywords (`var` was removed):
 
 Type annotations are optional when the type can be inferred. Tuples can be **destructured**.
 
-```nova
-// examples/03_variables.nova
+```kyte
+// examples/03_variables.ky
 fn main(): void {
     let count = 0;          // inferred int, mutable
     count = count + 5;      // ok, let is mutable
@@ -102,7 +102,7 @@ a = 1, b = 2
 
 ## Value vs reference
 
-Nova has two kinds of type. **Value types** are copied when you assign or pass them: primitives
+Kyte has two kinds of type. **Value types** are copied when you assign or pass them: primitives
 (`int`/`long`/`float`/`bool`/`ptr`/enums), a `struct`, and tuples. **Reference types** are shared, and
 managed by automatic reference counting (ARC): a `class`, plus the built-in heap types `string`,
 `decimal`, `List`/`Map`/`Set`, and closures.

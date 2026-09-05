@@ -1,6 +1,6 @@
-# Nova platform inventory (features, soundness, and acceptance criteria)
+# Kyte platform inventory (features, soundness, and acceptance criteria)
 
-Status: LIVE INVENTORY, started 2026-08-20. This is the authoritative register of what the Nova PLATFORM has
+Status: LIVE INVENTORY, started 2026-08-20. This is the authoritative register of what the Kyte PLATFORM has
 (language + runtime, the NovaDB engine, and the orchestrator / control plane), how sound each piece is, and
 the ACCEPTANCE CRITERIA that define "done and sound" for it. When we harden a feature, we make its unmet
 criteria pass, and we test against exactly these criteria.
@@ -28,7 +28,7 @@ Verification method (strongest wins): **probe** (compiled + run this session) / 
 gates it) / **read** (source read first-hand this session) / **swept** (broad audit sweep only; weakest;
 verify before trusting). When a swept claim and a probe disagree, the probe wins.
 
-## The shape of Nova (the model we built)
+## The shape of Kyte (the model we built)
 
 Deliberate architectural choices, stated as what we HAVE. The identity of the platform. All SOUND.
 
@@ -99,7 +99,7 @@ actual code fix that a probe or gate verifies, not a reframing.
       explicit type argument that is a known struct not declaring a known bound trait even when the body never
       calls the method (`checkGenericBounds`, nominal via `structImplementsTrait`). Conservative: primitives /
       type-parameters / unknown names / unknown traits are not newly rejected. Gated: positive case 389 +
-      negative `expect_fail/unused_bound_violation.nova`; corpus 398/401, baseline unchanged).
+      negative `expect_fail/unused_bound_violation.ky`; corpus 398/401, baseline unchanged).
 
 ### Enums and pattern matching ; SOUND ; case + probe
 
@@ -114,7 +114,7 @@ actual code fix that a probe or gate verifies, not a reframing.
       and runs a coverage-only check (`checkEnumCoverageOnly`) instead of skipping exhaustiveness. Additive: an
       integer/other switch (literal case values) never triggers it. Proven before/after: the old binary
       compiles an incomplete `switch (list[i])` silently (fail-open), the new binary rejects it at type-check
-      ("Enum variant 'Color.Blue' not handled"). Gated: `expect_fail/untypeable_switch_nonexhaustive.nova`;
+      ("Enum variant 'Color.Blue' not handled"). Gated: `expect_fail/untypeable_switch_nonexhaustive.ky`;
       corpus baseline unchanged. NB: a SEPARATE pre-existing codegen bug -- a COMPLETE `switch (list[i])` on an
       enum hits an `LLVMVerificationError` -- was discovered here and is logged in the worklist; it is not part
       of this criterion, which is a type-check-time property.)
@@ -163,7 +163,7 @@ actual code fix that a probe or gate verifies, not a reframing.
       still infers from the call site (so `list.map((x) => ...)` is NOT rejected), which is the intended
       behaviour, not a gap -- requiring types would break ~50 legitimate infer-from-context closures. Gated:
       case 393 (typed + aliased + untyped-infer all compile/run) and negative
-      `expect_fail/closure_arity_mismatch.nova` ("closure 'g' expects 1 argument(s), got 2"); corpus 404/407,
+      `expect_fail/closure_arity_mismatch.ky` ("closure 'g' expects 1 argument(s), got 2"); corpus 404/407,
       baseline unchanged.
 
 ### Integers (`int` 32-bit, `long` 64-bit) ; SOUND ; case + probe
@@ -182,7 +182,7 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] An invalid atomic element type (`Atomic<string>`) is rejected at compile time.
 - [x] The runtime works: `load`/`store`/`compareAndSwap`/`add`/`sub`/`delete` for `int` (i32) and `long`
-      (i64). Implemented as a codegen intercept (`compileAtomicCall`) over the runtime `nova_atomic_*_i32/i64`,
+      (i64). Implemented as a codegen intercept (`compileAtomicCall`) over the runtime `kyte_atomic_*_i32/i64`,
       not the stub stdlib body. Gated by case 31_atomics (7/7) and probed (int + long) ASAN-clean. The earlier
       "stub" mark read the dead stdlib body; the codegen path is real.
 
@@ -240,12 +240,12 @@ actual code fix that a probe or gate verifies, not a reframing.
 - [x] An async channel (reactor-aware) works.
 - [x] Actor mailboxes with `async receive`.
 - [x] Bounded async channel with backpressure (ADDED: `asyncchan.AsyncChannel<T>` -- a sender parks when the
-      buffer is full, a receiver parks when empty; pure Nova over the single-reactor park/resume, like
+      buffer is full, a receiver parks when empty; pure Kyte over the single-reactor park/resume, like
       AsyncLock. Case 396: a capacity-2 channel carries 10 values producer->consumer, forcing backpressure).
 - [x] `select` over channel operations (ADDED: `asyncchan.selectRecv<T>(channels)` parks on every channel and
       wakes when any delivers, returning its index -- the channel analogue of `selectAny` over futures. Case
       398: delivery only on the 2nd channel wakes the select and it picks index 1).
-- [x] Actor supervision / restart / registry (ADDED to `actor.nova`: `ActorRegistry` resolves an actor by
+- [x] Actor supervision / restart / registry (ADDED to `actor.ky`: `ActorRegistry` resolves an actor by
       name; `Supervisor<M>` runs a `SupervisedBehavior<M>` and RESTARTS it (reset + count) on a fault, up to
       maxRestarts, then stops it -- the one-for-one "let it crash" strategy. Case 399: a behavior that faults
       on a poison message is restarted twice, keeps working in between, then stops when the budget is spent;
@@ -314,7 +314,7 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] Parse and serialise with numeric fidelity (int fast-path, decimals as text).
 - [x] Malformed input sets a failed flag (no silent partial parse).
-- [x] YAML 1.2 (was a line-flattening config subset). REWROTE `serde/yaml.nova` as a real block+flow parser
+- [x] YAML 1.2 (was a line-flattening config subset). REWROTE `serde/yaml.ky` as a real block+flow parser
       (`class YamlParser`, reference-semantics cursor + per-document anchor registry): block mappings +
       sequences, sequences-of-mappings (the dash line carries the first key), FLOW style
       `{a: 1, b: [1, 2]}` incl. nesting, ANCHORS `&a` + ALIASES `*a` (deep-cloned), MERGE keys `<<: *a` with
@@ -333,7 +333,7 @@ actual code fix that a probe or gate verifies, not a reframing.
       the SHA-384 branch (`kind==1`) already existed throughout both the client and server key schedules
       (transcriptHash/hash384Into, hmacSha384 Finished, hashLen(1)=48, certVerify at 48 bytes) -- nothing had
       ever driven a real 0x1302 negotiation to PROVE it. Added `TlsServer.setRestrictSuite` (ServerBio
-      `restrictSuite`) to model a suite-restricted server; case 407 runs a full pure-Nova handshake where the
+      `restrictSuite`) to model a suite-restricted server; case 407 runs a full pure-Kyte handshake where the
       server offers ONLY AES-256-GCM-SHA384, the client (offering all three) negotiates 0x1302, BOTH Finished
       MACs verify on SHA-384, and application data round-trips under the AES-256-GCM record layer. Verified
       both sides land on kind=1/suite=1. Case 407.
@@ -349,21 +349,21 @@ actual code fix that a probe or gate verifies, not a reframing.
 - [x] RFC-1951 decoder, byte-exact against system gzip.
 - [x] Encoder emits dynamic Huffman + lazy matching (STALE MARK corrected by a probe -- it is NOT fixed-Huffman
       greedy). The encoder chooses the smallest of stored / fixed / DYNAMIC (BTYPE=10) per block
-      (deflate.nova:1115-1123) and uses a dual-hash LAZY matcher (Go compress/flate level-6 model,
-      deflate.nova:644, `prevLen`). Case 401: a byte-exact round trip at >20x ratio (only dynamic + good
+      (deflate.ky:1115-1123) and uses a dual-hash LAZY matcher (Go compress/flate level-6 model,
+      deflate.ky:644, `prevLen`). Case 401: a byte-exact round trip at >20x ratio (only dynamic + good
       matching reaches it) plus tiny/empty round trips.
 
 ### HTTP / web framework ; SOUND ; case
 
 - [x] HTTP/1.1 server + client, typed path params, DI, mediator, full middleware, hypermedia/SSE.
-- [x] HTTP/2 server. Implemented in `web/http2/` as three pure-Nova modules + web-framework wiring:
-      **hpack.nova** = full RFC 7541 HPACK (the appendix-B Huffman code embedded from the spec tables,
+- [x] HTTP/2 server. Implemented in `web/http2/` as three pure-Kyte modules + web-framework wiring:
+      **hpack.ky** = full RFC 7541 HPACK (the appendix-B Huffman code embedded from the spec tables,
       integer/string primitives, the 61-entry static table + a dynamic table with eviction, and header-block
       encode/decode) -- verified against the RFC 7541 C.4.1 Huffman-coded request vector (case 409);
-      **frame.nova** = the RFC 7540 frame codec (DATA/HEADERS/SETTINGS/WINDOW_UPDATE/PING/GOAWAY/RST_STREAM/
-      PRIORITY/CONTINUATION); **conn.nova** = the connection protocol (preface, SETTINGS handshake + ACK,
+      **frame.ky** = the RFC 7540 frame codec (DATA/HEADERS/SETTINGS/WINDOW_UPDATE/PING/GOAWAY/RST_STREAM/
+      PRIORITY/CONTINUATION); **conn.ky** = the connection protocol (preface, SETTINGS handshake + ACK,
       PING/PONG, HEADERS+CONTINUATION assembly with PADDED/PRIORITY handling, HPACK-decode -> request ->
-      handler -> HEADERS+DATA response, DATA chunked to max-frame-size). `web/app.nova` offers ALPN `h2`
+      handler -> HEADERS+DATA response, DATA chunked to max-frame-size). `web/app.ky` offers ALPN `h2`
       (fallback `http/1.1`) and routes an h2 connection through the SAME mediator/routing as HTTP/1.1
       (`handleConnH2` -> `await self.dispatch`). End-to-end in-memory request/response gated in case 410;
       both cases ASAN-clean. Documented limitations (refinements, not gaps in the protocol): no inbound
@@ -378,7 +378,7 @@ actual code fix that a probe or gate verifies, not a reframing.
       (now/parse/format/add*/dateDiff/*Iso), with `SECONDS_PER_MINUTE`/`MINUTES_PER_HOUR`/`HOURS_PER_DAY` as
       `long` and small date components cast to int only at the wall-clock boundary. `now()` = `nowNs()/1e9`.
       Case 403: a round trip of an instant beyond 2038 plus 64-bit arithmetic/diff.
-- [x] Timezone database (DST-aware; no longer treats wall-clock as UTC). `tz.nova` is a compact named-zone db
+- [x] Timezone database (DST-aware; no longer treats wall-clock as UTC). `tz.ky` is a compact named-zone db
       (UTC, US/EU/AU/India/JP/CN zones) with the current-era US/EU/Australia DST rules: `offsetAt(zone,
       utcEpoch)` returns the correct DST-aware offset (transition instants via nth-weekday-of-month), and
       `toLocal`/`formatInZone` render a UTC instant as the zone's wall clock. Not the full IANA historical
@@ -393,14 +393,14 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] Real binary protocols, server-side prepared statements, transactions.
 - [x] Connection pooling with idle/open caps and lifetime eviction.
-- [x] Micro-ORM has relations / migrations / query builder (was data-mapper only). ADDED three pure-Nova
+- [x] Micro-ORM has relations / migrations / query builder (was data-mapper only). ADDED three pure-Kyte
       modules over the db seam, all with parameterised `$N` binding (values never reach the SQL text):
-      **`data/query.nova`** -- a fluent `Query` builder (`from().select().where(col,op,val)/whereEq/whereIn/
+      **`data/query.ky`** -- a fluent `Query` builder (`from().select().where(col,op,val)/whereEq/whereIn/
       whereNull/whereRaw/join/leftJoin/orderBy/groupBy/having/limit/offset`) producing `toSql()`/
-      `toDeleteSql()` + `params()`, and `run(conn)`; **`data/migrate.nova`** -- versioned `Migration`
+      `toDeleteSql()` + `params()`, and `run(conn)`; **`data/migrate.ky`** -- versioned `Migration`
       up/down list, a `schema_migrations` tracking table, an idempotent `migrate`/`rollbackTo` runner
       (applies pending in version order, records them), and a `Table` CREATE-TABLE builder
-      (`id/column/primaryKey/foreignKey/unique`); **`data/relations.nova`** -- hasMany/belongsTo eager-load
+      (`id/column/primaryKey/foreignKey/unique`); **`data/relations.ky`** -- hasMany/belongsTo eager-load
       `... IN ($1,...)` query builders + `groupByColumn`/`childrenOf` to attach children (the N+1 avoidance
       pattern). Case 412 asserts the generated SQL + collected params for all three. The data-mapper
       (`bindAll`/`queryAs`/`insert`/`update`) is unchanged and composes with these.
@@ -415,7 +415,7 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] Encryption is on by default (FIXED: `connection.parse` now `encrypt=true` unless `?encrypt=false`).
 - [x] The server certificate is verified by default (FIXED: `trustCert=false` unless `?trustServerCertificate=true`).
-- Probe `nova-mssql/tests/111_connection_secure.nova`: a plain connection string yields `encrypt=true` /
+- Probe `nova-mssql/tests/111_connection_secure.ky`: a plain connection string yields `encrypt=true` /
   `trustCert=false`; explicit `?encrypt=false&trustServerCertificate=true` is honoured. Matches modern
   drivers (.NET SqlClient encrypt=true default). Committed nova-mssql 23b2c79.
 
@@ -443,9 +443,9 @@ actual code fix that a probe or gate verifies, not a reframing.
       connection over a dummy fd, closes, asserts the buffer is freed + nulled, and double-closes -- passing
       under `--asan` (no double-free). Committed nova-postgres.
 - [x] TlsStream does not leak ~16 KB per connection. STALE MARK corrected by a probe: `TlsStream.close`
-      already `bytes.free`s its 16 KB record scratch (asynctls.nova:104-110, guarded for double-close) AND
+      already `bytes.free`s its 16 KB record scratch (asynctls.ky:104-110, guarded for double-close) AND
       `closeBio()` frees the memory-BIO's ibuf/obuf (`freeBuffers`) plus every handshake scratch/key buffer
-      (tlsmembio.nova:371/705). This was the M1/M2 per-connection-leak work (task #159); the inventory line
+      (tlsmembio.ky:371/705). This was the M1/M2 per-connection-leak work (task #159); the inventory line
       was just never flipped.
 
 ---
@@ -462,14 +462,14 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 - [x] Git-pin dependency resolution with a lockfile.
 - [x] A package's own module wins over a same-named sibling/cached package (FIXED lang 6c14e13: import
-      resolution now checks the CWD/package-root `./<mod>.nova` + `./src/<mod>.nova` as the final
+      resolution now checks the CWD/package-root `./<mod>.ky` + `./src/<mod>.ky` as the final
       importer-relative step, before the global scans. Previously a bare-filename or `tests/`-relative importer
-      fell through to `~/.nova/cache` and `import connection` could bind to a DIFFERENT package's module, e.g.
+      fell through to `~/.kyte/cache` and `import connection` could bind to a DIFFERENT package's module, e.g.
       mssql resolving nova-postgres's `ConnectionOptions` -> `FieldNotFound`. Corpus 396/399, baseline unchanged).
 - [x] A central registry / discovery. ADDED `src/registry.zig`: a Cargo-style INDEX (a directory / git repo
       with one `<name>.json` per package listing its published versions + git url#ref). A manifest sets
-      `"registry"` (local path or git URL, cloned once into `~/.nova/registry-cache`) and depends on a
-      package by NAME + range (`"nova-http@^1.2.0"`); `packages.zig` rewrites each name-form dep to a concrete
+      `"registry"` (local path or git URL, cloned once into `~/.kyte/registry-cache`) and depends on a
+      package by NAME + range (`"kyte-http@^1.2.0"`); `packages.zig` rewrites each name-form dep to a concrete
       `url#ref` via `registry.rewriteDep` at the single dep-entry point in `resolveTree` (additive -- a
       git-URL dep, or any dep with no registry configured, is untouched, so all existing projects are
       unaffected). `registry.resolveEntry`/`unifyEntry` are the pure, tested core.
@@ -494,8 +494,8 @@ actual code fix that a probe or gate verifies, not a reframing.
 
 ### Formatter and test runner ; PARTIAL ; build
 
-- [x] `nova fmt` with a token-stream-equivalence self-check.
-- [x] `nova test` runs `@test` functions with assertions and a pass/fail tally.
+- [x] `kyte fmt` with a token-stream-equivalence self-check.
+- [x] `kyte test` runs `@test` functions with assertions and a pass/fail tally.
 - [ ] Coverage, benchmarks, name filters, fixtures in the test runner.
 
 ---
@@ -532,7 +532,7 @@ shell harnesses are manual and non-gating.
 - [x] Quorum-ack durable commit (RPO=0).
 - [x] Partition-then-heal soak keeps at most one leader; corrupted frames rejected; mTLS + auth.
 - [x] Automatic leader election / lease-driven failover. STALE MARK corrected: this is NOT manual. The lease
-      (`orch/lease.nova`) elects automatically -- a node's tick is "renew if leader, else `tryAcquire`", where
+      (`orch/lease.ky`) elects automatically -- a node's tick is "renew if leader, else `tryAcquire`", where
       `tryAcquire` create-CASes a free lease or takes an EXPIRED one with a bumped epoch, and `renew` steps down
       (fences) when a newer epoch owns the lease; `haReconcileTick` is the production driver (renew-or-acquire,
       then reconcile ONLY if `stillLeader`). Gated in `198_ha_cluster`: partition the leader, standbys keep
@@ -697,7 +697,7 @@ marked SOUND, so `185` (8/8), `186` (11/11), `181` (8/8), `188` (6/6), `192` and
       test_live_probe_up_then_down): a live TCP connect probes a serving backend UP and a bound-then-closed
       port DOWN over real sockets, then folds the results into `Backend.observe` (rise/fall hysteresis) to
       DRAIN the dead backend out of rotation -- a live probe sweep, not just the offline decision logic.
-- [x] VIP bind for a non-dotted-quad host. FIXED (nova-orchestrator): `bindAddrFor` (proxy.nova) now routes
+- [x] VIP bind for a non-dotted-quad host. FIXED (nova-orchestrator): `bindAddrFor` (proxy.ky) now routes
       through `socket.resolveHost4`, the same blocking getaddrinfo resolver the reactor connect path uses, so a
       Service VIP may be a hostname (`localhost`, `web.internal`) not just a literal dotted quad. A numeric
       IPv4 still parses directly, an empty host is INADDR_ANY, and a host that neither parses nor resolves
@@ -836,7 +836,7 @@ Language:
    (discovered while gating the exhaustiveness fix). Subscript-of-enum feeding a switch mis-lowers; the
    incomplete case is now caught at type-check, but the complete case should codegen and run.
    (The "escaping closure environment leak" was investigated and DISPROVEN empirically this session; it is not a
-   defect. The single-file `nova x -o out` build for `List` programs was fixed as a byproduct.)
+   defect. The single-file `kyte x -o out` build for `List` programs was fixed as a byproduct.)
 
 Drivers: 4. ~~BSON ORM `long` truncation.~~ FIXED (lang 6e83b1b, case 388). 5. ~~MSSQL secure-by-default transport.~~ FIXED (nova-mssql 23b2c79, test 111). 6. MySQL RSA-over-plaintext and unverified SCRAM signature. 7. pg / TLS per-connection buffer leaks. 8. Driver-package source/test skew (exposed once import resolution was fixed): nova-mysql `codec`
 arity mismatch (`buildStmtPrepare` / a 2-vs-3-arg call in tests/109); nova-postgres mock `EchoConn`

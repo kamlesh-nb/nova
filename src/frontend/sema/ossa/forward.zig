@@ -1,6 +1,6 @@
 //! Copy-forwarding analysis over the OSSA (ownership SSA) intermediate form.
 //!
-//! When Nova lowers a value-semantic `let y = x` (or any place a `copy`
+//! When Kyte lowers a value-semantic `let y = x` (or any place a `copy`
 //! instruction is emitted, see [`ir.Func.copy`]), the copy produces a second,
 //! independently-owned value. That copy is only genuinely needed if the *result*
 //! escapes: it is returned to the caller ([`ir.Terminator.ret_owned`]), or it is

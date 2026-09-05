@@ -1,6 +1,6 @@
 # Standard Library and Web Framework
 
-Nova's standard library is written **in Nova itself**, under `src/std/`. There is no precompiled standard
+Kyte's standard library is written **in Kyte itself**, under `src/std/`. There is no precompiled standard
 library binary: the modules that a program imports are compiled from source on every build, through the
 very same pipeline as user code. This keeps the language honest, since the standard library is the largest
 real world test of the compiler, and a standard library module that ceases to compile is caught in the
@@ -25,8 +25,8 @@ src/std/
 ```
 
 The set of standard library modules that the compiler knows how to resolve is registered in `main.zig`
-(the `std_modules` list). An `import <mod>` resolves to `src/std/<mod>.nova` (in checkout), or
-`~/.nova/std/<mod>.nova` (installed), or a fetched package's `src/<mod>.nova` (`~/.nova/cache/<repo>`).
+(the `std_modules` list). An `import <mod>` resolves to `src/std/<mod>.ky` (in checkout), or
+`~/.kyte/std/<mod>.ky` (installed), or a fetched package's `src/<mod>.ky` (`~/.kyte/cache/<repo>`).
 The identity is the **canonical `src/std/...` spelling**, irrespective of the location from which the
 bytes are read, so that a module imported in two ways is collected only once.
 
@@ -42,18 +42,18 @@ bytes are read, so that a module imported in two ways is collected only once.
 - **decimal128** is a first class type: `m` suffixed literals, exact arithmetic (with no implicit int to
   decimal conversion), and div and mod by zero traps. The runtime (`decimal.cpp`) performs the BID codec
   and the base-10 mathematics.
-- **crypto** is real wolfCrypt (SHA, HMAC, CSPRNG), along with base64 implemented in Nova. `random` exposes
+- **crypto** is real wolfCrypt (SHA, HMAC, CSPRNG), along with base64 implemented in Kyte. `random` exposes
   both a CSPRNG (for salts, nonces, and tokens) and a seedable PCG32 `Prng` (for reproducible tests and
   sampling); these two are kept deliberately distinct, so that a reviewer cannot mistake one for the other.
 - **async utilities.** `net/asyncio` (with `AsyncStream` and awaitable socket I/O), `net/asynctls` (with
-  `TlsStream`), the channels, and the actors are the Nova level surface over the runtime's async seam.
+  `TlsStream`), the channels, and the actors are the Kyte level surface over the runtime's async seam.
 
-## The Database Seam, `data/db.nova`
+## The Database Seam, `data/db.ky`
 
 Programs never talk to a concrete driver; they program against a trait seam, so that the backend is
 swappable.
 
-```nova
+```kyte
 pub trait Driver     { async fn connect(self, dsn: string): Connection; }
 pub trait Connection {
     async fn exec(self, sql: string, params: List<DbValue>): ExecResult;
@@ -68,15 +68,15 @@ pub trait Connection {
 `exec`, `query`, and `prepare` are `async fn`, so that a driver's socket recv **parks the coroutine** (in
 a non blocking manner). `DbValue` is a tag struct union of the SQL value kinds; `ResultSet` and `Row`
 decode the typed cells. The concrete drivers (Postgres, MySQL, MSSQL, NovaDB, MongoDB) are **separate
-published packages** (`nova-<name>`), fetched via `nova get`; only the seam and the generic connection pool
+published packages** (`kyte-<name>`), fetched via `kyte get`; only the seam and the generic connection pool
 reside in std. A repository merely constructs a driver and awaits it.
 
-```nova
+```kyte
 let conn = await driver.connect(dsn);
 let rs   = await conn.query("SELECT name FROM products WHERE id = $1", params);
 ```
 
-## The Web Framework, `web/app.nova`
+## The Web Framework, `web/app.ky`
 
 The App is a **minimal API, MediatR style** HTTP framework built on the async runtime. Three
 responsibilities are kept separate.
@@ -85,7 +85,7 @@ responsibilities are kept separate.
   plain data with no dispatch. The type key is `serde.typeName<TReq>()`, so that a route and its handler
   agree *by type*.
 - **Handlers** (`MessageHandler.handle(src): Response`) bind the request from a `ValueSource` themselves,
-  which is visible, debuggable Nova with no hidden binder, and return a `Response`.
+  which is visible, debuggable Kyte with no hidden binder, and return a `Response`.
 - **Dispatch** (`App.dispatch`) is the one request to Response site: it matches the route, builds the
   source, resolves the handler by type key from the `AppMediator`, and runs it.
 
@@ -95,7 +95,7 @@ database call, is **`async fn` end to end**, so that a request is served on one 
 block drive. This is what makes per-request database access work without deadlocking (please see the block
 drive guard in [03-runtime.md](03-runtime.md)).
 
-There are other pieces as well: **DI** (`web/di.nova`, providing `ServiceProvider` and `ServiceScope`,
+There are other pieces as well: **DI** (`web/di.ky`, providing `ServiceProvider` and `ServiceScope`,
 singleton, scoped, and transient lifetimes, and constructor injection via `handleFrom<T>`), a request
 pipeline (middleware, pre, post, and exception), `useStatic` (LRU cached static files), gzip content
 negotiation, inbound TLS (`app.useTls(cert, key)`, which gives in process HTTPS), and W6 hardening
@@ -112,7 +112,7 @@ without building the request string or dispatching.
 
 ## Templates and Scaffolding
 
-`nova init web|desktop` scaffolds an app (see `src/templates.zig` and `src/main.zig`) in an ASP.NET style,
+`kyte init web|desktop` scaffolds an app (see `src/templates.zig` and `src/main.zig`) in an ASP.NET style,
 vertical slice layout: features under `Features/<Area>/<UseCase>/{command,query,handler,validator}`, an
-`Infrastructure/` for repositories over the `db` seam, and a `main.nova` composition root that registers
+`Infrastructure/` for repositories over the `db` seam, and a `main.ky` composition root that registers
 the handlers and routes and calls `app.run(port)`. The `lang/flagship` app is the reference.

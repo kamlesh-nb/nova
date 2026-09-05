@@ -2,11 +2,11 @@
 
 - Chapter: [11-error-handling.md](../11-error-handling.md)
 - Estimated length: ~14 minutes
-- You will need: the `nova` compiler on your PATH, and the guide examples `17_errors.nova`, `25_errdefer.nova`, `26_defer.nova`, and `27_exception.nova`
+- You will need: the `kyte` compiler on your PATH, and the guide examples `17_errors.ky`, `25_errdefer.ky`, `26_defer.ky`, and `27_exception.ky`
 
 ## Hook (0:00)
 
-**Say:** Most languages handle failure by throwing something that unwinds the stack, and hoping somebody up the chain catches it. Nova does not do that. In Nova a function that can fail simply returns its error as a value, and the natural error type is an `exception`, a tagged union that always knows how to describe itself. By the end of this video you will define an exception, propagate errors with `try`, handle them with `catch`, and clean up safely with `defer` and `errdefer`.
+**Say:** Most languages handle failure by throwing something that unwinds the stack, and hoping somebody up the chain catches it. Kyte does not do that. In Kyte a function that can fail simply returns its error as a value, and the natural error type is an `exception`, a tagged union that always knows how to describe itself. By the end of this video you will define an exception, propagate errors with `try`, handle them with `catch`, and clean up safely with `defer` and `errdefer`.
 
 ## What we will cover (0:30)
 
@@ -27,7 +27,7 @@
 **Say:** The error type you reach for first is an `exception`. It is a tagged union whose variants each carry a payload explaining what went wrong, plus a `message` method that the compiler requires. That method turns any variant into text, so every caller reads the reason back the same way, with `e.message()`, and never has to switch on the error itself.
 
 **On screen:**
-```nova
+```kyte
 exception ConfigError {
     Empty,
     NotANumber(string),
@@ -56,7 +56,7 @@ exception ConfigError {
 **Say:** Let us make this concrete. `parsePort` really parses the digits of a string and returns a different typed error for each way the input can be wrong. This is the same `ConfigError` we just defined.
 
 **On screen:**
-```nova
+```kyte
 // A fallible function: parse a port number out of a string. It really parses the
 // digits, and returns a typed error variant for each way the input can be wrong.
 fn parsePort(s: string): int | ConfigError {
@@ -77,7 +77,7 @@ fn parsePort(s: string): int | ConfigError {
 **Say:** Empty string returns `Empty`. A non-digit byte returns `NotANumber` carrying the whole string. A number outside the valid port range returns `OutOfRange` carrying that number. Otherwise it returns the port as a plain int. Now watch how `buildUrl` uses it.
 
 **On screen:**
-```nova
+```kyte
 // `try` propagates parsePort's error to OUR caller and unwraps on success. Because
 // buildUrl also returns `... | ConfigError`, one bad value short-circuits the rest.
 fn buildUrl(host: string, portText: string): string | ConfigError {
@@ -89,7 +89,7 @@ fn buildUrl(host: string, portText: string): string | ConfigError {
 **Say:** `try parsePort(portText)`. On success, `port` is the unwrapped int and we build the URL. On failure, `buildUrl` stops right there and hands the very same error back to its own caller. Notice `buildUrl` also returns `string | ConfigError`, which is what lets `try` live inside it. Now `main`.
 
 **On screen:**
-```nova
+```kyte
 fn main(): void {
     // `catch d`: the ok value passes through, an error becomes the default d.
     console.log(`parsePort("8080")  = ${parsePort("8080") catch -1}`);
@@ -106,7 +106,7 @@ fn main(): void {
 
 **Say:** The first two lines use `catch -1` to turn a failure into minus one. The next four use `catch (e) e.message()` to let the exception describe itself, and each of the four fails in a different way. Let us run it.
 
-**Run it:** `nova examples/17_errors.nova -o out && ./out`
+**Run it:** `kyte examples/17_errors.ky -o out && ./out`
 
 ```
 parsePort("8080")  = 8080
@@ -121,13 +121,13 @@ url range = port out of range: 70000
 
 ## Segment: Cleanup with defer and errdefer (8:00)
 
-**Say:** A function often grabs something, a lock, a connection, a file, and then does work that might fail. Nova gives you two cleanup hooks. `defer expr` runs at every exit from the scope, on success or failure. `errdefer expr` runs only when the function leaves on the error path, either an explicit error-side return or a `try` that propagates a failure. Both run last-registered-first, LIFO. On the error path the `errdefer`s run first, then the `defer`s, so a rollback happens before the resource it depended on is released.
+**Say:** A function often grabs something, a lock, a connection, a file, and then does work that might fail. Kyte gives you two cleanup hooks. `defer expr` runs at every exit from the scope, on success or failure. `errdefer expr` runs only when the function leaves on the error path, either an explicit error-side return or a `try` that propagates a failure. Both run last-registered-first, LIFO. On the error path the `errdefer`s run first, then the `defer`s, so a rollback happens before the resource it depended on is released.
 
 **Say:** This example uses a plain enum, `TxError`, as its error type. That is our first fallback: an enum sits on the error side of `T | E` just fine when you do not need the guaranteed message.
 
 **On screen:**
-```nova
-// examples/26_defer.nova
+```kyte
+// examples/26_defer.ky
 import list;
 
 enum TxError { Conflict }
@@ -145,7 +145,7 @@ fn transfer(fail: bool, log: List<string>): int | TxError {
 
 **Say:** We acquire the lock, register a `defer` to release it, which always runs, and an `errdefer` to roll back, which only runs on failure. If `fail` is true we return the error, and both the errdefer and the defer fire. If not, we commit and return 1, and only the defer fires. Let us run the whole file.
 
-**Run it:** `nova examples/26_defer.nova -o out && ./out`
+**Run it:** `kyte examples/26_defer.ky -o out && ./out`
 
 ```
 success -> result 1
@@ -165,7 +165,7 @@ conflict -> result -1
 **Say:** When you hold more than one resource, each gets its own `errdefer`, and because they run LIFO they roll back in the reverse of the order you acquired them. This example uses a struct error type, `OpenError`, which is our second fallback. A struct is the right choice when the error is really one kind of thing carrying a few fields.
 
 **On screen:**
-```nova
+```kyte
 // A struct error type. Its fields carry the reason to the caller.
 struct OpenError {
     pub resource: string,
@@ -193,7 +193,7 @@ fn connectBoth(failFinal: bool, log: List<string>): int | OpenError {
 
 **Say:** We open db, then register its rollback. We open cache, then register its rollback. If the final step fails, both errdefers fire, but LIFO means cache closes first, then db, the reverse of how we opened them. On success neither errdefer runs. Let us see it.
 
-**Run it:** `nova examples/25_errdefer.nova -o out && ./out`
+**Run it:** `kyte examples/25_errdefer.ky -o out && ./out`
 
 ```
 both ok -> result 2
@@ -217,7 +217,7 @@ final step fails -> result -1
 **Say:** Here is the exception pattern in its own right. `LookupError` can fail two ways, and because the ok side is a string, a single `catch (e) e.message()` both handles the error and unifies the two arms, since both sides are strings.
 
 **On screen:**
-```nova
+```kyte
 exception LookupError {
     NotFound(string),
     Forbidden(string),
@@ -247,7 +247,7 @@ fn main(): void {
 
 **Say:** The single `catch (e) e.message()` dispatches to whichever variant occurred, so the caller never switches on the error itself. Run it.
 
-**Run it:** `nova examples/27_exception.nova -o out && ./out`
+**Run it:** `kyte examples/27_exception.ky -o out && ./out`
 
 ```
 count = 42
@@ -258,7 +258,7 @@ access denied for guest
 **Say:** First call succeeds and prints the value. Second call hits `NotFound` and prints its message. Third hits `Forbidden` and prints its message. One handler, three outcomes. And one last tool: the `exception` module also gives you `stackTrace()`, the current call stack as text, one frame per line, on macOS, Linux, and Windows, which you can log or fold into a `message()`.
 
 **On screen:**
-```nova
+```kyte
 import exception;
 // inside a handler or a message() method:
 let trace = exception.stackTrace();

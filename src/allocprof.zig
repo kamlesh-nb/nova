@@ -211,7 +211,7 @@ pub const Profiler = struct {
             }
         }.lt);
         const anchor = @intFromPtr(&dump);
-        std.debug.print("\n=== NOVA_ALLOC_PROFILE ===\n  total allocs={d}  total frees={d}  net-live={d}\n  ANCHOR allocprof.Profiler.dump runtime=0x{x}\n  TOP 30 SITES BY LIVE BYTES (addr  live_count  live_MB  total_allocs):\n", .{ self.total_alloc, self.total_free, self.total_alloc -| self.total_free, anchor });
+        std.debug.print("\n=== KYTE_ALLOC_PROFILE ===\n  total allocs={d}  total frees={d}  net-live={d}\n  ANCHOR allocprof.Profiler.dump runtime=0x{x}\n  TOP 30 SITES BY LIVE BYTES (addr  live_count  live_MB  total_allocs):\n", .{ self.total_alloc, self.total_free, self.total_alloc -| self.total_free, anchor });
         const n = @min(list.items.len, 30);
         for (list.items[0..n]) |e| {
             std.debug.print("  0x{x}  {d:>12}  {d:>8.1}  {d:>12}\n", .{ e.addr, e.live_count, @as(f64, @floatFromInt(e.live_bytes)) / (1024.0 * 1024.0), e.total });

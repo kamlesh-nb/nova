@@ -1,22 +1,22 @@
-# Nova Stability and Versioning Policy
+# Kyte Stability and Versioning Policy
 
-This document is the contract for how Nova versions itself and what "stable" means for each
+This document is the contract for how Kyte versions itself and what "stable" means for each
 surface a user depends on. It is the L5 deliverable of the production-readiness plan.
 
-Current release: **0.1.0 (Beta)**. Report it with `nova version`.
+Current release: **0.1.0 (Beta)**. Report it with `kyte version`.
 
 ## 1. Versioning scheme
 
-Nova uses **Semantic Versioning** (`MAJOR.MINOR.PATCH`) for the toolchain as a whole. The single
-source of truth is `build.zig` (`nova_version`), mirrored in `build.zig.zon` `.version`; `nova
+Kyte uses **Semantic Versioning** (`MAJOR.MINOR.PATCH`) for the toolchain as a whole. The single
+source of truth is `build.zig` (`kyte_version`), mirrored in `build.zig.zon` `.version`; `kyte
 version` prints it. There is a SEPARATE, independently incremented **ABI version** for the
 extern-C runtime seam (see section 4 and `docs/abi/runtime-abi.md`).
 
-While Nova is in the **0.x series it is BETA**: a `0.x` number is a deliberate signal that there
+While Kyte is in the **0.x series it is BETA**: a `0.x` number is a deliberate signal that there
 is **no cross-version stability guarantee yet**. Any `0.MINOR` bump may change syntax, semantics,
 the standard library, the ABI, or the CLI. Pin an exact `0.x.y` if you need reproducibility today.
 
-Once Nova reaches **1.0.0**, the guarantees in section 3 take effect and the scheme becomes:
+Once Kyte reaches **1.0.0**, the guarantees in section 3 take effect and the scheme becomes:
 
 - **MAJOR** -- a breaking change to any STABLE surface (section 3). Accompanied by a migration note.
 - **MINOR** -- backward-compatible additions (new syntax that does not invalidate old programs,
@@ -25,7 +25,7 @@ Once Nova reaches **1.0.0**, the guarantees in section 3 take effect and the sch
 
 ## 2. Surfaces
 
-Nova exposes five distinct surfaces. Each has its own stability level, because they mature at
+Kyte exposes five distinct surfaces. Each has its own stability level, because they mature at
 different rates:
 
 | Surface | What it is | Stability today (0.1.0) |
@@ -33,7 +33,7 @@ different rates:
 | Language syntax + semantics | What `docs/language-specification.md` describes | Beta -- pinned by the conformance corpus, but may still change |
 | Standard library | `src/std/*` APIs imported by user code | Beta -- the shape is settling; breaking changes possible |
 | Runtime ABI | The extern-C seam the compiler emits against (section 4) | Versioned (ABI v1); the header/ref-count core is intended to be long-lived |
-| CLI | `nova <file>`, `nova build/test/fmt/init/get/version` | Beta -- subcommands stable in spirit, flags may be added |
+| CLI | `kyte <file>`, `kyte build/test/fmt/init/get/version` | Beta -- subcommands stable in spirit, flags may be added |
 | On-disk formats | `project.json`, the build cache (`CACHE_VERSION`) | Internal -- may change between any versions; the cache is self-invalidating |
 
 ## 3. What "stable" will guarantee at 1.0
@@ -50,11 +50,11 @@ For a surface marked stable at 1.0, within a MAJOR series:
 ## 4. The runtime ABI
 
 The compiler emits native code that calls a fixed set of extern-C symbols and assumes a fixed
-heap-object layout. That contract is versioned independently as **NOVA_ABI_VERSION** (currently
-**1**), defined in `src/runtime/nova_abi.h` and surfaced via `nova version` and
-`build_options.nova_abi_version`. Its STABLE core -- the 8-byte heap header (refcount `u32` at
-`[ptr-8]`, length `u32` at `[ptr-4]`) and the `nova_retain` / `nova_release` / `nova_bytes_alloc`
-/ `nova_bytes_free` entry points -- is documented and frozen in `docs/abi/runtime-abi.md`. The
+heap-object layout. That contract is versioned independently as **KYTE_ABI_VERSION** (currently
+**1**), defined in `src/runtime/kyte_abi.h` and surfaced via `kyte version` and
+`build_options.ky_abi_version`. Its STABLE core -- the 8-byte heap header (refcount `u32` at
+`[ptr-8]`, length `u32` at `[ptr-4]`) and the `kyte_retain` / `kyte_release` / `kyte_bytes_alloc`
+/ `kyte_bytes_free` entry points -- is documented and frozen in `docs/abi/runtime-abi.md`. The
 async/reactor/syscall symbols in the same header are INTERNAL (compiler talking to its own
 runtime), not a third-party contract, and are not covered by the ABI version.
 
@@ -79,8 +79,8 @@ the one-minor-warning window is not yet guaranteed. It becomes binding at 1.0.
 
 ## 6. How a release is cut
 
-1. Bump `nova_version` in `build.zig` and `.version` in `build.zig.zon` (keep them equal).
-2. If the stable ABI core changed, bump `NOVA_ABI_VERSION` in `nova_abi.h` and `nova_abi_version`
+1. Bump `kyte_version` in `build.zig` and `.version` in `build.zig.zon` (keep them equal).
+2. If the stable ABI core changed, bump `KYTE_ABI_VERSION` in `kyte_abi.h` and `kyte_abi_version`
    in `build.zig`, and note the break in `docs/abi/runtime-abi.md`.
 3. The CI `soundness` job (build + conformance + `--shadow`) must be green on the commit.
 4. Tag the commit `v<version>`; write release notes covering additions, fixes, and any deprecations.

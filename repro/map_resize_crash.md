@@ -2,7 +2,7 @@
 
 > **RESOLVED.** Root cause was spec §10 #18 (bare fn value called as a closure box), not Map.
 > Fix landed in `expressions.zig:buildBareFnBox` + the direct-field-call path in `llvm_codegen.zig`;
-> see **The fix (as applied)** below. Regression-pinned by `conformance/cases/14_collections_map.nova`
+> see **The fix (as applied)** below. Regression-pinned by `conformance/cases/14_collections_map.ky`
 > (verified to fail before the fix, at `test_map_resize_survives`). The repro below now prints
 > `size=20`, exit 0. Kept as the record of the investigation.
 
@@ -11,7 +11,7 @@ sessions), and there were **zero Map conformance cases** — which is exactly wh
 
 ## Reproduce
 
-```nova
+```kyte
 import collections.map;
 import string;
 fn main(): void {
@@ -22,7 +22,7 @@ fn main(): void {
 }
 ```
 ```
-nova /tmp/mt.nova --native -o /tmp/mt && /tmp/mt     # -> exit 138 (SIGBUS), no output
+kyte /tmp/mt.ky --native -o /tmp/mt && /tmp/mt     # -> exit 138 (SIGBUS), no output
 ```
 
 ## Measured behaviour — it is RESIZE, not volume
@@ -42,15 +42,15 @@ resize — `cap=256`+20 inserts is clean.
 ## Hypotheses ELIMINATED — do not re-chase
 
 1. **`alloc_persistent` + `bytes.free` mismatch** (the long-standing theory: "allocZero uses the codegen
-   bump allocator but resize frees it") — **NO.** In the C++ runtime `nova_bytes_alloc_persistent` is
-   plain `std::malloc(size + HEADER)` (`alloc.cpp:95`) and `nova_bytes_free` does
+   bump allocator but resize frees it") — **NO.** In the C++ runtime `kyte_bytes_alloc_persistent` is
+   plain `std::malloc(size + HEADER)` (`alloc.cpp:95`) and `kyte_bytes_free` does
    `std::free(ptr - HEADER)` after an arena check (`alloc.cpp:105`). malloc'd memory freed by free —
    correct. (The bump allocator is **wasm-only**; native declares these extern.)
-2. **`allocZero` not zeroing** — **NO.** `map.nova:10-18` explicitly writes 0 over every byte
+2. **`allocZero` not zeroing** — **NO.** `map.ky:10-18` explicitly writes 0 over every byte
    (`malloc` doesn't zero, but allocZero does).
 3. **`bytes.ptr_size()` wrong** — **NO.** Returns **8** natively; `write_ptr`/`read_ptr` round-trip
    64-bit values correctly at 0 and 8.
-4. **`let i = 0` then `i = i + 1`** (map.nova:12/216 mutate a `let`, same wart as `string.slice`) —
+4. **`let i = 0` then `i = i + 1`** (map.ky:12/216 mutate a `let`, same wart as `string.slice`) —
    **NO.** Verified `let`-mutation compiles and increments correctly.
 
 ## ✅ ROOT CAUSE FOUND (ASAN, 2026-07-15) — a bare fn value is called as a closure box
@@ -67,7 +67,7 @@ function pointer** (`blr x8` on ARM64, x8 == pc == garbage). And the garbage is 
 as an address**.
 
 **Therefore:** `hashFn` holds a **bare function** value (`string.hash` = a raw *code* pointer), but the
-indirect call at `map.nova:223` uses the **closure-box** convention — box = `{fn_ptr, env}`, so it does
+indirect call at `map.ky:223` uses the **closure-box** convention — box = `{fn_ptr, env}`, so it does
 `fn_ptr = load [box+0]` / `env = load [box+8]` and calls `fn_ptr(env, …)`. Loading `[box+0]` off a
 **code** address reads `string.hash`'s own first instruction (`0xf9…`) as the target → `blr` into
 hyperspace → BUS.
@@ -118,13 +118,13 @@ Applied:
    removes the divergence** — deleting one of the two conventions was the actual point.
 
 **One box per target, cached** (`fn_box_globals`), which preserves fn-value **identity**: `string.hash`
-evaluates to the same address everywhere, so `map.nova:50`'s `self.hashFn == string.hash` — which selects
+evaluates to the same address everywhere, so `map.ky:50`'s `self.hashFn == string.hash` — which selects
 string comparison in `keysEqual` — keeps working. A per-evaluation heap box would have silently broken it.
 
 **Not affected:** `protocol.callDecoder`'s raw fn pointer (built directly at `expressions.zig:2142`, never
 flows through the ident/field-access value paths) and trait vtables (raw ptrs, separate mechanism).
 
-**Landed with:** `conformance/cases/14_collections_map.nova` — 15 tests: resize survival, all-keys-survive
+**Landed with:** `conformance/cases/14_collections_map.ky` — 15 tests: resize survival, all-keys-survive
 across cap 4→256, delete/tombstone churn, keys/values, plus four pinning the #18 convention itself
 (field-vs-local agreement, bare fn through a local, fn-value identity, multi-arg). Verified to **fail**
 without the fix (`test_map_resize_survives`, abnormal termination) — a case that passes before and after
@@ -135,33 +135,33 @@ bug, no longer load-bearing now that bare fns are safe to pass.
 
 ## Superseded suspects (kept for the record)
 
-1. **The indirect `(oldHashFn)(key)` call at `map.nova:223`.** `hashFn` is a *stored* function value.
+1. **The indirect `(oldHashFn)(key)` call at `map.ky:223`.** `hashFn` is a *stored* function value.
    Closures are a heap box `{fn_ptr, env}` with a hidden leading `env` param, but `string.hash` is a
    **bare fn**. If the stored-bare-fn call convention differs from the closure-box one, resize calls it
    wrong → garbage → SIGBUS. **Note the old finding "crashes with a lambda hashFn too" — worth
    re-verifying now that A1 landed real closure envs.** The `set` path also calls `hashFn`, and `set`
    works — so if this is it, the difference must be *where/how* it is called in resize.
-2. **The rehash probe loop (`map.nova:225-237`)** — `while (true)` with no bound. If no empty slot is
+2. **The rehash probe loop (`map.ky:225-237`)** — `while (true)` with no bound. If no empty slot is
    ever seen it spins forever; that is a hang, not a SIGBUS, but a mis-sized buffer would give OOB
    writes → SIGBUS. Check `newCap * ps` sizing vs the `idx * ps` strides.
-3. **`hash & (newCap - 1)` (`map.nova:224`)** with a negative hash from `string.hash`.
+3. **`hash & (newCap - 1)` (`map.ky:224`)** with a negative hash from `string.hash`.
 4. **`LOAD_FACTOR_MAX: f32 = 0.75`** — an **f32**, and spec §3.1 marks `f32` 🔎 unverified; every local
    is an i64 slot with floats bit-punned (§3.1). A wrong resize trigger wouldn't SIGBUS by itself, but
    the f32 compare is worth printing.
 
 ## Next step
 
-Run it under the ASAN harness (recipe in `driver_alloc_churn_crash.nova`) — that named the string bug's
+Run it under the ASAN harness (recipe in `driver_alloc_churn_crash.ky`) — that named the string bug's
 faulting frame in one shot and should do the same here:
 
 ```
-NOVA_KEEP_OBJ=1 nova /tmp/mt.nova --native -o /tmp/mt
+KYTE_KEEP_OBJ=1 kyte /tmp/mt.ky --native -o /tmp/mt
 clang++ -std=c++20 -g -O0 -fsanitize=address -pthread /tmp/mt.o \
-  /tmp/asan/nova_runtime_asan.o -L/opt/homebrew/lib deps/wolfssl/build/libwolfssl.a \
+  /tmp/asan/kyte_runtime_asan.o -L/opt/homebrew/lib deps/wolfssl/build/libwolfssl.a \
   -framework CoreFoundation -framework Security -o /tmp/mt_asan
 ASAN_OPTIONS=detect_leaks=0 /tmp/mt_asan
 ```
 
-**Land the fix WITH the first Map conformance case** (`conformance/cases/14_collections_map.nova`):
+**Land the fix WITH the first Map conformance case** (`conformance/cases/14_collections_map.ky`):
 grow past resize, verify every key survives, plus delete/tombstone churn. No case ⇒ unverified by
 construction (specs.md §13) — that is how this bug lived this long.

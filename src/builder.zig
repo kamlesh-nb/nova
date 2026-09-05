@@ -1,8 +1,8 @@
-//! The `nova build` / `nova <file>` command driver: turn Nova source into a
+//! The `kyte build` / `kyte <file>` command driver: turn Kyte source into a
 //! linked native or WASM binary.
 //!
 //! This file is the top of the compile pipeline the CLI reaches when the user
-//! asks to produce an executable (as opposed to `nova test`, `nova fmt`, etc.).
+//! asks to produce an executable (as opposed to `kyte test`, `kyte fmt`, etc.).
 //! It does two jobs and nothing else: [`cmdBuild`] parses the command line and
 //! computes every path/flag decision, and [`compileProgram`] runs the actual
 //! front-to-back compile for one program. The heavy lifting all lives elsewhere,
@@ -13,9 +13,9 @@
 //! Two shapes of invocation flow through here, and the difference is threaded
 //! everywhere as `build_mode`:
 //!
-//!   * Single-file mode (`nova app.nova ...`): compile one file to a binary,
+//!   * Single-file mode (`kyte app.ky ...`): compile one file to a binary,
 //!     the object file is a throwaway next to the output.
-//!   * Project mode (`nova build ...`): read `project.json` for the name, emit
+//!   * Project mode (`kyte build ...`): read `project.json` for the name, emit
 //!     into `build/<profile>/{obj,bin}`, keep the per-file `.o` split for
 //!     incremental linking, and stamp a content hash so an unchanged tree is a
 //!     no-op rebuild. This is the T6 per-file-split path.
@@ -54,10 +54,10 @@ const ast = @import("frontend/ast.zig");
 /// The lexer module. Imported for module-graph completeness, not called directly
 /// from this file (parsing here goes through [`parser`] and [`pipeline`]).
 const lexer = @import("frontend/lexer.zig");
-/// The Nova parser, used directly only to parse the injected WASM/native helper
+/// The Kyte parser, used directly only to parse the injected WASM/native helper
 /// snippet (`__log_i32` and friends) into extra declarations.
 const parser = @import("frontend/parser.zig");
-/// The source formatter. Imported for module-graph completeness; `nova build`
+/// The source formatter. Imported for module-graph completeness; `kyte build`
 /// does not format.
 const formatter = @import("frontend/formatter.zig");
 /// The classic type checker pass ([`type_checker.TypeChecker`]), run after alpha
@@ -73,14 +73,14 @@ const llvm_codegen = @import("backend/codegen/llvm_codegen.zig");
 /// (`asan_codegen_enabled`, `elide_enabled`, `balance_verify`, ...) from env.
 const codegen_arc = @import("backend/codegen/arc.zig");
 /// The shadow / typed-IR semantic pass and its many report toggles; `run` is the
-/// authoritative sema, the rest are diagnostics gated by `NOVA_*` env vars.
+/// authoritative sema, the rest are diagnostics gated by `KYTE_*` env vars.
 const sema_shadow = @import("frontend/sema/shadow.zig");
-/// Escape analysis (report-only), enabled by `NOVA_ESCAPE_REPORT`.
+/// Escape analysis (report-only), enabled by `KYTE_ESCAPE_REPORT`.
 const sema_escape = @import("frontend/sema/escape.zig");
-/// The ownership balance verifier, enabled by `NOVA_OWN_VERIFY` (soft or hard).
+/// The ownership balance verifier, enabled by `KYTE_OWN_VERIFY` (soft or hard).
 const sema_ownership = @import("frontend/sema/ownership.zig");
 /// OSSA lowering plus its ARC-balance self-verifier, default-on and fail-closed
-/// unless `NOVA_OSSA=off`.
+/// unless `KYTE_OSSA=off`.
 const sema_ossa_lower = @import("frontend/sema/ossa/lower.zig");
 /// The alpha-renaming pass, the FIRST sema step so later passes see unique names.
 const sema_alpha = @import("frontend/sema/alpha.zig");
@@ -108,12 +108,12 @@ var want_asan: bool = false;
 /// Process-global: keep the intermediate `.o` file instead of deleting it after
 /// a successful single-file link. Set from `--keep-obj`.
 var want_keep_obj: bool = false;
-/// Process-global: write the merged pre-compile source to `merged.nova` for
+/// Process-global: write the merged pre-compile source to `merged.ky` for
 /// inspection. Set from `--dump-merged`.
 var want_dump_merged: bool = false;
 
 
-/// Compile one Nova program end to end: load and merge its source graph, run the
+/// Compile one Kyte program end to end: load and merge its source graph, run the
 /// full semantic pipeline, generate LLVM code, and link the object into a native
 /// or WASM binary.
 ///
@@ -176,17 +176,17 @@ fn compileProgram(
     const tinfo = pipeline.deriveTargetInfo(target, target_triple_opt);
 
     const asan = !is_wasm and want_asan;
-    codegen_arc.asan_codegen_enabled = asan and (init.environ_map.get("NOVA_ASAN_CODEGEN") != null);
+    codegen_arc.asan_codegen_enabled = asan and (init.environ_map.get("KYTE_ASAN_CODEGEN") != null);
 
-    pipeline.loadProgram(allocator, init, "src/std/collections/string_builder.nova", visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
+    pipeline.loadProgram(allocator, init, "src/std/collections/string_builder.ky", visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
         std.debug.print("Warning: Failed to load string_builder standard library: {any}\n", .{err});
     };
 
     try pipeline.loadProgram(allocator, init, file_path, visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo);
 
     if (want_dump_merged) {
-        _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = merged.items, .sub_path = "merged.nova", .flags = .{} }) catch |err| {
-            std.debug.print("Failed to write merged.nova: {s}\n", .{@errorName(err)});
+        _ = Io.Dir.writeFile(.cwd(), init.io, .{ .data = merged.items, .sub_path = "merged.ky", .flags = .{} }) catch |err| {
+            std.debug.print("Failed to write merged.ky: {s}\n", .{@errorName(err)});
         };
     }
 
@@ -227,7 +227,7 @@ fn compileProgram(
             \\}
             \\
         ;
-        var helpers_p = try parser.Parser.init(allocator, helpers, "helpers.nova", is_wasm);
+        var helpers_p = try parser.Parser.init(allocator, helpers, "helpers.ky", is_wasm);
         defer helpers_p.deinit();
         const helpers_prog = try helpers_p.parseProgram();
         try declarations.appendSlice(allocator, helpers_prog.declarations);
@@ -261,10 +261,10 @@ fn compileProgram(
     tc.is_wasm = is_wasm;
     try tc.check(program);
 
-    sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    sema_shadow.tid_census = init.environ_map.get("NOVA_TID_CENSUS") != null;
-    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
-    codegen_arc.arc_census = init.environ_map.get("NOVA_ARC_CENSUS") != null;
+    sema_shadow.report_enabled = init.environ_map.get("KYTE_SEMA_SHADOW") != null;
+    sema_shadow.tid_census = init.environ_map.get("KYTE_TID_CENSUS") != null;
+    codegen_arc.elide_enabled = init.environ_map.get("KYTE_ARC_ELIDE_OFF") == null;
+    codegen_arc.arc_census = init.environ_map.get("KYTE_ARC_CENSUS") != null;
     pipeline.configureValueStructs(allocator, init.environ_map);
     sema_shadow.trace_resolution = sema_shadow.report_enabled;
     sema_shadow.f2_types_enabled = true;
@@ -292,8 +292,8 @@ fn compileProgram(
 
     {
         const reach = @import("frontend/sema/reach.zig");
-        const shadow = init.environ_map.get("NOVA_REACH_SHADOW") != null;
-        const gate = init.environ_map.get("NOVA_REACH_OFF") == null;
+        const shadow = init.environ_map.get("KYTE_REACH_SHADOW") != null;
+        const gate = init.environ_map.get("KYTE_REACH_OFF") == null;
         if (shadow or gate) {
             var rr = reach.compute(allocator, &owned_sema.tab, &owned_sema.ir, program, false) catch reach.Result{};
             defer rr.deinit(allocator);
@@ -305,10 +305,10 @@ fn compileProgram(
         }
     }
 
-    sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
+    sema_escape.report_enabled = init.environ_map.get("KYTE_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
 
-    if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
+    if (init.environ_map.get("KYTE_OWN_VERIFY")) |v| {
         const hard = std.mem.eql(u8, v, "hard");
         sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
         codegen_arc.balance_verify = true;
@@ -316,7 +316,7 @@ fn compileProgram(
     }
 
     {
-        const ossa = init.environ_map.get("NOVA_OSSA");
+        const ossa = init.environ_map.get("KYTE_OSSA");
         const disabled = ossa != null and std.mem.eql(u8, ossa.?, "off");
         if (!disabled) {
             const report_only = ossa != null and std.mem.eql(u8, ossa.?, "1");
@@ -434,12 +434,12 @@ fn compileProgram(
         try clang_args.append(allocator, "-I.");
 
         const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
-        const shared_nova = try std.fmt.allocPrint(allocator, "{s}/.nova", .{ home });
+        const shared_kyte = try std.fmt.allocPrint(allocator, "{s}/.kyte", .{ home });
 
         const ffi_libs = try pipeline.collectFfiLibs(allocator, program);
 
         if (target_triple_opt) |triple| {
-            if (try pipeline.crossLinkViaZig(allocator, init.environ_map, init.io, triple, link_objs, output_path, shared_nova, is_release)) {
+            if (try pipeline.crossLinkViaZig(allocator, init.environ_map, init.io, triple, link_objs, output_path, shared_kyte, is_release)) {
                 if (!want_keep_obj and !build_mode)
                     Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
                 if (build_mode) {
@@ -455,7 +455,7 @@ fn compileProgram(
         }
 
         if (build_options.inprocess_lld and builtin.target.os.tag == .macos and target_triple_opt == null and !asan) {
-            try pipeline.linkNativeInProcessMacho(allocator, init.environ_map, init.io, link_objs, output_path, shared_nova, ffi_libs);
+            try pipeline.linkNativeInProcessMacho(allocator, init.environ_map, init.io, link_objs, output_path, shared_kyte, ffi_libs);
 
             if (!want_keep_obj and !build_mode)
                 Io.Dir.deleteFile(.cwd(), init.io, obj_path) catch {};
@@ -468,15 +468,15 @@ fn compileProgram(
             return;
         }
 
-        const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
-        try clang_args.append(allocator, shared_nova_arg);
+        const shared_kyte_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_kyte});
+        try clang_args.append(allocator, shared_kyte_arg);
 
         for (link_objs) |o| try clang_args.append(allocator, o);
 
-        try pipeline.appendRuntimeLink(&clang_args, allocator, shared_nova, if (asan) "novacore_asan" else "novacore");
-        try pipeline.appendWolfsslLink(&clang_args, allocator, shared_nova, init.io);
+        try pipeline.appendRuntimeLink(&clang_args, allocator, shared_kyte, if (asan) "kytecore_asan" else "kytecore");
+        try pipeline.appendWolfsslLink(&clang_args, allocator, shared_kyte, init.io);
         for (ffi_libs) |lib| {
-            try pipeline.appendFfiLib(&clang_args, allocator, shared_nova, init.io, lib);
+            try pipeline.appendFfiLib(&clang_args, allocator, shared_kyte, init.io, lib);
         }
         try clang_args.append(allocator, "-o");
         try clang_args.append(allocator, output_path);
@@ -517,7 +517,7 @@ fn compileProgram(
     }
 }
 
-/// Parse the `nova build` / `nova <file>` command line and drive one (or many,
+/// Parse the `kyte build` / `kyte <file>` command line and drive one (or many,
 /// under `--watch`) compiles.
 ///
 /// This is the CLI-facing half: it does argument parsing, path/flag resolution,
@@ -529,7 +529,7 @@ fn compileProgram(
 /// Argument parsing has TWO shapes keyed off `args[1]`:
 ///   * `args[1] == "build"` → project mode. Flags carry values (`--target X`,
 ///     `--file X`, `-o X`, `--release`/`-r`, `--debug`/`-d`, `--watch`/`-w`).
-///     Defaults: entry `src/main.nova`, name from `project.json`, output under
+///     Defaults: entry `src/main.ky`, name from `project.json`, output under
 ///     `build/<profile>/bin`, objects under `build/<profile>/obj`, and a
 ///     `.build-hash` stamp for incremental rebuilds.
 ///   * otherwise → single-file mode with `args[1]` as the file and a looser flag
@@ -649,7 +649,7 @@ pub fn cmdBuild(allocator: std.mem.Allocator, init: std.process.Init, args: []co
     var build_hash_path: []const u8 = "";
     if (build_mode) {
 
-        if (file_path.len == 0) file_path = "src/main.nova";
+        if (file_path.len == 0) file_path = "src/main.ky";
 
         var proj_name: []const u8 = std.fs.path.stem(file_path);
         if (Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited)) |pj| {

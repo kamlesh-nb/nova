@@ -3,7 +3,7 @@
 A `trait` is an interface: a set of method signatures with no bodies. A struct opts in with
 `impl Trait` and supplies the methods. A value referred to through its trait type is a **trait object**:
 calling a method on it dispatches **dynamically** (through a vtable) to the concrete type's
-implementation. This is how Nova does polymorphism.
+implementation. This is how Kyte does polymorphism.
 
 Three moves round out the picture:
 
@@ -13,8 +13,8 @@ Three moves round out the picture:
 - Traits may be **generic** (`trait Handler<Q, R>`), with the type parameters appearing in the method
   signatures; each `impl` fills in concrete type arguments.
 
-```nova
-// examples/15_traits.nova
+```kyte
+// examples/15_traits.ky
 // A trait is an interface: a set of method signatures. A struct declares
 // `impl Trait` and provides the methods; calls through a trait-typed binding
 // dispatch dynamically (via a vtable). A trait value can be downcast back to a
@@ -111,7 +111,7 @@ doubler(21) = 42
 Dispatch is by vtable, so `announce` never learns whether it holds a `Dog` or a `Cat`. Generic traits
 are checked by substituting the trait's type parameters (`Q`, `R`) with the impl's arguments; a wrong
 concrete type is a compile error, while dispatch itself is type-erased, so one vtable slot serves every
-instantiation. The generic-trait pattern here is the foundation for Nova's typed request/handler
+instantiation. The generic-trait pattern here is the foundation for Kyte's typed request/handler
 (mediator) routing.
 
 Next: [Optionals](10-optionals.md)

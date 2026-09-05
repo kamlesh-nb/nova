@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# conc_scaling.sh — concurrency-scaling benchmark for a Nova DB driver (D5b).
+# conc_scaling.sh — concurrency-scaling benchmark for a Kyte DB driver (D5b).
 #
 # Launches C independent CLIENT PROCESSES (each its own connection), all running a
 # fixed-duration workload at once, and sums their op counts -> aggregate ops/sec.

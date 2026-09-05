@@ -1,9 +1,9 @@
-# A Self-Reliant Nova Runtime: Study First, Then Build
+# A Self-Reliant Kyte Runtime: Study First, Then Build
 
 ## Decision (2026-07-28)
 
 Stop the piecemeal tuning of the Asio-based runtime. The head-to-head measurements are clear:
-Nova serves about 55k rps where Go, C#, and Rust serve 120k to 135k, that is, roughly 2.2x
+Kyte serves about 55k rps where Go, C#, and Rust serve 120k to 135k, that is, roughly 2.2x
 to 2.4x behind (see `../../flagship/bench/headtohead/`). The profile
 (`../../flagship/bench/PROFILE.md`) is equally clear that this is not a codegen problem, the
 compute core is already native-tier, but a runtime problem: per-request allocation, refcount
@@ -12,7 +12,7 @@ at a time on top of Boost.Asio is trial and error against a design we did not ch
 not fully control.
 
 The correct path is to study the best known implementations of the exact things we need, adopt
-their proven structure, and build a runtime that Nova owns end to end. Boost.Asio was a
+their proven structure, and build a runtime that Kyte owns end to end. Boost.Asio was a
 reasonable bootstrap, but it is a general-purpose C++ library, it is a large external
 dependency, and its per-coroutine strand model is the source of the cross-thread state we have
 been fighting. The language now has a solid compute core and a working FFI. That is exactly the
@@ -28,8 +28,8 @@ reference model and the architecture below are agreed.
   1.95 microseconds for parse plus render). This is not the problem and must not be disturbed.
 - **LLVM stackless coroutines.** The `async`/`await` mechanism is sound and is the same family
   as Rust futures. We keep the coroutine intrinsics; we change who drives them.
-- **FFI (`extern("lib") fn`).** The keystone that makes a Nova-owned syscall layer possible.
-- **The wolfSSL memory-BIO TLS seam.** TLS is already pumped by Nova over an in-memory BIO, not
+- **FFI (`extern("lib") fn`).** The keystone that makes a Kyte-owned syscall layer possible.
+- **The wolfSSL memory-BIO TLS seam.** TLS is already pumped by Kyte over an in-memory BIO, not
   by Asio. This design already points the right way and is reused unchanged.
 - **ARC for application objects.** ARC is correct for user data. What must change is that the
   I/O hot path (buffers, headers) must stop flowing through ARC (see buffers below).
@@ -41,12 +41,12 @@ reference model and the architecture below are agreed.
 | **Seastar** (ScyllaDB) | C++ | The canonical share-nothing thread-per-core reactor. One shard per core, no shared mutable state, explicit message passing across shards, per-core allocator, io_uring backend, `temporary_buffer` for refcounted zero-copy slices. This is the closest match to our target and the primary reference. |
 | **glommio** (Datadog) | Rust | Thread-per-core on io_uring, done as a library rather than a framework. Good model for how a thread-per-core reactor exposes `async`/`await` without a work-stealing scheduler. |
 | **monoio** (ByteDance) | Rust | io_uring-first thread-per-core, with an epoll fallback, and a completion-based buffer ownership model (buffers are moved into the kernel and returned). The reference for a portable completion or readiness split. |
-| **tokio + mio** | Rust | mio is the minimal, portable readiness reactor (epoll, kqueue, IOCP, and now io_uring). The reference for the low-level event source abstraction we must build in Nova. Tokio itself is work-stealing, which we do not want, but its `Bytes`/`BytesMut` are the reference for refcounted, cheaply sliceable buffers. |
+| **tokio + mio** | Rust | mio is the minimal, portable readiness reactor (epoll, kqueue, IOCP, and now io_uring). The reference for the low-level event source abstraction we must build in Kyte. Tokio itself is work-stealing, which we do not want, but its `Bytes`/`BytesMut` are the reference for refcounted, cheaply sliceable buffers. |
 | **libuv** (Node.js) | C | The most portable event loop in existence (epoll, kqueue, IOCP, io_uring, event ports). The reference for cross-platform structure, the handle and request lifecycle, and the timer, signal, and async-wakeup integration. |
 | **nginx** | C | Worker-per-core share-nothing, its own memory pools (`ngx_pool_t`, allocate-many free-once per request), buffer chains (`ngx_chain_t`), and kernel zero-copy for static content (`sendfile`, `splice`). The reference for per-request arena allocation and zero-copy pass-through. |
 | **h2o + picohttpparser** | C | picohttpparser is the fastest HTTP/1 parser, and it is zero-copy: it returns slices into the read buffer and allocates nothing. The reference for our request parser, which today builds three hash maps per request. |
 | **hyper + httparse** | Rust | Zero-copy, SIMD-accelerated HTTP/1 parsing, and the buffer and backpressure discipline that makes axum fast. |
-| **Kestrel + System.IO.Pipelines** (.NET) | C# | The `Pipe`: a single ring buffer between a producer and a consumer, with backpressure and zero-copy `ReadOnlySequence<byte>` reads, over a pooled slab allocator (`MemoryPool`, `ArrayPool`). Since Nova's `App` framework is deliberately ASP.NET-shaped, Pipelines is the natural model for our buffer and connection I/O layer. |
+| **Kestrel + System.IO.Pipelines** (.NET) | C# | The `Pipe`: a single ring buffer between a producer and a consumer, with backpressure and zero-copy `ReadOnlySequence<byte>` reads, over a pooled slab allocator (`MemoryPool`, `ArrayPool`). Since Kyte's `App` framework is deliberately ASP.NET-shaped, Pipelines is the natural model for our buffer and connection I/O layer. |
 | **io_uring** (Linux kernel) | - | Submission and completion queues, registered (fixed) buffers, and provided-buffer rings for zero-copy receive. The endgame for Linux I/O; the design must leave room for it as a backend. |
 
 The common thread across every fast server above: **share-nothing per core, a small purpose-built
@@ -67,7 +67,7 @@ for buffers, and picohttpparser for parsing:
    cross-thread CoroState problem, because a connection and its coroutine tree live and die on
    one core and are never touched by another.
 
-2. **A Nova-owned event loop over raw syscalls.** A per-core reactor written in Nova, calling
+2. **A Kyte-owned event loop over raw syscalls.** A per-core reactor written in Kyte, calling
    the kernel through a thin FFI syscall layer:
    - macOS: `kqueue` / `kevent` (readiness).
    - Linux: `io_uring` (completion) as the primary backend, `epoll` (readiness) as the
@@ -96,7 +96,7 @@ for buffers, and picohttpparser for parsing:
      (`os/sys`, done 2026-07-28, `conformance/cases/193`), `memchr` is the SIMD delimiter scan the
      parser needs, and routing `string.indexOf`, `string.eql`, and `string.compare` through
      `memchr` and `memcmp` makes general string handling faster too, with no compiler work.
-   - **Level 2, first-class Nova SIMD.** For kernels the libc functions do not cover, Nova would
+   - **Level 2, first-class Kyte SIMD.** For kernels the libc functions do not cover, Kyte would
      gain vector types lowered to LLVM's portable vector IR (which already targets NEON, SSE, and
      AVX). This is a real but separable compiler capability, a track of its own, not a blocker for
      the loop. Recommend level 1 now, and scoping level 2 as a language feature after the loop
@@ -113,7 +113,7 @@ for buffers, and picohttpparser for parsing:
 These are the things that must be resolved or built before the architecture above is reachable.
 They are the reason this is a study-and-plan document and not a patch.
 
-1. **FFI expressiveness (the keystone).** A Nova-owned syscall layer needs the FFI to express,
+1. **FFI expressiveness (the keystone).** A Kyte-owned syscall layer needs the FFI to express,
    with exact C ABI layout: structs by pointer and by value (`sockaddr_in`, `kevent`,
    `epoll_event`, `io_uring` SQE and CQE, `iovec`, `timespec`), fixed-size arrays of those
    structs (an `epoll_event[]` or `kevent[]` batch), out-parameters, `errno` access, and a few
@@ -121,7 +121,7 @@ They are the reason this is a study-and-plan document and not a patch.
    close the gaps, with conformance tests, before anything else. This is task one.
 
 2. **Raw memory outside ARC.** The buffer pools must be `mmap`-backed arenas that ARC never
-   touches. Nova can already hold 64-bit addresses (`long`) and read and write through them
+   touches. Kyte can already hold 64-bit addresses (`long`) and read and write through them
    (`bytes.read`/`write`), but we need first-class, safe primitives for slab and ring buffers,
    for pointer-sliced `Bytes`, and for a per-request arena (the nginx pool model), none of which
    should incur retain and release.
@@ -148,11 +148,11 @@ They are the reason this is a study-and-plan document and not a patch.
 7. **Windows.** IOCP is a completion model and a different beast. Recommend deferring Windows
    server support explicitly and keeping the door open through the completion abstraction.
 
-8. **The hot-loop overhead risk of writing the loop in Nova.** This is the honest counter-risk
+8. **The hot-loop overhead risk of writing the loop in Kyte.** This is the honest counter-risk
    to self-hosting. If ARC, bounds checks, or optional-unwrapping creep into the innermost loop,
-   Nova-level overhead could eat the win. Mitigation: keep the loop body allocation-free and
+   Kyte-level overhead could eat the win. Mitigation: keep the loop body allocation-free and
    ARC-free by construction (raw arenas and slices), measure the empty-loop and echo-server cost
-   very early (phase 4), and be willing to push the tightest inner step behind FFI if Nova-level
+   very early (phase 4), and be willing to push the tightest inner step behind FFI if Kyte-level
    overhead is shown to dominate. Measure before deciding, do not assume either way.
 
 ## Phased plan
@@ -163,26 +163,26 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   mould, Pipelines-style pooled buffers, picohttpparser-style zero-copy parse, readiness loop
   first (kqueue and epoll) with io_uring as a later backend. Write the interface contracts.
 - **Phase 1. Harden FFI** to the syscall surface in gap 1, with conformance tests. Keystone.
-  **DONE (2026-07-28).** Delivered: `nova_ffi_errno`/`nova_ffi_set_errno` runtime helpers (errno
+  **DONE (2026-07-28).** Delivered: `kyte_ffi_errno`/`kyte_ffi_set_errno` runtime helpers (errno
   is now readable after a failing call); `bytes.read_u16`/`write_u16` builtins (16-bit C struct
   fields; the existing `read_i32`/`write_i32` and `read_ptr`/`write_ptr` already cover 32-bit and
-  64-bit); and `src/std/os/sys.nova`, a first cut of the POSIX bindings (socket, socketpair, bind,
+  64-bit); and `src/std/os/sys.ky`, a first cut of the POSIX bindings (socket, socketpair, bind,
   listen, accept, connect, setsockopt, fcntl, read, write, close, plus `setNonBlocking`,
   `makeSockaddrIn`, `htons`). Proven end to end and offline by `conformance/cases/187_ffi_syscall
-  _surface.nova`: a real kernel socketpair write and read round-trip, errno after a failing
+  _surface.ky`: a real kernel socketpair write and read round-trip, errno after a failing
   `close(-1)` (EBADF), and building and reading a `sockaddr_in` in a raw buffer via the typed
   accessors. Native corpus 181/181, ASAN 331/331. **What this establishes:** scalars, pointer and
   out-parameter buffers, errno, and C structs and arrays of structs as raw buffers with typed
   field access (the systems idiom) all compose correctly for the syscall surface. **Deferred as
   not-on-the-syscall-path:** full struct-by-value FFI marshalling and true C variadics (`printf`
   style); fixed-argument-count calls to variadic C functions such as `fcntl` already work.
-- **Phase 2. `os/sys` syscall bindings in Nova**: sockets, `accept4`, `epoll`/`kqueue`,
+- **Phase 2. `os/sys` syscall bindings in Kyte**: sockets, `accept4`, `epoll`/`kqueue`,
   `read`/`write`/`writev`, `close`, `mmap`, `eventfd`/`timerfd`, non-blocking. Tested against
-  the kernel. **Poll mechanism DONE (2026-07-28).** `src/std/os/kqueue.nova` (macOS and BSD
+  the kernel. **Poll mechanism DONE (2026-07-28).** `src/std/os/kqueue.ky` (macOS and BSD
   readiness reactor: `kqueue`, `kevent`, the 32-byte `struct kevent` build-and-read helpers, the
   filter and flag constants, plus `registerOne` and `wait`) is proven end to end on macOS by
   `conformance/cases/188`: register read-interest on a socket, write to its peer, and `kevent`
-  reports the correct fd, filter, byte count, and udata token. `src/std/os/epoll.nova` (Linux:
+  reports the correct fd, filter, byte count, and udata token. `src/std/os/epoll.ky` (Linux:
   `epoll_create1`/`epoll_ctl`/`epoll_wait`, `eventfd`, `timerfd_create`/`timerfd_settime`, the
   constants, and the `struct epoll_event` helpers) compiles and links on macOS (its syscalls are
   dropped by globalDCE where uncalled) and its x86_64 layout logic is covered by
@@ -191,68 +191,68 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   sign-extending `bytes.read_i16` for signed 16-bit fields (`kevent.filter`). Native corpus
   183/183, ASAN 335/335. **Still open in phase 2:** `accept4`, `writev`, `mmap`, and the Linux
   eventfd and timerfd round-trip verification.
-- **Phase 3. Buffer infrastructure in Nova**: slab pool, ring buffer, refcounted `Bytes` slice,
+- **Phase 3. Buffer infrastructure in Kyte**: slab pool, ring buffer, refcounted `Bytes` slice,
   per-connection arena. Benchmarked in isolation against malloc and against ARC. **Started
-  (2026-07-28).** `src/std/io/slab.nova` (`SlabPool`): one backing allocation, fixed-size blocks
+  (2026-07-28).** `src/std/io/slab.ky` (`SlabPool`): one backing allocation, fixed-size blocks
   on an intrusive free list, a manual per-block refcount so a block can be shared zero-copy and
   is recycled automatically at zero references, all as plain `long` addresses OUTSIDE ARC (the
   nginx-pool and Kestrel-MemoryPool model, with the tokio-Bytes and Seastar-temporary_buffer
-  refcount). `src/std/io/arena.nova` (`Arena`): a bump allocator for per-connection scratch that
+  refcount). `src/std/io/arena.ky` (`Arena`): a bump allocator for per-connection scratch that
   reclaims a whole request's memory with one `reset`, no per-object free (the nginx ngx_pool_t
   model). Proven by `conformance/cases/190` (acquire, distinct blocks, payload read and write,
   the retain and release refcount lifecycle, recycling, exhaustion) and `191` (bump, alignment,
   reset reuse, exhaustion). Native corpus 185/185, ASAN 339/339. **Still open in phase 3:** the
   ring buffer over a chain of slab blocks (the per-connection read buffer), the refcounted `Bytes`
   slice as a first-class value (blocked on a language value-type or stack-struct feature, since a
-  Nova struct is itself an ARC heap object; for now a slice is passed as an explicit base, offset,
+  Kyte struct is itself an ARC heap object; for now a slice is passed as an explicit base, offset,
   length triple with the block refcount for sharing), and an isolation benchmark versus malloc and
   ARC.
-- **Phase 4. The per-core event loop in Nova**, driving coroutines directly. First milestone: a
+- **Phase 4. The per-core event loop in Kyte**, driving coroutines directly. First milestone: a
   raw echo server. Measure the empty-loop and echo cost immediately (gap 8). Compare to an Asio
-  echo baseline. **Milestone 1 STARTED (2026-07-28).** `src/std/net/reactor.nova` (`Reactor`): a
+  echo baseline. **Milestone 1 STARTED (2026-07-28).** `src/std/net/reactor.ky` (`Reactor`): a
   per-core kqueue event loop that owns its `kqueue` fd, an event buffer, and a read-buffer
   `SlabPool`, with `addRead`/`delRead`, `poll`, and `readyFd`/`readyToken`/`readyBytes`/`readyEof`
   accessors; the udata token on each event is where a connection identity (later a coroutine
   handle) rides, so the loop finds the right connection in O(1) with no map and no lock. Proven by
-  `conformance/cases/192`: a request served entirely through the Nova loop with no Asio, a
+  `conformance/cases/192`: a request served entirely through the Kyte loop with no Asio, a
   connected fd pair standing in for an accepted connection, register read-interest, block in
   kqueue, wake on readiness, read into a recycled slab block, echo back, client receives it. Native
   corpus 187/187, ASAN clean. **Milestone 2 DONE (2026-07-28): the load-tested server, and the
-  gap-8 measurement is emphatic.** `flagship/bench/headtohead/nova-reactor/server.nova` is a minimal
+  gap-8 measurement is emphatic.** `flagship/bench/headtohead/kyte-reactor/server.ky` is a minimal
   HTTP/1.1 server on the reactor (listener, `accept`, non-blocking, keep-alive, a fixed constant-JSON
   response, a `SlabPool` read buffer), no Asio and no web.App. Driven by `oha` at the same settings
   as the head-to-head, a **single reactor on one core sustains about 186,500 req/s at 100 percent
   success and 0.34 ms average**, which beats every tuned framework's eight-core number in the
   head-to-head (Rust axum 134.8k, C# Kestrel 124.6k, Go net/http 121.7k) and is about 27 times
-  Nova's own eight-core web.App (55.4k) per core. This is the plan's thesis made concrete: the
+  Kyte's own eight-core web.App (55.4k) per core. This is the plan's thesis made concrete: the
   ceiling was the runtime, not the compiler. Caveats recorded in the bench README: the server does
   not yet parse the request (fixed response), it is single-core (the peers ran eight), and there is
   no TLS. A real finding en route: `fcntl` is variadic and a non-variadic FFI declaration mispasses
   its third argument on arm64 (varargs go on the stack), which silently left the listener blocking;
-  fixed with a tiny runtime shim `nova_set_nonblock` (the general lesson for variadic syscalls until
+  fixed with a tiny runtime shim `kyte_set_nonblock` (the general lesson for variadic syscalls until
   first-class variadic FFI lands). **Milestone 3 DONE (2026-07-28): LLVM coroutines driven directly
   by the reactor, no Asio.** A normal `async fn` handler registers its own coroutine handle with the
   reactor and yields; the reactor resumes it on readiness. Three ADDITIVE primitives (they do not
   touch any existing `await` path, so the whole async stack is unaffected): `coroStart(asyncCall)`
   creates a coroutine WITHOUT scheduling it on Asio (spawn is exactly `awaitedCallHandle` plus a
-  separable `nova_sched_schedule`, so omitting the schedule yields an Asio-free handle) and kicks it
+  separable `kyte_sched_schedule`, so omitting the schedule yields an Asio-free handle) and kicks it
   once past the async initial-suspend so its body registers; `currentCoro()` returns the running
   coroutine's handle to use as the reactor token; `coroSuspend()` yields to the reactor (reusing the
-  existing `buildAwaitSuspend`). The runtime `nova_reactor_resume(h)` resumes via `raw_coro_resume`
+  existing `buildAwaitSuspend`). The runtime `kyte_reactor_resume(h)` resumes via `raw_coro_resume`
   and reaps the frame when the coroutine finishes; single reactor thread, so no CoroState and no
   mutex, which is the lockless per-reactor drive we could not safely retrofit onto Asio. Proven by
   `conformance/cases/194` (a coroutine echo over a socketpair), clean under `--tsan`. Native 188/188,
   ASAN 345/345, TSan subset 193/193, case 194 zero races. **Wired into the server and re-measured
-  (2026-07-28):** `flagship/bench/headtohead/nova-reactor/server_coro.nova` handles each connection
+  (2026-07-28):** `flagship/bench/headtohead/kyte-reactor/server_coro.ky` handles each connection
   with a real `async fn` coroutine (await-style suspension) instead of the callback loop. Single
   reactor, one core: about **168,500 req/s** at 100 percent success, versus **186,500** for the
   callback server. **The async layer costs about 10 percent**, a small and reasonable price for real
   `async`/`await` in the handler, and the coroutine server still beats every tuned framework's
   eight-core head-to-head number on one core. **Share-nothing multi-core DONE (2026-07-28), verified
-  race-free.** `nova_run_reactors(n, worker)` spawns n OS threads (via the FFI box convention, exposed
+  race-free.** `kyte_run_reactors(n, worker)` spawns n OS threads (via the FFI box convention, exposed
   as the typed `reactor.runReactors`), each running an independent reactor with its own
   `SO_REUSEPORT` listener, its own slab pool, and its own coroutines, with no shared state;
-  `server_mc.nova` is the multi-core server. The multi-core code is CLEAN under ThreadSanitizer
+  `server_mc.ky` is the multi-core server. The multi-core code is CLEAN under ThreadSanitizer
   (`conformance/cases/195`: four concurrent reactors running coroutines over a slab pool and the
   shared allocator, in the `--tsan` gate); the share-nothing design and the lockless per-reactor
   coroutine drive hold up. The multi-core THROUGHPUT, however, cannot be measured on a single
@@ -262,32 +262,32 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   real figure needs a separate load-generation machine. **Still open in phase 4:** the Linux epoll
   backend behind the same `Reactor` shape.
 - **Phase 5. Zero-copy HTTP/1 parser** (picohttpparser model), replacing the per-request maps.
-  **DONE (2026-07-28).** `src/std/web/httpparser.nova` (`HttpRequest`): parses a request in place,
+  **DONE (2026-07-28).** `src/std/web/httpparser.ky` (`HttpRequest`): parses a request in place,
   recording the method, path, and each header as an (offset, length) slice into the read buffer,
   never copied and never individually allocated; delimiter scanning uses the SIMD-backed libc
   `memchr`; matching is by byte comparison (`methodEq`, `pathEq`, case-insensitive `header`), so
-  the hot path materialises no Nova string. The struct is created once per connection and reused,
+  the hot path materialises no Kyte string. The struct is created once per connection and reused,
   so a whole request costs no allocation. Proven correct by `conformance/cases/196` (complete and
-  incomplete detection, case-insensitive header lookup, path matching). `server_parse.nova` wires
+  incomplete detection, case-insensitive header lookup, path matching). `server_parse.ky` wires
   it into the reactor server and routes on the parsed method. Cost: on the network benchmark the
   parse is below the noise floor (parse and no-parse both land in the same client-bound 150k to
   185k band); microbenchmarked in isolation, `parse()` runs **5,000,000 four-header requests in
   0.33 s of CPU, about 66 ns per request**, roughly one percent of the per-request budget, which is
   why it does not move the throughput. This retires the old `Request.fromString` path that built
   three `Map<string,string>` per request.
-- **Phase 6. Port the `App` server** onto the Nova reactor. Re-run the head-to-head. Target is
+- **Phase 6. Port the `App` server** onto the Kyte reactor. Re-run the head-to-head. Target is
   parity within about 1.2x to 1.5x of Go and Kestrel, which the profile says is reachable.
   **Started (2026-07-28), and it surfaced the one real blocker.** The flagship's actual per-request
   business logic (the `CreateProduct` slice: zero-copy parse, serde-bind the JSON body, validate,
   render) runs on the reactor as a coroutine per connection
-  (`flagship/bench/headtohead/nova-reactor/server_flagship.nova`), at about **146k req/s on one
+  (`flagship/bench/headtohead/kyte-reactor/server_flagship.ky`), at about **146k req/s on one
   core** at 100 percent success, with the real bind and validation observable (an invalid body is
   rejected). But the FULL async `App` framework cannot yet run on the reactor, and this was
   verified rather than assumed: the `App` mediator dispatch is built on **nested `async`/`await`**,
-  and Nova's nested `await` and `spawn` route through the Asio scheduler (`nova_sched_schedule`),
+  and Kyte's nested `await` and `spawn` route through the Asio scheduler (`kyte_sched_schedule`),
   which the reactor bypasses, so a reactor-driven coroutine that performs a nested `await`
   DEADLOCKS (a minimal test hangs). **The remaining piece is therefore the async scheduler
-  migration:** replace `nova_sched_schedule`'s Asio post with a per-reactor run queue (set a
+  migration:** replace `kyte_sched_schedule`'s Asio post with a per-reactor run queue (set a
   thread-local reactor mode; the reactor loop drains the queue and reproduces the waiter and
   held-argument completion logic), so nested awaits and spawns are driven by the reactor. This is
   the largest and most delicate remaining item because it touches the coroutine ABI the whole async
@@ -295,33 +295,33 @@ Each phase ends with a measurement or a conformance gate, so we never fly blind 
   `App` (mediator, DI, middleware, and eventually the reactor-native DB drivers) runs on the loop.
 
   **Scheduler migration LANDED (2026-07-28), M1 of the retirement plan.** The approach above shipped:
-  a thread-local reactor run queue (`g_rq`), `nova_sched_schedule` diverting to it in reactor mode, a
-  `reactor_finish`/`reactor_pump` that resumes waiters on completion, and a `nova_reactor
+  a thread-local reactor run queue (`g_rq`), `kyte_sched_schedule` diverting to it in reactor mode, a
+  `reactor_finish`/`reactor_pump` that resumes waiters on completion, and a `kyte_reactor
   _detach` so top-level coroutines are reaped while spawned-and-awaited ones survive for their await.
-  With the M0 file-based trace (`NOVA_TRACE`), the earlier "multi-level hangs" report turned out to
+  With the M0 file-based trace (`KYTE_TRACE`), the earlier "multi-level hangs" report turned out to
   be a conflation: multi-level nested `await` (`top -> await middle -> await leaf`) and `spawn`+
   `await` both drain correctly and synchronously through the queue (corpus case 199, TSan clean). The
   real boundary the trace pinned down is that an `await` which suspends on an Asio-backed primitive
   (`sleep`/timer, `arecv`, `asend`, `aconnect`, `aaccept`) cannot complete on the reactor, because
   the reactor thread never runs the Asio `io_context`; that combination now fails fast via
-  `nova_reactor_io_violation` (loud, not a silent orphan) and is closed by moving those primitives
+  `kyte_reactor_io_violation` (loud, not a silent orphan) and is closed by moving those primitives
   onto the reactor in M2. See `docs/design/cpp-runtime-retirement-plan.md`.
 
-## North star: retire the C++ runtime, build the runtime in Nova
+## North star: retire the C++ runtime, build the runtime in Kyte
 
-The whole of this document serves one long-term goal, namely that Nova should stand on itself. The
+The whole of this document serves one long-term goal, namely that Kyte should stand on itself. The
 C++ runtime (`src/runtime/`) was a reasonable bootstrap, but the direction is to replace it, piece by
-piece, with Nova code over a thin FFI, until Boost.Asio and then the rest of the C++ can be retired.
-The work so far already moves several pieces into Nova: the event loop, the buffer pools, the HTTP
-parser, and the poll and socket layers are all Nova now. What remains in C++ is the coroutine
+piece, with Kyte code over a thin FFI, until Boost.Asio and then the rest of the C++ can be retired.
+The work so far already moves several pieces into Kyte: the event loop, the buffer pools, the HTTP
+parser, and the poll and socket layers are all Kyte now. What remains in C++ is the coroutine
 intrinsics glue (which is really LLVM), the async scheduler (the migration above), the allocator, the
 channels and actors, and the wolfSSL TLS pump. The order that keeps each step verifiable is: finish
 the scheduler migration (so the reactor owns scheduling), then move the DB drivers onto the reactor,
-then retire Asio, then port the remaining runtime services (allocator, channels, actors) to Nova over
-FFI, keeping the corpus, ASAN, and TSan gates green throughout. The endpoint is a Nova runtime written
-in Nova, with only a minimal syscall and crypto FFI surface underneath.
+then retire Asio, then port the remaining runtime services (allocator, channels, actors) to Kyte over
+FFI, keeping the corpus, ASAN, and TSan gates green throughout. The endpoint is a Kyte runtime written
+in Kyte, with only a minimal syscall and crypto FFI surface underneath.
 - **Phase 7. io_uring completion backend** on Linux, and `sendfile`/`splice` for static content.
-- **Retirement.** Keep Asio as a fallback until the Nova loop meets or beats it on the
+- **Retirement.** Keep Asio as a fallback until the Kyte loop meets or beats it on the
   head-to-head, then remove the Boost dependency and delete the Asio path.
 
 ## Success criteria
@@ -337,18 +337,18 @@ in Nova, with only a minimal syscall and crypto FFI surface underneath.
 
 ## Open decisions to settle in Phase 0
 
-1. **Loop in Nova versus a thin purpose-built C++ reactor.** The user's direction is to reduce
-   external reliance and to implement the loop in Nova over FFI. The counter-risk is hot-loop
-   overhead (gap 8). Recommendation: commit to the Nova loop, but validate the overhead at
+1. **Loop in Kyte versus a thin purpose-built C++ reactor.** The user's direction is to reduce
+   external reliance and to implement the loop in Kyte over FFI. The counter-risk is hot-loop
+   overhead (gap 8). Recommendation: commit to the Kyte loop, but validate the overhead at
    phase 4 with a hard measurement, and keep a thin-FFI escape hatch for the single tightest
    step if the data demands it. Decide on data, not preference.
 2. **Readiness first or io_uring first.** Recommendation: readiness first for portability and
    simplicity (macOS development uses kqueue anyway), io_uring as a phase-7 backend.
-3. **Add the ThreadSanitizer build now. DONE (2026-07-28).** `NOVA_TSAN=1 zig build` builds
-   `libnova_runtime_tsan.a` (the C++ runtime instrumented with `-fsanitize=thread`), mirroring the
-   ASAN build; `nova test` links it and `-fsanitize=thread` when `NOVA_TSAN=1`; and
+3. **Add the ThreadSanitizer build now. DONE (2026-07-28).** `KYTE_TSAN=1 zig build` builds
+   `libkyte_runtime_tsan.a` (the C++ runtime instrumented with `-fsanitize=thread`), mirroring the
+   ASAN build; `kyte test` links it and `-fsanitize=thread` when `KYTE_TSAN=1`; and
    `conformance/run.sh --tsan` runs the concurrency subset (`10_async_go`, `11_channels`,
-   `102_future_first_class`, `103_async_when_all`, `113_async_stream_io`) under `NOVA_THREADS=4`,
+   `102_future_first_class`, `103_async_when_all`, `113_async_stream_io`) under `KYTE_THREADS=4`,
    turning any data race in the multi-reactor runtime into a located report. All five pass clean
    today, which also establishes that the existing async runtime's `when_all`, channel, future, and
    async-socket paths are race-free under TSan at four threads. Extend `TSAN_CASES` as the event

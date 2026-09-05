@@ -1,6 +1,6 @@
 # 17. Building a web application
 
-Nova ships a small, direct web framework in the standard library. There is no
+Kyte ships a small, direct web framework in the standard library. There is no
 mediator, no dependency-injection container, and no annotation magic in the
 request path. A route maps a URL to a handler object, the handler reads its
 typed input from the request and returns a response, and you wire the handlers
@@ -12,9 +12,9 @@ client-side JavaScript. It works just as well for JSON APIs; the only
 difference is what a handler puts in the response body.
 
 The running example for this chapter is the project the toolchain scaffolds
-with `nova init web`. The full source lives in
+with `kyte init web`. The full source lives in
 [`examples/webapp`](examples/webapp), builds offline, and its tests pass with
-`nova test`. Every snippet below is taken from it.
+`kyte test`. Every snippet below is taken from it.
 
 ## Vertical slices
 
@@ -26,24 +26,24 @@ one folder under `Features/`. This is vertical slice architecture: to change
 
 ```
 src/
-  main.nova                         composition root
+  main.ky                         composition root
   Domain/
-    Entities/Product.nova           the business object (persistence-agnostic)
-    Dtos/ProductDto.nova            the shape returned to clients
-    Dtos/CreateProductDto.nova
+    Entities/Product.ky           the business object (persistence-agnostic)
+    Dtos/ProductDto.ky            the shape returned to clients
+    Dtos/CreateProductDto.ky
   Features/
     Products/
-      routes.nova                   this feature's route table
+      routes.ky                   this feature's route table
       CreateProduct/
-        command.nova                the write input (a @serializable struct)
-        handler.nova                the RouteHandler
-        validator.nova              input checks
+        command.ky                the write input (a @serializable struct)
+        handler.ky                the RouteHandler
+        validator.ky              input checks
       GetProductById/
-        query.nova                  the read input
-        handler.nova
+        query.ky                  the read input
+        handler.ky
       Shared/
-        repository.nova             data access for the feature
-        database.nova               an in-memory Connection (the default)
+        repository.ky             data access for the feature
+        database.ky               an in-memory Connection (the default)
       views/product_card.nsx        an NSX view
   wwwroot/                          static assets
 ```
@@ -51,19 +51,19 @@ src/
 ## Scaffolding the project
 
 ```bash
-nova init web --name shop
+kyte init web --name shop
 cd shop
-nova build
+kyte build
 ./build/debug/bin/shop      # serves on http://127.0.0.1:8080
 ```
 
-`nova init web` writes two manifests, and it is worth knowing which is which:
+`kyte init web` writes two manifests, and it is worth knowing which is which:
 
-- **`project.json`** is the Nova manifest. It carries the project name,
+- **`project.json`** is the Kyte manifest. It carries the project name,
   version, and the list of package dependencies the compiler resolves. This is
   the one the build reads. Chapter 19, Package management, covers it in full.
 - **`package.json`** is only for the Tailwind CSS command-line tool (an npm
-  dev dependency). The Nova build ignores it. If you do not use Tailwind you can
+  dev dependency). The Kyte build ignores it. If you do not use Tailwind you can
   delete it.
 
 ## A read slice: get a product by id
@@ -71,8 +71,8 @@ nova build
 A slice starts with its **input type**. For a read that is a `query`: a plain
 `@serializable` struct whose fields the framework fills from the request.
 
-```nova
-// Features/Products/GetProductById/query.nova
+```kyte
+// Features/Products/GetProductById/query.ky
 @serializable pub struct GetProductById {
     pub id: int,
     init() { self.id = 0; }
@@ -84,8 +84,8 @@ The **handler** implements the `RouteHandler` trait from `web.routing`. A
 exposes exactly one method, `serve(ctx)`. It reads its typed input with
 `ctx.bind<T>()`, does its work, and returns a `Response`.
 
-```nova
-// Features/Products/GetProductById/handler.nova
+```kyte
+// Features/Products/GetProductById/handler.ky
 import web.routing;
 import web.response;
 import web.status;
@@ -132,7 +132,7 @@ Later sources win over earlier ones, so a path parameter overrides a query
 parameter of the same name. Two smaller accessors exist for when you want a
 single raw value instead of a bound struct:
 
-```nova
+```kyte
 let raw = ctx.query("q");     // one query-string value, or ""
 let ids = ctx.param("id");    // one path parameter, or ""
 ```
@@ -142,11 +142,11 @@ Because a hypermedia form POSTs `application/x-www-form-urlencoded`, the SAME
 
 ## Views: NSX
 
-View code lives in `.nsx` files. NSX is the same language as `.nova`, just
+View code lives in `.nsx` files. NSX is the same language as `.ky`, just
 filed apart so markup stays separate from logic. An NSX element is a `string`,
 so views compose directly and expressions embed with `{...}`.
 
-```nova
+```kyte
 // Features/Products/views/product_card.nsx
 pub fn productCard(name: string, price: int): Html {
     return <div class="rounded-lg border border-slate-200 p-4 shadow-sm">
@@ -169,8 +169,8 @@ The write input is a `command`, again a plain `@serializable` struct. Command
 means write intent (a `POST`/`PUT`/`DELETE`); query means read intent. They are
 the same kind of object, named for what they express.
 
-```nova
-// Features/Products/CreateProduct/command.nova
+```kyte
+// Features/Products/CreateProduct/command.ky
 @serializable pub struct CreateProduct {
     pub name: string,
     pub price: int,
@@ -182,8 +182,8 @@ Validation is a plain function that returns "" when the input is good, or the
 error text otherwise. There is no validator trait to implement and no framework
 to register it with; the handler calls it.
 
-```nova
-// Features/Products/CreateProduct/validator.nova
+```kyte
+// Features/Products/CreateProduct/validator.ky
 pub fn validateCreateProduct(cmd: CreateProduct): string {
     if (cmd.name.length == 0) { return "name is required"; }
     if (cmd.price < 0) { return "price must be >= 0"; }
@@ -196,8 +196,8 @@ product's card. Because this is hypermedia, the 201 body is the HTML fragment
 the browser swaps in; for a JSON API you would `serde.json.stringify` a DTO
 instead.
 
-```nova
-// Features/Products/CreateProduct/handler.nova
+```kyte
+// Features/Products/CreateProduct/handler.ky
 pub struct CreateProductHandler impl RouteHandler {
     repo: ProductRepository,
     init(repo: ProductRepository) { self.repo = repo; }
@@ -218,13 +218,13 @@ pub struct CreateProductHandler impl RouteHandler {
 
 ## Wiring: routes and the composition root
 
-Each feature owns a small `routes.nova` that binds its paths to handler
+Each feature owns a small `routes.ky` that binds its paths to handler
 instances. `app.get`/`app.post`/`app.put`/`app.delete`/`app.patch` each take a
 path and a handler INSTANCE, and you pass that handler its dependencies as plain
 constructor arguments.
 
-```nova
-// Features/Products/routes.nova
+```kyte
+// Features/Products/routes.ky
 pub fn registerProducts(app: App, repo: ProductRepository): void {
     app.post("/api/products", CreateProductHandler(repo));
     app.get("/api/products/{id:int}", GetProductByIdHandler(repo));
@@ -234,12 +234,12 @@ pub fn registerProducts(app: App, repo: ProductRepository): void {
 `{id:int}` is a typed path parameter: a non-numeric id never reaches the
 handler, it is a 400 at the router. Plain `{name}` captures any single segment.
 
-`main.nova` is the composition root. It builds the shared dependencies ONCE and
+`main.ky` is the composition root. It builds the shared dependencies ONCE and
 calls each feature's `register`. There is no container resolving things behind
 your back: you can see every dependency being constructed.
 
-```nova
-// main.nova
+```kyte
+// main.ky
 import web.app;
 import Features.Products.Shared.database;
 import Features.Products.Shared.repository;
@@ -274,8 +274,8 @@ The repository is the one place that knows SQL. Its connection field is the
 repository runs over an in-memory connection in tests and over a real database
 in production with no change.
 
-```nova
-// Features/Products/Shared/repository.nova
+```kyte
+// Features/Products/Shared/repository.ky
 pub struct ProductRepository {
     conn: Connection,
     init(conn: Connection) { self.conn = conn; }
@@ -298,7 +298,7 @@ pub struct ProductRepository {
 ```
 
 The starter ships a tiny `InMemoryConnection impl Connection` (in
-`Shared/database.nova`) so the app runs and its tests pass with no database
+`Shared/database.ky`) so the app runs and its tests pass with no database
 server. Parameters are built with `db.dbInt`/`db.dbText`/`db.dbLong` and bound
 to `$1, $2, ...`; the micro-ORM (`orm.bindOne`/`orm.bindAll`) maps result rows
 onto `ProductDto` by column name. Chapter 18, Data access and the ORM, covers
@@ -310,8 +310,8 @@ Handlers are objects, so a test builds the app the same way the composition
 root does and drives one request through `app.dispatch(req)` with no socket
 open. That makes feature tests fast and hermetic.
 
-```nova
-// tests/features/products_test.nova
+```kyte
+// tests/features/products_test.ky
 fn testApp(): App {
     let conn = InMemoryConnection();
     let repo = ProductRepository(conn);
@@ -331,18 +331,18 @@ fn test_get_missing_is_404(): void {
 ```
 
 ```bash
-nova test tests/features/products_test.nova
+kyte test tests/features/products_test.ky
 ```
 
 ## The same app over a real database
 
-The example includes `main_postgres.nova` at the project root: the SAME app over a
-real PostgreSQL. Look at it beside `src/main.nova` and only the composition root
+The example includes `main_postgres.ky` at the project root: the SAME app over a
+real PostgreSQL. Look at it beside `src/main.ky` and only the composition root
 differs. Every feature slice, the repository, the handlers, and the views are
 identical, because they depend on the `Connection` trait, never on a driver.
 
-```nova
-// main_postgres.nova  (excerpt)
+```kyte
+// main_postgres.ky  (excerpt)
 fn buildApp(dsn: string, poolSize: int): App {
     let app = App();
     let conn = PooledConnection(dsn, poolSize);   // built now; connects lazily, per request
@@ -353,7 +353,7 @@ fn buildApp(dsn: string, poolSize: int): App {
 }
 ```
 
-`PooledConnection` (in `Shared/pooled_connection.nova`) wraps a
+`PooledConnection` (in `Shared/pooled_connection.ky`) wraps a
 `pool.Pool(PgDriver(), dsn, size)` and implements `Connection` by acquiring a
 connection per call, running the statement, and releasing it. The pool is built
 synchronously and opens its connections lazily inside a request, which is the
@@ -377,7 +377,7 @@ The framework in `web.*` covers the rest of a real application:
 - **Static files**: `app.useStatic(prefix, dir)`, as above.
 - **The client side**: `web.client` is an HTTP client for calling other
   services, and TLS is built in (chapter 15 and the runtime crypto are pure
-  Nova, no OpenSSL).
+  Kyte, no OpenSSL).
 
 ## Where to go next
 

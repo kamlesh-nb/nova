@@ -1,4 +1,4 @@
-# Nova Compiler LLD: the type-inference / typed-IR pass
+# Kyte Compiler LLD: the type-inference / typed-IR pass
 
 Inference is the pass that turns a parsed, symbol-resolved AST into a **typed IR**: a set of
 side tables that map every expression node (by its stable `ast.ExprId`) to a `TypeId`, plus the
@@ -49,7 +49,7 @@ type args per call), plus the instantiation-keyed variants (`expr_owned_inst`, `
 monomorphisations. Inference also **interacts with ownership** by computing an owned/borrowed
 disposition per node (`ownedDisposition`, backed by `store.isOwnedSafe`), which `ownership.zig`
 and codegen's `arc.zig` consume; it interacts with `shadow.zig` through the shared `TypeStore`
-that `NOVA_SEMA_SHADOW` diffs against the legacy engine.
+that `KYTE_SEMA_SHADOW` diffs against the legacy engine.
 
 Besides typing, the pass carries a set of **fail-closed soundness checks** (labelled A1 / L2 / G5
 and the `gaps.md` C-chk-* ids) that collect located diagnostics into per-category error lists on
@@ -147,7 +147,7 @@ walk.
   names the position.
 
 - **`pub const MethodArityError { span, name, expected, got }`**: a method call whose argument
-  count does not match the declared parameters (A1, C-chk-1). Nova has no defaults/variadics, so
+  count does not match the declared parameters (A1, C-chk-1). Kyte has no defaults/variadics, so
   arity is exact.
 
 - **`pub const Inferer = struct`**: the engine and all its mutable state (see below).
@@ -190,7 +190,7 @@ There is no mutable module-level state. Module-level items are the imports (`std
 type declarations above, and, at the bottom, `const testing = std.testing` plus the in-file unit
 tests. Notable magic constants live inside functions: the recursion caps `2000` (`inferExprInner`)
 and `8` (`constType`), and the hard-coded builtin receiver/namespace names in `isFatalUnresolvedIdent`
-(`"self"`, the `nova_` prefix, `{ "bytes", "console", "sync", "atomic" }`, `{ "Storage", "Atomic" }`)
+(`"self"`, the `kyte_` prefix, `{ "bytes", "console", "sync", "atomic" }`, `{ "Storage", "Atomic" }`)
 and the special-cased generic namespaces `"serde"`, `"mem"`, `"bytes"`, `"Storage"` in
 `inferExprInner`'s `.generic_call` arm.
 
@@ -263,7 +263,7 @@ Free functions (module scope):
   what codegen would mis-stringify or mis-free). Numeric/struct/trait/enum variety is allowed.
 
 - **`fn errorTypesCompatible(self, a, b) bool`** (private): do two error types match: identical
-  `TypeId`, same enum symbol, or same struct decl; an unresolved side never flags. Nova has no
+  `TypeId`, same enum symbol, or same struct decl; an unresolved side never flags. Kyte has no
   error subtyping, so anything else is a G5 mismatch.
 
 - **`pub fn inferExpr(self, ep) !TypeId`**: the public expression entry; delegates to
@@ -386,7 +386,7 @@ Free functions (module scope):
   temporary `solved`/`solved_args` buffers (freed via defer). Returns null on failure paths.
 
 - **`fn recordOptDeref(self, fa, is_method, kind) void`** (private): record an
-  optional/error-union see-through field or method access, with an optional `NOVA_OPT_AUDIT`
+  optional/error-union see-through field or method access, with an optional `KYTE_OPT_AUDIT`
   stderr trace. Appends to `optional_deref_errors`.
 
 - **`fn fieldType(self, fa) !?TypeId`** (private): resolve `obj.field`: infer the object; if it is
@@ -426,7 +426,7 @@ Free functions (module scope):
 
 - **`fn isFatalUnresolvedIdent(self, name) bool`** (private): is an unresolved ident a genuine
   unknown that should reject the compile, versus a name that later passes resolve (`self`, the
-  `nova_` runtime prefix, the magic receivers `bytes`/`console`/`sync`/`atomic`, builtin receivers,
+  `kyte_` runtime prefix, the magic receivers `bytes`/`console`/`sync`/`atomic`, builtin receivers,
   the builtin types `Storage`/`Atomic`, or any known imported/segment module name).
 
 - **`fn isKnownModule(self, name) bool`** (private): does `name` resolve to an imported module,
@@ -644,7 +644,7 @@ for the trickier inference rules.
   solved concretely.
 - **`ownership.zig`**: consumes `ownedDisposition`/`expr_owned`/`expr_op` (and `store.isOwnedSafe`)
   to place ARC retains/releases; inference produces the owned/move/drop facts it reads.
-- **`shadow.zig`**: the `NOVA_SEMA_SHADOW` diff harness that compares the two type engines over
+- **`shadow.zig`**: the `KYTE_SEMA_SHADOW` diff harness that compares the two type engines over
   the shared `TypeStore`; the `Stats` coverage numbers here are how that comparison is gauged.
 - **`types.zig`**: the `TypeStore` and `TypeId`: minting (`intT`, `stringT`, `boolT`, `voidT`,
   `doubleT`, `decimalT`, `unresolvedT`), interning (`.array`, `.tuple`, `.func`, `.future`,

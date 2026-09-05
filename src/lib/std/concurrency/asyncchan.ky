@@ -1,0 +1,253 @@
+//! Cooperative in-process channels for the async runtime.
+//!
+//! This file provides two quite different things that both go by the word
+//! "channel", kept together because they solve the same problem at different
+//! layers:
+//!
+//!   1. `AsyncChannel<T>`, a pure-Kyte, typed, cooperatively scheduled channel.
+//!      It is the one you normally reach for. It carries values of any type `T`,
+//!      buffers them in an ordinary `list.List<T>`, and blocks a coroutine (not
+//!      an OS thread) when there is nothing to receive or no room to send.
+//!   2. `chanNew` / `chanSend` / `chanRecv` / `chanFree`, thin wrappers over the
+//!      C++ runtime's native integer channel (`kyte_chan_*`). These predate the
+//!      typed channel and survive as a low-level, untyped `long`/`int` seam.
+//!
+//! Why a Kyte-level channel at all, when the runtime already has one? Because
+//! the web runtime is single-reactor and coroutine-based (see
+//! [`concurrency`] direction notes): the units that need to rendezvous are
+//! coroutines multiplexed onto one thread, not threads. Blocking such a unit
+//! must NOT block the thread, so `AsyncChannel` never calls a locking primitive.
+//! It parks the current coroutine instead, by recording its handle in a waiter
+//! list and calling `coroSuspend()`, and the counterparty wakes it later with
+//! `kyte_sched_schedule()`. A blocking mutex inside an async path is a known
+//! severe pessimisation on this runtime, so the whole type is built to avoid it.
+//!
+//! Design and invariants worth holding in mind:
+//!
+//!   - A coroutine handle is just a `long` (a frame address). The waiter lists
+//!     hold these raw handles. A parked coroutine appears in exactly one send or
+//!     receive waiter list at a time for a plain `send`/`recv`; `selectRecv`
+//!     deliberately registers ONE handle across many channels at once and
+//!     unregisters from all of them on wake, so a handle can briefly sit in
+//!     several receive lists together.
+//!   - Wakeups are a hand-off, not a broadcast: a completed `send` wakes at most
+//!     one waiting receiver, and a completed `recv` wakes at most one waiting
+//!     sender. The woken coroutine re-checks its loop condition when it resumes,
+//!     so a spurious or racey wake simply parks again rather than proceeding on a
+//!     false assumption. This is why both `send` and `recv` loop with `while`
+//!     rather than testing the condition once.
+//!   - `capacity <= 0` means UNBOUNDED: the `capacity > 0` guard in `send` is
+//!     false, so a send never blocks and never records a sender waiter. A
+//!     positive `capacity` makes the channel bounded and enables back-pressure.
+//!     There is no lower bound check; a negative capacity behaves as unbounded.
+//!   - FIFO order in and out: the buffer is used head-to-tail (`push` to append,
+//!     `at(0)` + `remove(0)` to take the oldest), and waiters are woken oldest
+//!     first, so both values and blocked coroutines are served in arrival order.
+//!
+//! The type is NOT thread-safe and is not meant to be. It assumes a single
+//! reactor thread and cooperative scheduling; there is no lock around the buffer
+//! or the waiter lists because two coroutines on one thread never touch them at
+//! the same instant. Sharing an `AsyncChannel` across OS threads would corrupt
+//! the lists. For cross-thread or cross-reactor signalling, use the runtime's
+//! own facilities rather than this type.
+
+import list;
+
+/// A typed, bounded-or-unbounded channel that blocks COROUTINES, not threads.
+///
+/// Values of type `T` are buffered in insertion order in [`AsyncChannel.buffer`]
+/// and delivered oldest first. A receiver on an empty channel and a sender on a
+/// full one both park the current coroutine (record its handle, then
+/// `coroSuspend()`) instead of spinning or blocking the thread; the
+/// counterparty wakes exactly one parked coroutine when it makes progress.
+///
+/// Construct with a capacity: a positive value bounds the buffer and turns on
+/// back-pressure, while zero or a negative value makes the channel unbounded so
+/// [`AsyncChannel.send`] never blocks. See the file header for the full
+/// concurrency contract; in short, this type is single-reactor only and not
+/// safe to share across OS threads.
+pub class AsyncChannel<T> {
+    /// The in-flight values, held oldest first. `send` appends with `push`;
+    /// `recv` takes the head with `at(0)` then `remove(0)`, giving FIFO delivery.
+    /// Its `size()` is both the queue depth and, against `capacity`, the
+    /// fullness test that drives back-pressure.
+    buffer: list.List<T>,
+    /// Maximum number of buffered values before a `send` must wait. A positive
+    /// value bounds the channel; zero or negative means unbounded, in which case
+    /// `send` never parks a sender. Not re-validated after construction.
+    capacity: int,
+    /// Handles of coroutines parked inside `send` because the buffer was full.
+    /// Woken oldest first by `recv` after it frees a slot. Only ever populated
+    /// when `capacity > 0`, since an unbounded channel never blocks a sender.
+    sendWaiters: list.List<long>,
+    /// Handles of coroutines parked inside `recv` (or registered by
+    /// [`selectRecv`]) because the buffer was empty. Woken oldest first by `send`
+    /// once a value is available, and pruned by [`AsyncChannel.unregisterRecv`].
+    recvWaiters: list.List<long>,
+
+    /// Creates a channel with the given buffer capacity and empty waiter lists.
+    ///
+    /// A positive `capacity` bounds the buffer and enables back-pressure; zero
+    /// or a negative value yields an unbounded channel whose `send` never blocks.
+    init(capacity: int) {
+        self.buffer = list.List<T>();
+        self.capacity = capacity;
+        self.sendWaiters = list.List<long>();
+        self.recvWaiters = list.List<long>();
+    }
+
+    /// Sends `val`, parking the current coroutine while the channel is full.
+    ///
+    /// On a bounded channel (`capacity > 0`) this loops as long as the buffer is
+    /// at or over capacity: each turn it records the current coroutine in
+    /// [`AsyncChannel.sendWaiters`] and calls `coroSuspend()`, so the thread is
+    /// free to run other work. It re-checks fullness on every resume because the
+    /// wake is only a hint that a slot MAY have opened, not a guarantee. An
+    /// unbounded channel skips the loop entirely and never blocks.
+    ///
+    /// Once there is room, it appends the value and, if a receiver is parked,
+    /// hands off to the oldest one by removing it from [`AsyncChannel.recvWaiters`]
+    /// and scheduling it via `kyte_sched_schedule`. At most one receiver is woken
+    /// per send. Pairs with [`AsyncChannel.recv`].
+    pub async fn send(self: AsyncChannel<T>, val: T): void {
+        while (self.capacity > 0 && self.buffer.size() >= self.capacity) {
+            self.sendWaiters.push(currentCoro());
+            coroSuspend();
+        }
+        self.buffer.push(val);
+        if (self.recvWaiters.size() > 0) {
+            let h = self.recvWaiters.at(0);
+            self.recvWaiters.remove(0);
+            kyte_sched_schedule(h);
+        }
+    }
+
+    /// Receives the oldest buffered value, parking the coroutine while empty.
+    ///
+    /// It loops while the buffer is empty: each turn it records the current
+    /// coroutine in [`AsyncChannel.recvWaiters`] and calls `coroSuspend()`,
+    /// yielding the thread. On resume it re-tests emptiness rather than assuming
+    /// a value arrived, so a spurious wake just parks again.
+    ///
+    /// Once a value is present it takes the head (`at(0)` then `remove(0)`,
+    /// preserving FIFO order) and, if a sender is blocked on a full bounded
+    /// channel, wakes the oldest one from [`AsyncChannel.sendWaiters`] via
+    /// `kyte_sched_schedule` so it can retry its send. At most one sender is
+    /// woken per receive. Pairs with [`AsyncChannel.send`].
+    pub async fn recv(self: AsyncChannel<T>): T {
+        while (self.buffer.size() == 0) {
+            self.recvWaiters.push(currentCoro());
+            coroSuspend();
+        }
+        let v = self.buffer.at(0);
+        self.buffer.remove(0);
+        if (self.sendWaiters.size() > 0) {
+            let h = self.sendWaiters.at(0);
+            self.sendWaiters.remove(0);
+            kyte_sched_schedule(h);
+        }
+        return v;
+    }
+
+    /// True when a `recv` would return without parking, i.e. the buffer is
+    /// non-empty. A non-blocking readiness probe, used by [`selectRecv`] to find
+    /// a channel it can drain immediately.
+    pub fn ready(self: AsyncChannel<T>): bool { return self.buffer.size() > 0; }
+    /// Number of values currently buffered and waiting to be received.
+    pub fn depth(self: AsyncChannel<T>): int { return self.buffer.size(); }
+    /// Number of coroutines currently parked in `send` waiting for a free slot.
+    /// Always zero on an unbounded channel, since such a channel never blocks a
+    /// sender.
+    pub fn waitingSenders(self: AsyncChannel<T>): int { return self.sendWaiters.size(); }
+
+    /// Adds a coroutine handle to the receive-waiter list without suspending.
+    ///
+    /// This is the multiplexing hook for [`selectRecv`], which registers one
+    /// handle across several channels so any of them can wake it. Callers that
+    /// register must later remove the handle (see
+    /// [`AsyncChannel.unregisterRecv`]); a plain `recv` manages its own waiter
+    /// entry and should not use this.
+    pub fn registerRecv(self: AsyncChannel<T>, h: long): void { self.recvWaiters.push(h); }
+    /// Removes the first occurrence of handle `h` from the receive-waiter list.
+    ///
+    /// The counterpart to [`AsyncChannel.registerRecv`]: after a `selectRecv`
+    /// wakes on one channel, it calls this on every channel it registered with
+    /// so a stale handle is never scheduled again. It scans linearly and stops
+    /// at the first match; if `h` is absent it is a no-op.
+    pub fn unregisterRecv(self: AsyncChannel<T>, h: long): void {
+        let i = 0;
+        while (i < self.recvWaiters.size()) {
+            if (self.recvWaiters.at(i) == h) { self.recvWaiters.remove(i); return; }
+            i = i + 1;
+        }
+    }
+}
+
+/// Waits until any channel in `channels` is receivable and returns its index.
+///
+/// This is the async equivalent of a `select` over receive operations. Each
+/// pass scans the channels in order and returns the index of the first one that
+/// is [`AsyncChannel.ready`], giving lower indices priority when several are
+/// ready at once. It does NOT consume the value; the caller then calls `recv`
+/// on the returned channel to take it.
+///
+/// If none is ready, it registers the current coroutine's handle on EVERY
+/// channel (via [`AsyncChannel.registerRecv`]) so a send on any of them can wake
+/// it, suspends, and on resume unregisters that handle from ALL of them (via
+/// [`AsyncChannel.unregisterRecv`]) before looping to re-scan. Registering
+/// everywhere and cleaning up everywhere is what makes the wait fair across
+/// channels and prevents a stale handle lingering in a list it no longer waits
+/// on. An empty `channels` list returns -1 rather than parking forever.
+pub async fn selectRecv<T>(channels: list.List<AsyncChannel<T>>): int {
+    while (true) {
+        let i = 0;
+        while (i < channels.size()) {
+            if (channels.at(i).ready()) { return i; }
+            i = i + 1;
+        }
+        if (channels.size() == 0) { return -1; }
+        let h = currentCoro();
+        let j = 0;
+        while (j < channels.size()) { channels.at(j).registerRecv(h); j = j + 1; }
+        coroSuspend();
+        let k = 0;
+        while (k < channels.size()) { channels.at(k).unregisterRecv(h); k = k + 1; }
+    }
+}
+
+/// Creates a native runtime integer channel and returns its opaque handle.
+///
+/// This is the low-level, untyped seam over the C++ runtime's `kyte_chan_new`,
+/// distinct from [`AsyncChannel`]: it carries plain `int` values and is
+/// referred to by a raw `long` handle rather than a Kyte object. The `0`
+/// argument requests the runtime's default configuration. The handle must
+/// eventually be released with [`chanFree`].
+pub fn chanNew(): long {
+    return kyte_chan_new(0);
+}
+
+/// Sends one integer on the native channel identified by handle `ch`.
+///
+/// A direct pass-through to the runtime's `kyte_chan_send`; blocking and
+/// buffering semantics are whatever that native channel implements.
+pub fn chanSend(ch: long, val: int): void {
+    kyte_chan_send(ch, val);
+}
+
+/// Placeholder receive on a native channel: currently always returns 0.
+///
+/// Unlike its `chanSend` sibling this does NOT call into the runtime and does
+/// not actually take a value off the channel; it is an unimplemented stub that
+/// yields a constant 0. Use [`AsyncChannel.recv`] for real receiving. Kept so
+/// the native-channel API surface stays symmetric.
+pub fn chanRecv(ch: long): int {
+    return 0;
+}
+
+/// Frees the native channel identified by handle `ch`.
+///
+/// Releases the runtime resources allocated by [`chanNew`] via
+/// `kyte_chan_free`. The handle must not be used again after this call.
+pub fn chanFree(ch: long): void {
+    kyte_chan_free(ch);
+}

@@ -2,7 +2,7 @@
 
 - Chapter: [08-enums.md](../08-enums.md)
 - Estimated length: ~9 minutes
-- You will need: Nova installed and on your PATH, a terminal, and the file `examples/14_enums.nova` from the guide.
+- You will need: Kyte installed and on your PATH, a terminal, and the file `examples/14_enums.ky` from the guide.
 
 ## Hook (0:00)
 
@@ -25,7 +25,7 @@
 **Say:** First a colour type. Three plain variants: Red, Green, Blue. You refer to one as `Color.Red`. And an enum can carry methods too, declared after the variants. This one returns a numeric code, and it dispatches on `self` using a `switch`.
 
 **On screen:**
-```nova
+```kyte
 // Payload-less variants, plus a method that dispatches on the value.
 enum Color {
     Red,
@@ -50,7 +50,7 @@ enum Color {
 **Say:** Now a type where each variant carries data. Here `Node` has a `Leaf` and a `Branch`, and each one holds an `int`. You construct a payload variant like a function call, so `Node.Leaf(3)`. The `describe` method matches each variant and binds the payload into a name we can use, here called `v`.
 
 **On screen:**
-```nova
+```kyte
 // Payload variants: each carries an int. `sum` folds the tree recursively,
 // binding the payload in each `case`.
 enum Node {
@@ -74,7 +74,7 @@ enum Node {
 **Say:** Let us use both types. Payload-less variants are just plain values, so we can store `Color.Green` in a variable and call a method on it, and we can even call a method straight on a literal like `Color.Blue`.
 
 **On screen:**
-```nova
+```kyte
 fn main(): void {
     // Payload-less variants are plain values: `Color.Green`.
     let c = Color.Green;
@@ -85,7 +85,7 @@ fn main(): void {
 **Say:** So `c` holds Green and `c.code()` gives 2, and calling `code` directly on `Color.Blue` gives 3. Now the payload side.
 
 **On screen:**
-```nova
+```kyte
     // Payload variants are constructed like a call: `Node.Leaf(3)`.
     let leaf = Node.Leaf(3);
     let branch = Node.Branch(10);
@@ -96,7 +96,7 @@ fn main(): void {
 **Say:** We build a Leaf holding 3 and a Branch holding 10, then ask each to describe itself. Finally, let us match on them outside a method and add the payloads up.
 
 **On screen:**
-```nova
+```kyte
     // Match and bind the payload directly at the case site.
     let total = 0;
     switch (leaf)   { case Node.Leaf(v): { total = total + v; } case Node.Branch(v): { total = total + v; } }
@@ -109,7 +109,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/14_enums.nova -o out && ./out
+kyte examples/14_enums.ky -o out && ./out
 ```
 
 ```
@@ -138,4 +138,4 @@ total payload = 13
 
 ## Outro (8:45)
 
-**Say:** Next we look at traits, Nova's interfaces, which give you polymorphism through dynamic dispatch. If you are enjoying the series, a like and subscribe really helps. See you there.
+**Say:** Next we look at traits, Kyte's interfaces, which give you polymorphism through dynamic dispatch. If you are enjoying the series, a like and subscribe really helps. See you there.

@@ -1,12 +1,12 @@
 //! The compiler-intrinsic call registry: the built-in `receiver.method(...)`
 //! and bare `extern` runtime functions that sema knows the return type of
-//! without ever seeing a Nova declaration for them.
+//! without ever seeing a Kyte declaration for them.
 //!
-//! Nova's standard library is written in Nova and type-checks like any other
+//! Kyte's standard library is written in Kyte and type-checks like any other
 //! code, but a handful of primitives cannot be, they are the raw seam onto
 //! machine memory, SIMD registers, the C++ runtime, and the async reactor.
-//! `bytes.read_i32(p, off)`, `simd.addU32x4(a, b)`, and `nova_reactor_resume(h)`
-//! have no Nova body to infer a type from; the codegen backend emits them
+//! `bytes.read_i32(p, off)`, `simd.addU32x4(a, b)`, and `kyte_reactor_resume(h)`
+//! have no Kyte body to infer a type from; the codegen backend emits them
 //! directly as loads/stores, LLVM vector ops, or `extern` calls. This module is
 //! how the *front end* learns their signatures' return side so a call
 //! expression can be typed and the rest of inference can proceed.
@@ -20,7 +20,7 @@
 //!     builtin namespace", and [`find`] resolves the specific method.
 //!
 //!   * [`externs`], bare-name functions (empty `receiver`) that bind straight
-//!     to a symbol in the C++ runtime (`nova_*`) or the coroutine ABI
+//!     to a symbol in the C++ runtime (`kyte_*`) or the coroutine ABI
 //!     (`currentCoro`, `coroStart`, ...). Resolved by [`findExtern`].
 //!
 //! Each entry records ONLY the return type, as a small [`Ret`] tag rather than a
@@ -61,7 +61,7 @@ pub const Builtin = struct {
     /// The builtin namespace this method hangs off, e.g. `"bytes"` or `"simd"`.
     /// Empty (`""`) for a bare [`externs`] function that has no receiver.
     receiver: []const u8,
-    /// The method / function identifier as written in Nova source, matched
+    /// The method / function identifier as written in Kyte source, matched
     /// verbatim by [`find`] and [`findExtern`] (exact byte comparison, no
     /// normalisation).
     name: []const u8,
@@ -175,75 +175,75 @@ pub const table = [_]Builtin{
 /// Bare-name functions that bind directly to a runtime or ABI symbol.
 ///
 /// These have an empty receiver and are resolved by [`findExtern`]. They fall
-/// into a few families: the `nova_test_*` unit-test harness hooks; the coroutine
-/// / reactor ABI (`currentCoro`, `coroStart`, `nova_reactor_*`, `nova_run_reactors`)
+/// into a few families: the `kyte_test_*` unit-test harness hooks; the coroutine
+/// / reactor ABI (`currentCoro`, `coroStart`, `kyte_reactor_*`, `kyte_run_reactors`)
 /// that async lowering calls into; locking and threading primitives
-/// (`nova_mutex_*`, `nova_spin_*`, `nova_thread_id`); low-level numeric and
-/// protocol helpers (`nova_f64_bits`, `nova_pg_be_f64` for Postgres big-endian
-/// wire decode, `nova_html_find_meta`); process control (`nova_exit`,
-/// `nova_process_*`, `nova_arg_*`); and tracing (`nova_trace_*`). A name absent
+/// (`kyte_mutex_*`, `kyte_spin_*`, `kyte_thread_id`); low-level numeric and
+/// protocol helpers (`kyte_f64_bits`, `kyte_pg_be_f64` for Postgres big-endian
+/// wire decode, `kyte_html_find_meta`); process control (`kyte_exit`,
+/// `kyte_process_*`, `kyte_arg_*`); and tracing (`kyte_trace_*`). A name absent
 /// from this table is NOT a builtin extern and must resolve some other way (see
 /// the `bare-name runtime functions resolve` test).
 pub const externs = [_]Builtin{
-    .{ .receiver = "", .name = "nova_test_fail", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_test_fail", .ret = .void_ },
 
-    .{ .receiver = "", .name = "nova_test_reset", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_test_begin", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_test_did_fail", .ret = .int },
-    .{ .receiver = "", .name = "nova_test_fail_message", .ret = .string },
-    .{ .receiver = "", .name = "nova_arc_audit_report", .ret = .long },
-    .{ .receiver = "", .name = "nova_exit", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_arg_count", .ret = .long },
-    .{ .receiver = "", .name = "nova_arg_at", .ret = .string },
+    .{ .receiver = "", .name = "kyte_test_reset", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_test_begin", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_test_did_fail", .ret = .int },
+    .{ .receiver = "", .name = "kyte_test_fail_message", .ret = .string },
+    .{ .receiver = "", .name = "kyte_arc_audit_report", .ret = .long },
+    .{ .receiver = "", .name = "kyte_exit", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_arg_count", .ret = .long },
+    .{ .receiver = "", .name = "kyte_arg_at", .ret = .string },
 
-    .{ .receiver = "", .name = "nova_f64_bits", .ret = .long },
-    .{ .receiver = "", .name = "nova_pg_be_f64", .ret = .double },
-    .{ .receiver = "", .name = "nova_pg_be_i64", .ret = .long },
-    .{ .receiver = "", .name = "nova_html_find_meta", .ret = .int },
+    .{ .receiver = "", .name = "kyte_f64_bits", .ret = .long },
+    .{ .receiver = "", .name = "kyte_pg_be_f64", .ret = .double },
+    .{ .receiver = "", .name = "kyte_pg_be_i64", .ret = .long },
+    .{ .receiver = "", .name = "kyte_html_find_meta", .ret = .int },
 
-    .{ .receiver = "", .name = "nova_f64_sqrt", .ret = .double },
+    .{ .receiver = "", .name = "kyte_f64_sqrt", .ret = .double },
 
-    .{ .receiver = "", .name = "nova_mutex_create", .ret = .long },
-    .{ .receiver = "", .name = "nova_mutex_lock", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_mutex_unlock", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_mutex_create", .ret = .long },
+    .{ .receiver = "", .name = "kyte_mutex_lock", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_mutex_unlock", .ret = .void_ },
 
-    .{ .receiver = "", .name = "nova_thread_id", .ret = .long },
-    .{ .receiver = "", .name = "nova_worker_count", .ret = .long },
+    .{ .receiver = "", .name = "kyte_thread_id", .ret = .long },
+    .{ .receiver = "", .name = "kyte_worker_count", .ret = .long },
 
-    .{ .receiver = "", .name = "nova_pin_next_coro", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_pin_next_coro", .ret = .void_ },
 
-    .{ .receiver = "", .name = "nova_trace_msg", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_trace_kv", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_trace_enabled", .ret = .int },
+    .{ .receiver = "", .name = "kyte_trace_msg", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_trace_kv", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_trace_enabled", .ret = .int },
 
     .{ .receiver = "", .name = "currentCoro", .ret = .long },
     .{ .receiver = "", .name = "coroSuspend", .ret = .void_ },
     .{ .receiver = "", .name = "coroStart", .ret = .long },
-    .{ .receiver = "", .name = "nova_reactor_resume", .ret = .long },
-    .{ .receiver = "", .name = "nova_run_reactors", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_reactor_set_current", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_reactor_current", .ret = .long },
-    .{ .receiver = "", .name = "nova_reactor_set_timer", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_reactor_cancel_timer", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_reactor_batch_begin", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_mono_ms", .ret = .long },
-    .{ .receiver = "", .name = "nova_reactor_wake_register", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_reactor_post", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_reactor_drain_one", .ret = .long },
-    .{ .receiver = "", .name = "nova_evfilt_user", .ret = .long },
+    .{ .receiver = "", .name = "kyte_reactor_resume", .ret = .long },
+    .{ .receiver = "", .name = "kyte_run_reactors", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_reactor_set_current", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_reactor_current", .ret = .long },
+    .{ .receiver = "", .name = "kyte_reactor_set_timer", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_reactor_cancel_timer", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_reactor_batch_begin", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_mono_ms", .ret = .long },
+    .{ .receiver = "", .name = "kyte_reactor_wake_register", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_reactor_post", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_reactor_drain_one", .ret = .long },
+    .{ .receiver = "", .name = "kyte_evfilt_user", .ret = .long },
 
-    .{ .receiver = "", .name = "nova_hold_all_reactors", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_hold_all_reactors", .ret = .void_ },
 
-    .{ .receiver = "", .name = "nova_spin_create", .ret = .long },
-    .{ .receiver = "", .name = "nova_spin_lock", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_spin_unlock", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_close", .ret = .void_ },
-    .{ .receiver = "", .name = "nova_getrandom", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_spin_create", .ret = .long },
+    .{ .receiver = "", .name = "kyte_spin_lock", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_spin_unlock", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_close", .ret = .void_ },
+    .{ .receiver = "", .name = "kyte_getrandom", .ret = .void_ },
 
-    .{ .receiver = "", .name = "nova_process_try_wait", .ret = .int },
-    .{ .receiver = "", .name = "nova_process_pid", .ret = .long },
-    .{ .receiver = "", .name = "nova_aserver_listen_addr", .ret = .long },
-    .{ .receiver = "", .name = "nova_process_spawn_isolated", .ret = .ptr },
+    .{ .receiver = "", .name = "kyte_process_try_wait", .ret = .int },
+    .{ .receiver = "", .name = "kyte_process_pid", .ret = .long },
+    .{ .receiver = "", .name = "kyte_aserver_listen_addr", .ret = .long },
+    .{ .receiver = "", .name = "kyte_process_spawn_isolated", .ret = .ptr },
 };
 
 /// Looks up a bare runtime extern by exact name, or `null` if it is not one.
@@ -361,15 +361,15 @@ test "builtins: console is all void" {
     }
 }
 
-// Checks that the full `nova_test_*` harness surface is registered in
+// Checks that the full `kyte_test_*` harness surface is registered in
 // [`externs`] with the right return types, not just an arbitrary one of them
 // (a regression guard against dropping a hook when editing the table).
 test "externs: the WHOLE test harness is declared, not just one of it" {
 
-    try testing.expectEqual(Ret.void_, findExtern("nova_test_reset").?.ret);
-    try testing.expectEqual(Ret.int, findExtern("nova_test_did_fail").?.ret);
-    try testing.expectEqual(Ret.string, findExtern("nova_test_fail_message").?.ret);
-    try testing.expectEqual(Ret.void_, findExtern("nova_test_fail").?.ret);
+    try testing.expectEqual(Ret.void_, findExtern("kyte_test_reset").?.ret);
+    try testing.expectEqual(Ret.int, findExtern("kyte_test_did_fail").?.ret);
+    try testing.expectEqual(Ret.string, findExtern("kyte_test_fail_message").?.ret);
+    try testing.expectEqual(Ret.void_, findExtern("kyte_test_fail").?.ret);
 }
 
 // Checks [`findExtern`] both ways: a registered name resolves, and names that
@@ -377,8 +377,8 @@ test "externs: the WHOLE test harness is declared, not just one of it" {
 // codegen helper, and pure nonsense) all return `null`.
 test "externs: bare-name runtime functions resolve" {
 
-    try testing.expectEqual(Ret.void_, findExtern("nova_test_fail").?.ret);
-    try testing.expect(findExtern("nova_file_open") == null);
+    try testing.expectEqual(Ret.void_, findExtern("kyte_test_fail").?.ret);
+    try testing.expect(findExtern("kyte_file_open") == null);
     try testing.expect(findExtern("__i32_to_string") == null);
     try testing.expect(findExtern("not_an_extern") == null);
 }

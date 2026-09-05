@@ -1,0 +1,42 @@
+import assert;
+import bytes;
+import net.poller;
+import net.aio;
+import concurrency.asynclock;
+
+async fn worker(lock: asynclock.AsyncLock, counter: long, iters: int, done: long): void {
+    let k = 0;
+    while (k < iters) {
+        if (!lock.tryAcquire()) { await lock.acquireSlow(); }
+        let cur = bytes.read_i32(counter, 0) as int;
+        await aio.delay(1);
+        bytes.write_i32(counter, 0, cur + 1);
+        lock.release();
+        k = k + 1;
+    }
+    bytes.write_i32(done, 0, (bytes.read_i32(done, 0) as int) + 1);
+}
+
+@test
+fn test_async_lock_serialises_critical_sections(): void {
+    let r = poller.Reactor(64, 4096, 16);
+    poller.setCurrent(r.kq);
+    let lock = asynclock.AsyncLock();
+    let counter = bytes.alloc(4); bytes.write_i32(counter, 0, 0);
+    let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
+    let n = 8; let kk = 5;
+    let i = 0;
+    while (i < n) { coroStart(worker(lock, counter, kk, done)); i = i + 1; }
+    let guard = 0;
+    while ((bytes.read_i32(done, 0) as int) < n && guard < 40000) {
+        let nev = r.pollComplete(20);
+        poller.batchBegin();
+        let j = 0;
+        while (j < nev) { kyte_reactor_resume(r.completedToken(j)); j = j + 1; }
+        guard = guard + 1;
+    }
+    poller.setCurrent(0);
+    assert.equalInt(bytes.read_i32(counter, 0) as int, n * kk);
+    assert.equalInt(bytes.read_i32(done, 0) as int, n);
+    bytes.free(counter); bytes.free(done); r.destroy();
+}

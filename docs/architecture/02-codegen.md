@@ -1,22 +1,22 @@
 # Code Generation
 
 `src/codegen/` (about 11,500 lines) turns the typed IR into **LLVM IR**, and thereafter an object file. It
-is the largest subsystem, and the one in which Nova's runtime representation is decided. The entry point
+is the largest subsystem, and the one in which Kyte's runtime representation is decided. The entry point
 is `declarations.zig:compile(...)`, which constructs an `LlvmCompiler` (see `llvm_codegen.zig`) and runs
 three phases: declare everything, then emit bodies, and finally verify, optimise, and emit the object.
 
 | File | Role |
 |------|------|
-| `llvm_codegen.zig` (about 3050) | The `LlvmCompiler` struct: the LLVM context, module, and builder, the type table, and the emitted primitives (the allocator, `nova_retain` and `nova_release`, vtable construction, and trait dispatch). |
+| `llvm_codegen.zig` (about 3050) | The `LlvmCompiler` struct: the LLVM context, module, and builder, the type table, and the emitted primitives (the allocator, `kyte_retain` and `kyte_release`, vtable construction, and trait dispatch). |
 | `declarations.zig` (about 1710) | Phase 1 declares every function, global, vtable, and the WASM allocator; Phase 3 verifies, runs `CoroSplit` and `globalDCE`, and writes the `.o` (per file under T6). |
 | `expressions.zig` (about 3970) | Lowers expression IR to LLVM values (calls, closures, trait dispatch, await, operators, literals). |
 | `statements.zig` (about 720) | Lowers statements (let, assign, return, if, while, for) along with the ownership drops around them. |
 | `arc.zig` (about 1250) | Emits retain and release, and the per-type destructors (`__destruct_*`) that `ownership.zig` planned. |
-| `types.zig` (about 740) | Maps Nova `TypeId`s to LLVM types, and computes struct layouts. |
+| `types.zig` (about 740) | Maps Kyte `TypeId`s to LLVM types, and computes struct layouts. |
 
 ## The Value Model: `val_type` is i64
 
-**Every Nova value is a 64 bit handle** (`val_type = LLVMInt64Type`), on both native and WASM. The reason
+**Every Kyte value is a 64 bit handle** (`val_type = LLVMInt64Type`), on both native and WASM. The reason
 is uniformity: the same slot must be capable of holding an `int`, a `long`, a heap pointer, or an `f64`
 (for which the float path bit casts `val_type` to and from `double`). The consequences are as follows.
 
@@ -33,17 +33,17 @@ is uniformity: the same slot must be capable of holding an `int`, a `long`, a he
 
 ## Heap Objects and ARC
 
-Nova is reference counted, and not garbage collected. Every heap allocation carries an **8 byte header**.
+Kyte is reference counted, and not garbage collected. Every heap allocation carries an **8 byte header**.
 
 ```
   [ refcount : i32 @ ptr-8 ][ length : i32 @ ptr-4 ][ payload ... @ ptr ]
 ```
 
-- `nova_bytes_alloc(size)` returns `payload` (the client pointer); the header sits just below it.
-- **`nova_retain(ptr)`** bumps the refcount. **`nova_release(ptr, dtor)`** decrements it and, at zero,
+- `kyte_bytes_alloc(size)` returns `payload` (the client pointer); the header sits just below it.
+- **`kyte_retain(ptr)`** bumps the refcount. **`kyte_release(ptr, dtor)`** decrements it and, at zero,
   calls the type's destructor (which releases the owned fields) and frees the block.
 - On **native** these are provided by the C++ runtime. On **WASM** the compiler *emits* a bump allocator
-  in the module (please see below), and `nova_retain` and `nova_release` are at present no ops there (only
+  in the module (please see below), and `kyte_retain` and `kyte_release` are at present no ops there (only
   explicit `bytes.free` is used); this is a deliberate best effort simplification for the secondary target.
 
 The ownership pass (`sema/ownership.zig`) decides, per IR edge, who owns a value and where it is dropped;
@@ -92,7 +92,7 @@ An `async fn` compiles to an **LLVM coroutine** (`presplitcoroutine`, then the `
 instantiation, and not from an erased `M` context.
 
 There is one seam worth an understanding. A **synchronous** caller (a sync `main` or `@test`, at top
-level) may call an `async fn` directly; codegen block drives it to completion via `nova_run_root`. Doing
+level) may call an `async fn` directly; codegen block drives it to completion via `kyte_run_root`. Doing
 this from *inside* the event loop (that is, from a running coroutine) re-enters `io.run()` and deadlocks;
 the runtime detects the nested drive and aborts loudly, and the checker's function colouring rules keep it
 from arising in normal code. For further details, kindly see [03-runtime.md](03-runtime.md).
@@ -104,7 +104,7 @@ Codegen is parameterised by the target through `is_wasm`. The differences that m
 - **Pointer width.** `ptr_type` is i32; the vtable and pointer array strides use `ptrElemSize()`; and the
   host imports mask pointers to 32 bits (via the harness helper `ptr32`).
 - **The allocator is emitted in the module.** There is no C++ runtime on WASM, and hence
-  `declarations.zig` emits `nova_bytes_alloc` (a bump allocator) and `nova_bytes_alloc_persistent` (also
+  `declarations.zig` emits `kyte_bytes_alloc` (a bump allocator) and `kyte_bytes_alloc_persistent` (also
   bump; the free list is disabled on WASM, because a hardcoded 32 MB heap and persistent boundary did not
   survive the `__heap_base` seeding, so pure bump trades reuse for correctness). The heap is seeded lazily
   from the linker symbol **`__heap_base`** upon the first allocation (a static `ptrtoint(&__heap_base)`

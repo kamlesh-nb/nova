@@ -20,7 +20,7 @@ Gates as of last edit (**2026-07-19d**): conformance **70/70** · `--arc` **120/
 | **F2** typed IR | 1-4d, 5, 6:0/1/2/3p | 6:rest | - | **97%** | undefined-ident hard sema error (F2-5). **F2-6 UNDERWAY 2026-07-19 (stages 0,1,2,3-partial): the IR is ~99.5% complete for VALUES (the "gap" was ~90% namespace/method-callee noise); closure params typed from call sites (second-pass, `bfa24aa`); interpolation type-decisions read the store.** Remaining: finish stage-3 cutover (codegen reads typeOf everywhere) → stage-4 TypeId-keyed destructors → stage-5 static balance check (the "provable" upgrade) → stage-6 delete the string engine |
 | **F3** primitives | 1, 2, 3, 4, 4b, 5, 6 | - | 5a, 7 | **86%** | **F3-5 int-overflow CORRECTNESS verified DONE (18u): int arithmetic wraps at 32 bits via canonicalizeInt on every op (19_int_overflow passes); long doesn't.** i64 slot stores the canonical value (not a lie). Remaining: honest i32 SLOTS = memory-opt only (wide/risky, low value); overflow debug-trap = optional; ~27 `orelse "i32"` guesses (F3-7) |
 | **F4** generics | 2, 3, 4, 4b, 5 | 6 | 1 | **88%** | `.type_param` corruption-class DONE; erasure rule principled. **2026-07-19: the "chained-generic-method leak" — F4's one hard SOUNDNESS blocker — is CLOSED. Root cause traced (NOT generics-mono as long assumed): a template-interpolation `${var}` retain-without-release (`63217a8`); `xs.map(f).map(g)` leaked because map's closure interpolates its owned element. Fixed + the closure typing that fed it (`bfa24aa`).** Remaining is CODE-SIZE cleanup, not soundness: method-level mono (List_U_push), type-param-receiver resolution, drop erased body; serde source-gen reparse-based |
-| **F5** ARC ownership | 2a,3,5,O4,acquisition-rewrite,cases-41-49 | balance-check | - | **95%** | **The DANGER is dead: no ownership decision is made by an unprincipled string guess** — proven corpus-wide (NOVA_SEMA_SHADOW, disagree=0) and enforced by the `--shadow` gate. ARC 0 leaks. **Coverage-probe pass (cases 41–45) fixed 5 real defects the corpus was dodging: struct-literal owned-field UAF, single-letter struct misclassified, struct-literal-as-arg leak, trait-downcast UAF, and the `try`-returns-owned double-free (payload was registered twice; masked as a box leak by a return band-aid).** `--asan` is a REQUIRED gate (ARC-audit is blind to these UAFs). **2026-07-19 ACQUISITION-LAYER REWRITE (arc.md Option A): the RAII "constructor" (acquisition) half is now ONE principled TypeId decision (`acquisitionDisposition`/`takeOwnedElement`), matching the (already-correct) destruction half — no producer whitelist, no per-site string-kind re-derivation. Fixed 6 real bugs this session, each with a regression case (46-49): orphaned-tuple leak, owned-if-expr UAF (per-edge drops), template-part leak, chained-map leak, closure box/result leak, and a closure-string SIGSEGV.** Remaining to a PROVABLE 100%: promote the codegen-level rule to a sema pass with the **static balance check** (arc.md §6.1, = F2-6 stage 5) — until then "green," not "proven"; O4 formal audit subsumed by it |
+| **F5** ARC ownership | 2a,3,5,O4,acquisition-rewrite,cases-41-49 | balance-check | - | **95%** | **The DANGER is dead: no ownership decision is made by an unprincipled string guess** — proven corpus-wide (KYTE_SEMA_SHADOW, disagree=0) and enforced by the `--shadow` gate. ARC 0 leaks. **Coverage-probe pass (cases 41–45) fixed 5 real defects the corpus was dodging: struct-literal owned-field UAF, single-letter struct misclassified, struct-literal-as-arg leak, trait-downcast UAF, and the `try`-returns-owned double-free (payload was registered twice; masked as a box leak by a return band-aid).** `--asan` is a REQUIRED gate (ARC-audit is blind to these UAFs). **2026-07-19 ACQUISITION-LAYER REWRITE (arc.md Option A): the RAII "constructor" (acquisition) half is now ONE principled TypeId decision (`acquisitionDisposition`/`takeOwnedElement`), matching the (already-correct) destruction half — no producer whitelist, no per-site string-kind re-derivation. Fixed 6 real bugs this session, each with a regression case (46-49): orphaned-tuple leak, owned-if-expr UAF (per-edge drops), template-part leak, chained-map leak, closure box/result leak, and a closure-string SIGSEGV.** Remaining to a PROVABLE 100%: promote the codegen-level rule to a sema pass with the **static balance check** (arc.md §6.1, = F2-6 stage 5) — until then "green," not "proven"; O4 formal audit subsumed by it |
 
 Legend: ✅ done · 🟡 partial · ❌ open. Per-stage evidence tables below.
 
@@ -39,7 +39,7 @@ phase — it **is** the completion of these exact stages, done behind a shadow-d
 ## ✅ Landed this session (2026-07-18, Lane A)
 
 - **Shadow-diff harness** (18b): computes both engines' ownership answer at every `isOwnedTypeId` site;
-  proved `DISAGREE=0` → migration is safe. `NOVA_SEMA_SHADOW=1` prints the live breakdown.
+  proved `DISAGREE=0` → migration is safe. `KYTE_SEMA_SHADOW=1` prints the live breakdown.
 - **Keystone cutover** (18c/18d, first real string→TypeId cutover): struct-level `.type_param` ownership
   now resolved via `subst.substitute` in the store, byte-identical (`DISAGREE=0`, `keystone-DISAGREE=0`).
 - **map<U> refcounted leak FIXED** (18e, `f35d8b4`): `xs.map((x) => \`val${x}\`)` was `List<U>` (erased,
@@ -154,7 +154,7 @@ blocked: `closure`/`generic_call` (F4-5), `await` (needs `Handle<T>`), `optional
 
 **Verdict: HYBRID.** Bodies genuinely monomorphized; erasure **not** removed — `.type_param` still
 reaches codegen (resolved by render-boundary string substitution). This is the F5-2 blocker. ("Map
-excluded from mono" is **stale** — `map.nova:37` holds `Storage<K>`/`Storage<V>`.)
+excluded from mono" is **stale** — `map.ky:37` holds `Storage<K>`/`Storage<V>`.)
 
 ### F5 — ARC ownership  (Landed 2a,3 · Partial 2,4,5 · Open 6)
 | Stage | Status | Evidence |
@@ -196,7 +196,7 @@ identically. The 73 uncovered keep the scan.
 Byte-identical (DISAGREE=0 + `hasFunction` fail-safe). N2 preserved via `findFunctionAmbiguous` (an
 ambiguous bare name is NOT recorded, so the scan still errors naming both — `ambiguous_bare_call`).
 
-**Measured scan-reach AFTER the flip (per-case, `run.sh` hides per-case stderr — run `nova test`
+**Measured scan-reach AFTER the flip (per-case, `run.sh` hides per-case stderr — run `kyte test`
 directly):** 13_serde still hits the suffix scan 18×. WHAT reaches it — the real blockers:
 - **Compiler-GENERATED code sema never walked** (~7): serde binders/toJson (`Order__bind` →
   `<serde-generated>_Order__bind`), and the **test harness** (`test_map` → `collections_map_test_map`).
@@ -253,7 +253,7 @@ So F4-5 = method-level monomorphization; F1-3b deletion = F4-6 (serde/harness in
 ## Session log — 2026-07-18 (later increments)
 
 - **i32→int cleanup** (user directive: int is the canonical F3 primitive, i32 not used):
-  type-annotation `i32`→`int` in all `.nova` source (5 expect_fail cases, the repro); `i32_hash`→
+  type-annotation `i32`→`int` in all `.ky` source (5 expect_fail cases, the repro); `i32_hash`→
   `int_hash` (dead fn). Left: `bytes.write_i32`/`read_i32` (API names), `__i32_to_string`/`__destruct_*_i32`
   (symbols), truncation-history comments. The compiler's own `i32` render feeds MANGLING
   (`List_i32_push`), so migrating it is the F3-6 vocabulary stage, not a swap.
@@ -274,7 +274,7 @@ So F4-5 = method-level monomorphization; F1-3b deletion = F4-6 (serde/harness in
   standalone win.
 - **Finding — stale comment:** `codegen/types.zig:117-137` still documents a Map monomorphization
   *exclusion*, but the exclusion CODE is gone (lines 140-142 just base-match). Map IS monomorphized
-  now ([[nova-storage-get-not-owned]]). Comment is orphaned — trim when touching that function.
+  now ([[kyte-storage-get-not-owned]]). Comment is orphaned — trim when touching that function.
 - **F4-5 crux (measured):** the "erased body, always" (`types.zig:99-104`) is NOT dead code — it is a
   **live link fallback** for generic-from-generic calls (a generic body calling another generic has no
   concrete instantiation). F4-5 (drop it + make `.type_param` fatal) is blocked until every

@@ -1,4 +1,4 @@
-//! Top-level LLVM code-generation driver: turns a fully type-checked Nova
+//! Top-level LLVM code-generation driver: turns a fully type-checked Kyte
 //! [`ast.Program`] into an object file (or a set of per-file object files) on
 //! disk. This is the entry point the compiler pipeline calls after semantic
 //! analysis; everything below it (`expressions.zig`, `statements.zig`,
@@ -67,7 +67,7 @@ fn stderrIsTty() bool {
     return std.c.isatty(2) != 0;
 }
 
-/// Nova's abstract syntax tree. Provides [`ast.Program`], [`ast.Statement`], and
+/// Kyte's abstract syntax tree. Provides [`ast.Program`], [`ast.Statement`], and
 /// the declaration variants ([`ast.fn_decl`]/`struct_decl`/`enum_decl`) that
 /// [`compile`] walks to drive emission.
 const ast = @import("../../frontend/ast.zig");
@@ -115,7 +115,7 @@ const errors = llvm.errors;
 /// `current_*` cursor the expression/statement emitters read while walking a
 /// body. [`compile`] constructs one and threads it through every phase.
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
-/// Expands Nova source-level escape sequences in a string literal to their raw
+/// Expands Kyte source-level escape sequences in a string literal to their raw
 /// bytes, so the interned literal's length and `LLVMConstString` payload are the
 /// real byte contents.
 const unescapeString = @import("llvm_codegen.zig").unescapeString;
@@ -134,7 +134,7 @@ const Scope = @import("llvm_codegen.zig").Scope;
 /// inside the split-emit and per-module paths.
 pub const flags = struct {
     /// When true, [`compileSplitEmit`] partitions the module into one object
-    /// file per Nova source file instead of a single combined object. This is
+    /// file per Kyte source file instead of a single combined object. This is
     /// the default-on T6 per-file split that feeds the content-hash object cache.
     pub var split_per_file: bool = false;
     /// When true (see [`pruneEnabled`]), split emit first runs a whole-program
@@ -217,7 +217,7 @@ fn pruneEnabled() bool {
     return flags.prune;
 }
 
-/// Map a Nova FFI scalar type name to the LLVM type used at the C boundary.
+/// Map a Kyte FFI scalar type name to the LLVM type used at the C boundary.
 ///
 /// Handles the four scalars that have a distinct C ABI representation (`int` →
 /// i32, `long` → i64, `bool` → i8, `void` → void) and falls back to an opaque
@@ -391,63 +391,63 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     {
         var i64_p = [_]types.LLVMTypeRef{compiler.val_type};
         const i64_t = core.LLVMFunctionType(compiler.val_type, &i64_p, 1, 0);
-        try compiler.func_map.put("nova_i64_to_string", core.LLVMAddFunction(compiler.module, "nova_i64_to_string", i64_t));
+        try compiler.func_map.put("kyte_i64_to_string", core.LLVMAddFunction(compiler.module, "kyte_i64_to_string", i64_t));
 
         var f64_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
         const f64_t = core.LLVMFunctionType(compiler.val_type, &f64_p, 1, 0);
-        try compiler.func_map.put("nova_f64_to_string", core.LLVMAddFunction(compiler.module, "nova_f64_to_string", f64_t));
+        try compiler.func_map.put("kyte_f64_to_string", core.LLVMAddFunction(compiler.module, "kyte_f64_to_string", f64_t));
 
         var ieee_p = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type };
-        try compiler.func_map.put("nova_ieee_le_to_str", core.LLVMAddFunction(compiler.module, "nova_ieee_le_to_str", core.LLVMFunctionType(compiler.ptr_type, &ieee_p, 2, 0)));
+        try compiler.func_map.put("kyte_ieee_le_to_str", core.LLVMAddFunction(compiler.module, "kyte_ieee_le_to_str", core.LLVMFunctionType(compiler.ptr_type, &ieee_p, 2, 0)));
 
         var f64bits_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
-        try compiler.func_map.put("nova_f64_bits", core.LLVMAddFunction(compiler.module, "nova_f64_bits", core.LLVMFunctionType(compiler.val_type, &f64bits_p, 1, 0)));
+        try compiler.func_map.put("kyte_f64_bits", core.LLVMAddFunction(compiler.module, "kyte_f64_bits", core.LLVMFunctionType(compiler.val_type, &f64bits_p, 1, 0)));
 
         var pgbe_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type };
-        try compiler.func_map.put("nova_pg_be_f64", core.LLVMAddFunction(compiler.module, "nova_pg_be_f64", core.LLVMFunctionType(core.LLVMDoubleType(), &pgbe_p, 2, 0)));
+        try compiler.func_map.put("kyte_pg_be_f64", core.LLVMAddFunction(compiler.module, "kyte_pg_be_f64", core.LLVMFunctionType(core.LLVMDoubleType(), &pgbe_p, 2, 0)));
         var pgbei_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type };
-        try compiler.func_map.put("nova_pg_be_i64", core.LLVMAddFunction(compiler.module, "nova_pg_be_i64", core.LLVMFunctionType(compiler.val_type, &pgbei_p, 2, 0)));
+        try compiler.func_map.put("kyte_pg_be_i64", core.LLVMAddFunction(compiler.module, "kyte_pg_be_i64", core.LLVMFunctionType(compiler.val_type, &pgbei_p, 2, 0)));
         var hfm_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.i32_type, compiler.i32_type };
-        try compiler.func_map.put("nova_html_find_meta", core.LLVMAddFunction(compiler.module, "nova_html_find_meta", core.LLVMFunctionType(compiler.i32_type, &hfm_p, 3, 0)));
+        try compiler.func_map.put("kyte_html_find_meta", core.LLVMAddFunction(compiler.module, "kyte_html_find_meta", core.LLVMFunctionType(compiler.i32_type, &hfm_p, 3, 0)));
 
         var sqrt_p = [_]types.LLVMTypeRef{core.LLVMDoubleType()};
-        try compiler.func_map.put("nova_f64_sqrt", core.LLVMAddFunction(compiler.module, "llvm.sqrt.f64", core.LLVMFunctionType(core.LLVMDoubleType(), &sqrt_p, 1, 0)));
+        try compiler.func_map.put("kyte_f64_sqrt", core.LLVMAddFunction(compiler.module, "llvm.sqrt.f64", core.LLVMFunctionType(core.LLVMDoubleType(), &sqrt_p, 1, 0)));
 
         var bool_p = [_]types.LLVMTypeRef{compiler.val_type};
         const bool_t = core.LLVMFunctionType(compiler.val_type, &bool_p, 1, 0);
-        try compiler.func_map.put("nova_bool_to_string", core.LLVMAddFunction(compiler.module, "nova_bool_to_string", bool_t));
+        try compiler.func_map.put("kyte_bool_to_string", core.LLVMAddFunction(compiler.module, "kyte_bool_to_string", bool_t));
 
         var dec_from_p = [_]types.LLVMTypeRef{compiler.ptr_type};
         const dec_from_t = core.LLVMFunctionType(compiler.val_type, &dec_from_p, 1, 0);
-        try compiler.func_map.put("nova_decimal_from_string", core.LLVMAddFunction(compiler.module, "nova_decimal_from_string", dec_from_t));
+        try compiler.func_map.put("kyte_decimal_from_string", core.LLVMAddFunction(compiler.module, "kyte_decimal_from_string", dec_from_t));
 
         var dec_to_p = [_]types.LLVMTypeRef{compiler.val_type};
         const dec_to_t = core.LLVMFunctionType(compiler.val_type, &dec_to_p, 1, 0);
-        try compiler.func_map.put("nova_decimal_to_string", core.LLVMAddFunction(compiler.module, "nova_decimal_to_string", dec_to_t));
+        try compiler.func_map.put("kyte_decimal_to_string", core.LLVMAddFunction(compiler.module, "kyte_decimal_to_string", dec_to_t));
 
         var dec_bin_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
         const dec_bin_t = core.LLVMFunctionType(compiler.val_type, &dec_bin_p, 2, 0);
-        for ([_][:0]const u8{ "nova_decimal_add", "nova_decimal_sub", "nova_decimal_mul", "nova_decimal_div", "nova_decimal_mod", "nova_decimal_cmp" }) |name| {
+        for ([_][:0]const u8{ "kyte_decimal_add", "kyte_decimal_sub", "kyte_decimal_mul", "kyte_decimal_div", "kyte_decimal_mod", "kyte_decimal_cmp" }) |name| {
             try compiler.func_map.put(name, core.LLVMAddFunction(compiler.module, name, dec_bin_t));
         }
 
         var dec_fi_p = [_]types.LLVMTypeRef{compiler.val_type};
         const dec_fi_t = core.LLVMFunctionType(compiler.val_type, &dec_fi_p, 1, 0);
-        try compiler.func_map.put("nova_decimal_from_int", core.LLVMAddFunction(compiler.module, "nova_decimal_from_int", dec_fi_t));
-        try compiler.func_map.put("nova_decimal_to_int", core.LLVMAddFunction(compiler.module, "nova_decimal_to_int", dec_fi_t));
+        try compiler.func_map.put("kyte_decimal_from_int", core.LLVMAddFunction(compiler.module, "kyte_decimal_from_int", dec_fi_t));
+        try compiler.func_map.put("kyte_decimal_to_int", core.LLVMAddFunction(compiler.module, "kyte_decimal_to_int", dec_fi_t));
 
         var dec_fsn_p = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.val_type };
         const dec_fsn_t = core.LLVMFunctionType(compiler.val_type, &dec_fsn_p, 2, 0);
-        try compiler.func_map.put("nova_decimal_from_string_n", core.LLVMAddFunction(compiler.module, "nova_decimal_from_string_n", dec_fsn_t));
+        try compiler.func_map.put("kyte_decimal_from_string_n", core.LLVMAddFunction(compiler.module, "kyte_decimal_from_string_n", dec_fsn_t));
     }
 
     if (!is_wasm) {
         var inv_p = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
         const inv_t = core.LLVMFunctionType(compiler.val_type, &inv_p, 2, 0);
-        try compiler.func_map.put("nova_invoke_str_closure", core.LLVMAddFunction(compiler.module, "nova_invoke_str_closure", inv_t));
+        try compiler.func_map.put("kyte_invoke_str_closure", core.LLVMAddFunction(compiler.module, "kyte_invoke_str_closure", inv_t));
         var invv_p = [_]types.LLVMTypeRef{compiler.val_type};
         const invv_t = core.LLVMFunctionType(compiler.void_type, &invv_p, 1, 0);
-        try compiler.func_map.put("nova_invoke_void_closure", core.LLVMAddFunction(compiler.module, "nova_invoke_void_closure", invv_t));
+        try compiler.func_map.put("kyte_invoke_void_closure", core.LLVMAddFunction(compiler.module, "kyte_invoke_void_closure", invv_t));
     }
 
     if (is_wasm) {
@@ -462,16 +462,16 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         try compiler.generateWasmMemoryFunctions();
 
         const now_fn_type = core.LLVMFunctionType(compiler.val_type, null, 0, 0);
-        const now_fn = core.LLVMAddFunction(compiler.module, "nova_time_now", now_fn_type);
+        const now_fn = core.LLVMAddFunction(compiler.module, "kyte_time_now", now_fn_type);
         core.LLVMAddTargetDependentFunctionAttr(now_fn, "wasm-import-module", "env");
         core.LLVMAddTargetDependentFunctionAttr(now_fn, "wasm-import-name", "now");
-        try compiler.func_map.put("nova_time_now", now_fn);
+        try compiler.func_map.put("kyte_time_now", now_fn);
 
         const get_st_type = core.LLVMFunctionType(compiler.val_type, null, 0, 0);
-        const get_st_fn = core.LLVMAddFunction(compiler.module, "nova_get_stacktrace", get_st_type);
+        const get_st_fn = core.LLVMAddFunction(compiler.module, "kyte_get_stacktrace", get_st_type);
         core.LLVMAddTargetDependentFunctionAttr(get_st_fn, "wasm-import-module", "env");
         core.LLVMAddTargetDependentFunctionAttr(get_st_fn, "wasm-import-name", "get_stacktrace");
-        try compiler.func_map.put("nova_get_stacktrace", get_st_fn);
+        try compiler.func_map.put("kyte_get_stacktrace", get_st_fn);
 
         {
             var th_ptr = [_]types.LLVMTypeRef{compiler.ptr_type};
@@ -481,13 +481,13 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
             const th_ptr_ret = core.LLVMFunctionType(compiler.ptr_type, null, 0, 0);
             const Imp = struct { name: [:0]const u8, ty: types.LLVMTypeRef };
             const imps = [_]Imp{
-                .{ .name = "nova_test_reset", .ty = th_void },
-                .{ .name = "nova_test_begin", .ty = th_void_ptr },
-                .{ .name = "nova_test_fail", .ty = th_void_ptr },
-                .{ .name = "nova_test_did_fail", .ty = th_i32 },
-                .{ .name = "nova_test_fail_message", .ty = th_ptr_ret },
-                .{ .name = "nova_optional_deref_fail", .ty = th_void_ptr },
-                .{ .name = "nova_panic", .ty = th_void_ptr },
+                .{ .name = "kyte_test_reset", .ty = th_void },
+                .{ .name = "kyte_test_begin", .ty = th_void_ptr },
+                .{ .name = "kyte_test_fail", .ty = th_void_ptr },
+                .{ .name = "kyte_test_did_fail", .ty = th_i32 },
+                .{ .name = "kyte_test_fail_message", .ty = th_ptr_ret },
+                .{ .name = "kyte_optional_deref_fail", .ty = th_void_ptr },
+                .{ .name = "kyte_panic", .ty = th_void_ptr },
             };
             for (imps) |imp| {
                 const f = core.LLVMAddFunction(compiler.module, imp.name.ptr, imp.ty);
@@ -504,8 +504,8 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
             const val_1val = core.LLVMFunctionType(compiler.val_type, &one_val, 1, 0);
             const Imp2 = struct { name: [:0]const u8, ty: types.LLVMTypeRef };
             const imps2 = [_]Imp2{
-                .{ .name = "nova_arg_count", .ty = val_0 },
-                .{ .name = "nova_arg_at", .ty = val_1val },
+                .{ .name = "kyte_arg_count", .ty = val_0 },
+                .{ .name = "kyte_arg_at", .ty = val_1val },
             };
             for (imps2) |imp| {
                 const f = core.LLVMAddFunction(compiler.module, imp.name.ptr, imp.ty);
@@ -525,10 +525,10 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         compiler.puts_fn = core.LLVMAddFunction(compiler.module, "puts", puts_type);
 
         const log_str_type = core.LLVMFunctionType(compiler.void_type, &puts_params, 1, 0);
-        compiler.nova_log_string_fn = core.LLVMAddFunction(compiler.module, "nova_log_string", log_str_type);
-        compiler.nova_log_info_fn = core.LLVMAddFunction(compiler.module, "nova_log_info", log_str_type);
-        compiler.nova_log_debug_fn = core.LLVMAddFunction(compiler.module, "nova_log_debug", log_str_type);
-        compiler.nova_log_err_fn = core.LLVMAddFunction(compiler.module, "nova_log_err", log_str_type);
+        compiler.kyte_log_string_fn = core.LLVMAddFunction(compiler.module, "kyte_log_string", log_str_type);
+        compiler.kyte_log_info_fn = core.LLVMAddFunction(compiler.module, "kyte_log_info", log_str_type);
+        compiler.kyte_log_debug_fn = core.LLVMAddFunction(compiler.module, "kyte_log_debug", log_str_type);
+        compiler.kyte_log_err_fn = core.LLVMAddFunction(compiler.module, "kyte_log_err", log_str_type);
 
         var malloc_params = [_]types.LLVMTypeRef{compiler.val_type};
         const malloc_type = core.LLVMFunctionType(compiler.ptr_type, &malloc_params, 1, 0);
@@ -536,16 +536,16 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         try compiler.func_map.put("malloc", malloc_fn);
 
         const now_type = core.LLVMFunctionType(compiler.val_type, null, 0, 0);
-        const now_fn = core.LLVMAddFunction(compiler.module, "nova_time_now", now_type);
-        try compiler.func_map.put("nova_time_now", now_fn);
+        const now_fn = core.LLVMAddFunction(compiler.module, "kyte_time_now", now_type);
+        try compiler.func_map.put("kyte_time_now", now_fn);
 
         const now_ns_type = core.LLVMFunctionType(compiler.val_type, null, 0, 0);
-        const now_ns_fn = core.LLVMAddFunction(compiler.module, "nova_time_now_ns", now_ns_type);
-        try compiler.func_map.put("nova_time_now_ns", now_ns_fn);
+        const now_ns_fn = core.LLVMAddFunction(compiler.module, "kyte_time_now_ns", now_ns_type);
+        try compiler.func_map.put("kyte_time_now_ns", now_ns_fn);
 
         const get_st_type = core.LLVMFunctionType(compiler.val_type, null, 0, 0);
-        const get_st_fn = core.LLVMAddFunction(compiler.module, "nova_get_stacktrace", get_st_type);
-        try compiler.func_map.put("nova_get_stacktrace", get_st_fn);
+        const get_st_fn = core.LLVMAddFunction(compiler.module, "kyte_get_stacktrace", get_st_type);
+        try compiler.func_map.put("kyte_get_stacktrace", get_st_fn);
 
         try setupCoroutineSupport(&compiler);
 
@@ -553,284 +553,284 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         var one_param_ptr = [_]types.LLVMTypeRef{compiler.ptr_type};
 
         const close_type = core.LLVMFunctionType(compiler.i32_type, &one_param_i32, 1, 0);
-        const close_fn = core.LLVMAddFunction(compiler.module, "nova_close", close_type);
+        const close_fn = core.LLVMAddFunction(compiler.module, "kyte_close", close_type);
         try compiler.func_map.put("close", close_fn);
-        try compiler.func_map.put("nova_close", close_fn);
+        try compiler.func_map.put("kyte_close", close_fn);
 
         const test_reset_type = core.LLVMFunctionType(compiler.void_type, null, 0, 0);
-        const test_reset_fn = core.LLVMAddFunction(compiler.module, "nova_test_reset", test_reset_type);
-        try compiler.func_map.put("nova_test_reset", test_reset_fn);
+        const test_reset_fn = core.LLVMAddFunction(compiler.module, "kyte_test_reset", test_reset_type);
+        try compiler.func_map.put("kyte_test_reset", test_reset_fn);
 
         const opt_fail_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        const opt_fail_fn = core.LLVMAddFunction(compiler.module, "nova_optional_deref_fail", opt_fail_type);
-        try compiler.func_map.put("nova_optional_deref_fail", opt_fail_fn);
+        const opt_fail_fn = core.LLVMAddFunction(compiler.module, "kyte_optional_deref_fail", opt_fail_type);
+        try compiler.func_map.put("kyte_optional_deref_fail", opt_fail_fn);
 
-        const panic_fn = core.LLVMAddFunction(compiler.module, "nova_panic", core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0));
-        try compiler.func_map.put("nova_panic", panic_fn);
+        const panic_fn = core.LLVMAddFunction(compiler.module, "kyte_panic", core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0));
+        try compiler.func_map.put("kyte_panic", panic_fn);
 
-        const panic_cstr_fn = core.LLVMAddFunction(compiler.module, "nova_panic_cstr", core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0));
-        try compiler.func_map.put("nova_panic_cstr", panic_cstr_fn);
+        const panic_cstr_fn = core.LLVMAddFunction(compiler.module, "kyte_panic_cstr", core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0));
+        try compiler.func_map.put("kyte_panic_cstr", panic_cstr_fn);
 
         const test_begin_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        const test_begin_fn = core.LLVMAddFunction(compiler.module, "nova_test_begin", test_begin_type);
-        try compiler.func_map.put("nova_test_begin", test_begin_fn);
+        const test_begin_fn = core.LLVMAddFunction(compiler.module, "kyte_test_begin", test_begin_type);
+        try compiler.func_map.put("kyte_test_begin", test_begin_fn);
 
         const test_fail_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        const test_fail_fn = core.LLVMAddFunction(compiler.module, "nova_test_fail", test_fail_type);
-        try compiler.func_map.put("nova_test_fail", test_fail_fn);
+        const test_fail_fn = core.LLVMAddFunction(compiler.module, "kyte_test_fail", test_fail_type);
+        try compiler.func_map.put("kyte_test_fail", test_fail_fn);
 
         const test_did_fail_type = core.LLVMFunctionType(compiler.i32_type, null, 0, 0);
-        const test_did_fail_fn = core.LLVMAddFunction(compiler.module, "nova_test_did_fail", test_did_fail_type);
-        try compiler.func_map.put("nova_test_did_fail", test_did_fail_fn);
+        const test_did_fail_fn = core.LLVMAddFunction(compiler.module, "kyte_test_did_fail", test_did_fail_type);
+        try compiler.func_map.put("kyte_test_did_fail", test_did_fail_fn);
 
         const test_fail_msg_type = core.LLVMFunctionType(compiler.ptr_type, null, 0, 0);
-        const test_fail_msg_fn = core.LLVMAddFunction(compiler.module, "nova_test_fail_message", test_fail_msg_type);
-        try compiler.func_map.put("nova_test_fail_message", test_fail_msg_fn);
+        const test_fail_msg_fn = core.LLVMAddFunction(compiler.module, "kyte_test_fail_message", test_fail_msg_type);
+        try compiler.func_map.put("kyte_test_fail_message", test_fail_msg_fn);
 
 
 
         const argc_type = core.LLVMFunctionType(compiler.val_type, &one_param_ptr, 0, 0);
-        try compiler.func_map.put("nova_arg_count", core.LLVMAddFunction(compiler.module, "nova_arg_count", argc_type));
+        try compiler.func_map.put("kyte_arg_count", core.LLVMAddFunction(compiler.module, "kyte_arg_count", argc_type));
         var argat_params = [_]types.LLVMTypeRef{compiler.val_type};
         const argat_type = core.LLVMFunctionType(compiler.val_type, &argat_params, 1, 0);
-        try compiler.func_map.put("nova_arg_at", core.LLVMAddFunction(compiler.module, "nova_arg_at", argat_type));
+        try compiler.func_map.put("kyte_arg_at", core.LLVMAddFunction(compiler.module, "kyte_arg_at", argat_type));
 
         var getrandom_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i64_type };
-        const getrandom_fn = core.LLVMAddFunction(compiler.module, "nova_getrandom", core.LLVMFunctionType(compiler.void_type, &getrandom_params, 2, 0));
-        try compiler.func_map.put("nova_getrandom", getrandom_fn);
+        const getrandom_fn = core.LLVMAddFunction(compiler.module, "kyte_getrandom", core.LLVMFunctionType(compiler.void_type, &getrandom_params, 2, 0));
+        try compiler.func_map.put("kyte_getrandom", getrandom_fn);
 
 
         var process_spawn_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
         const process_spawn_type = core.LLVMFunctionType(compiler.ptr_type, &process_spawn_params, 2, 0);
-        const process_spawn_fn = core.LLVMAddFunction(compiler.module, "nova_process_spawn", process_spawn_type);
-        try compiler.func_map.put("nova_process_spawn", process_spawn_fn);
+        const process_spawn_fn = core.LLVMAddFunction(compiler.module, "kyte_process_spawn", process_spawn_type);
+        try compiler.func_map.put("kyte_process_spawn", process_spawn_fn);
 
         var process_iso_params = [_]types.LLVMTypeRef{
             compiler.ptr_type, compiler.ptr_type, compiler.i64_type, compiler.ptr_type,
             compiler.ptr_type, compiler.i32_type, compiler.i32_type, compiler.i32_type,
         };
         const process_iso_type = core.LLVMFunctionType(compiler.ptr_type, &process_iso_params, 8, 0);
-        const process_iso_fn = core.LLVMAddFunction(compiler.module, "nova_process_spawn_isolated", process_iso_type);
-        try compiler.func_map.put("nova_process_spawn_isolated", process_iso_fn);
+        const process_iso_fn = core.LLVMAddFunction(compiler.module, "kyte_process_spawn_isolated", process_iso_type);
+        try compiler.func_map.put("kyte_process_spawn_isolated", process_iso_fn);
 
         var process_write_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
         const process_write_type = core.LLVMFunctionType(compiler.i32_type, &process_write_params, 2, 0);
-        const process_write_fn = core.LLVMAddFunction(compiler.module, "nova_process_write_stdin", process_write_type);
-        try compiler.func_map.put("nova_process_write_stdin", process_write_fn);
+        const process_write_fn = core.LLVMAddFunction(compiler.module, "kyte_process_write_stdin", process_write_type);
+        try compiler.func_map.put("kyte_process_write_stdin", process_write_fn);
 
         var process_read_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type, compiler.i32_type };
         const process_read_type = core.LLVMFunctionType(compiler.i32_type, &process_read_params, 3, 0);
-        const process_read_fn = core.LLVMAddFunction(compiler.module, "nova_process_read_stdout", process_read_type);
-        try compiler.func_map.put("nova_process_read_stdout", process_read_fn);
+        const process_read_fn = core.LLVMAddFunction(compiler.module, "kyte_process_read_stdout", process_read_type);
+        try compiler.func_map.put("kyte_process_read_stdout", process_read_fn);
 
         const process_wait_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const process_wait_fn = core.LLVMAddFunction(compiler.module, "nova_process_wait", process_wait_type);
-        try compiler.func_map.put("nova_process_wait", process_wait_fn);
+        const process_wait_fn = core.LLVMAddFunction(compiler.module, "kyte_process_wait", process_wait_type);
+        try compiler.func_map.put("kyte_process_wait", process_wait_fn);
 
         const process_pid_type = core.LLVMFunctionType(compiler.i64_type, &one_param_ptr, 1, 0);
-        const process_pid_fn = core.LLVMAddFunction(compiler.module, "nova_process_pid", process_pid_type);
-        try compiler.func_map.put("nova_process_pid", process_pid_fn);
+        const process_pid_fn = core.LLVMAddFunction(compiler.module, "kyte_process_pid", process_pid_type);
+        try compiler.func_map.put("kyte_process_pid", process_pid_fn);
 
         const process_trywait_type = core.LLVMFunctionType(compiler.i32_type, &one_param_ptr, 1, 0);
-        const process_trywait_fn = core.LLVMAddFunction(compiler.module, "nova_process_try_wait", process_trywait_type);
-        try compiler.func_map.put("nova_process_try_wait", process_trywait_fn);
+        const process_trywait_fn = core.LLVMAddFunction(compiler.module, "kyte_process_try_wait", process_trywait_type);
+        try compiler.func_map.put("kyte_process_try_wait", process_trywait_fn);
 
         var process_kill_params = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.i32_type };
         const process_kill_type = core.LLVMFunctionType(compiler.i32_type, &process_kill_params, 2, 0);
-        const process_kill_fn = core.LLVMAddFunction(compiler.module, "nova_process_kill", process_kill_type);
-        try compiler.func_map.put("nova_process_kill", process_kill_fn);
+        const process_kill_fn = core.LLVMAddFunction(compiler.module, "kyte_process_kill", process_kill_type);
+        try compiler.func_map.put("kyte_process_kill", process_kill_fn);
 
         const process_free_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        const process_free_fn = core.LLVMAddFunction(compiler.module, "nova_process_free", process_free_type);
-        try compiler.func_map.put("nova_process_free", process_free_fn);
+        const process_free_fn = core.LLVMAddFunction(compiler.module, "kyte_process_free", process_free_type);
+        try compiler.func_map.put("kyte_process_free", process_free_fn);
 
         const watcher_create_type = core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0);
-        const watcher_create_fn = core.LLVMAddFunction(compiler.module, "nova_fs_watcher_create", watcher_create_type);
-        try compiler.func_map.put("nova_fs_watcher_create", watcher_create_fn);
+        const watcher_create_fn = core.LLVMAddFunction(compiler.module, "kyte_fs_watcher_create", watcher_create_type);
+        try compiler.func_map.put("kyte_fs_watcher_create", watcher_create_fn);
 
         const watcher_next_event_type = core.LLVMFunctionType(compiler.ptr_type, &one_param_ptr, 1, 0);
-        const watcher_next_event_fn = core.LLVMAddFunction(compiler.module, "nova_fs_watcher_next_event", watcher_next_event_type);
-        try compiler.func_map.put("nova_fs_watcher_next_event", watcher_next_event_fn);
+        const watcher_next_event_fn = core.LLVMAddFunction(compiler.module, "kyte_fs_watcher_next_event", watcher_next_event_type);
+        try compiler.func_map.put("kyte_fs_watcher_next_event", watcher_next_event_fn);
 
         const watcher_free_event_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        const watcher_free_event_fn = core.LLVMAddFunction(compiler.module, "nova_fs_watcher_free_event", watcher_free_event_type);
-        try compiler.func_map.put("nova_fs_watcher_free_event", watcher_free_event_fn);
+        const watcher_free_event_fn = core.LLVMAddFunction(compiler.module, "kyte_fs_watcher_free_event", watcher_free_event_type);
+        try compiler.func_map.put("kyte_fs_watcher_free_event", watcher_free_event_fn);
 
         const watcher_close_type = core.LLVMFunctionType(compiler.void_type, &one_param_ptr, 1, 0);
-        const watcher_close_fn = core.LLVMAddFunction(compiler.module, "nova_fs_watcher_close", watcher_close_type);
-        try compiler.func_map.put("nova_fs_watcher_close", watcher_close_fn);
+        const watcher_close_fn = core.LLVMAddFunction(compiler.module, "kyte_fs_watcher_close", watcher_close_type);
+        try compiler.func_map.put("kyte_fs_watcher_close", watcher_close_fn);
 
         const exit_type = core.LLVMFunctionType(compiler.void_type, &one_param_i32, 1, 0);
-        const exit_fn = core.LLVMAddFunction(compiler.module, "nova_exit", exit_type);
-        try compiler.func_map.put("nova_exit", exit_fn);
+        const exit_fn = core.LLVMAddFunction(compiler.module, "kyte_exit", exit_type);
+        try compiler.func_map.put("kyte_exit", exit_fn);
 
         const audit_type = core.LLVMFunctionType(compiler.val_type, null, 0, 0);
-        const audit_fn = core.LLVMAddFunction(compiler.module, "nova_arc_audit_report", audit_type);
-        try compiler.func_map.put("nova_arc_audit_report", audit_fn);
+        const audit_fn = core.LLVMAddFunction(compiler.module, "kyte_arc_audit_report", audit_type);
+        try compiler.func_map.put("kyte_arc_audit_report", audit_fn);
 
 
         var bytes_free_params = [_]types.LLVMTypeRef{compiler.val_type};
         const bytes_free_type = core.LLVMFunctionType(compiler.void_type, &bytes_free_params, 1, 0);
-        const bytes_free_fn = core.LLVMAddFunction(compiler.module, "nova_bytes_free", bytes_free_type);
-        try compiler.func_map.put("nova_bytes_free", bytes_free_fn);
+        const bytes_free_fn = core.LLVMAddFunction(compiler.module, "kyte_bytes_free", bytes_free_type);
+        try compiler.func_map.put("kyte_bytes_free", bytes_free_fn);
 
         var ch_create_params = [_]types.LLVMTypeRef{compiler.i32_type};
         const ch_create_type = core.LLVMFunctionType(compiler.val_type, &ch_create_params, 1, 0);
-        const ch_create_fn = core.LLVMAddFunction(compiler.module, "nova_channel_create", ch_create_type);
-        try compiler.func_map.put("nova_channel_create", ch_create_fn);
+        const ch_create_fn = core.LLVMAddFunction(compiler.module, "kyte_channel_create", ch_create_type);
+        try compiler.func_map.put("kyte_channel_create", ch_create_fn);
 
         var ch_send_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
         const ch_send_type = core.LLVMFunctionType(compiler.void_type, &ch_send_params, 2, 0);
-        const ch_send_fn = core.LLVMAddFunction(compiler.module, "nova_channel_send", ch_send_type);
-        try compiler.func_map.put("nova_channel_send", ch_send_fn);
+        const ch_send_fn = core.LLVMAddFunction(compiler.module, "kyte_channel_send", ch_send_type);
+        try compiler.func_map.put("kyte_channel_send", ch_send_fn);
 
         var ch_recv_params = [_]types.LLVMTypeRef{compiler.val_type};
         const ch_recv_type = core.LLVMFunctionType(compiler.val_type, &ch_recv_params, 1, 0);
-        const ch_recv_fn = core.LLVMAddFunction(compiler.module, "nova_channel_recv", ch_recv_type);
-        try compiler.func_map.put("nova_channel_recv", ch_recv_fn);
+        const ch_recv_fn = core.LLVMAddFunction(compiler.module, "kyte_channel_recv", ch_recv_type);
+        try compiler.func_map.put("kyte_channel_recv", ch_recv_fn);
 
         const void_type = compiler.void_type;
         const val_type = compiler.val_type;
 
         const mutex_create_type = core.LLVMFunctionType(val_type, null, 0, 0);
-        const mutex_create_fn = core.LLVMAddFunction(compiler.module, "nova_mutex_create", mutex_create_type);
-        try compiler.func_map.put("nova_mutex_create", mutex_create_fn);
+        const mutex_create_fn = core.LLVMAddFunction(compiler.module, "kyte_mutex_create", mutex_create_type);
+        try compiler.func_map.put("kyte_mutex_create", mutex_create_fn);
 
-        try compiler.func_map.put("nova_thread_id", core.LLVMAddFunction(compiler.module, "nova_thread_id", mutex_create_type));
-        try compiler.func_map.put("nova_worker_count", core.LLVMAddFunction(compiler.module, "nova_worker_count", mutex_create_type));
+        try compiler.func_map.put("kyte_thread_id", core.LLVMAddFunction(compiler.module, "kyte_thread_id", mutex_create_type));
+        try compiler.func_map.put("kyte_worker_count", core.LLVMAddFunction(compiler.module, "kyte_worker_count", mutex_create_type));
 
-        const spin_create_fn = core.LLVMAddFunction(compiler.module, "nova_spin_create", mutex_create_type);
-        try compiler.func_map.put("nova_spin_create", spin_create_fn);
+        const spin_create_fn = core.LLVMAddFunction(compiler.module, "kyte_spin_create", mutex_create_type);
+        try compiler.func_map.put("kyte_spin_create", spin_create_fn);
         var spin_p = [_]types.LLVMTypeRef{val_type};
         const spin_lu_type = core.LLVMFunctionType(void_type, &spin_p, 1, 0);
-        try compiler.func_map.put("nova_spin_lock", core.LLVMAddFunction(compiler.module, "nova_spin_lock", spin_lu_type));
-        try compiler.func_map.put("nova_spin_unlock", core.LLVMAddFunction(compiler.module, "nova_spin_unlock", spin_lu_type));
+        try compiler.func_map.put("kyte_spin_lock", core.LLVMAddFunction(compiler.module, "kyte_spin_lock", spin_lu_type));
+        try compiler.func_map.put("kyte_spin_unlock", core.LLVMAddFunction(compiler.module, "kyte_spin_unlock", spin_lu_type));
 
-        try compiler.func_map.put("nova_pin_next_coro", core.LLVMAddFunction(compiler.module, "nova_pin_next_coro", spin_lu_type));
+        try compiler.func_map.put("kyte_pin_next_coro", core.LLVMAddFunction(compiler.module, "kyte_pin_next_coro", spin_lu_type));
 
-        try compiler.func_map.put("nova_trace_msg", core.LLVMAddFunction(compiler.module, "nova_trace_msg", spin_lu_type));
-        try compiler.func_map.put("nova_trace_enabled", core.LLVMAddFunction(compiler.module, "nova_trace_enabled", mutex_create_type));
+        try compiler.func_map.put("kyte_trace_msg", core.LLVMAddFunction(compiler.module, "kyte_trace_msg", spin_lu_type));
+        try compiler.func_map.put("kyte_trace_enabled", core.LLVMAddFunction(compiler.module, "kyte_trace_enabled", mutex_create_type));
         var trace_kv_p = [_]types.LLVMTypeRef{ val_type, val_type };
         const trace_kv_type = core.LLVMFunctionType(void_type, &trace_kv_p, 2, 0);
-        try compiler.func_map.put("nova_trace_kv", core.LLVMAddFunction(compiler.module, "nova_trace_kv", trace_kv_type));
+        try compiler.func_map.put("kyte_trace_kv", core.LLVMAddFunction(compiler.module, "kyte_trace_kv", trace_kv_type));
 
         var reactor_resume_p = [_]types.LLVMTypeRef{val_type};
         const reactor_resume_type = core.LLVMFunctionType(val_type, &reactor_resume_p, 1, 0);
-        try compiler.func_map.put("nova_reactor_resume", core.LLVMAddFunction(compiler.module, "nova_reactor_resume", reactor_resume_type));
+        try compiler.func_map.put("kyte_reactor_resume", core.LLVMAddFunction(compiler.module, "kyte_reactor_resume", reactor_resume_type));
 
         var run_reactors_p = [_]types.LLVMTypeRef{ val_type, val_type };
         const run_reactors_type = core.LLVMFunctionType(void_type, &run_reactors_p, 2, 0);
-        try compiler.func_map.put("nova_run_reactors", core.LLVMAddFunction(compiler.module, "nova_run_reactors", run_reactors_type));
+        try compiler.func_map.put("kyte_run_reactors", core.LLVMAddFunction(compiler.module, "kyte_run_reactors", run_reactors_type));
 
         var detach_p = [_]types.LLVMTypeRef{val_type};
         const detach_type = core.LLVMFunctionType(void_type, &detach_p, 1, 0);
-        try compiler.func_map.put("nova_reactor_detach", core.LLVMAddFunction(compiler.module, "nova_reactor_detach", detach_type));
+        try compiler.func_map.put("kyte_reactor_detach", core.LLVMAddFunction(compiler.module, "kyte_reactor_detach", detach_type));
 
         var set_current_p = [_]types.LLVMTypeRef{val_type};
         const set_current_type = core.LLVMFunctionType(void_type, &set_current_p, 1, 0);
-        try compiler.func_map.put("nova_reactor_set_current", core.LLVMAddFunction(compiler.module, "nova_reactor_set_current", set_current_type));
+        try compiler.func_map.put("kyte_reactor_set_current", core.LLVMAddFunction(compiler.module, "kyte_reactor_set_current", set_current_type));
 
         const current_type = core.LLVMFunctionType(val_type, null, 0, 0);
-        try compiler.func_map.put("nova_reactor_current", core.LLVMAddFunction(compiler.module, "nova_reactor_current", current_type));
+        try compiler.func_map.put("kyte_reactor_current", core.LLVMAddFunction(compiler.module, "kyte_reactor_current", current_type));
 
         var set_timer_p = [_]types.LLVMTypeRef{ val_type, val_type };
         const set_timer_type = core.LLVMFunctionType(void_type, &set_timer_p, 2, 0);
-        try compiler.func_map.put("nova_reactor_set_timer", core.LLVMAddFunction(compiler.module, "nova_reactor_set_timer", set_timer_type));
+        try compiler.func_map.put("kyte_reactor_set_timer", core.LLVMAddFunction(compiler.module, "kyte_reactor_set_timer", set_timer_type));
 
         var cancel_timer_p = [_]types.LLVMTypeRef{val_type};
         const cancel_timer_type = core.LLVMFunctionType(void_type, &cancel_timer_p, 1, 0);
-        try compiler.func_map.put("nova_reactor_cancel_timer", core.LLVMAddFunction(compiler.module, "nova_reactor_cancel_timer", cancel_timer_type));
+        try compiler.func_map.put("kyte_reactor_cancel_timer", core.LLVMAddFunction(compiler.module, "kyte_reactor_cancel_timer", cancel_timer_type));
 
         const batch_begin_type = core.LLVMFunctionType(void_type, null, 0, 0);
-        try compiler.func_map.put("nova_reactor_batch_begin", core.LLVMAddFunction(compiler.module, "nova_reactor_batch_begin", batch_begin_type));
+        try compiler.func_map.put("kyte_reactor_batch_begin", core.LLVMAddFunction(compiler.module, "kyte_reactor_batch_begin", batch_begin_type));
 
         const mono_ms_type = core.LLVMFunctionType(val_type, null, 0, 0);
-        try compiler.func_map.put("nova_mono_ms", core.LLVMAddFunction(compiler.module, "nova_mono_ms", mono_ms_type));
+        try compiler.func_map.put("kyte_mono_ms", core.LLVMAddFunction(compiler.module, "kyte_mono_ms", mono_ms_type));
 
         var wake_reg_p = [_]types.LLVMTypeRef{ val_type, val_type };
         const wake_reg_type = core.LLVMFunctionType(void_type, &wake_reg_p, 2, 0);
-        try compiler.func_map.put("nova_reactor_wake_register", core.LLVMAddFunction(compiler.module, "nova_reactor_wake_register", wake_reg_type));
+        try compiler.func_map.put("kyte_reactor_wake_register", core.LLVMAddFunction(compiler.module, "kyte_reactor_wake_register", wake_reg_type));
 
         var post_p = [_]types.LLVMTypeRef{ val_type, val_type };
         const post_type = core.LLVMFunctionType(void_type, &post_p, 2, 0);
-        try compiler.func_map.put("nova_reactor_post", core.LLVMAddFunction(compiler.module, "nova_reactor_post", post_type));
+        try compiler.func_map.put("kyte_reactor_post", core.LLVMAddFunction(compiler.module, "kyte_reactor_post", post_type));
 
         var drain_p = [_]types.LLVMTypeRef{val_type};
         const drain_type = core.LLVMFunctionType(val_type, &drain_p, 1, 0);
-        try compiler.func_map.put("nova_reactor_drain_one", core.LLVMAddFunction(compiler.module, "nova_reactor_drain_one", drain_type));
+        try compiler.func_map.put("kyte_reactor_drain_one", core.LLVMAddFunction(compiler.module, "kyte_reactor_drain_one", drain_type));
 
         const evfilt_user_type = core.LLVMFunctionType(val_type, null, 0, 0);
-        try compiler.func_map.put("nova_evfilt_user", core.LLVMAddFunction(compiler.module, "nova_evfilt_user", evfilt_user_type));
+        try compiler.func_map.put("kyte_evfilt_user", core.LLVMAddFunction(compiler.module, "kyte_evfilt_user", evfilt_user_type));
 
         const void_noarg_type = core.LLVMFunctionType(void_type, null, 0, 0);
-        try compiler.func_map.put("nova_hold_all_reactors", core.LLVMAddFunction(compiler.module, "nova_hold_all_reactors", void_noarg_type));
+        try compiler.func_map.put("kyte_hold_all_reactors", core.LLVMAddFunction(compiler.module, "kyte_hold_all_reactors", void_noarg_type));
 
         var one_val_param = [_]types.LLVMTypeRef{val_type};
         const mutex_lock_type = core.LLVMFunctionType(void_type, &one_val_param, 1, 0);
-        const mutex_lock_fn = core.LLVMAddFunction(compiler.module, "nova_mutex_lock", mutex_lock_type);
-        try compiler.func_map.put("nova_mutex_lock", mutex_lock_fn);
+        const mutex_lock_fn = core.LLVMAddFunction(compiler.module, "kyte_mutex_lock", mutex_lock_type);
+        try compiler.func_map.put("kyte_mutex_lock", mutex_lock_fn);
 
-        const mutex_unlock_fn = core.LLVMAddFunction(compiler.module, "nova_mutex_unlock", mutex_lock_type);
-        try compiler.func_map.put("nova_mutex_unlock", mutex_unlock_fn);
+        const mutex_unlock_fn = core.LLVMAddFunction(compiler.module, "kyte_mutex_unlock", mutex_lock_type);
+        try compiler.func_map.put("kyte_mutex_unlock", mutex_unlock_fn);
 
         const cond_create_type = core.LLVMFunctionType(val_type, null, 0, 0);
-        const cond_create_fn = core.LLVMAddFunction(compiler.module, "nova_condvar_create", cond_create_type);
-        try compiler.func_map.put("nova_condvar_create", cond_create_fn);
+        const cond_create_fn = core.LLVMAddFunction(compiler.module, "kyte_condvar_create", cond_create_type);
+        try compiler.func_map.put("kyte_condvar_create", cond_create_fn);
 
         var two_val_params = [_]types.LLVMTypeRef{ val_type, val_type };
         const cond_wait_type = core.LLVMFunctionType(void_type, &two_val_params, 2, 0);
-        const cond_wait_fn = core.LLVMAddFunction(compiler.module, "nova_condvar_wait", cond_wait_type);
-        try compiler.func_map.put("nova_condvar_wait", cond_wait_fn);
+        const cond_wait_fn = core.LLVMAddFunction(compiler.module, "kyte_condvar_wait", cond_wait_type);
+        try compiler.func_map.put("kyte_condvar_wait", cond_wait_fn);
 
-        const cond_signal_fn = core.LLVMAddFunction(compiler.module, "nova_condvar_signal", mutex_lock_type);
-        try compiler.func_map.put("nova_condvar_signal", cond_signal_fn);
+        const cond_signal_fn = core.LLVMAddFunction(compiler.module, "kyte_condvar_signal", mutex_lock_type);
+        try compiler.func_map.put("kyte_condvar_signal", cond_signal_fn);
 
-        const cond_broadcast_fn = core.LLVMAddFunction(compiler.module, "nova_condvar_broadcast", mutex_lock_type);
-        try compiler.func_map.put("nova_condvar_broadcast", cond_broadcast_fn);
+        const cond_broadcast_fn = core.LLVMAddFunction(compiler.module, "kyte_condvar_broadcast", mutex_lock_type);
+        try compiler.func_map.put("kyte_condvar_broadcast", cond_broadcast_fn);
 
         const rw_create_type = core.LLVMFunctionType(val_type, null, 0, 0);
-        const rw_create_fn = core.LLVMAddFunction(compiler.module, "nova_rwlock_create", rw_create_type);
-        try compiler.func_map.put("nova_rwlock_create", rw_create_fn);
+        const rw_create_fn = core.LLVMAddFunction(compiler.module, "kyte_rwlock_create", rw_create_type);
+        try compiler.func_map.put("kyte_rwlock_create", rw_create_fn);
 
-        const rw_acq_r_fn = core.LLVMAddFunction(compiler.module, "nova_rwlock_acquire_read", mutex_lock_type);
-        try compiler.func_map.put("nova_rwlock_acquire_read", rw_acq_r_fn);
+        const rw_acq_r_fn = core.LLVMAddFunction(compiler.module, "kyte_rwlock_acquire_read", mutex_lock_type);
+        try compiler.func_map.put("kyte_rwlock_acquire_read", rw_acq_r_fn);
 
-        const rw_rel_r_fn = core.LLVMAddFunction(compiler.module, "nova_rwlock_release_read", mutex_lock_type);
-        try compiler.func_map.put("nova_rwlock_release_read", rw_rel_r_fn);
+        const rw_rel_r_fn = core.LLVMAddFunction(compiler.module, "kyte_rwlock_release_read", mutex_lock_type);
+        try compiler.func_map.put("kyte_rwlock_release_read", rw_rel_r_fn);
 
-        const rw_acq_w_fn = core.LLVMAddFunction(compiler.module, "nova_rwlock_acquire_write", mutex_lock_type);
-        try compiler.func_map.put("nova_rwlock_acquire_write", rw_acq_w_fn);
+        const rw_acq_w_fn = core.LLVMAddFunction(compiler.module, "kyte_rwlock_acquire_write", mutex_lock_type);
+        try compiler.func_map.put("kyte_rwlock_acquire_write", rw_acq_w_fn);
 
-        const rw_rel_w_fn = core.LLVMAddFunction(compiler.module, "nova_rwlock_release_write", mutex_lock_type);
-        try compiler.func_map.put("nova_rwlock_release_write", rw_rel_w_fn);
+        const rw_rel_w_fn = core.LLVMAddFunction(compiler.module, "kyte_rwlock_release_write", mutex_lock_type);
+        try compiler.func_map.put("kyte_rwlock_release_write", rw_rel_w_fn);
 
         var bytes_alloc_p_params = [_]types.LLVMTypeRef{compiler.val_type};
         const bytes_alloc_p_type = core.LLVMFunctionType(compiler.val_type, &bytes_alloc_p_params, 1, 0);
-        const bytes_alloc_p_fn = core.LLVMAddFunction(compiler.module, "nova_bytes_alloc_persistent", bytes_alloc_p_type);
-        try compiler.func_map.put("nova_bytes_alloc_persistent", bytes_alloc_p_fn);
+        const bytes_alloc_p_fn = core.LLVMAddFunction(compiler.module, "kyte_bytes_alloc_persistent", bytes_alloc_p_type);
+        try compiler.func_map.put("kyte_bytes_alloc_persistent", bytes_alloc_p_fn);
 
-        const ch_destroy_fn = core.LLVMAddFunction(compiler.module, "nova_channel_destroy", mutex_lock_type);
-        try compiler.func_map.put("nova_channel_destroy", ch_destroy_fn);
+        const ch_destroy_fn = core.LLVMAddFunction(compiler.module, "kyte_channel_destroy", mutex_lock_type);
+        try compiler.func_map.put("kyte_channel_destroy", ch_destroy_fn);
 
-        const mutex_destroy_fn = core.LLVMAddFunction(compiler.module, "nova_mutex_destroy", mutex_lock_type);
-        try compiler.func_map.put("nova_mutex_destroy", mutex_destroy_fn);
+        const mutex_destroy_fn = core.LLVMAddFunction(compiler.module, "kyte_mutex_destroy", mutex_lock_type);
+        try compiler.func_map.put("kyte_mutex_destroy", mutex_destroy_fn);
 
-        const cond_destroy_fn = core.LLVMAddFunction(compiler.module, "nova_condvar_destroy", mutex_lock_type);
-        try compiler.func_map.put("nova_condvar_destroy", cond_destroy_fn);
+        const cond_destroy_fn = core.LLVMAddFunction(compiler.module, "kyte_condvar_destroy", mutex_lock_type);
+        try compiler.func_map.put("kyte_condvar_destroy", cond_destroy_fn);
 
-        const rw_destroy_fn = core.LLVMAddFunction(compiler.module, "nova_rwlock_destroy", mutex_lock_type);
-        try compiler.func_map.put("nova_rwlock_destroy", rw_destroy_fn);
+        const rw_destroy_fn = core.LLVMAddFunction(compiler.module, "kyte_rwlock_destroy", mutex_lock_type);
+        try compiler.func_map.put("kyte_rwlock_destroy", rw_destroy_fn);
 
         var retain_params = [_]types.LLVMTypeRef{compiler.val_type};
         const retain_fn_type = core.LLVMFunctionType(compiler.void_type, &retain_params, 1, 0);
-        const retain_fn = core.LLVMAddFunction(compiler.module, "nova_retain", retain_fn_type);
-        try compiler.func_map.put("nova_retain", retain_fn);
+        const retain_fn = core.LLVMAddFunction(compiler.module, "kyte_retain", retain_fn_type);
+        try compiler.func_map.put("kyte_retain", retain_fn);
 
         const ptr_type = core.LLVMPointerType(compiler.void_type, 0);
         var release_params = [_]types.LLVMTypeRef{compiler.val_type, ptr_type};
         const release_fn_type = core.LLVMFunctionType(compiler.void_type, &release_params, 2, 0);
-        const release_fn = core.LLVMAddFunction(compiler.module, "nova_release", release_fn_type);
-        try compiler.func_map.put("nova_release", release_fn);
+        const release_fn = core.LLVMAddFunction(compiler.module, "kyte_release", release_fn_type);
+        try compiler.func_map.put("kyte_release", release_fn);
     }
 
     if (!is_wasm) {
@@ -838,13 +838,13 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         {
             var to_p = [_]types.LLVMTypeRef{compiler.ptr_type};
             const to_t = core.LLVMFunctionType(compiler.ptr_type, &to_p, 1, 0);
-            try compiler.func_map.put("nova_ffi_to_cstr", core.LLVMAddFunction(compiler.module, "nova_ffi_to_cstr", to_t));
+            try compiler.func_map.put("kyte_ffi_to_cstr", core.LLVMAddFunction(compiler.module, "kyte_ffi_to_cstr", to_t));
             var from_p = [_]types.LLVMTypeRef{compiler.ptr_type};
             const from_t = core.LLVMFunctionType(compiler.ptr_type, &from_p, 1, 0);
-            try compiler.func_map.put("nova_ffi_from_cstr", core.LLVMAddFunction(compiler.module, "nova_ffi_from_cstr", from_t));
+            try compiler.func_map.put("kyte_ffi_from_cstr", core.LLVMAddFunction(compiler.module, "kyte_ffi_from_cstr", from_t));
             var free_p = [_]types.LLVMTypeRef{ compiler.ptr_type, compiler.ptr_type };
             const free_t = core.LLVMFunctionType(compiler.void_type, &free_p, 2, 0);
-            try compiler.func_map.put("nova_ffi_free_cstr", core.LLVMAddFunction(compiler.module, "nova_ffi_free_cstr", free_t));
+            try compiler.func_map.put("kyte_ffi_free_cstr", core.LLVMAddFunction(compiler.module, "kyte_ffi_free_cstr", free_t));
         }
         for (program.declarations) |decl| {
             if (decl != .fn_decl) continue;
@@ -1076,7 +1076,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
         const ret_t = if (is_main) compiler.val_type else if (is_async_native) compiler.val_type else if (is_void) compiler.void_type else if (is_vec_ret) compiler.slotTypeForLocal(func.return_type) else compiler.val_type;
 
         const fn_type = core.LLVMFunctionType(ret_t, params.ptr, @intCast(func.param_count), 0);
-        const real_name = if (is_main) "__nova_main" else func.name;
+        const real_name = if (is_main) "__kyte_main" else func.name;
         const fn_name_z = try allocator.dupeZ(u8, real_name);
         defer allocator.free(fn_name_z);
         const fn_val = core.LLVMAddFunction(compiler.module, fn_name_z.ptr, fn_type);
@@ -1392,9 +1392,9 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
             try reg.writeMetadataFile();
             const N = reg.blocks.items.len;
             if (N > 0) {
-                const counters_glob = core.LLVMGetNamedGlobal(compiler.module, "__nova_cov_counters") orelse blk: {
+                const counters_glob = core.LLVMGetNamedGlobal(compiler.module, "__kyte_cov_counters") orelse blk: {
                     const ptr_to_ptr = core.LLVMPointerType(compiler.i64_type, 0);
-                    const glob = core.LLVMAddGlobal(compiler.module, ptr_to_ptr, "__nova_cov_counters");
+                    const glob = core.LLVMAddGlobal(compiler.module, ptr_to_ptr, "__kyte_cov_counters");
                     core.LLVMSetLinkage(glob, types.LLVMLinkage.LLVMExternalLinkage);
                     break :blk glob;
                 };
@@ -1412,11 +1412,11 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
                         core.LLVMPositionBuilderAtEnd(cov_builder, entry_bb);
                     }
 
-                    const init_fn = if (compiler.func_map.get("nova_coverage_init")) |f| f else blk: {
+                    const init_fn = if (compiler.func_map.get("kyte_coverage_init")) |f| f else blk: {
                         var arg_types = [_]types.LLVMTypeRef{compiler.i64_type};
                         const fn_type = core.LLVMFunctionType(compiler.void_type, &arg_types, 1, 0);
-                        const f = core.LLVMAddFunction(compiler.module, "nova_coverage_init", fn_type);
-                        try compiler.func_map.put("nova_coverage_init", f);
+                        const f = core.LLVMAddFunction(compiler.module, "kyte_coverage_init", fn_type);
+                        try compiler.func_map.put("kyte_coverage_init", f);
                         break :blk f;
                     };
                     const init_fn_t = core.LLVMGlobalGetValueType(init_fn);
@@ -1437,7 +1437,7 @@ pub fn compile(allocator: std.mem.Allocator, program: ast.Program, is_wasm: bool
     var ll_buf: [std.fs.max_path_bytes]u8 = undefined;
     const ll_name: ?[]const u8 = if (flags.dump_ir) blk: {
         const dir = std.fs.path.dirname(output_path) orelse ".";
-        break :blk std.fmt.bufPrint(&ll_buf, "{s}/nova_ir.ll", .{dir}) catch "nova_ir.ll";
+        break :blk std.fmt.bufPrint(&ll_buf, "{s}/kyte_ir.ll", .{dir}) catch "kyte_ir.ll";
     } else null;
     try emitModule(&compiler, allocator, compiler.module, output_path, is_wasm, is_release, ll_name);
 }
@@ -1549,7 +1549,7 @@ fn compileSplitEmit(
             var cf = core.LLVMGetFirstFunction(clone);
             while (cf != null) : (cf = core.LLVMGetNextFunction(cf)) {
                 const nm = std.mem.span(core.LLVMGetValueName(cf));
-                if (!std.mem.eql(u8, nm, "__nova_main")) core.LLVMSetLinkage(cf, .LLVMInternalLinkage);
+                if (!std.mem.eql(u8, nm, "__kyte_main")) core.LLVMSetLinkage(cf, .LLVMInternalLinkage);
             }
             const opts = transform.LLVMCreatePassBuilderOptions();
             defer transform.LLVMDisposePassBuilderOptions(opts);
@@ -1564,7 +1564,7 @@ fn compileSplitEmit(
         var rf = core.LLVMGetFirstFunction(compiler.module);
         while (rf != null) : (rf = core.LLVMGetNextFunction(rf)) {
             const nm = std.mem.span(core.LLVMGetValueName(rf));
-            if (std.mem.eql(u8, nm, "__nova_main")) continue;
+            if (std.mem.eql(u8, nm, "__kyte_main")) continue;
             if (!reachable.contains(nm)) core.LLVMSetLinkage(rf, .LLVMInternalLinkage);
         }
         const opts2 = transform.LLVMCreatePassBuilderOptions();
@@ -1597,7 +1597,7 @@ fn compileSplitEmit(
         var obj_path: []const u8 = undefined;
         if (cache_dir) |cdir| {
             const base = std.fs.path.basename(src_path);
-            const stem = if (std.mem.endsWith(u8, base, ".nova")) base[0 .. base.len - 5] else base;
+            const stem = if (std.mem.endsWith(u8, base, ".ky")) base[0 .. base.len - 3] else base;
             const ph: u32 = @truncate(std.hash.Wyhash.hash(T6_CACHE_VERSION ^ (if (is_release) @as(u64, 1) else 0), src_path));
             obj_path = try std.fmt.allocPrint(allocator, "{s}/{s}_{x}.o", .{ cdir, stem, ph });
 
@@ -1808,7 +1808,7 @@ const CoroCtx = struct {
     /// frame is destroyed.
     final_bb: types.LLVMBasicBlockRef,
     /// The cleanup block: frees the coroutine frame (`llvm.coro.free` +
-    /// `nova_coro_free`) on the destroy path.
+    /// `kyte_coro_free`) on the destroy path.
     cleanup_bb: types.LLVMBasicBlockRef,
     /// The common return/suspend block that runs `llvm.coro.end` and returns the
     /// handle; every suspend switch's default lands here.
@@ -1819,7 +1819,7 @@ const CoroCtx = struct {
 /// [`CoroCtx`].
 ///
 /// Builds the promise alloca (zeroing its waiter slot), the `llvm.coro.id`,
-/// heap-allocates the frame via `llvm.coro.size` + `nova_coro_alloc`, calls
+/// heap-allocates the frame via `llvm.coro.size` + `kyte_coro_alloc`, calls
 /// `llvm.coro.begin`, and creates the body/final/cleanup/return blocks. It then
 /// emits the initial suspend and switches: 0 → body, 1 → cleanup, default →
 /// return. On return the builder is positioned at the start of the body block so
@@ -1848,7 +1848,7 @@ fn emitCoroPrologue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef) !CoroCt
     const size_t = core.LLVMGlobalGetValueType(size_fn);
     const size_val = core.LLVMBuildCall2(b, size_t, size_fn, null, 0, "coro.size");
 
-    const alloc_fn = compiler.func_map.get("nova_coro_alloc").?;
+    const alloc_fn = compiler.func_map.get("kyte_coro_alloc").?;
     const alloc_t = core.LLVMGlobalGetValueType(alloc_fn);
     var alloc_args = [_]types.LLVMValueRef{size_val};
     const frame_i = core.LLVMBuildCall2(b, alloc_t, alloc_fn, &alloc_args, 1, "coro.frame");
@@ -1890,7 +1890,7 @@ fn emitCoroPrologue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef) !CoroCt
 /// At `final_bb` it issues the final `llvm.coro.suspend` and switches on it:
 /// 0 → an `unreachable` trap (a resume of a completed coroutine is a bug),
 /// 1 → cleanup, default → return. The cleanup block runs `llvm.coro.free` and
-/// hands the memory to `nova_coro_free`. The return block runs `llvm.coro.end`
+/// hands the memory to `kyte_coro_free`. The return block runs `llvm.coro.end`
 /// and returns the handle as an integer word. Must be called after the body has
 /// been emitted, with `ctx` from the matching [`emitCoroPrologue`].
 fn emitCoroEpilogue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, ctx: CoroCtx) void {
@@ -1916,7 +1916,7 @@ fn emitCoroEpilogue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, ctx: Co
     var free_args = [_]types.LLVMValueRef{ ctx.id, ctx.hdl };
     const mem_p = core.LLVMBuildCall2(b, free_t, free_fn, &free_args, 2, "coro.free");
     const mem_i = core.LLVMBuildPtrToInt(b, mem_p, compiler.val_type, "coro.freei");
-    const nfree_fn = compiler.func_map.get("nova_coro_free").?;
+    const nfree_fn = compiler.func_map.get("kyte_coro_free").?;
     const nfree_t = core.LLVMGlobalGetValueType(nfree_fn);
     var nfree_args = [_]types.LLVMValueRef{mem_i};
     _ = core.LLVMBuildCall2(b, nfree_t, nfree_fn, &nfree_args, 1, "");
@@ -1936,13 +1936,13 @@ fn emitCoroEpilogue(compiler: *LlvmCompiler, fn_val: types.LLVMValueRef, ctx: Co
 ///
 /// This registers the full coroutine/async ABI into `func_map`: the
 /// `llvm.coro.*` intrinsics (via [`declareCoroIntrinsic`]); the frame
-/// allocator/free/scheduler hooks (`nova_coro_alloc`/`nova_coro_free`,
-/// `nova_sched_*`, `nova_run`/`nova_run_root`); the await primitives
-/// (`nova_await_timer`/`nova_register_waiter`/`nova_await_future`); async
-/// channels (`nova_chan_*`); the async socket/server I/O surface
-/// (`nova_io_*_async`, `nova_aserver_listen*`, `nova_aaccept`/`nova_aconnect`/
-/// `nova_arecv`/`nova_arecv_deadline`/`nova_asend`/`nova_aclose`); and the
-/// combinators (`nova_when_any`/`nova_when_any_deadline`). Called from within
+/// allocator/free/scheduler hooks (`kyte_coro_alloc`/`kyte_coro_free`,
+/// `kyte_sched_*`, `kyte_run`/`kyte_run_root`); the await primitives
+/// (`kyte_await_timer`/`kyte_register_waiter`/`kyte_await_future`); async
+/// channels (`kyte_chan_*`); the async socket/server I/O surface
+/// (`kyte_io_*_async`, `kyte_aserver_listen*`, `kyte_aaccept`/`kyte_aconnect`/
+/// `kyte_arecv`/`kyte_arecv_deadline`/`kyte_asend`/`kyte_aclose`); and the
+/// combinators (`kyte_when_any`/`kyte_when_any_deadline`). Called from within
 /// [`compile`]'s native branch; the actual bodies live in the C++ runtime.
 fn setupCoroutineSupport(compiler: *LlvmCompiler) !void {
     try declareCoroIntrinsic(compiler, "llvm.coro.id", null);
@@ -1958,117 +1958,117 @@ fn setupCoroutineSupport(compiler: *LlvmCompiler) !void {
 
     var one_val = [_]types.LLVMTypeRef{compiler.val_type};
     const alloc_type = core.LLVMFunctionType(compiler.val_type, &one_val, 1, 0);
-    const alloc_fn = core.LLVMAddFunction(compiler.module, "nova_coro_alloc", alloc_type);
-    try compiler.func_map.put("nova_coro_alloc", alloc_fn);
+    const alloc_fn = core.LLVMAddFunction(compiler.module, "kyte_coro_alloc", alloc_type);
+    try compiler.func_map.put("kyte_coro_alloc", alloc_fn);
     const free_type = core.LLVMFunctionType(compiler.void_type, &one_val, 1, 0);
-    const free_fn = core.LLVMAddFunction(compiler.module, "nova_coro_free", free_type);
-    try compiler.func_map.put("nova_coro_free", free_fn);
+    const free_fn = core.LLVMAddFunction(compiler.module, "kyte_coro_free", free_type);
+    try compiler.func_map.put("kyte_coro_free", free_fn);
 
     const sched_type = core.LLVMFunctionType(compiler.void_type, &one_val, 1, 0);
-    const sched_fn = core.LLVMAddFunction(compiler.module, "nova_sched_schedule", sched_type);
-    try compiler.func_map.put("nova_sched_schedule", sched_fn);
-    const sched_det_fn = core.LLVMAddFunction(compiler.module, "nova_sched_schedule_detached", sched_type);
-    try compiler.func_map.put("nova_sched_schedule_detached", sched_det_fn);
+    const sched_fn = core.LLVMAddFunction(compiler.module, "kyte_sched_schedule", sched_type);
+    try compiler.func_map.put("kyte_sched_schedule", sched_fn);
+    const sched_det_fn = core.LLVMAddFunction(compiler.module, "kyte_sched_schedule_detached", sched_type);
+    try compiler.func_map.put("kyte_sched_schedule_detached", sched_det_fn);
     const next_type = core.LLVMFunctionType(compiler.val_type, null, 0, 0);
-    const next_fn = core.LLVMAddFunction(compiler.module, "nova_sched_next", next_type);
-    try compiler.func_map.put("nova_sched_next", next_fn);
+    const next_fn = core.LLVMAddFunction(compiler.module, "kyte_sched_next", next_type);
+    try compiler.func_map.put("kyte_sched_next", next_fn);
 
     const run_type = core.LLVMFunctionType(compiler.void_type, null, 0, 0);
-    const run_fn = core.LLVMAddFunction(compiler.module, "nova_run", run_type);
-    try compiler.func_map.put("nova_run", run_fn);
+    const run_fn = core.LLVMAddFunction(compiler.module, "kyte_run", run_type);
+    try compiler.func_map.put("kyte_run", run_fn);
 
     var release_params = [_]types.LLVMTypeRef{compiler.val_type};
     const release_type = core.LLVMFunctionType(compiler.void_type, &release_params, 1, 0);
-    const release_fn = core.LLVMAddFunction(compiler.module, "nova_coro_release", release_type);
-    try compiler.func_map.put("nova_coro_release", release_fn);
+    const release_fn = core.LLVMAddFunction(compiler.module, "kyte_coro_release", release_type);
+    try compiler.func_map.put("kyte_coro_release", release_fn);
 
     var run_root_params = [_]types.LLVMTypeRef{compiler.val_type};
     const run_root_type = core.LLVMFunctionType(compiler.void_type, &run_root_params, 1, 0);
-    const run_root_fn = core.LLVMAddFunction(compiler.module, "nova_run_root", run_root_type);
-    try compiler.func_map.put("nova_run_root", run_root_fn);
+    const run_root_fn = core.LLVMAddFunction(compiler.module, "kyte_run_root", run_root_type);
+    try compiler.func_map.put("kyte_run_root", run_root_fn);
 
     var timer_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
     const timer_type = core.LLVMFunctionType(compiler.void_type, &timer_params, 2, 0);
-    const timer_fn = core.LLVMAddFunction(compiler.module, "nova_await_timer", timer_type);
-    try compiler.func_map.put("nova_await_timer", timer_fn);
+    const timer_fn = core.LLVMAddFunction(compiler.module, "kyte_await_timer", timer_type);
+    try compiler.func_map.put("kyte_await_timer", timer_fn);
 
     var waiter_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
     const waiter_type = core.LLVMFunctionType(compiler.void_type, &waiter_params, 2, 0);
-    const waiter_fn = core.LLVMAddFunction(compiler.module, "nova_register_waiter", waiter_type);
-    try compiler.func_map.put("nova_register_waiter", waiter_fn);
+    const waiter_fn = core.LLVMAddFunction(compiler.module, "kyte_register_waiter", waiter_type);
+    try compiler.func_map.put("kyte_register_waiter", waiter_fn);
 
     var fut_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
     const fut_type = core.LLVMFunctionType(compiler.val_type, &fut_params, 2, 0);
-    const fut_fn = core.LLVMAddFunction(compiler.module, "nova_await_future", fut_type);
-    try compiler.func_map.put("nova_await_future", fut_fn);
+    const fut_fn = core.LLVMAddFunction(compiler.module, "kyte_await_future", fut_type);
+    try compiler.func_map.put("kyte_await_future", fut_fn);
 
     var one_val_c = [_]types.LLVMTypeRef{compiler.val_type};
     const cnew_type = core.LLVMFunctionType(compiler.val_type, &one_val_c, 1, 0);
-    const cnew_fn = core.LLVMAddFunction(compiler.module, "nova_chan_new", cnew_type);
-    try compiler.func_map.put("nova_chan_new", cnew_fn);
+    const cnew_fn = core.LLVMAddFunction(compiler.module, "kyte_chan_new", cnew_type);
+    try compiler.func_map.put("kyte_chan_new", cnew_fn);
     var csend_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
     const csend_type = core.LLVMFunctionType(compiler.void_type, &csend_params, 2, 0);
-    const csend_fn = core.LLVMAddFunction(compiler.module, "nova_chan_send", csend_type);
-    try compiler.func_map.put("nova_chan_send", csend_fn);
+    const csend_fn = core.LLVMAddFunction(compiler.module, "kyte_chan_send", csend_type);
+    try compiler.func_map.put("kyte_chan_send", csend_fn);
     var crecv_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.ptr_type };
     const crecv_type = core.LLVMFunctionType(compiler.val_type, &crecv_params, 3, 0);
-    const crecv_fn = core.LLVMAddFunction(compiler.module, "nova_chan_recv", crecv_type);
-    try compiler.func_map.put("nova_chan_recv", crecv_fn);
+    const crecv_fn = core.LLVMAddFunction(compiler.module, "kyte_chan_recv", crecv_type);
+    try compiler.func_map.put("kyte_chan_recv", crecv_fn);
     const cfree_type = core.LLVMFunctionType(compiler.void_type, &one_val_c, 1, 0);
-    const cfree_fn = core.LLVMAddFunction(compiler.module, "nova_chan_free", cfree_type);
-    try compiler.func_map.put("nova_chan_free", cfree_fn);
+    const cfree_fn = core.LLVMAddFunction(compiler.module, "kyte_chan_free", cfree_type);
+    try compiler.func_map.put("kyte_chan_free", cfree_fn);
 
     var recv_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.val_type, compiler.val_type };
     const iorecv_type = core.LLVMFunctionType(compiler.void_type, &recv_params, 4, 0);
-    const iorecv_fn = core.LLVMAddFunction(compiler.module, "nova_io_recv_async", iorecv_type);
-    try compiler.func_map.put("nova_io_recv_async", iorecv_fn);
+    const iorecv_fn = core.LLVMAddFunction(compiler.module, "kyte_io_recv_async", iorecv_type);
+    try compiler.func_map.put("kyte_io_recv_async", iorecv_fn);
     var accept_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
     const ioaccept_type = core.LLVMFunctionType(compiler.void_type, &accept_params, 2, 0);
-    const ioaccept_fn = core.LLVMAddFunction(compiler.module, "nova_io_accept_async", ioaccept_type);
-    try compiler.func_map.put("nova_io_accept_async", ioaccept_fn);
+    const ioaccept_fn = core.LLVMAddFunction(compiler.module, "kyte_io_accept_async", ioaccept_type);
+    try compiler.func_map.put("kyte_io_accept_async", ioaccept_fn);
     const iotake_type = core.LLVMFunctionType(compiler.val_type, &one_val_c, 1, 0);
-    const iotake_fn = core.LLVMAddFunction(compiler.module, "nova_io_take_result", iotake_type);
-    try compiler.func_map.put("nova_io_take_result", iotake_fn);
+    const iotake_fn = core.LLVMAddFunction(compiler.module, "kyte_io_take_result", iotake_type);
+    try compiler.func_map.put("kyte_io_take_result", iotake_fn);
 
     const listen_type = core.LLVMFunctionType(compiler.val_type, &one_val_c, 1, 0);
-    const listen_fn = core.LLVMAddFunction(compiler.module, "nova_aserver_listen", listen_type);
-    try compiler.func_map.put("nova_aserver_listen", listen_fn);
+    const listen_fn = core.LLVMAddFunction(compiler.module, "kyte_aserver_listen", listen_type);
+    try compiler.func_map.put("kyte_aserver_listen", listen_fn);
     var two_val_c = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type };
 
     const listen_addr_type = core.LLVMFunctionType(compiler.val_type, &two_val_c, 2, 0);
-    const listen_addr_fn = core.LLVMAddFunction(compiler.module, "nova_aserver_listen_addr", listen_addr_type);
-    try compiler.func_map.put("nova_aserver_listen_addr", listen_addr_fn);
+    const listen_addr_fn = core.LLVMAddFunction(compiler.module, "kyte_aserver_listen_addr", listen_addr_type);
+    try compiler.func_map.put("kyte_aserver_listen_addr", listen_addr_fn);
     const aaccept_type = core.LLVMFunctionType(compiler.void_type, &two_val_c, 2, 0);
-    const aaccept_fn = core.LLVMAddFunction(compiler.module, "nova_aaccept", aaccept_type);
-    try compiler.func_map.put("nova_aaccept", aaccept_fn);
+    const aaccept_fn = core.LLVMAddFunction(compiler.module, "kyte_aaccept", aaccept_type);
+    try compiler.func_map.put("kyte_aaccept", aaccept_fn);
     var three_val_conn = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.val_type };
     const aconn_type = core.LLVMFunctionType(compiler.void_type, &three_val_conn, 3, 0);
-    const aconn_fn = core.LLVMAddFunction(compiler.module, "nova_aconnect", aconn_type);
-    try compiler.func_map.put("nova_aconnect", aconn_fn);
+    const aconn_fn = core.LLVMAddFunction(compiler.module, "kyte_aconnect", aconn_type);
+    try compiler.func_map.put("kyte_aconnect", aconn_fn);
     var four_val_c = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.val_type, compiler.val_type };
     const arecv_type = core.LLVMFunctionType(compiler.void_type, &four_val_c, 4, 0);
-    const arecv_fn = core.LLVMAddFunction(compiler.module, "nova_arecv", arecv_type);
-    try compiler.func_map.put("nova_arecv", arecv_fn);
+    const arecv_fn = core.LLVMAddFunction(compiler.module, "kyte_arecv", arecv_type);
+    try compiler.func_map.put("kyte_arecv", arecv_fn);
     var five_val_c = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.val_type, compiler.val_type, compiler.val_type };
     const arecv_dl_type = core.LLVMFunctionType(compiler.void_type, &five_val_c, 5, 0);
-    const arecv_dl_fn = core.LLVMAddFunction(compiler.module, "nova_arecv_deadline", arecv_dl_type);
-    try compiler.func_map.put("nova_arecv_deadline", arecv_dl_fn);
+    const arecv_dl_fn = core.LLVMAddFunction(compiler.module, "kyte_arecv_deadline", arecv_dl_type);
+    try compiler.func_map.put("kyte_arecv_deadline", arecv_dl_fn);
     var three_val_c = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.val_type };
     const asend_type = core.LLVMFunctionType(compiler.void_type, &three_val_c, 3, 0);
-    const asend_fn = core.LLVMAddFunction(compiler.module, "nova_asend", asend_type);
-    try compiler.func_map.put("nova_asend", asend_fn);
+    const asend_fn = core.LLVMAddFunction(compiler.module, "kyte_asend", asend_type);
+    try compiler.func_map.put("kyte_asend", asend_fn);
     const aclose_type = core.LLVMFunctionType(compiler.void_type, &one_val_c, 1, 0);
-    const aclose_fn = core.LLVMAddFunction(compiler.module, "nova_aclose", aclose_type);
-    try compiler.func_map.put("nova_aclose", aclose_fn);
+    const aclose_fn = core.LLVMAddFunction(compiler.module, "kyte_aclose", aclose_type);
+    try compiler.func_map.put("kyte_aclose", aclose_fn);
 
     var holdarg_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.ptr_type };
     const holdarg_type = core.LLVMFunctionType(compiler.void_type, &holdarg_params, 3, 0);
-    try compiler.func_map.put("nova_coro_hold_arg", core.LLVMAddFunction(compiler.module, "nova_coro_hold_arg", holdarg_type));
+    try compiler.func_map.put("kyte_coro_hold_arg", core.LLVMAddFunction(compiler.module, "kyte_coro_hold_arg", holdarg_type));
 
     var whenany_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.val_type };
     const whenany_type = core.LLVMFunctionType(compiler.val_type, &whenany_params, 3, 0);
-    try compiler.func_map.put("nova_when_any", core.LLVMAddFunction(compiler.module, "nova_when_any", whenany_type));
+    try compiler.func_map.put("kyte_when_any", core.LLVMAddFunction(compiler.module, "kyte_when_any", whenany_type));
     var whenanydl_params = [_]types.LLVMTypeRef{ compiler.val_type, compiler.val_type, compiler.val_type, compiler.val_type };
     const whenanydl_type = core.LLVMFunctionType(compiler.val_type, &whenanydl_params, 4, 0);
-    try compiler.func_map.put("nova_when_any_deadline", core.LLVMAddFunction(compiler.module, "nova_when_any_deadline", whenanydl_type));
+    try compiler.func_map.put("kyte_when_any_deadline", core.LLVMAddFunction(compiler.module, "kyte_when_any_deadline", whenanydl_type));
 }

@@ -1,7 +1,7 @@
 # 23. Deploying with the orchestrator
 
 You have a PostgreSQL-backed web service (Chapter 18). This chapter runs it in production shape: several
-replicas behind a load balancer, supervised and kept at their desired count. Nova ships a small
+replicas behind a load balancer, supervised and kept at their desired count. Kyte ships a small
 orchestrator for exactly this. It is a container-free, Kubernetes-style control plane that runs your
 workloads as ordinary native binaries (no images, no container runtime), split into a handful of
 binaries that mirror the Kubernetes control-plane / data-plane split.
@@ -24,14 +24,14 @@ reference, so the binaries come out naturally separated.
 
 | Binary      | Plane / role  | Entry file            |
 |-------------|---------------|-----------------------|
-| `service`   | data plane: an L7/L4 reverse proxy and load balancer in front of your app replicas, and the fd-handoff gateway. | `bin/service.nova` |
-| `orchd`     | control plane: reconciles desired vs actual replicas, runs health probes, publishes service discovery, runs the HA leader lease, writes metrics. | `bin/orchd.nova` |
-| `orchctl`   | operations: an offline CLI over a config-store dump. Inspect it, manage cluster membership, print a rolling-upgrade plan. | `bin/orchctl.nova` |
-| `artifactd` | the content-addressed artifact origin: a blob server that distributes deploy binaries by hash. | `bin/artifactd.nova` |
-| `orchweb`   | an optional, best-effort control-plane web UI. | `webui/src/main.nova` |
+| `service`   | data plane: an L7/L4 reverse proxy and load balancer in front of your app replicas, and the fd-handoff gateway. | `bin/service.ky` |
+| `orchd`     | control plane: reconciles desired vs actual replicas, runs health probes, publishes service discovery, runs the HA leader lease, writes metrics. | `bin/orchd.ky` |
+| `orchctl`   | operations: an offline CLI over a config-store dump. Inspect it, manage cluster membership, print a rolling-upgrade plan. | `bin/orchctl.ky` |
+| `artifactd` | the content-addressed artifact origin: a blob server that distributes deploy binaries by hash. | `bin/artifactd.ky` |
+| `orchweb`   | an optional, best-effort control-plane web UI. | `webui/src/main.ky` |
 
 The core set is `service`, `orchd`, `orchctl`, and `artifactd`. `orchweb` is a fifth, optional UI: the
-build script only attempts it when `webui/src/main.nova` is present, and a build failure there never
+build script only attempts it when `webui/src/main.ky` is present, and a build failure there never
 fails the core stack.
 
 `artifactd` and the blob store behind it are the subject of the next chapter (Chapter 24, artifact
@@ -46,8 +46,8 @@ cd packages/nova-orchestrator
 ./build.sh --release --target linux-arm64   # cross-compile -> build/release/linux-arm64/bin/
 ```
 
-Native builds go through `nova build --file <src> -o <out>`; cross builds use the single-file compile
-mode, `nova <src> -o <out> --target <triple>`. The supported cross triples are `linux-x86_64`,
+Native builds go through `kyte build --file <src> -o <out>`; cross builds use the single-file compile
+mode, `kyte <src> -o <out> --target <triple>`. The supported cross triples are `linux-x86_64`,
 `linux-arm64`, `macos-x86_64`, `macos-arm64`, `windows-x86_64`, and `windows-arm64`.
 
 ## The shape of a deployment
@@ -73,7 +73,7 @@ store.
 ## service: the data plane
 
 `service` reads a JSON config and load-balances across a set of backends. It reads its config path from
-`SERVICE_CONFIG` (default `service.json`), and `NOVA_PORT` overrides the listen port. The minimal config:
+`SERVICE_CONFIG` (default `service.json`), and `KYTE_PORT` overrides the listen port. The minimal config:
 
 ```json
 {
@@ -88,7 +88,7 @@ Run it, or lint the config without serving:
 
 ```sh
 service service.json --check     # validate, print backend count + strategy, exit
-service service.json             # serve; NOVA_PORT overrides listenPort
+service service.json             # serve; KYTE_PORT overrides listenPort
 ```
 
 Strategies are `roundrobin`, `weighted`, `leastconn`, and `consistenthash`. Active health checks poll
@@ -96,8 +96,8 @@ the health path; a backend is taken out after `fall` consecutive failures and re
 successes. `service` refuses to start with zero live backends, so a misconfigured pool fails loudly
 instead of silently black-holing traffic.
 
-Your app already supports running many replicas on one host: `main_postgres.nova` honours `NOVA_PORT`, so
-`NOVA_PORT=8080 ./webapp` and `NOVA_PORT=8081 ./webapp` give you two replicas for service to balance.
+Your app already supports running many replicas on one host: `main_postgres.ky` honours `KYTE_PORT`, so
+`KYTE_PORT=8080 ./webapp` and `KYTE_PORT=8081 ./webapp` give you two replicas for service to balance.
 
 > **Note.** `service` runs on the reactor-native socket path (the same one the web server uses in
 > Chapter 17): it binds, accepts, forwards to a backend, and streams the response back, load-balancing
@@ -138,11 +138,11 @@ and reconciles desired state read from the store. Both are covered below.
 The workload you want orchd to run is described declaratively. There are two schemas in the package, and
 it is worth knowing which is which.
 
-The current schema is a **YAML manifest**, parsed by `src/orch/manifest.nova`. The canonical example is
+The current schema is a **YAML manifest**, parsed by `src/orch/manifest.ky`. The canonical example is
 `examples/manifests/shop.yaml`:
 
 ```yaml
-apiVersion: nova/v1
+apiVersion: kyte/v1
 kind: App
 metadata:
   name: shop
@@ -186,25 +186,25 @@ resources:
   pidsMax: 128
 ```
 
-`manifest.nova` gives you `parseManifest(text)`, `validateManifest(m)` (returns `""` when valid),
+`manifest.ky` gives you `parseManifest(text)`, `validateManifest(m)` (returns `""` when valid),
 `toYaml(m)` (round-trips), and `toSpec(m)`, which lowers a manifest to the internal run spec the
 supervisor acts on.
 
 ### Where the app's own config lives
 
 The manifest above describes only how the orchestrator *runs* the app; it does not carry the app's own
-configuration. Nova keeps application config **file-based and outside the orchestrator on purpose**. The
+configuration. Kyte keeps application config **file-based and outside the orchestrator on purpose**. The
 app reads it from an `app.yaml` at the project root through the framework loader `web.config`, which the
 framework calls once when `App()` is constructed and exposes as `app.config`:
 
-```nova
+```kyte
 // app.yaml at the project root
 config:
   port: 8080
   logLevel: info
 ```
 
-```nova
+```kyte
 // in main(): read a value with a default, or bind a typed section
 let port = app.config.port(8080);           // --port argv, else config.port, else the default
 let db = app.config.bind<DbSettings>("db"); // an @serializable section
@@ -212,13 +212,13 @@ let db = app.config.bind<DbSettings>("db"); // an @serializable section
 
 The orchestrator never injects app config as environment variables (co-located apps would collide on the
 same names), and orchd does not parse an app `config:` section even if one is present in the manifest
-file: `src/orch/manifest.nova` deliberately ignores the `config:` key when binding a `Manifest`, and
-`src/orch/spec.nova` states the same. What the orchestrator does pass to a replica is operational: the
+file: `src/orch/manifest.ky` deliberately ignores the `config:` key when binding a `Manifest`, and
+`src/orch/spec.ky` states the same. What the orchestrator does pass to a replica is operational: the
 `--config <profile>` argument from `workload.args` (selecting, say, the `prod` profile) and the port. So
 the same binary runs locally with no orchestrator, reading its `app.yaml` directly, and works with zero
 extra wiring.
 
-There is also a **legacy JSON `Spec`** schema in `src/orch/spec.nova`, parsed by `parseSpec(text)`. It
+There is also a **legacy JSON `Spec`** schema in `src/orch/spec.ky`, parsed by `parseSpec(text)`. It
 carries the same intent in a flatter, older shape (`name`, `binaryPath`, `args`, `restartPolicy`,
 `replicas`, cgroup limits, probe settings, handoff settings, and an `artifact` field for hash-addressed
 binaries, which the next chapter covers). New manifests should use the YAML form; the JSON `Spec` is
@@ -227,7 +227,7 @@ still parsed for existing deployments.
 ## The artifactd-hosted config store
 
 When `store.enabled` is set, orchd reaches its config store over HTTP at `artifactd`. The `store` block
-becomes a base URL through the `storeBaseUrl` helper (in `src/cfg/config.nova`): `http://host:port`, or
+becomes a base URL through the `storeBaseUrl` helper (in `src/cfg/config.ky`): `http://host:port`, or
 `https://host:port` when `tls` is set. There is no database connection string and no database process,
 which is the whole point of the move: the control-plane data set is a few megabytes, and it never needed
 a general database. It needed exactly four things, and a small key-value store gives all four: mutable
@@ -242,7 +242,7 @@ let store = httpconfig.HttpConfigStore(base, c.store.token);
 let _s = await store.ensureSchema();      // a no-op ping; artifactd self-initialises
 ```
 
-`HttpConfigStore` (in `src/store/httpconfig.nova`) is an etcd-shaped key-value client: a monotonic global
+`HttpConfigStore` (in `src/store/httpconfig.ky`) is an etcd-shaped key-value client: a monotonic global
 revision, a per-key modification revision, prefix listing, compare-and-swap on a revision, delete, and a
 poll-based watch. Each method is one request to artifactd's `/cfg/*` routes, guarded by the same deploy
 token. The keys it persists are worth knowing:
@@ -251,9 +251,9 @@ token. The keys it persists are worth knowing:
 - the leader lease under `leases/orchd`,
 - cluster membership under `members/<id>`.
 
-The store logic itself is the same in-memory core, `ConfigStore` in `src/store/config.nova`, that the
+The store logic itself is the same in-memory core, `ConfigStore` in `src/store/config.ky`, that the
 offline `orchctl` and the backup tooling operate on. artifactd hosts one instance of it behind its
-routes (`src/artifacts/cfgstore.nova`), snapshots it to a file after every write so it survives a
+routes (`src/artifacts/cfgstore.ky`), snapshots it to a file after every write so it survives a
 restart with each key's revision intact, and serves one request at a time on its single reactor. That
 last point is what makes the leader election correct: every compare-and-set is a single synchronous call
 into one store, so two racing orchd nodes are serialised and exactly one wins an epoch. It is a simpler,
@@ -268,7 +268,7 @@ single artifactd with several orchd nodes, failover is correct today.
 
 orchd and service meet through a small discovery file rather than a shared socket.
 
-The writer side is orchd's nativelet (`src/orch/nativelet.nova`). Each reconcile tick it renders one
+The writer side is orchd's nativelet (`src/orch/nativelet.ky`). Each reconcile tick it renders one
 `name=host:port` line per replica and atomically writes the discovery file. With `basePort` set on a
 workload, replica `i` advertises as `host:(basePort + i)`; otherwise replicas share the probe port.
 
@@ -286,7 +286,7 @@ replica that has died but not yet been removed from the file still gets taken ou
 This is a place where the earlier revision of this chapter drifted, so read it carefully.
 
 `orchd` does **not** serve `/healthz` and `/readyz` as HTTP routes. It has no listen port. Instead,
-`src/orch/health.nova` computes health as plain data:
+`src/orch/health.ky` computes health as plain data:
 
 - `healthy()` is true when the config store is reachable.
 - `ready()` is true when the store is reachable and the node's role is one of leader, standby, or
@@ -313,20 +313,20 @@ receive traffic.
 There are two rolling mechanisms at two levels.
 
 **Workload-level replica replacement** happens inside a node. The supervisor
-(`src/orch/supervisor.nova`) can retire the oldest replica gracefully (SIGTERM, then a timed grace
+(`src/orch/supervisor.ky`) can retire the oldest replica gracefully (SIGTERM, then a timed grace
 window, then SIGKILL) and spawn a fresh one, and it can swap in a changed spec without restarting
 replicas that are already running the right thing. On a detected spec change the nativelet replaces one
 replica per grace window until the roll is complete, so a config change rolls through the replicas rather
 than bouncing them all at once.
 
-**Node-level rolling upgrade** happens across nodes, driven by the leader lease. `src/orch/rollout.nova`
+**Node-level rolling upgrade** happens across nodes, driven by the leader lease. `src/orch/rollout.ky`
 walks the nodes one at a time: if a node is the live leader, it releases the lease and promotes a peer
 *before* the upgrade so leadership is never lost; it upgrades the node; the node rejoins as a standby; and
 a failed upgrade rolls back and stops the roll. `orchctl upgrade-plan <file>` prints this node order so
 you can review it before it touches a live cluster.
 
-**The HA leader lease** underneath all this is in `src/orch/asynclease.nova` (`AsyncLeaderLease`; there is
-a synchronous sibling in `lease.nova`). orchd builds it in its HA path against the `leases/orchd` key with
+**The HA leader lease** underneath all this is in `src/orch/asynclease.ky` (`AsyncLeaderLease`; there is
+a synchronous sibling in `lease.ky`). orchd builds it in its HA path against the `leases/orchd` key with
 a TTL of `max(reconcileMs * 5, 15000)` ms. The lease value encodes `holder|epoch|deadlineMs`. Acquisition
 is a compare-and-swap on the lease key, and the epoch is bumped on every takeover. Safety rests on that
 **fencing epoch**, not on wall-clock time: the CAS guarantees exactly one winner per epoch, and a new
@@ -350,11 +350,11 @@ connections the other replica is already serving.
 
 Two details that look like bugs if you get them wrong:
 
-- The rendezvous path is `/tmp/nova-<name>.sock`, and the **short path is deliberate**. AF_UNIX
+- The rendezvous path is `/tmp/kyte-<name>.sock`, and the **short path is deliberate**. AF_UNIX
   `sun_path` caps at roughly 104 bytes on macOS and 108 on Linux. Do not "portably" swap `/tmp` for
   `$TMPDIR` or `dir.tempDir()`; `/var/folders/...` overflows `sun_path` and breaks the macOS bind.
-  `NOVA_HANDOFF_SOCK` overrides the path when you need to, and the default in `bin/service.nova` is
-  `/tmp/nova-service.sock`.
+  `KYTE_HANDOFF_SOCK` overrides the path when you need to, and the default in `bin/service.ky` is
+  `/tmp/kyte-service.sock`.
 - It is same-host by design. Passing a file descriptor cannot cross a kernel, so the handoff fits
   co-resident replicas on one node, not replicas spread across machines.
 
@@ -381,7 +381,7 @@ orchctl upgrade-plan store.dump            # print the safe rolling-upgrade node
 it, then lets it rejoin, so a rolling upgrade never takes down the quorum.
 
 Backup and restore are a supported operation, though they are not a distinct `orchctl` subcommand.
-`src/orch/backup.nova` provides `dump(store, prefix)` (line-oriented, escaped `key<TAB>value`) and
+`src/orch/backup.ky` provides `dump(store, prefix)` (line-oriented, escaped `key<TAB>value`) and
 `restore(store, data)` (re-applies each entry, last write wins). `orchctl` is the operator surface over
 such a dump: loading a file is a restore into an in-memory store, saving it is a dump. The live config
 store itself is durable without any of this: artifactd snapshots it to `<root>/config.snap` after every
@@ -392,8 +392,8 @@ write and reloads it on start, so a restart keeps every key at its original revi
 `lang/docs/guide/examples/run-live.sh` puts it together against the real binaries. It:
 
 1. connects to PostgreSQL on `127.0.0.1:5432` and seeds a `products` table,
-2. builds the PostgreSQL-backed web app (`main_postgres.nova`) and starts two replicas on 8080 and 8081
-   via `NOVA_PORT`,
+2. builds the PostgreSQL-backed web app (`main_postgres.ky`) and starts two replicas on 8080 and 8081
+   via `KYTE_PORT`,
 3. exercises the app directly: a `POST /api/products` write through to PostgreSQL and a
    `GET /api/products/1` read back,
 4. builds the orchestrator with `./build.sh`, writes a `service.json` for the two replicas, validates it

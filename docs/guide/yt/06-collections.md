@@ -2,11 +2,11 @@
 
 - Chapter: [06-collections.md](../06-collections.md)
 - Estimated length: ~11 minutes
-- You will need: the `nova` compiler installed, a terminal, and the guide's `examples/` folder open
+- You will need: the `kyte` compiler installed, a terminal, and the guide's `examples/` folder open
 
 ## Hook (0:00)
 
-**Say:** Nova ships three generic collections in its standard library: `List`, `Map`, and `Set`. In this video we will use all three. You will learn how to grow a list and run pipelines over it, how a map stores key-value pairs with a hash function, and how a set keeps only unique elements. There is one recurring theme to watch for: accessors hand you an optional, and we will unwrap it as we go.
+**Say:** Kyte ships three generic collections in its standard library: `List`, `Map`, and `Set`. In this video we will use all three. You will learn how to grow a list and run pipelines over it, how a map stores key-value pairs with a hash function, and how a set keeps only unique elements. There is one recurring theme to watch for: accessors hand you an optional, and we will unwrap it as we go.
 
 ## What we will cover (0:30)
 
@@ -24,8 +24,8 @@
 **Say:** A `List<T>` is a growable, indexed vector. You import it from its module under `collections`. Let us build one of strings, poke at it, and then run a transform pipeline.
 
 **On screen:**
-```nova
-// examples/10_collections.nova
+```kyte
+// examples/10_collections.ky
 import collections.list;
 
 fn main(): void {
@@ -62,7 +62,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/10_collections.nova -o out && ./out
+kyte examples/10_collections.ky -o out && ./out
 ```
 
 ```
@@ -83,8 +83,8 @@ squares>4 count = 3, total = 50
 **Say:** A `Map<K, V>` is a hash map. Its constructor is a little different from what you may expect: it takes an initial capacity and a hash function for the key type. For string keys, that hash function is `string.hash`, so you import `string` too. Let us store some ages.
 
 **On screen:**
-```nova
-// examples/11_maps.nova
+```kyte
+// examples/11_maps.ky
 import collections.map;
 import string;
 
@@ -120,7 +120,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/11_maps.nova -o out && ./out
+kyte examples/11_maps.ky -o out && ./out
 ```
 
 ```
@@ -140,8 +140,8 @@ key count = 2
 **Say:** Last one: `Set<T>` stores unique elements. Adding a value that is already present is simply a no-op. Under the hood a set is a thin wrapper over a `Map` of `T` to `bool`, so it takes the same capacity and hash-function pair. There is one Beta quirk in this standalone example, and I will point it out.
 
 **On screen:**
-```nova
-// examples/12_sets.nova
+```kyte
+// examples/12_sets.ky
 import collections.set;
 import collections.map;
 import string;
@@ -186,7 +186,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/12_sets.nova -o out && ./out
+kyte examples/12_sets.ky -o out && ./out
 ```
 
 ```

@@ -1,6 +1,6 @@
-# The Nova Language — Specification & Reference
+# The Kyte Language — Specification & Reference
 
-**Spec version:** 0.1.0 (Beta) -- tracks the `nova version` release. Per `docs/STABILITY.md`, a 0.x
+**Spec version:** 0.1.0 (Beta) -- tracks the `kyte version` release. Per `docs/STABILITY.md`, a 0.x
 number means there is no cross-version stability guarantee yet; syntax and semantics may still change.
 
 **Status:** authoritative language reference, reverse-engineered from the compiler's actual behavior and
@@ -17,15 +17,15 @@ runtime ABI contract live in `docs/STABILITY.md` and `docs/abi/runtime-abi.md`.
 
 ## 1. Overview & toolchain
 
-Nova is a statically-typed, natively-compiled language with **deterministic automatic reference counting
+Kyte is a statically-typed, natively-compiled language with **deterministic automatic reference counting
 (ARC)** — no garbage collector, no manual `free`. Syntax is ES6/TypeScript-flavored; the compiler is
 written in Zig and emits native code via LLVM; the runtime is C++20 (Boost.Asio for async).
 
 **Commands:**
-- `nova build --file app.nova` → a **native executable** (the default target; `cargo build`-style). WASM
+- `kyte build --file app.ky` → a **native executable** (the default target; `cargo build`-style). WASM
   is opt-in via `--target wasm` *(→ fix 05ca77b; WASM build is currently unverified — see §15)*.
-- `nova test [file.nova]` → compiles `@test` functions with a harness and runs them.
-- `nova fmt`, `nova init`, `nova add`, `nova get` — formatting, scaffolding, dependencies.
+- `kyte test [file.ky]` → compiles `@test` functions with a harness and runs them.
+- `kyte fmt`, `kyte init`, `kyte add`, `kyte get` — formatting, scaffolding, dependencies.
 
 A program's entry is `fn main(): void`. Command-line arguments are read via `env.args()` *(→ 54_process_args)*.
 
@@ -118,11 +118,11 @@ directly (`(int | undefined)` parses as a tuple).
 
 ### 3.5 Error unions — `T | E`
 
-Nova's error model: a function that can fail returns `T | E` where `E` is a user error type (an enum,
+Kyte's error model: a function that can fail returns `T | E` where `E` is a user error type (an enum,
 struct, or an **`exception`**). **Errors are values you return, not exceptions in the throwing sense**
 *(→ 33_error_union, 32_error_payloads, 266_exception)*:
 
-```nova
+```kyte
 fn readConfig(path: string): string | ConfigError { … }
 ```
 
@@ -150,7 +150,7 @@ fn readConfig(path: string): string | ConfigError { … }
 
 `T | E | undefined` composes the two: read as `(T | undefined) | E` (absence vs failure). There is **no
 stack unwinding**: `try`/`catch` are branches on a value — nothing leaks, no UB under coroutines.
-`try { … }` as a statement block is a **parse error** (Nova has no exceptions).
+`try { … }` as a statement block is a **parse error** (Kyte has no exceptions).
 
 ### 3.6 `decimal` — decimal128, complete
 
@@ -184,7 +184,7 @@ per-instantiation destructors and ARC) *(→ 07_generics, 02_generics_destructor
 
 ### 3.8 Structs, enums, traits
 
-```nova
+```kyte
 struct Point { pub x: int, pub y: int
     init(x: int, y: int) { self.x = x; self.y = y }
     pub fn sum(self: Point): int { return self.x + self.y }
@@ -201,7 +201,7 @@ struct Point { pub x: int, pub y: int
   explicitly. Every target field must be covered by either a convention match or an explicit value, or
   the literal is a **compile error** (build-time exhaustiveness, the AutoMapper `ForMember` model with
   static validation). This is the compiler-generated half of an entity→DTO mapper:
-  ```nova
+  ```kyte
   struct Product { image_url: string, is_vegetarian: bool, price: double, stock: int }
   struct ProductDto { imageUrl: string, veg: bool, price: double, label: string }
   fn toDto(p: Product): ProductDto {
@@ -241,7 +241,7 @@ struct Point { pub x: int, pub y: int
   expect_fail/from_spread_uncovered_field, expect_fail/from_spread_type_mismatch,
   expect_fail/generic_spread_uncovered)*.
 - **Enums** are tagged; variants may be payload-less or carry a payload:
-  ```nova
+  ```kyte
   enum Color { Red, Green, Blue }          // Color.Red
   enum Tagged { N(int), S(string) }        // Tagged.N(3)
   enum Shape { Rect(int, int) }            // tuple-form, multiple payloads; matched positionally
@@ -250,14 +250,14 @@ struct Point { pub x: int, pub y: int
   A tuple-form variant may carry more than one payload; `case Shape.Rect(w, h)` binds them by position, and
   a struct-form variant (`Rect { w: int, h: int }`) binds by name *(→ 298_tuple_payload_multi_enum)*.
 - **Traits** are interfaces with dynamic dispatch (vtables):
-  ```nova
+  ```kyte
   trait Speaker { fn speak(self: Speaker): int; }
   struct Dog impl Speaker { pub fn speak(self: Dog): int { return 5; } }
   fn make(): Speaker { return Dog(); }     // factory returning a trait object
   ```
   Trait-typed bindings, downcasts (`x as T`), and factory returns all work *(→ 12_traits_dispatch,
   44_downcast_and_struct_literal_args)*. A trait->concrete downcast is CHECKED at runtime: the trait
-  object's vtable must match the target concrete type, or it traps (`nova_panic_cstr`) rather than
+  object's vtable must match the target concrete type, or it traps (`kyte_panic_cstr`) rather than
   silently reinterpreting memory *(→ 305_checked_trait_downcast)*.
   A trait method may carry a **default body** (`fn greet(self: Self): string { … }`); an impl'ing struct
   inherits it unless it defines its own. The default is copied onto the struct, so it works on a concrete
@@ -265,7 +265,7 @@ struct Point { pub x: int, pub y: int
   the impl'ing struct must be declared in one module.)
 - **Generic traits** — a trait may take type parameters that appear in its method
   signatures, and an impl supplies concrete type arguments:
-  ```nova
+  ```kyte
   trait Handler<Q, R> { fn handle(self, req: Q): R; }
   struct GetUserHandler impl Handler<GetUser, UserDto> {
       fn handle(self, req: GetUser): UserDto { return UserDto{ id: req.id, name: "Ada" }; }
@@ -298,7 +298,7 @@ one is known; `any` exists for genuinely heterogeneous storage (for example a DI
 
 ## 4. Ownership & memory model
 
-Nova uses **RAII + ARC**. The compiler inserts retain/release so every heap object is freed exactly once
+Kyte uses **RAII + ARC**. The compiler inserts retain/release so every heap object is freed exactly once
 when its last owner goes away — deterministically, at scope exit, with no GC pauses.
 
 - **Disposition.** Every expression is *owned* (a fresh `+1` the statement must consume) or *borrowed*
@@ -322,7 +322,7 @@ payloads. Not owned: `int`/`long`/`float`/`bool`/`ptr`/enums.
 ## 5. Declarations
 
 ### 5.1 Functions & methods
-```nova
+```kyte
 fn add(a: int, b: int): int { return a + b }
 fn id<T>(x: T): T { return x }            // generic
 fn show<T>(x: T): string where T: Show { return x.show() }   // `where` clause: accepted, advisory
@@ -352,7 +352,7 @@ optional-binding loop: it runs while `opt` is present, binding the narrowed valu
 
 ### 6.2 `for` — all four forms
 The increment lives in its own block, so `continue` runs it for every form *(→ 53_for_loops)*:
-```nova
+```kyte
 for (let i: int = 0; i < n; i = i + 1) { … }   // C-style
 for (i in 0..n)   { … }                         // range, exclusive
 for (i in 1..=n)  { … }                         // range, inclusive
@@ -362,7 +362,7 @@ for ((k, v) in m) { … }                         // map — over keys()/get()
 `break` and `continue` work in all forms.
 
 ### 6.3 `switch`
-```nova
+```kyte
 switch (self) {
     case Color.Red:   { return 1; }
     case Tagged.N(v): { return v; }                    // binds the payload
@@ -402,7 +402,7 @@ Because a switch lowers to an integer jump table, each value/variant appears in 
   `name=""`). A void element must self-close (`<input .../>`). An NSX element expression has type `string`,
   so it composes like any other string: a `+` operand, a `{expression}` child, or a string-typed argument
   (`card("Title", <div>...</div>)`) all work without hoisting to a local first. View code may live in a
-  `.nsx` file, which the compiler treats exactly like `.nova` (same language) so JSX-heavy views file apart
+  `.nsx` file, which the compiler treats exactly like `.ky` (same language) so JSX-heavy views file apart
   from plain logic; imports are by module name and never mention the extension. *(→ nsx_attributes)*
 
 ---
@@ -412,7 +412,7 @@ Because a switch lowers to an integer jump table, each value/variant appears in 
 - **Import:** `import assert;`, `import collections.map;` — dotted paths address nested stdlib modules.
   Names are used qualified by the last segment: `map.Map<K,V>()`, `bson.BsonDocument{…}`.
   - A path segment is normally an identifier, but a **version directory** may be a bare integer:
-    `import crypto.tls.13.tls;` addresses `crypto/tls/13/tls.nova`, qualified as `tls.*`. The integer
+    `import crypto.tls.13.tls;` addresses `crypto/tls/13/tls.ky`, qualified as `tls.*`. The integer
     may not be the first segment.
 - **Compiler-provided `platform` module** *(→ this session)* — `import platform;` resolves to a module the
   compiler **synthesizes** from the compilation target (it is not a file on disk; its values always match
@@ -430,12 +430,12 @@ Because a switch lowers to an integer jump table, each value/variant appears in 
   behind a `platform` `if`** — the symbol would still be emitted and fail to link on the other OS. For
   divergent-extern code, use target-conditional files (next bullet) instead.
 - **Target-conditional files (build constraints)** *(→ this session)* — when resolving module `M`, if a
-  file `M_<os>.nova` exists next to `M.nova` (where `<os>` is the target's `platform.os` value), the
+  file `M_<os>.ky` exists next to `M.ky` (where `<os>` is the target's `platform.os` value), the
   suffixed file is compiled **instead of** the base file. So `import os.backend;` compiles
-  `os/backend_darwin.nova` on macOS, `os/backend_linux.nova` on Linux, `os/backend_windows.nova` on
+  `os/backend_darwin.ky` on macOS, `os/backend_linux.ky` on Linux, `os/backend_windows.ky` on
   Windows. This is how whole modules with platform-divergent syscalls (e.g. the reactor's kqueue / epoll
   / IOCP backends) are selected — the non-target files are never parsed, so their externs never reach the
-  linker. The base `M.nova` (if present) is the fallback when no suffixed file matches the target.
+  linker. The base `M.ky` (if present) is the fallback when no suffixed file matches the target.
 - **`pub`** marks a declaration exported from its module. **Cross-module visibility is enforced**: a
   non-`pub` **function**, **type** (struct/enum), or **const** referenced from another module is a hard
   error — "not public" *(→ this session, commit 7d7a76d; the stdlib is `pub` where it must be)*.
@@ -447,7 +447,7 @@ Because a switch lowers to an integer jump table, each value/variant appears in 
 ## 9. Concurrency
 
 `async` / `await` / `spawn` over a Boost.Asio coroutine runtime *(→ 10_async_go, 11_channels)*:
-```nova
+```kyte
 async fn fetch(): int { … }
 let f = spawn fetch();   // launch concurrently → Future
 let v = await f;         // suspend until it completes
@@ -523,7 +523,7 @@ that breaks any case fails the gate.
 
 ## 15. Known gaps (honest)
 
-- **WASM build** ⏳ — `nova build --target wasm` is unverified and currently fails even for trivial
+- **WASM build** ⏳ — `kyte build --target wasm` is unverified and currently fails even for trivial
   programs (the WASM codegen branch lacks the test-harness externs and has no `--wasm` conformance run).
   Native is the working default. CLAUDE.md still lists WASM as a strategic target.
 - **Function cross-module visibility** — has a multi-segment-import hole (a non-`pub` function reachable

@@ -2,11 +2,11 @@
 
 - Chapter: [18-data-access.md](../18-data-access.md)
 - Estimated length: ~15 minutes
-- You will need: Nova installed, a terminal, and the guide's `examples/` folder handy (`28_db_drivers.nova` and the `webapp/` project). Watching Video 16 on serialization and Video 17 on the web service first will help.
+- You will need: Kyte installed, a terminal, and the guide's `examples/` folder handy (`28_db_drivers.ky` and the `webapp/` project). Watching Video 16 on serialization and Video 17 on the web service first will help.
 
 ## Hook (0:00)
 
-**Say:** In the last video we built a web service, but it kept its products in memory. Real services use a database. In this video you will see how Nova talks to one. There is a single interface, the `Connection` seam, that every driver implements, so the code you write does not change when you change databases. You will see the drivers, the connection strings, how the micro-ORM turns rows into your typed structs, and finally we will take the exact web app from the last video and point it at a live PostgreSQL by changing one file.
+**Say:** In the last video we built a web service, but it kept its products in memory. Real services use a database. In this video you will see how Kyte talks to one. There is a single interface, the `Connection` seam, that every driver implements, so the code you write does not change when you change databases. You will see the drivers, the connection strings, how the micro-ORM turns rows into your typed structs, and finally we will take the exact web app from the last video and point it at a live PostgreSQL by changing one file.
 
 ## What we will cover (0:30)
 
@@ -22,7 +22,7 @@
 
 ## Segment: One seam, many drivers (1:00)
 
-**Say:** Nova has one data-access interface, the `Connection` trait in `data.db`. Every database is a separate driver package that implements it. You pick the driver in one place, and everything above it is driver-agnostic.
+**Say:** Kyte has one data-access interface, the `Connection` trait in `data.db`. Every database is a separate driver package that implements it. You pick the driver in one place, and everything above it is driver-agnostic.
 
 **On screen:**
 ```
@@ -51,10 +51,10 @@ PgDriver().connect("127.0.0.1:5432");                                 // minimal
 
 ## Segment: Typed parameters (3:45)
 
-**Say:** Now, the most important rule in this whole video: never build SQL by pasting values into strings. Nova passes values as typed `DbValue` parameters, with dollar-one, dollar-two placeholders that the driver fills in safely.
+**Say:** Now, the most important rule in this whole video: never build SQL by pasting values into strings. Kyte passes values as typed `DbValue` parameters, with dollar-one, dollar-two placeholders that the driver fills in safely.
 
 **On screen:**
-```nova
+```kyte
 import list;
 import data.db;
 
@@ -73,7 +73,7 @@ let rs = await conn.query("SELECT id, name FROM users WHERE id = $1", params);
 **Say:** Reading cells by index is tedious. The micro-ORM in `data.orm` binds a whole result set into your typed structs, matching columns to fields by name. Mark the struct `@serializable` and the compiler generates the binder.
 
 **On screen:**
-```nova
+```kyte
 import data.orm;
 
 @serializable pub struct Product {
@@ -85,11 +85,11 @@ let products = orm.bindAll<Product>(rs);   // List<Product>
 let one      = orm.bindOne<Product>(rs);   // Product | undefined
 ```
 
-**Say:** `bindAll` gives you a typed list, `bindOne` gives you the first row or `undefined` for an empty result, which fits Nova's optionals. The example `28_db_drivers.nova` builds a result set exactly the way a driver returns one, then binds it, all offline. Let us run it.
+**Say:** `bindAll` gives you a typed list, `bindOne` gives you the first row or `undefined` for an empty result, which fits Kyte's optionals. The example `28_db_drivers.ky` builds a result set exactly the way a driver returns one, then binds it, all offline. Let us run it.
 
 **Run it:**
 ```sh
-nova test docs/guide/examples/28_db_drivers.nova
+kyte test docs/guide/examples/28_db_drivers.ky
 ```
 
 **On screen:**
@@ -109,7 +109,7 @@ Results: ... passed, 0 failed
 **Say:** Keep the data access out of your handlers by putting it behind a repository. The key detail is the field type: it holds the `Connection` trait, not a concrete driver, so the same repository runs against any database.
 
 **On screen:**
-```nova
+```kyte
 pub struct ProductRepository impl Service {
     conn: Connection,                       // the trait, not a concrete type
     init(conn: Connection) { self.conn = conn; }
@@ -130,12 +130,12 @@ pub struct ProductRepository impl Service {
 **Say:** Here is the payoff. The web app from Video 17 built an in-memory connection in its composition root. That in-memory connection implements the same `Connection` trait PostgreSQL does, which is why the repository never noticed the difference. To move onto a real database we change the composition root and nothing else. There is no container and no downcast: we construct a different `Connection` and pass it to the same repository.
 
 **On screen:**
-```nova
-// main.nova (in-memory, the default build)
+```kyte
+// main.ky (in-memory, the default build)
 let conn = InMemoryConnection();
 let repo = ProductRepository(conn);
 
-// main_postgres.nova (the same app, live PostgreSQL): only the connection changes
+// main_postgres.ky (the same app, live PostgreSQL): only the connection changes
 let conn = PooledConnection(dsn, poolSize);   // a Connection over a PostgreSQL pool
 let repo = ProductRepository(conn);
 ```
@@ -161,7 +161,7 @@ cd docs/guide/examples && ./run-live.sh
 
 **Say:** Let us recap.
 
-- Nova has one data-access seam, `Connection`, and a driver per database: PostgreSQL, MySQL, SQL Server, MongoDB.
+- Kyte has one data-access seam, `Connection`, and a driver per database: PostgreSQL, MySQL, SQL Server, MongoDB.
 - A connection string is a URL, `postgresql://user:pass@host:port/name`, and a bare host and port works too.
 - Values are typed `DbValue` parameters with dollar-N placeholders, never string-concatenated.
 - The micro-ORM binds rows into `@serializable` structs with `bindAll` and `bindOne`.

@@ -2,7 +2,7 @@
 
 - Chapter: [05-functions-and-closures.md](../05-functions-and-closures.md)
 - Estimated length: ~10 minutes
-- You will need: the `nova` compiler installed, a terminal, and the guide's `examples/` folder open
+- You will need: the `kyte` compiler installed, a terminal, and the guide's `examples/` folder open
 
 ## Hook (0:00)
 
@@ -22,8 +22,8 @@
 **Say:** A function is declared with `fn`. Parameters are typed, and the return type comes after the parameter list. If a function returns nothing you annotate it `void`. Generics take type parameters in angle brackets, and at the call site you write the type argument explicitly. Let us look at one program that shows all of these together.
 
 **On screen:**
-```nova
-// examples/08_functions.nova
+```kyte
+// examples/08_functions.ky
 
 // A plain function: typed parameters, a declared return type.
 fn add(a: int, b: int): int {
@@ -56,7 +56,7 @@ struct Counter {
 
 fn main(): void {
     console.log(`add(2, 3) = ${add(2, 3)}`);
-    greet("Nova");
+    greet("Kyte");
 
     // identity works at any type; each call is a distinct instantiation.
     console.log(`identity<int>(42) = ${identity<int>(42)}`);
@@ -75,27 +75,27 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/08_functions.nova -o out && ./out
+kyte examples/08_functions.ky -o out && ./out
 ```
 
 ```
 add(2, 3) = 5
-hello, Nova
+hello, Kyte
 identity<int>(42) = 42
 identity<string>("hi") = hi
 firstOf<int>(10, 20) = 10
 c.bumped() = 42
 ```
 
-**Say:** Everything lines up. `Counter(41)` starts the value at 41, and `bumped` returns 41 plus 1, which is 42. One important note on generics: Nova monomorphizes them. That means `identity<int>` and `identity<string>` compile to separate specialised bodies, not one type-erased routine. You get the convenience of generics with the performance of hand-written specialised code.
+**Say:** Everything lines up. `Counter(41)` starts the value at 41, and `bumped` returns 41 plus 1, which is 42. One important note on generics: Kyte monomorphizes them. That means `identity<int>` and `identity<string>` compile to separate specialised bodies, not one type-erased routine. You get the convenience of generics with the performance of hand-written specialised code.
 
 ## Segment: closures (5:00)
 
 **Say:** Now to closures. A closure is an anonymous function written with the fat arrow: params, then `=>`, then a body. The body is either a single expression, like `(x) => x + 1`, or a block wrapped in braces. Two things make closures special. First, their parameters are untyped, the types are inferred from how the closure is used. Second, a closure captures variables from the surrounding scope by value, meaning it takes a snapshot at creation time. Here they are in action, mostly feeding higher-order list methods.
 
 **On screen:**
-```nova
-// examples/09_closures.nova
+```kyte
+// examples/09_closures.ky
 import collections.list;
 
 fn main(): void {
@@ -133,7 +133,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/09_closures.nova -o out && ./out
+kyte examples/09_closures.ky -o out && ./out
 ```
 
 ```
@@ -151,7 +151,7 @@ sum = 10
 **Say:** Let us recap:
 
 - Functions use `fn` with typed parameters and a return type after the list, and `void` when nothing is returned.
-- Generics take `<T>` and are called with an explicit type argument like `identity<int>(42)`, and Nova monomorphizes them into specialised bodies.
+- Generics take `<T>` and are called with an explicit type argument like `identity<int>(42)`, and Kyte monomorphizes them into specialised bodies.
 - Methods take `self`; free functions do not.
 - Closures use the fat arrow, have untyped parameters, and capture surrounding variables by value.
 - `map` transforms, `filter` selects, and `reduce` folds a list to a single value.

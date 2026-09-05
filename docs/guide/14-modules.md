@@ -1,9 +1,9 @@
 # 14. Modules & visibility
 
-Every `.nova` file is a **module**. You bring one module into another with `import`, and you control
+Every `.ky` file is a **module**. You bring one module into another with `import`, and you control
 what crosses a module boundary with `pub`. There are three kinds of import, all using the same syntax:
 
-- **Sibling files:** `import geometry;` resolves `geometry.nova` in the same directory.
+- **Sibling files:** `import geometry;` resolves `geometry.ky` in the same directory.
 - **Stdlib paths:** dotted, e.g. `import collections.list;`. You always **qualify by the last
   segment**, so `collections.list` is used as `list.List`, `serde.json` as `json.*`, and so on.
 - **The `platform` module:** `import platform;` pulls in a module the **compiler synthesises** for the
@@ -14,12 +14,12 @@ Visibility is opt-in. A declaration is private to its module unless it is marked
 marks its fields and methods `pub` individually. Referencing a non-`pub` declaration from another module
 is a **hard compile error**, not a warning, so a module's surface is exactly what it says `pub` on.
 
-First, the sibling module, a small `geometry.nova` with one `pub struct` and two `pub fn`s (plus a
+First, the sibling module, a small `geometry.ky` with one `pub struct` and two `pub fn`s (plus a
 private helper that importers can't see):
 
-```nova
-// examples/geometry.nova
-// A tiny sibling module imported by 20_modules.nova. Only `pub` declarations are
+```kyte
+// examples/geometry.ky
+// A tiny sibling module imported by 20_modules.ky. Only `pub` declarations are
 // visible to other modules; a non-pub struct/fn referenced from another file is a
 // hard compile error. Both the struct and the free function below are `pub`.
 
@@ -47,7 +47,7 @@ pub fn perimeter(a: Point, b: Point): int {
 }
 
 // A @test so the guide's run_all.sh exercises this module directly (it has no
-// `main`). Importers ignore @test functions; they run only under `nova test`.
+// `main`). Importers ignore @test functions; they run only under `kyte test`.
 import assert;
 
 @test
@@ -61,11 +61,11 @@ fn t_geometry(): void {
 
 Now the program that imports it, plus a stdlib module and `platform`:
 
-```nova
-// examples/20_modules.nova
-// A Nova program is a set of MODULES that `import` one another.
+```kyte
+// examples/20_modules.ky
+// A Kyte program is a set of MODULES that `import` one another.
 //
-//   * `import geometry;`         : a SIBLING file (geometry.nova in this dir).
+//   * `import geometry;`         : a SIBLING file (geometry.ky in this dir).
 //   * `import collections.list;` : a dotted stdlib path; you qualify by the LAST
 //                                  segment, so `collections.list` becomes `list.List`.
 //   * `import platform;`         : a module the COMPILER synthesises for the build

@@ -2,7 +2,7 @@
 //! basic-block IR so the release-balance verifier can PROVE that every owned
 //! value is destroyed exactly once (no leak, no double-free).
 //!
-//! This is the front half of the `NOVA_OSSA` self-check. Codegen's real ARC is
+//! This is the front half of the `KYTE_OSSA` self-check. Codegen's real ARC is
 //! decided elsewhere (`codegen/arc.zig`); this pass is a SEPARATE, conservative
 //! model whose only job is to catch ownership imbalances at compile time. It
 //! walks the typed AST, tracks the set of live owned locals in scope, and emits
@@ -50,11 +50,11 @@
 //! Entry points: [`lowerFunction`] lowers one function; [`report`] /
 //! [`reportQuiet`] lower every function in a program, run the verifier and
 //! forwarding census, and (in `hard` mode) FAIL THE BUILD with a non-zero exit
-//! if any lowered function is imbalanced. This is what the `NOVA_OSSA` gate
+//! if any lowered function is imbalanced. This is what the `KYTE_OSSA` gate
 //! calls.
 
 const std = @import("std");
-/// Nova AST node definitions: the `Statement`/`Expression` shapes this pass walks.
+/// Kyte AST node definitions: the `Statement`/`Expression` shapes this pass walks.
 const ast = @import("../../ast.zig");
 /// The type engine. Used only for [`TypeStore.isOwnedSafe`], the fallback that
 /// decides whether an initialiser produces an ARC-owned value.
@@ -966,7 +966,7 @@ pub fn report(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const Typed
 /// [`lowerAndCheck`] for each into a [`Counts`]. When not `quiet`, prints the
 /// coverage table. When `hard` and any lowered function was imbalanced, prints
 /// the OSSA gate failure (naming the first offender) and calls
-/// `std.process.exit(1)` to FAIL THE BUILD; this is the `NOVA_OSSA` gate's teeth.
+/// `std.process.exit(1)` to FAIL THE BUILD; this is the `KYTE_OSSA` gate's teeth.
 pub fn reportQuiet(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const TypedIr, program: *const ast.Program, hard: bool, quiet: bool) void {
     var c = Counts{};
     for (program.declarations) |decl| {
@@ -983,7 +983,7 @@ pub fn reportQuiet(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const 
         std.debug.print(
             "\x1b[1m\x1b[31mOSSA OWNERSHIP GATE FAILED:\x1b[0m {d} function(s) have an ARC release imbalance " ++
             "(a leak or double-free the release-balance verifier proved). First: '{s}'.\n" ++
-            "(Set NOVA_OSSA=off to disable this check, or NOVA_OSSA=1 for the full coverage report.)\n",
+            "(Set KYTE_OSSA=off to disable this check, or KYTE_OSSA=1 for the full coverage report.)\n",
             .{ c.imbalanced, c.first_imbalance_fn },
         );
         std.process.exit(1);
@@ -999,7 +999,7 @@ pub fn reportQuiet(gpa: std.mem.Allocator, store: *const TypeStore, tir: *const 
 fn printCensus(c: *const Counts) void {
     const cov: usize = if (c.total == 0) 0 else (c.lowered * 100) / c.total;
     std.debug.print(
-        "=== OSSA-lite lowering + verify (NOVA_OSSA, I2 slice 1) ===\n" ++
+        "=== OSSA-lite lowering + verify (KYTE_OSSA, I2 slice 1) ===\n" ++
         "  functions            : {d}\n" ++
         "  lowered (straight-line, owned-locals modelled) : {d}  ({d}% coverage)\n" ++
         "  deferred (control flow / uncertain)            : {d}\n" ++

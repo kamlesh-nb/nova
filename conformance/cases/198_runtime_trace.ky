@@ -1,0 +1,12 @@
+import assert;
+
+@test
+fn test_trace_is_a_noop_when_disabled(): void {
+    kyte_trace_msg("this line only appears when KYTE_TRACE is set");
+    let i = 0;
+    while (i < 3) {
+        kyte_trace_kv("iteration", i as long);
+        i = i + 1;
+    }
+    assert.isTrue(kyte_trace_enabled() == 0 || kyte_trace_enabled() == 1);
+}

@@ -1,4 +1,4 @@
-# Nova — Execution Plan & Design (every incomplete roadmap item)
+# Kyte — Execution Plan & Design (every incomplete roadmap item)
 
 **Purpose.** The roadmap (`feature-roadmap.md`) says *what* and *why*; it is too coarse to implement
 from without drift. This document is the *how* — one design per incomplete item — and the single place
@@ -29,7 +29,7 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
 - **A2 — async function-coloring soundness + the sync→async deadlock fixed ✅** (`dd2a9ea`). A sync web
   request handler that drove an `async fn` DB call NESTED-block-drive-DEADLOCKED (silent hang) under a live
   server. Fixed in three coordinated parts: (1) **runtime nested-block-drive guard** — a thread-local
-  run-depth counter around every `io.run()`; `nova_run_root` aborts LOUDLY (SIGABRT) instead of hanging when
+  run-depth counter around every `io.run()`; `kyte_run_root` aborts LOUDLY (SIGABRT) instead of hanging when
   a block-drive is attempted from inside the event loop; (2) **call-side function coloring** — a bare
   (non-`await`/`spawn`) call to an `async fn` inside an `async fn` is now a typecheck error (the `await`-in-
   sync half already existed); deliberately narrower than "forbid all sync→async" so the tested sync-top-level
@@ -39,12 +39,12 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
   accept-loop coroutine, so **per-request DB works** (flagship: real `await repo.productName(id)` through the
   fetched nova-postgres driver — the flow that used to hang). Gates `185_async_handler_chain` +
   expect_fail `bare_async_call_in_async`; specs.md §9 documents coloring. Native **179/179**, ASAN **327/327**.
-- **`nova build` relink-on-runtime-change ✅** (`1973cf5`) — the T6 cache keyed only on `.nova` source
-  content, so a runtime-only edit (re-synced `~/.nova/lib/libnova_runtime.a`) left the hash unchanged and
+- **`kyte build` relink-on-runtime-change ✅** (`1973cf5`) — the T6 cache keyed only on `.ky` source
+  content, so a runtime-only edit (re-synced `~/.kyte/lib/libkyte_runtime.a`) left the hash unchanged and
   kept the OLD runtime linked (`rm -rf build` workaround). `linkLibsStamp` now folds the linked static libs'
   mtimes into the cache key → a runtime change forces a relink; unchanged sources still cache-hit.
 - **Orchestrator perf test (flagship in orch) ✅** — flagship behind `nova-orchestrator`'s `net.proxy` Pool
-  (round-robin) over 3 replicas (`NOVA_PORT` added for multi-replica runs). 8-core mac, release: **~47.6k
+  (round-robin) over 3 replicas (`KYTE_PORT` added for multi-replica runs). 8-core mac, release: **~47.6k
   rps** `GET /` through the proxy vs ~48.9k direct (near-zero LB overhead, 100% success); **~10.2k rps** on
   the per-request DB path (each request opens a real TCP connect). LB verified **20/20/20** perfect
   round-robin across replicas.
@@ -61,10 +61,10 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
   module ~82 KB; native binary ~142 KB. **For real end-to-end flagship HTTP throughput see the orchestrator
   perf bullet above: ~48.9k rps direct / 47.6k via proxy / 10.2k DB path.** The ~500k-vs-~49k gap is exactly
   the I/O + HTTP + scheduling cost this microbenchmark excludes (compute ~1.95 µs/req; the rest ~18 µs/req).
-- **Cross-language head-to-head (real HTTP rps) ✅** — `flagship/bench/headtohead/`: Nova `web.App` vs Go
+- **Cross-language head-to-head (real HTTP rps) ✅** — `flagship/bench/headtohead/`: Kyte `web.App` vs Go
   `net/http` vs Rust `axum` vs C# ASP.NET minimal API, each answering `GET /` with the SAME constant JSON,
-  built release, loaded with `oha` 15s @ 64 conns. 8-core arm64: **Rust 143.1k, Go 122.0k, C# 120.1k, Nova
-  48.7k rps.** Nova is ~2.5–2.9× behind the tuned frameworks end-to-end. HONEST READ: this is NOT a codegen
+  built release, loaded with `oha` 15s @ 64 conns. 8-core arm64: **Rust 143.1k, Go 122.0k, C# 120.1k, Kyte
+  48.7k rps.** Kyte is ~2.5–2.9× behind the tuned frameworks end-to-end. HONEST READ: this is NOT a codegen
   gap (LLVM backend; the compute core is already native-tier, ~1.95 µs/req) — it is the young HTTP/IO stack +
   ARC per-request allocation traffic + `web.App`'s per-request mediator dispatch (ValueSource + trait
   dispatch) doing more than a bare handler. Closing it is runtime/framework hot-path engineering (zero-copy
@@ -76,7 +76,7 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
   state, ~29% unbatched send/recv syscalls, ~7% HTTP parse/framework. Two profile-guided fixes landed: (1)
   runtime — the ARC audit guard was a function-local `static` (thread-safe-static check on EVERY alloc/free +
   blocked inlining) → load-once global; (2) framework — `Request.fromString` built 3 cap-16 hash maps per
-  request (query/headers/cookies) even when unused → cap 1–8, still auto-resizing. Result: Nova **48.7k →
+  request (query/headers/cookies) even when unused → cap 1–8, still auto-resizing. Result: Kyte **48.7k →
   55.4k rps at c=64 (+14%)**, gap to Go/Rust/C# narrowed from ~2.5–2.9× to ~2.2–2.4×; corpus 180/180, ASAN
   329/329 green. Open levers (bigger): per-reactor lockless CoroState, full per-request arena / in-place
   header parse, syscall batching — all on Asio, no rewrite.
@@ -86,54 +86,54 @@ An item is **never** ✅ on "it compiles" or "the happy path works" — only on 
 - **N1 — Network I/O stack: share-nothing thread-per-core on Asio (Path A), P0→P5 + P2 ✅.** Decided over
   a from-scratch io_uring loop (tradeoff doc); S/R rejected. Runtime = N=cores-1 independent reactors,
   coroutines pinned (strands are no-ops), SO_REUSEPORT per-reactor accept fan-out, **proxy pooling limit
-  gone structurally**, P2 lock-striping for contention. `NOVA_THREADS=1`=rollback. Native 177/177 + ASAN
-  324/324 every phase; **Linux distribution Docker-verified with a real nova server** (90 conns even/6
+  gone structurally**, P2 lock-striping for contention. `KYTE_THREADS=1`=rollback. Native 177/177 + ASAN
+  324/324 every phase; **Linux distribution Docker-verified with a real kyte server** (90 conns even/6
   reactors). See the N1 row + `docs/design/{network-io-stack-tradeoff,path-a-share-nothing-scope}.md`.
 - **T1 zlib cross-gap fixed** (`c93004d`): vendored zlib → FULL-runtime programs (servers/proxies) now
   cross-compile to Linux; live-verified.
 - **11-bug language/web/serde correctness sweep** (gates 168–176, corpus 167→177, ASAN 305→324): enum
   method-return + payload-less-enum-optional-tag0 (168), value-optional STRUCT FIELD boxing (169),
   @serializable OPTIONAL field bind+toJson+dump (170/174) + enum-FIELD serde string-name (176), trait-impl
-  method visibility (171), **5 stdlib WEB MIDDLEWARE modules that didn't compile** + fs.nova (172), module-
+  method visibility (171), **5 stdlib WEB MIDDLEWARE modules that didn't compile** + fs.ky (172), module-
   qualified enum variant (173), **string.parseI64 2^31 overflow** (175). Lesson: uncovered stdlib modules
   rot silently — each fix added permanent gate coverage.
 
 ## ✅ Recently completed (2026-07-21 session) — foundation closed, roadmap advancing
 
-These are DONE and verified (ASAN + `NOVA_ARC_AUDIT` + corpus), not "compiles":
+These are DONE and verified (ASAN + `KYTE_ARC_AUDIT` + corpus), not "compiles":
 - **F1–F5 memory-safety CLOSED** — A1 (`??` owned-default UAF), C2 (heterogeneous if-expr SEGV), the
   struct-field/tuple/err-union destructor cutover, nested-owned-list dtor, array-literal owned-temp, and
   the trait-widening fat-pointer leak all fixed. Corpus 103/103; ASAN + ARC-audit at floor.
 - **Monomorphization COMPLETE** — abstract residue fully eliminated (`c8e1769`); worklist discovers
   method-return instantiations, spec-vs-base ARC reconciled, erased dead bodies dropped via reachability
   closure (M3-R1 `88db887` / R2 `992a6bb`).
-- **NovaDB end-to-end LIVE** — Nova → running server: connect / DDL / insert / query / typed-decode,
+- **NovaDB end-to-end LIVE** — Kyte → running server: connect / DDL / insert / query / typed-decode,
   ARC-clean (2 driver leaks fixed, `9a86f41`).
-- **D4 — YCSB A–F in Nova vs live NovaDB** ✅ — full suite runs (release: ~20–30K ops/sec), ARC-clean,
+- **D4 — YCSB A–F in Kyte vs live NovaDB** ✅ — full suite runs (release: ~20–30K ops/sec), ARC-clean,
   **measurably faster than the Python YCSB baseline** (`4c17abd`, `8a5da75`).
 - **Async runtime confirmed REAL** — multi-core (8 tasks 98 ms vs 616 ms serial; scales with
-  `NOVA_THREADS`), async I/O (8 concurrent sleeps 201 ms on 1 thread). Not the "synchronous shim" the
+  `KYTE_THREADS`), async I/O (8 concurrent sleeps 201 ms on 1 thread). Not the "synchronous shim" the
   old roadmap claimed.
 - **`fiber` retired → `spawn` keyword** — the C-runtime fiber shim deleted (`64df8f5`); `go`→`spawn`
   contextual keyword (`2a3573a`), soft so `process.spawn` still parses.
 - **PRODUCT SURFACE COMPLETE — T3 → W1 → W2 → W3 → T5** (see the "🏁 Product surface COMPLETE" section below
   and the master table): FFI (`extern("lib")`), native webview (bind/dispatch/NSX, 100%), `App.useStatic`
-  (LruCache + static store), outbound circuit breaker, and `nova init web`/`desktop` scaffolds.
+  (LruCache + static store), outbound circuit breaker, and `kyte init web`/`desktop` scaffolds.
 - **Bitwise operators `^` and `~`** (2026-07-22) — closed the incomplete bitwise set (`& | << >>` had no
   `^`/`~`). `^` = XOR with C-family precedence `& > ^ > |`; `~` = one's complement (lowers to LLVM `xor`/`not`);
   integers only. Spec §operators updated; gate `88_bitwise_xor` (values, precedence, `~`, `x & ~mask`, 64-bit
-  ulong). Retired the `(a|b)-(a&b)` XOR workaround in `crypto/random.nova`. Unblocks C1 (SCRAM's `ClientProof =
+  ulong). Retired the `(a|b)-(a&b)` XOR workaround in `crypto/random.ky`. Unblocks C1 (SCRAM's `ClientProof =
   ClientKey ^ ClientSignature`). Also added the **bitwise compound-assignments** `&= |= ^= <<= >>=` (desugar to
   `a = a <op> b`, like `+=`). The bitwise operator set (`& | ^ ~ << >>` + compounds) is now complete.
 - **General language/stdlib fixes landed this session** (all gated, corpus 103→108):
   - **typed lambda params** `(s: string) => …` (§10 #19) + **module-qualified const access** `mod.CONST` +
     confirmed function-type return annotations (`29a1f07`, gate `84`).
-  - **FFI callbacks** — `nova_invoke_str_closure` primitive; C invokes a Nova closure (gate `83`).
-  - **`nova test` was broken for EVERY user project** — std read from `~/.nova/std` took its absolute HOME
+  - **FFI callbacks** — `kyte_invoke_str_closure` primitive; C invokes a Kyte closure (gate `83`).
+  - **`kyte test` was broken for EVERY user project** — std read from `~/.kyte/std` took its absolute HOME
     path as identity → stdlib free fn collected/called under different spellings → `nextPowerOfTwo not found`;
     fixed in loadProgram (canonical `src/std/…` spelling) + a project-root `src/<module>` import fallback (`c13fb7c`).
-  - **latent stdlib bugs** exercised for the first time and fixed: `nova_file_read_all` typed `.string` →
-    `.int` (was ARC-releasing an int as a pointer → SIGSEGV, broke `File.readText`); `client.nova` `Request{…}`
+  - **latent stdlib bugs** exercised for the first time and fixed: `kyte_file_read_all` typed `.string` →
+    `.int` (was ARC-releasing an int as a pointer → SIGSEGV, broke `File.readText`); `client.ky` `Request{…}`
     missing `cookies`.
 
 The foundation + product surface are done. Remaining work is the non-product backlog: harness integrity (H1),
@@ -144,7 +144,7 @@ toolchain/tooling (T1/T2/T4).
 
 ## Priority policy (user, 2026-07-24): **LANGUAGE FIRST**
 
-The compiler/runtime/stdlib — **Nova the language** — is ALWAYS the top execution priority. NovaDB (a separate
+The compiler/runtime/stdlib — **Kyte the language** — is ALWAYS the top execution priority. NovaDB (a separate
 engine) and the orchestrator/infrastructure items (**R1, I1, I2, I3, I4, BT1**) are valuable and user-requested, but
 they are **sequenced AFTER language work**. The `⭐user` tag marks *user interest*, not execution order. Global
 ordering:
@@ -156,7 +156,7 @@ ordering:
    **⚠️ RELOCATED (2026-07-28):** I1–I4 are APPLICATIONS built on the language, NOT stdlib. They now ship as
    a separate package `packages/nova-orchestrator/` (net.proxy/autoscale/service, orch.*, os.sandbox) with its
    own `tests/` (gates 167/178–183) + `run-tests.sh`, resolved like the DB drivers. Only the runtime SEAMS
-   stay in the language: `nova_process_{try_wait,pid,spawn_isolated}`, `nova_aserver_listen_addr`,
+   stay in the language: `kyte_process_{try_wait,pid,spawn_isolated}`, `kyte_aserver_listen_addr`,
    `asyncio.sleep`, and R1's `process` module. The stdlib is pure language again.
 
 Rule of thumb: **if an item would pull focus off the language and it isn't unblocking a language feature, it waits.**
@@ -179,48 +179,48 @@ not instead of finishing it.
 | **C1** | crypto expansion: PBKDF2 + SCRAM-SHA-256 primitives | P4 | ✅ | `89_crypto_scram` (RFC 7677) | (this session) |
 | **D1** | MySQL live verification (MySQL 9, caching_sha2 auth) | P3 | ✅ | live via `ycsb_mysql` (A–F) | (this session) |
 | **D2** | MSSQL driver (TDS 7.4) — offline codec + **live SQL-auth (cleartext AND TLS/ENCRYPT_ON)**, decimal/money/unicode exact; NTLM deferred | P3 | ✅ | `100_mssql_codec` | `d72dac1`, `d377cf1`, `1f8448b`, `48b47f2` |
-| **D3** | MongoDB driver (OP_MSG + SCRAM) — shipped as a **PACKAGE**; now **async/non-blocking** + all 4 SQL drivers ALSO moved to `packages/nova-<name>` (db seam + generic pool stay std) | ⭐P6 | ✅ | `90_bson_binary` + package `tests/` (17/17) + live vs mongod | (this session) |
-| **D4** | YCSB benchmarks in Nova vs NovaDB | P2 | ✅ | bench A–F (live NovaDB) | `4c17abd` `8a5da75` |
+| **D3** | MongoDB driver (OP_MSG + SCRAM) — shipped as a **PACKAGE**; now **async/non-blocking** + all 4 SQL drivers ALSO moved to `packages/kyte-<name>` (db seam + generic pool stay std) | ⭐P6 | ✅ | `90_bson_binary` + package `tests/` (17/17) + live vs mongod | (this session) |
+| **D4** | YCSB benchmarks in Kyte vs NovaDB | P2 | ✅ | bench A–F (live NovaDB) | `4c17abd` `8a5da75` |
 | **D5** | YCSB over the `Driver` trait — driver-generic; **ALL FOUR engines (NovaDB + Postgres + MySQL + MSSQL) live** ✅ by swapping only the Driver | ⭐P3 | ✅ | `repro/ycsb/` (4 engines live) | (this session) |
 | **D6** | Driver **hardening + completeness DONE**: timeouts + pooling + circuit-breaker + **all auth** (MySQL fast **& RSA full**, **PG SCRAM**) + **real server-side prepared statements on all 4 engines** (PG extended-query, MySQL COM_STMT binary, MSSQL sp_prepare RPC, NovaDB); live on all. Async-recv now DONE under A1 (async-first seam → drivers non-blocking) | P3 | ✅ | `104`–`110` + driver gates + live | (this session) |
 | **E1** | Error model `T \| Error` — `try`/`catch`/`catch (e)` + **`errdefer`** ✅; unguarded `.field` on `T\|E` = located typecheck error; `throw` removed (two-register-return = deferred perf opt) | P4 | ✅ | `32`/`33`/`45`/`101_errdefer` + `errunion_unguarded` | (this session) |
-| **A1** | async: **`future<T>` first-class** ✅ + **`when_all`/`parallel_for` fan-out/join** ✅ + **async METHODS + async TRAIT methods w/ dynamic dispatch** ✅ + **AsyncStream (parking socket I/O)** ✅ + **non-blocking TLS** (wolfSSL memory-BIO pumped by Nova async; crypto stays in wolfSSL) ✅ + **AsyncIO trait** ✅ + **async-first `Connection` seam — ALL 5 drivers non-blocking** ✅ (PG+MySQL LIVE-PROVEN: 5 concurrent server-side sleeps on ONE scheduler thread overlap ~0.3–0.7s vs ~1.5s serial; MSSQL TDS-tunneled async TLS; MongoDB async live) + **async `Driver.connect` → pooling works INSIDE coroutines** ✅ (live: concurrent handlers each `await pool.acquire()`+query+release, second wave reuses idle conns) + **awaited-deadline recv timeouts** ✅ (`Connection.setTimeout` real on the async transport — recv raced against a timer, `nova_arecv_deadline`; live: `pg_sleep(1)` under 150ms → empty in ~0.15s) + **`select` over futures** ✅ (`selectAny<T>` — await first of N, non-consuming) + **whole-query deadline** ✅ (`withTimeout<T>`/`selectTimeout<T>`; live: `pg_sleep(2)` bounded to 300ms) + **actor stdlib layer** ✅ (`Mailbox<M>`+`Behavior<M>` trait+`runActor<M>`; required **generic trait objects**, also fixed) + **generic-return typecheck** ✅ (`foo<int>()` result resolves `T`→`int`, `List<T>`→`List<int>`, etc.). **A1 COMPLETE** | P4 | ✅ | `102_future_first_class`, `103_async_when_all`, `111`–`119` (async_trait / stream / tls / timeout / select / whole_query_deadline / actor / generic_return) | `e645bb7`,`bdf60f2`,(this session) |
-| **A2** | **async function-coloring soundness + sync→async deadlock FIXED** ✅ — (1) runtime nested-block-drive guard (thread-local `io.run()` depth; `nova_run_root` aborts LOUD instead of hanging); (2) call-side coloring: a bare (non-`await`/`spawn`) async call inside an `async fn` is a typecheck error (caught 2 real latent bugs); (3) async web handler chain (`handle`/`send`/`dispatch`/`respondMiss` all async) → **per-request DB works** (flagship real query, was a hang). Narrower than "forbid all sync→async" so the sync-top-level drive (case 111) stays legal | P0 soundness | ✅ | `185_async_handler_chain` + `bare_async_call_in_async` | `dd2a9ea` (PR #2) |
+| **A1** | async: **`future<T>` first-class** ✅ + **`when_all`/`parallel_for` fan-out/join** ✅ + **async METHODS + async TRAIT methods w/ dynamic dispatch** ✅ + **AsyncStream (parking socket I/O)** ✅ + **non-blocking TLS** (wolfSSL memory-BIO pumped by Kyte async; crypto stays in wolfSSL) ✅ + **AsyncIO trait** ✅ + **async-first `Connection` seam — ALL 5 drivers non-blocking** ✅ (PG+MySQL LIVE-PROVEN: 5 concurrent server-side sleeps on ONE scheduler thread overlap ~0.3–0.7s vs ~1.5s serial; MSSQL TDS-tunneled async TLS; MongoDB async live) + **async `Driver.connect` → pooling works INSIDE coroutines** ✅ (live: concurrent handlers each `await pool.acquire()`+query+release, second wave reuses idle conns) + **awaited-deadline recv timeouts** ✅ (`Connection.setTimeout` real on the async transport — recv raced against a timer, `kyte_arecv_deadline`; live: `pg_sleep(1)` under 150ms → empty in ~0.15s) + **`select` over futures** ✅ (`selectAny<T>` — await first of N, non-consuming) + **whole-query deadline** ✅ (`withTimeout<T>`/`selectTimeout<T>`; live: `pg_sleep(2)` bounded to 300ms) + **actor stdlib layer** ✅ (`Mailbox<M>`+`Behavior<M>` trait+`runActor<M>`; required **generic trait objects**, also fixed) + **generic-return typecheck** ✅ (`foo<int>()` result resolves `T`→`int`, `List<T>`→`List<int>`, etc.). **A1 COMPLETE** | P4 | ✅ | `102_future_first_class`, `103_async_when_all`, `111`–`119` (async_trait / stream / tls / timeout / select / whole_query_deadline / actor / generic_return) | `e645bb7`,`bdf60f2`,(this session) |
+| **A2** | **async function-coloring soundness + sync→async deadlock FIXED** ✅ — (1) runtime nested-block-drive guard (thread-local `io.run()` depth; `kyte_run_root` aborts LOUD instead of hanging); (2) call-side coloring: a bare (non-`await`/`spawn`) async call inside an `async fn` is a typecheck error (caught 2 real latent bugs); (3) async web handler chain (`handle`/`send`/`dispatch`/`respondMiss` all async) → **per-request DB works** (flagship real query, was a hang). Narrower than "forbid all sync→async" so the sync-top-level drive (case 111) stays legal | P0 soundness | ✅ | `185_async_handler_chain` + `bare_async_call_in_async` | `dd2a9ea` (PR #2) |
 | **S1** | serde completeness — exact decimal in JSON/YAML via manual API **and** `@serializable` structs ✅ + 2 pre-existing yaml ARC/co-import bugs fixed ✅ (F4-6 reparse-removal relocated to T6-1b; streaming = future enhancement) | P4 | ✅ | `96`–`99` (`serde_decimal_json/yaml`, `coimport`, `struct_decimal`) | `92b507f`, `9d7553a`, `0f41faa` |
 | **S2** | regex engine (bytecode-VM backtracking) + foundational early-`return`-in-loop double-free fix | P4/Tier3 | ✅ | `92_regex`, `93_loop_early_return_arc` | `54e31b4` |
 | **S3** | decimal follow-ups: div/mod-by-zero TRAP + explicit `int↔decimal` conv | Tier3 | ✅ | `94_decimal_conv` | `8541922` |
 | **S4** | text→decimal128 parser (`decimal.fromString`) + 3 DB drivers switched to exact `.dec` | P3 dep | ✅ | `95_decimal_parse` | `4c5adcc` |
-| **T1** | Toolchain + cross-compilation. **Cross-compile from macOS to Linux x86_64/arm64 (static ELF, runs) AND Windows x86_64 (PE32+, real ws2_32/mswsock imports) ✅** via bundled `zig c++` (crossLinkViaZig/mapCrossTarget). **Deps generalized off Homebrew ✅**: vendored Boost.Asio header subset (deps/boost, ~7MB) + static LLVM fetched from a self-hosted **lazy `build.zig.zon` mirror** (kamlesh-nb/llvm-dist) for linux-{aarch64,x86_64}=LLVM21 + macos-arm64=LLVM22 — static nova builds w/o NOVA_LLVM_PREFIX, `ldd`/`otool` show NO libLLVM. Windows COFF via `x86_64-pc-windows-gnu` triple + `-lws2_32 -lmswsock`. **zlib cross-gap FIXED (`c93004d`)**: vendored zlib (deps/zlib, in-memory subset) so FULL-runtime programs (any server/proxy → compress.cpp) now cross-compile to Linux — was blocked by host-only `-lz`; live-verified (gzip roundtrip + a real nova server on Linux). **Remaining:** UPLOAD the 3 LLVM tarballs to the mirror (go-live, needs GitHub); no-Xcode mac (`.tbd` stubs); x86_64-macos drop | ⭐user P5 | ● | cross build+run (Docker/colima) + CI `cross-compile` gate | `6f78008`,`a6eb6f1`,`33a2d29`,…,`c93004d` |
-| **T2** | WASM target: capability gate + compile + run. **Target-capability gate DONE**: native-only features (async/await/spawn, sockets/TLS/crypto/process/FFI runtime symbols) now produce CLEAN, LOCATED compile errors on the wasm target instead of CRASHING codegen (async) or a cryptic "not found" (externs). `@native {}`/`@wasm {}` conditional blocks are the "compiler flag" to exclude/branch native code. **Compile gate ratcheted 56→104** (accurate valid-wasm set). **Execution 0→5→57** (restored missing runtime-helper imports nova_valopt_box/_unbox/_panic, then FIXED #23): on wasm32 a pointer is 32-bit but nova's value handle is i64, so a pointer rides the LOW 32 bits with don't-care high bits (inside wasm, inttoptr truncates → memory access correct even when dirty; a re-entrant alloc leaves stack garbage there). A HOST import received the full i64 → OOB. Fixed by masking pointer args/returns to 32 bits at the host-ABI boundary (`ptr32` in wasm-run.mjs — the wasm32 pointer ABI, not a workaround). then decimal128 in the shim (BigInt port of decimal.cpp) + f64_bits, then FIXED the wasm heap-base bug: the bump allocator started at a hand-counted Nova-string estimate that missed decimal-literal C-strings / vtables / linker globals, so the heap OVERLAPPED `.rodata`/`.data` and allocations clobbered static data (a decimal literal read back as garbage). Now the heap lazily seeds from `__heap_base` (wasm-ld's true end-of-static-data) on first alloc — the general static-data-corruption fix. then FIXED the trait-dispatch cluster: the vtable is a `[N x ptr]` array, but `ptr_type` is i32 (4 bytes) on wasm32 while the readers indexed it with a hardcoded 8-byte stride → read the WRONG slot → garbage function index → call_indirect "null function". Fix: index vtable elements by the TARGET pointer size (`ptrElemSize()` = 4 wasm / 8 native). **`--wasm-run` 5→57→71→85/104.** Then FIXED the persistent free-list corruption: `nova_bytes_free` classifies blocks by a HARDCODED 32MB heap/persistent boundary, but the `__heap_base` seeding shifted those regions, so freed StringBuilder buffers were reused over live strings ("garbage tail" in url/serde). Fix: pure-bump on wasm (never free-list; native keeps it) → **`--wasm-run` 85→91/104.** **REMAINING (⬜):** ~13 — serde-decimal/yaml, http-parse, misc singletons, ALL traced to ONE root via a new **bounds-checking guard** (`wasm-run.mjs --guard`: snapshots read-only static data `[0, __data_end)` minus the allocator globals, re-checks after every @test → names the first test that writes into it). Guard verdict, bisected with the tool: a POSITION-DEPENDENT single-byte write into static data at `__data_end-40` during `Map<K,V>(cap, hashFn)` construction ALONE. **RESOLVED (commit `1490f8d`) — and the `Storage<T>` label was a MISDIAGNOSIS.** The real fault was the **function-as-value representation on wasm**, in three layers, all `is_wasm`-gated (native untouched): (1) a free-function used as a value (the "fnbox", e.g. `string.hash` as `(K)->int`) stored the thunk via a RUNTIME `ptrtoint` patch — LLVM cannot `ptrtoint` a function into an `i64` data initializer on wasm32 — and THAT runtime store was the "corruption"; worse, the runtime `ptrtoint` is not a valid `call_indirect` table index → trap wherever the box overlapped live data. Fixed by mirroring the vtable (which works because it stores functions as static `ptr` constants that `wasm-ld` relocates via `R_WASM_TABLE_INDEX_I32`): wasm fnbox layout `{i32,i32,ptr,i32,i64}`, thunk as a static `ptr`, no runtime write. (2) lambdas had the same defect → new `fnRefInt` helper loads the index from a static `{ptr,i32}` global. (3) void lambdas were `-> void` but `buildClosureCall` invokes every closure `-> val_type`; wasm `call_indirect` checks signatures strictly → void lambdas now `-> i32` on wasm. Guard now reports "static data intact across all tests". **`--wasm-run` 91→100/100.** LESSON: on wasm a function reference must ride as a linker-relocated table index (static `ptr`), never a runtime `ptrtoint` of the symbol | ⭐user P5 | ✅ | `--wasm` 104/104 + `--wasm-run` 100/100 + `--guard` clean | (this session) |
+| **T1** | Toolchain + cross-compilation. **Cross-compile from macOS to Linux x86_64/arm64 (static ELF, runs) AND Windows x86_64 (PE32+, real ws2_32/mswsock imports) ✅** via bundled `zig c++` (crossLinkViaZig/mapCrossTarget). **Deps generalized off Homebrew ✅**: vendored Boost.Asio header subset (deps/boost, ~7MB) + static LLVM fetched from a self-hosted **lazy `build.zig.zon` mirror** (kamlesh-nb/llvm-dist) for linux-{aarch64,x86_64}=LLVM21 + macos-arm64=LLVM22 — static kyte builds w/o KYTE_LLVM_PREFIX, `ldd`/`otool` show NO libLLVM. Windows COFF via `x86_64-pc-windows-gnu` triple + `-lws2_32 -lmswsock`. **zlib cross-gap FIXED (`c93004d`)**: vendored zlib (deps/zlib, in-memory subset) so FULL-runtime programs (any server/proxy → compress.cpp) now cross-compile to Linux — was blocked by host-only `-lz`; live-verified (gzip roundtrip + a real kyte server on Linux). **Remaining:** UPLOAD the 3 LLVM tarballs to the mirror (go-live, needs GitHub); no-Xcode mac (`.tbd` stubs); x86_64-macos drop | ⭐user P5 | ● | cross build+run (Docker/colima) + CI `cross-compile` gate | `6f78008`,`a6eb6f1`,`33a2d29`,…,`c93004d` |
+| **T2** | WASM target: capability gate + compile + run. **Target-capability gate DONE**: native-only features (async/await/spawn, sockets/TLS/crypto/process/FFI runtime symbols) now produce CLEAN, LOCATED compile errors on the wasm target instead of CRASHING codegen (async) or a cryptic "not found" (externs). `@native {}`/`@wasm {}` conditional blocks are the "compiler flag" to exclude/branch native code. **Compile gate ratcheted 56→104** (accurate valid-wasm set). **Execution 0→5→57** (restored missing runtime-helper imports kyte_valopt_box/_unbox/_panic, then FIXED #23): on wasm32 a pointer is 32-bit but kyte's value handle is i64, so a pointer rides the LOW 32 bits with don't-care high bits (inside wasm, inttoptr truncates → memory access correct even when dirty; a re-entrant alloc leaves stack garbage there). A HOST import received the full i64 → OOB. Fixed by masking pointer args/returns to 32 bits at the host-ABI boundary (`ptr32` in wasm-run.mjs — the wasm32 pointer ABI, not a workaround). then decimal128 in the shim (BigInt port of decimal.cpp) + f64_bits, then FIXED the wasm heap-base bug: the bump allocator started at a hand-counted Kyte-string estimate that missed decimal-literal C-strings / vtables / linker globals, so the heap OVERLAPPED `.rodata`/`.data` and allocations clobbered static data (a decimal literal read back as garbage). Now the heap lazily seeds from `__heap_base` (wasm-ld's true end-of-static-data) on first alloc — the general static-data-corruption fix. then FIXED the trait-dispatch cluster: the vtable is a `[N x ptr]` array, but `ptr_type` is i32 (4 bytes) on wasm32 while the readers indexed it with a hardcoded 8-byte stride → read the WRONG slot → garbage function index → call_indirect "null function". Fix: index vtable elements by the TARGET pointer size (`ptrElemSize()` = 4 wasm / 8 native). **`--wasm-run` 5→57→71→85/104.** Then FIXED the persistent free-list corruption: `kyte_bytes_free` classifies blocks by a HARDCODED 32MB heap/persistent boundary, but the `__heap_base` seeding shifted those regions, so freed StringBuilder buffers were reused over live strings ("garbage tail" in url/serde). Fix: pure-bump on wasm (never free-list; native keeps it) → **`--wasm-run` 85→91/104.** **REMAINING (⬜):** ~13 — serde-decimal/yaml, http-parse, misc singletons, ALL traced to ONE root via a new **bounds-checking guard** (`wasm-run.mjs --guard`: snapshots read-only static data `[0, __data_end)` minus the allocator globals, re-checks after every @test → names the first test that writes into it). Guard verdict, bisected with the tool: a POSITION-DEPENDENT single-byte write into static data at `__data_end-40` during `Map<K,V>(cap, hashFn)` construction ALONE. **RESOLVED (commit `1490f8d`) — and the `Storage<T>` label was a MISDIAGNOSIS.** The real fault was the **function-as-value representation on wasm**, in three layers, all `is_wasm`-gated (native untouched): (1) a free-function used as a value (the "fnbox", e.g. `string.hash` as `(K)->int`) stored the thunk via a RUNTIME `ptrtoint` patch — LLVM cannot `ptrtoint` a function into an `i64` data initializer on wasm32 — and THAT runtime store was the "corruption"; worse, the runtime `ptrtoint` is not a valid `call_indirect` table index → trap wherever the box overlapped live data. Fixed by mirroring the vtable (which works because it stores functions as static `ptr` constants that `wasm-ld` relocates via `R_WASM_TABLE_INDEX_I32`): wasm fnbox layout `{i32,i32,ptr,i32,i64}`, thunk as a static `ptr`, no runtime write. (2) lambdas had the same defect → new `fnRefInt` helper loads the index from a static `{ptr,i32}` global. (3) void lambdas were `-> void` but `buildClosureCall` invokes every closure `-> val_type`; wasm `call_indirect` checks signatures strictly → void lambdas now `-> i32` on wasm. Guard now reports "static data intact across all tests". **`--wasm-run` 91→100/100.** LESSON: on wasm a function reference must ride as a linker-relocated table index (static `ptr`), never a runtime `ptrtoint` of the symbol | ⭐user P5 | ✅ | `--wasm` 104/104 + `--wasm-run` 100/100 + `--guard` clean | (this session) |
 | **T3** | FFI (`extern("lib") fn`) — **keystone for W1/W2/W3** | ⭐P2 | ✅ v1 | `82_ffi_extern` | `97ba8ef` `1e31ad1` |
-| **T4** | Tooling: LSP FULL ✅ + package manager ✅ + `nova fmt` comment-preserving/idempotent ✅ (44→53 coverage); fmt construct long-tail remains | P5/6 | ◑ | `fmt-check.sh` + nls e2e + `pkg-manager-check.sh` | `4e4571c` |
-| **T5** | `nova init` templates → **`web` (VSA + per-feature JSX) AND `desktop` (webview)**, replacing `app` | ⭐P3 | ✅ | scaffold build+test (manual) | `c13fb7c` |
+| **T4** | Tooling: LSP FULL ✅ + package manager ✅ + `kyte fmt` comment-preserving/idempotent ✅ (44→53 coverage); fmt construct long-tail remains | P5/6 | ◑ | `fmt-check.sh` + nls e2e + `pkg-manager-check.sh` | `4e4571c` |
+| **T5** | `kyte init` templates → **`web` (VSA + per-feature JSX) AND `desktop` (webview)**, replacing `app` | ⭐P3 | ✅ | scaffold build+test (manual) | `c13fb7c` |
 | **W1** | Webview in the runtime (desktop GUI over HTML/JS/NSX) | ⭐P3 | ✅ | `webview_*` (manual) + `83`/`84` | `513ecf2`+`29a1f07` |
 | **W2** | `App.useStatic(...)` — static content store + LRU cache | ⭐P3 | ✅ | `85_static_content` | `ddd2c08` |
 | **W3** | Circuit breaker for the OUTBOUND TCP/TLS client (external calls) | ⭐P4 | ✅ | `86_circuit_breaker` | `a63ffa4` |
-| **T6** | Phase 1a ✅ (`nova build` + `build/<profile>/{obj,bin}` + content-hash cache); Phase 2 dead-strip ✅ (71% smaller); **Phase 1b per-file `.o` split ✅ DONE** — clone-and-strip emission loop + per-file content-hash cache (globaldce-before-hash) + default-on (`NOVA_T6_NOSPLIT` escape hatch); one-file-body edit → 25/26 objects cached. **F4-6 satisfied** (generated serde/mediator units are their own cached `.o`; no reparse-removal needed). Remaining: Phase 3 per-unit checking (gated on F2-6/F4/F5). **Relink-on-runtime-change FIXED** (`1973cf5`): `linkLibsStamp` folds libnova_runtime.a + libwolfssl.a mtimes into the cache key so a runtime-only edit forces a relink (was `rm -rf build`) | ⭐user P5 | ● | `nova build` split default; corpus 148/148 + 270/270 ASAN under split; 25/26 incremental | `1b85154`,`af4932a`,`4d1bb61`,`7077596`,`0e19e62`,`1973cf5` |
-| **W4** | **DI through `App` + constructor injection — ✅ COMPLETE (100%).** di.nova stores services as owned **`Service`** trait objects; `App` owns a `ServiceProvider` (`useServices`/`app.provider`); **all 3 lifetimes** `addSingleton`/`addScoped`/`addTransient` + **per-request `ServiceScope`** (`createScope`); **type-keyed generics** `addSingletonType<T>`/`addScopedType<T>`/`addTransientType<T>` + `resolveType<T>`; **`handleFrom<T>((sp) => H(sp.require("Db") as Db))`** builds the handler PER REQUEST from the scope with ctor-injected deps (+ the plain `handle<T>(instance)` path). Gates `123`/`124`/`125` (scoped-vs-singleton, per-request scope, transient, generics; ARC-clean). Enabled by **3 general compiler fixes** (closure-return trait widening; closure-collection recursion into `??`/`.cast`; **closure-arg param typing for GENERIC method calls**) | ⭐user P2 | ✅ | `123`/`124`/`125` di gates + 151/151 + 276/276 ASAN | (this session) |
-| **H3** | **Test infrastructure** — consolidate the project-wide `@test` runner (`nova test` already scans/collects across files; add suite UX + docs) + **relocate corpus cases into their owning stdlib modules** (compiler/language-only tests stay in `conformance/`) | ⭐user P3 | ⬜ | (design below) | — |
+| **T6** | Phase 1a ✅ (`kyte build` + `build/<profile>/{obj,bin}` + content-hash cache); Phase 2 dead-strip ✅ (71% smaller); **Phase 1b per-file `.o` split ✅ DONE** — clone-and-strip emission loop + per-file content-hash cache (globaldce-before-hash) + default-on (`KYTE_T6_NOSPLIT` escape hatch); one-file-body edit → 25/26 objects cached. **F4-6 satisfied** (generated serde/mediator units are their own cached `.o`; no reparse-removal needed). Remaining: Phase 3 per-unit checking (gated on F2-6/F4/F5). **Relink-on-runtime-change FIXED** (`1973cf5`): `linkLibsStamp` folds libkyte_runtime.a + libwolfssl.a mtimes into the cache key so a runtime-only edit forces a relink (was `rm -rf build`) | ⭐user P5 | ● | `kyte build` split default; corpus 148/148 + 270/270 ASAN under split; 25/26 incremental | `1b85154`,`af4932a`,`4d1bb61`,`7077596`,`0e19e62`,`1973cf5` |
+| **W4** | **DI through `App` + constructor injection — ✅ COMPLETE (100%).** di.ky stores services as owned **`Service`** trait objects; `App` owns a `ServiceProvider` (`useServices`/`app.provider`); **all 3 lifetimes** `addSingleton`/`addScoped`/`addTransient` + **per-request `ServiceScope`** (`createScope`); **type-keyed generics** `addSingletonType<T>`/`addScopedType<T>`/`addTransientType<T>` + `resolveType<T>`; **`handleFrom<T>((sp) => H(sp.require("Db") as Db))`** builds the handler PER REQUEST from the scope with ctor-injected deps (+ the plain `handle<T>(instance)` path). Gates `123`/`124`/`125` (scoped-vs-singleton, per-request scope, transient, generics; ARC-clean). Enabled by **3 general compiler fixes** (closure-return trait widening; closure-collection recursion into `??`/`.cast`; **closure-arg param typing for GENERIC method calls**) | ⭐user P2 | ✅ | `123`/`124`/`125` di gates + 151/151 + 276/276 ASAN | (this session) |
+| **H3** | **Test infrastructure** — consolidate the project-wide `@test` runner (`kyte test` already scans/collects across files; add suite UX + docs) + **relocate corpus cases into their owning stdlib modules** (compiler/language-only tests stay in `conformance/`) | ⭐user P3 | ⬜ | (design below) | — |
 | **T7** | **Rename async socket primitives** — `arecv`→`async_read`, `asend`→`async_write` (user said `awrite`; the write side is `asend`), `arecvDeadline`→`async_read_deadline` | ⭐user P5 | ✅ | corpus 148/148 + 270/270 ASAN | (this session) |
 | **D7** | **DB production-readiness** (`db-production-roadmap.md`, MongoDB-first M1–M9) — pooling/cursors/timeouts/resilience/txns/concern/typed-errors/topology/auth-breadth/observability; then port patterns to SQL drivers. **Foundations all DONE** (async seam, generic pool+breaker, timeouts, TLS, error model) → we ARE in a position | ⭐user P2 | ⬜ | (design below) | — |
 | **D8** | ✅ **DONE (read + write)** — READ: `RowSource impl ValueSource` + `queryAs<T>`/`queryOne<T>` via `<Struct>__bind`. WRITE: `ValueSink` trait + generated `<Struct>__dump` + `serde.dump<T>` reify → `ParamSink`/`toParams<T>`/`insert<T>` (out-of-band `$N`) + `BsonSink`/`toBson<T>` (typed BSON leaves). Injection-safe by construction. Live-driver write gate + Mongo DocSource + nested/List write fields deferred | ⭐user P3 | ✅ | `159_micro_orm`, `160_direct_serde_bind`, `161_orm_write_injection` | 161/161, ASAN 293/293 |
 | **W5** | ✅ **DONE** — `Http` client: URL parse → `https`⇒verified TLS (fail-closed), 6 verbs + `request`, Content-Length + chunked framing (any size), per-request timeout, bounded redirects. Live-proven vs example.com. ``getJson<T>`/`postJson<T>` (module-qualified generic-call routing landed) | ⭐user P2 | ✅ | `157_http_client` | 157/157, ASAN 285/285 |
-| **W6** | ✅ **DONE** — App server hardened: chunked request decode, per-read timeout (slow-loris), header/body size caps → 431/413 (`App.configureServer`). **Inbound TLS DONE** (`App.useTls(cert,key)`): server-side wolfSSL handshake per connection, then the SAME HTTP framing loop over a `TlsStream` — plaintext + HTTPS share one `handleConn(io: AsyncIO)`. Required widening the `AsyncIO.recvInto` buffer seam `int→long` (was truncating 64-bit heap addresses; backward-compatible). Live-proven: real **TLSv1.3** (curl + openssl s_client), plaintext-to-TLS-port rejected. Deferred: chunked resp streaming write, nova-init template swap | ⭐user P2 | ✅ | `186_inbound_tls_http` + `test_chunked_request_decode` + live | 180/180, ASAN 328/328 |
-| **W7** | ✅ **DONE** — gzip over already-linked zlib: `nova_gzip_compress/decompress` + `compress/gzip.nova` + HTTP negotiation (server gzips on Accept-Encoding, client sends it + transparently decompresses). Live-proven (1800→80 bytes, 22x) | ⭐user P3 | ✅ | `158_gzip` | 158/158, ASAN 287/287 |
-| **R1** | ✅ **DONE** — `nova_process_spawn`/`_write_stdin`/`_read_stdout`/`_wait`/`_free` implemented over POSIX fork/execvp/pipe/waitpid (were stubs); NEW `nova_process_kill(ctx,sig)` + Nova `kill`/`terminate`/`forceKill`. Identity = kernel PID (long, untruncated). Windows stubbed. The exec layer I1/I2 build on | ⭐P2 | ✅ | `163_process` | 163/163, ASAN 297/297 |
-| **N1** | **Network I/O stack — share-nothing thread-per-core (Path A on Asio)** ✅. Decided over a from-scratch io_uring loop (`docs/design/network-io-stack-tradeoff.md`); Senders/Receivers rejected (Nova composes async in-language). Runtime is now **N=cores-1 independent reactors** (io_context per pinned thread), coroutines **PINNED** (no migration → per-coroutine strands are free no-ops), reactor-aware sockets + **SO_REUSEPORT per-reactor accept fan-out** (`spawnOn`=`nova_pin_next_coro` one-shot pin + persistence=`nova_hold_all_reactors` work_guards; the transient `nova_run` all gates use is UNTOUCHED). **Proxy pooling reuse gate LIFTED** — the original I1 per-coroutine-strand limit gone STRUCTURALLY. **P2** lock-striping (g_corostates/g_heldargs → 64 stripes) for contention relief. `NOVA_THREADS=1`=exact old behavior (rollback). Also T1 zlib cross-gap fixed (vendored zlib → full runtime cross-compiles to Linux) | ⭐user P1 | ✅ | 177/177 + ASAN 324/324 every phase; Linux SO_REUSEPORT distribution **Docker-verified with a real nova server** (90 conns even across 6 reactors) | P0 `cbdb71f`, P1 `c161d75`, P3 `f55cf5b`, P4a `c21a179`, P4c `a51f778`, P5 `9a665f6`, P2 `561d9de`, zlib `c93004d` |
-| **I1** | **Nova reverse proxy + load balancer + PID autoscaler** (⭐"most important", user) ✅ **DONE** — L4/L7 proxy on the async runtime + TCP server + **HAProxy-style per-reactor lock-free conn pool**, **share-nothing MULTI-CORE via N1** (per-reactor SO_REUSEPORT accept fan-out; `Proxy.run`; pooling reuse gate lifted). **LB algos** (`LbStrategy`: round-robin/weighted/least-conn/consistent-hash, all lock-free per-reactor; `178`). **Health-checked backend pool** (active TCP-connect / HTTP-GET probes, rise/fall drain hysteresis, drained backends excluded from every strategy; `179`). **PID autoscaler** (`net/autoscale`: anti-windup PID drives replica count from live in-flight metric, spawns/kills backends via R1, drain-before-kill; `180`, live-proven load=8→4 replicas, drain→1) | ⭐user P1 | ✅ | `167`+`178`+`179`+`180` + live | proxy `db492a9`/`423f666`; N1 multi-core; LB `ab07a2f`; health `b70d371`; autoscaler `ed00c5a` |
-| **I2** | **Nova orchestrator (native-k8s MVP)** ✅ **DONE (MVP)** — reconcile-loop node agent for **binaries (not containers)** in `std/orch/` (spec/supervisor/nativelet/isolation/autoscaler). Manifest-dir watch → desired-vs-actual reconcile (start/replace-changed/poll/stop-removed, filename-keyed presence robust to a SIGCHLD-EINTR read race), N **replicas**, **restart-on-crash** per policy (non-blocking `nova_process_try_wait`), graceful SIGTERM→SIGKILL stop, async **HTTP `/healthz` probes** (restart unhealthy, live-proven), **cgroups-v2** cpu/mem/pids via fs writes (`nova_process_pid` attach; Linux-only), **PID autoscaler** (reuses I1 controller, cgroup-CPU metric). One async coroutine drives it (no thread-per-workload). Deferred (full vision): multi-node/apiserver/scheduler, namespaces/seccomp/Landlock, service-VIP/DNS | ⭐user P2 | ✅ | `181` + live (deploy replicas:3→3, kill→restart, scale→5, delete→0; probe restarts 503, keeps 200) | `nova_process_try_wait`/`_pid` + `3f8e7e2` (core), `e18d586` (probe+cgroups), `d8054ed` (autoscaler) |
+| **W6** | ✅ **DONE** — App server hardened: chunked request decode, per-read timeout (slow-loris), header/body size caps → 431/413 (`App.configureServer`). **Inbound TLS DONE** (`App.useTls(cert,key)`): server-side wolfSSL handshake per connection, then the SAME HTTP framing loop over a `TlsStream` — plaintext + HTTPS share one `handleConn(io: AsyncIO)`. Required widening the `AsyncIO.recvInto` buffer seam `int→long` (was truncating 64-bit heap addresses; backward-compatible). Live-proven: real **TLSv1.3** (curl + openssl s_client), plaintext-to-TLS-port rejected. Deferred: chunked resp streaming write, kyte-init template swap | ⭐user P2 | ✅ | `186_inbound_tls_http` + `test_chunked_request_decode` + live | 180/180, ASAN 328/328 |
+| **W7** | ✅ **DONE** — gzip over already-linked zlib: `kyte_gzip_compress/decompress` + `compress/gzip.ky` + HTTP negotiation (server gzips on Accept-Encoding, client sends it + transparently decompresses). Live-proven (1800→80 bytes, 22x) | ⭐user P3 | ✅ | `158_gzip` | 158/158, ASAN 287/287 |
+| **R1** | ✅ **DONE** — `kyte_process_spawn`/`_write_stdin`/`_read_stdout`/`_wait`/`_free` implemented over POSIX fork/execvp/pipe/waitpid (were stubs); NEW `kyte_process_kill(ctx,sig)` + Kyte `kill`/`terminate`/`forceKill`. Identity = kernel PID (long, untruncated). Windows stubbed. The exec layer I1/I2 build on | ⭐P2 | ✅ | `163_process` | 163/163, ASAN 297/297 |
+| **N1** | **Network I/O stack — share-nothing thread-per-core (Path A on Asio)** ✅. Decided over a from-scratch io_uring loop (`docs/design/network-io-stack-tradeoff.md`); Senders/Receivers rejected (Kyte composes async in-language). Runtime is now **N=cores-1 independent reactors** (io_context per pinned thread), coroutines **PINNED** (no migration → per-coroutine strands are free no-ops), reactor-aware sockets + **SO_REUSEPORT per-reactor accept fan-out** (`spawnOn`=`kyte_pin_next_coro` one-shot pin + persistence=`kyte_hold_all_reactors` work_guards; the transient `kyte_run` all gates use is UNTOUCHED). **Proxy pooling reuse gate LIFTED** — the original I1 per-coroutine-strand limit gone STRUCTURALLY. **P2** lock-striping (g_corostates/g_heldargs → 64 stripes) for contention relief. `KYTE_THREADS=1`=exact old behavior (rollback). Also T1 zlib cross-gap fixed (vendored zlib → full runtime cross-compiles to Linux) | ⭐user P1 | ✅ | 177/177 + ASAN 324/324 every phase; Linux SO_REUSEPORT distribution **Docker-verified with a real kyte server** (90 conns even across 6 reactors) | P0 `cbdb71f`, P1 `c161d75`, P3 `f55cf5b`, P4a `c21a179`, P4c `a51f778`, P5 `9a665f6`, P2 `561d9de`, zlib `c93004d` |
+| **I1** | **Kyte reverse proxy + load balancer + PID autoscaler** (⭐"most important", user) ✅ **DONE** — L4/L7 proxy on the async runtime + TCP server + **HAProxy-style per-reactor lock-free conn pool**, **share-nothing MULTI-CORE via N1** (per-reactor SO_REUSEPORT accept fan-out; `Proxy.run`; pooling reuse gate lifted). **LB algos** (`LbStrategy`: round-robin/weighted/least-conn/consistent-hash, all lock-free per-reactor; `178`). **Health-checked backend pool** (active TCP-connect / HTTP-GET probes, rise/fall drain hysteresis, drained backends excluded from every strategy; `179`). **PID autoscaler** (`net/autoscale`: anti-windup PID drives replica count from live in-flight metric, spawns/kills backends via R1, drain-before-kill; `180`, live-proven load=8→4 replicas, drain→1) | ⭐user P1 | ✅ | `167`+`178`+`179`+`180` + live | proxy `db492a9`/`423f666`; N1 multi-core; LB `ab07a2f`; health `b70d371`; autoscaler `ed00c5a` |
+| **I2** | **Kyte orchestrator (native-k8s MVP)** ✅ **DONE (MVP)** — reconcile-loop node agent for **binaries (not containers)** in `std/orch/` (spec/supervisor/nativelet/isolation/autoscaler). Manifest-dir watch → desired-vs-actual reconcile (start/replace-changed/poll/stop-removed, filename-keyed presence robust to a SIGCHLD-EINTR read race), N **replicas**, **restart-on-crash** per policy (non-blocking `kyte_process_try_wait`), graceful SIGTERM→SIGKILL stop, async **HTTP `/healthz` probes** (restart unhealthy, live-proven), **cgroups-v2** cpu/mem/pids via fs writes (`kyte_process_pid` attach; Linux-only), **PID autoscaler** (reuses I1 controller, cgroup-CPU metric). One async coroutine drives it (no thread-per-workload). Deferred (full vision): multi-node/apiserver/scheduler, namespaces/seccomp/Landlock, service-VIP/DNS | ⭐user P2 | ✅ | `181` + live (deploy replicas:3→3, kill→restart, scale→5, delete→0; probe restarts 503, keeps 200) | `kyte_process_try_wait`/`_pid` + `3f8e7e2` (core), `e18d586` (probe+cgroups), `d8054ed` (autoscaler) |
 | **BT1** | **NovaDB concurrency → hundreds of clients** (SEPARATE btree repo) — Phase 0 wire the disconnected thread knob (`concurrent_limit` from config, trivial) + **re-benchmark under realistic YCSB** first; the global `db.rw_lock` removal needs a latch-safe B+tree SMO rewrite (Deep-P3, invasive) — **gate that on measured evidence** (the readiness plan itself walked back its urgency). NOT single-threaded (fibers on `std.Io.Threaded`); pool just isn't scaling | ⭐user P3 | ⬜ | (design below) | — |
-| **I3** | **Virtual network layer (k8s-Service-style VIPs)** ✅ **Tier 1 DONE** — `net/service`: `Service{name,vip,port,pool}` = a stable front address LB'ing to backend replicas on ephemeral ports over the I1 proxy, **health-gated membership** (drain via I1 checker), `ServiceRegistry` name→endpoint + `/etc/hosts`-style discovery file (`resolveFrom`). Runtime add `nova_aserver_listen_addr` (bind a specific VIP, not just INADDR_ANY) → `asyncio.serverListenAddr` + `proxy.serveAddr`. **Kernel tier (netns/veth/overlay/IPVS/eBPF) DEFERRED** (large FFI, Linux, root) — `veth` NOT implemented. Optional `nova_udp_*` DNS also deferred (discovery is file/registry-based) | infra (post-language) | ✅ (Tier 1) | `182` + live (stable :8080 → replicas 9101/9102 split 4/4; kill one → health-drained; registry discovery) | `1dfcbf0` |
-| **I4** | **Container-grade isolation (NATIVE kernel primitives — no bubblewrap/systemd/runc)** ✅ **Level 1 + seccomp DONE** — runtime `nova_process_spawn_isolated` shim (io.cpp, `__linux__`): `clone()` into namespaces (PID/mount/UTS/IPC/net/user) → sethostname → private mounts + `pivot_root` rootfs + fresh `/proc` → `no_new_privs` → drop ALL caps (bounding+capset, kernel headers not libcap → cross-compiles) → seccomp-BPF deny unshare/setns/mount/pivot_root/ptrace → `execve`. `os/sandbox` DIAL (level0/1/3) + `Process.spawnIsolated`. **I2 drives it** (Spec.isolationLevel+rootfs → supervisor). Off-Linux degrades to plain spawn | infra (post-language) | ✅ (L1+seccomp) | `183` + **Docker-verified** (native arm64 privileged: level-1 child PID=1 (own PID ns, host PIDs invisible) + HOST=novacontainer (UTS ns); seccomp `unshare`→EPERM) | `2d09a82` |
+| **I3** | **Virtual network layer (k8s-Service-style VIPs)** ✅ **Tier 1 DONE** — `net/service`: `Service{name,vip,port,pool}` = a stable front address LB'ing to backend replicas on ephemeral ports over the I1 proxy, **health-gated membership** (drain via I1 checker), `ServiceRegistry` name→endpoint + `/etc/hosts`-style discovery file (`resolveFrom`). Runtime add `kyte_aserver_listen_addr` (bind a specific VIP, not just INADDR_ANY) → `asyncio.serverListenAddr` + `proxy.serveAddr`. **Kernel tier (netns/veth/overlay/IPVS/eBPF) DEFERRED** (large FFI, Linux, root) — `veth` NOT implemented. Optional `kyte_udp_*` DNS also deferred (discovery is file/registry-based) | infra (post-language) | ✅ (Tier 1) | `182` + live (stable :8080 → replicas 9101/9102 split 4/4; kill one → health-drained; registry discovery) | `1dfcbf0` |
+| **I4** | **Container-grade isolation (NATIVE kernel primitives — no bubblewrap/systemd/runc)** ✅ **Level 1 + seccomp DONE** — runtime `kyte_process_spawn_isolated` shim (io.cpp, `__linux__`): `clone()` into namespaces (PID/mount/UTS/IPC/net/user) → sethostname → private mounts + `pivot_root` rootfs + fresh `/proc` → `no_new_privs` → drop ALL caps (bounding+capset, kernel headers not libcap → cross-compiles) → seccomp-BPF deny unshare/setns/mount/pivot_root/ptrace → `execve`. `os/sandbox` DIAL (level0/1/3) + `Process.spawnIsolated`. **I2 drives it** (Spec.isolationLevel+rootfs → supervisor). Off-Linux degrades to plain spawn | infra (post-language) | ✅ (L1+seccomp) | `183` + **Docker-verified** (native arm64 privileged: level-1 child PID=1 (own PID ns, host PIDs invisible) + HOST=kytecontainer (UTS ns); seccomp `unshare`→EPERM) | `2d09a82` |
 | **Z1** | **Docs: technical architecture + contributor onboarding — DONE.** `docs/architecture/`: README overview + system map, 01-compiler, 02-codegen, 03-runtime, 04-stdlib/framework, 05-adding-a-feature onboarding, **06-btreedb**, **07-orchestrator**. All in a consistent formal register (no em-dashes), grounded in the real code | P3 | ✅ | `docs/architecture/*` | (this session) |
 
 Legend for the "◑" rows: partially landed; the *remaining* scope is the design below.
 
 ## 🅱️ BETA (2026-07-28) — declared; all beta gates met on the native target (WASM = best-effort)
 
-**Nova is Beta.** Scope decision (user, 2026-07-28): **WASM is a SECONDARY / best-effort target, no longer
+**Kyte is Beta.** Scope decision (user, 2026-07-28): **WASM is a SECONDARY / best-effort target, no longer
 primary** — so wasm bugs and B-gate-2-for-wasm do not gate Beta; the bar is the native toolchain. Evidence,
 on `main` @ `a1dd076` (fast-forwarded; PRs #3–#6 landed):
 - **Sound core** ✅ — real type-checking/generics; the async-from-sync **deadlock is fixed** (A2), the last
@@ -241,7 +241,7 @@ function-as-value representation; see T2), native multi-OS *CI runners* (deliver
 cross-compile+Docker), D7/H3/BT1, F3/F4 partials.
 
 **Latest (2026-07-28):** corpus **180/180 functional, 329/329 ASAN, `--wasm-run` 100/100** clean; ARC-audit at
-floor. Beta declared (above). This session: async-deadlock fix (A2), `nova build` relink, W6 inbound TLS, T2
+floor. Beta declared (above). This session: async-deadlock fix (A2), `kyte build` relink, W6 inbound TLS, T2
 WASM (capability gate + exec 5→**100/100** + `--guard` bounds checker + function-as-value fix), Z1 architecture
 docs. Partial: F3 (overflow-trap by design), F4 (Itanium mangling only), T1 (LLVM-mirror upload), T6 (Phase-3
 checking). Not started: **H3**, **D7**, **BT1**.
@@ -257,11 +257,11 @@ for generic method calls** (`infer.zig`: propagate declared param types in the `
 `explicitMethodReturn`), and the `any`→`.ptr` fix. **Foundational bug DISCOVERED (not W4, flagged):** value-type
 optionals use handle `0` as the `undefined` sentinel, so `Map<K,int>`/`List<int>` storing `0` reads back as
 `undefined` (a stored `0` is indistinguishable from absent). DI sidesteps it with 1-based lifetime codes; the general
-fix (box/tag value-type optionals) is a large separate change — see `nova-value-optional-zero-bug`. **See the Priority policy above: LANGUAGE FIRST** —
+fix (box/tag value-type optionals) is a large separate change — see `kyte-value-optional-zero-bug`. **See the Priority policy above: LANGUAGE FIRST** —
 the infra epics (R1/I1/I2/I3/I4) and BT1 are sequenced AFTER language work. **15 new items added 2026-07-24** across
 planning passes. Pass 1 (framework/DB): W4 (DI via App), H3 (test infra), T7 (async rename), D7 (DB
 production-readiness), D8 (micro-ORM). Pass 2 (HTTP/infra): W5 (REST client + auto-TLS), W6 (HTTP server hardening),
-W7 (compression), R1 (process runtime primitives), I1 (reverse proxy + LB + PID autoscaler), I2 (Nova
+W7 (compression), R1 (process runtime primitives), I1 (reverse proxy + LB + PID autoscaler), I2 (Kyte
 orchestrator/native-k8s MVP), I3 (virtual network / k8s-Service VIPs), I4 (native container-grade isolation), BT1
 (NovaDB concurrency); plus Z1 (architecture + onboarding docs — onboarding v1 authored). All designed below. Since the last update this session also: closed the last **A1** follow-ons
 (actor stdlib as `ActorCell.run()` generic-async METHOD + generic-trait-FIELD dispatch fix, gate 120; channel-gated
@@ -276,8 +276,8 @@ drivers — Postgres,
 MySQL, MSSQL (TDS-tunneled async TLS), NovaDB, MongoDB — are non-blocking over one `db.Connection`/`db.Driver`
 seam, their socket recv PARKS the coroutine instead of holding the scheduler thread (PG+MySQL live-proven: 5
 concurrent server-side sleeps on ONE thread overlap ~0.3–0.7s vs ~1.5s serial). Non-blocking TLS was built the
-right way — wolfSSL keeps all crypto + cert-verification (memory-BIO), only the record pump is Nova async. The
-concrete drivers now live in **`packages/nova-<name>`** (the `db` seam + generic `pool` stay in std). Also live:
+right way — wolfSSL keeps all crypto + cert-verification (memory-BIO), only the record pump is Kyte async. The
+concrete drivers now live in **`packages/kyte-<name>`** (the `db` seam + generic `pool` stay in std). Also live:
 **timeouts + pooling + circuit-breaker + full auth + real server-side prepared statements on every engine**; error
 model (`try`/`catch`/`errdefer`) complete; `future<T>` first-class + `when_all`/`parallel_for`.
 ✅ done (27): X1, X2, H1, H2, F1, F2, F5, C1, D1, **D2**, D3, D4, **D5**, **D6**, **E1**, **A1**, S1, S2, S3, S4,
@@ -294,10 +294,10 @@ handlers + `addSingleton`/`addTransient`/`addScoped`; reconciles the manual DI i
 MongoDB-first M1–M9 epic; foundations all done, only replica-set infra gates M6/M7), **D8** (Dapper-style micro-ORM
 typed materializer — reuses the serde `__bind`/`ValueSource` machinery, read-side prototypable now); and the
 **HTTP/infra pass** — **W5** (HTTP REST client with auto-TLS from the URL scheme — TLS plumbing already done),
-**W6** (HTTP server hardening: chunked, timeouts, size caps, inbound HTTPS; swap the `nova init` template onto the
+**W6** (HTTP server hardening: chunked, timeouts, size caps, inbound HTTPS; swap the `kyte init` template onto the
 fast `App` server), **W7** (gzip/deflate compression over the already-linked zlib — no new dep), **R1** (implement
-the process-spawn/kill runtime primitives — currently STUBS; blocks I2), **I1** (⭐ Nova reverse proxy + load
-balancer + PID autoscaler — the flagship "most important" app; every primitive already exists), **I2** (Nova
+the process-spawn/kill runtime primitives — currently STUBS; blocks I2), **I1** (⭐ Kyte reverse proxy + load
+balancer + PID autoscaler — the flagship "most important" app; every primitive already exists), **I2** (Kyte
 orchestrator / native-k8s MVP for binaries not containers — ports the Zig PoC, gated on R1), **BT1** (NovaDB
 concurrency to hundreds of clients — Phase 0 config-knob + **re-benchmark first**; the latching rewrite is
 Deep-P3, gated on measured evidence per the readiness plan's own walk-back). **T6 Phase 1b DONE**
@@ -305,11 +305,11 @@ Deep-P3, gated on measured evidence per the readiness plan's own walk-back). **T
 their own cached objects, so no reparse-removal was needed). Only T6 Phase 3 (per-unit *checking*, gated on
 F2-6/F4/F5) is future work.
 
-**CI policy (2026-07-24 decision).** **GitHub Actions CI is retired; Nova is built and tested locally.** The
+**CI policy (2026-07-24 decision).** **GitHub Actions CI is retired; Kyte is built and tested locally.** The
 `.github/workflows/ci.yml` matrix went red on **corpus-test** failures in the allow-fail non-mac cells — the
 toolchain is macOS-developed and Linux/Windows are cross-compile *targets* (T1), not native build hosts. Rather
 than chase green on runners we don't develop on, the gate is now **local builds + `conformance/run.sh`**; cross-OS
-delivery is covered by T1 (`nova --target …` from macOS, format-asserted). The pending LLVM-mirror upload is
+delivery is covered by T1 (`kyte --target …` from macOS, format-asserted). The pending LLVM-mirror upload is
 therefore **no longer CI-blocking** — it only matters for fresh-clone *static* builds. The workflow may be kept as
 a manual `workflow_dispatch` smoke or removed. Revisit hosted CI only if a native non-mac build host joins the
 workflow.
@@ -323,12 +323,12 @@ but the *architecture* is a workaround the design (`route-handling-via-mediator.
 - `pub fn __addRoute(...)` is exposed on the App API (never agreed);
 - dispatch routes by **type-name string** via a generated `__mediator_dispatch_by_name` switch, not by a
   reified per-request dispatcher — this is the *flavor* the design set out to remove;
-- the typed handler lives in a **separate `web/routing.nova` Router**, not in `App`/`web/mediator.nova`;
+- the typed handler lives in a **separate `web/routing.ky` Router**, not in `App`/`web/mediator.ky`;
 - the **mediator pipeline** (behaviors/pre/post/exception) is not threaded through dispatch.
 
 **Target public surface (the ONLY thing users see) — bare verbs (roadmap override of the doc's `map` prefix):**
-```nova
-struct GetUserHandler impl RequestHandler<GetUser, UserDto> {     // web/mediator.nova
+```kyte
+struct GetUserHandler impl RequestHandler<GetUser, UserDto> {     // web/mediator.ky
     fn handle(self, req: GetUser): UserDto { return UserDto{ id: req.id, name: "Ada" }; }
 }
 let app = App();
@@ -339,8 +339,8 @@ app.run(8080);
 `dispatch(req): Response` (for in-process testing). **No `__addRoute`, no `Mediator`, no `MessageHandler`.**
 
 **Design of the internals (the part that must change):**
-1. **`RequestHandler<TRequest,TResponse>`** trait moves to `web/mediator.nova` (per design §4.1);
-   `web/routing.nova` is **deleted**, its Router folded away. Pipeline traits (`PipelineBehavior`,
+1. **`RequestHandler<TRequest,TResponse>`** trait moves to `web/mediator.ky` (per design §4.1);
+   `web/routing.ky` is **deleted**, its Router folded away. Pipeline traits (`PipelineBehavior`,
    `PreProcessor`, `PostProcessor`, `ExceptionHandler`) are defined here too (design §1.5 table).
 2. **Per-request dispatcher stays compiler-generated** — `__mediator_dispatch_<Q>(src: ValueSource): string`
    emits `TResp__toJson(pipeline(H{}.handle(Q__bind(src))))`. This is `ptr→ptr` and **marshals fine as a
@@ -358,16 +358,16 @@ app.run(8080);
 4. **Pipeline threading:** `dispatch` runs discovered `PipelineBehavior`s around `handle`, `PreProcessor`s
    before, `PostProcessor`s after, `ExceptionHandler`s on failure. Additive; ships after the core is clean.
 5. **`@fromRoute` over `@fromBody`:** unchanged — `CompositeSource(ParamSource(routeParams), bodySource)`.
-6. **`app.run`:** keep app.nova's existing async server (asyncio, Content-Length, 100-continue); it calls
+6. **`app.run`:** keep app.ky's existing async server (asyncio, Content-Length, 100-continue); it calls
    the new `dispatch`.
 
-**Files:** `web/mediator.nova` (RequestHandler + pipeline traits), `web/app.nova` (App rewrite),
-delete `web/routing.nova`; `src/codegen/expressions.zig` (verb lowering → fn-ptr register), `src/main.zig`
+**Files:** `web/mediator.ky` (RequestHandler + pipeline traits), `web/app.ky` (App rewrite),
+delete `web/routing.ky`; `src/codegen/expressions.zig` (verb lowering → fn-ptr register), `src/main.zig`
 (`generateMediatorDispatch` — keep per-Q dispatchers, drop the by-name switch), migrate gates 58/59/60 → App.
 
 **Definition of Done:**
 - [x] `App` public API is exactly `get/post/put/delete/patch/options/head<T>`, `run`, `dispatch`; no `__addRoute`, no `Mediator`/`MessageHandler` types. (all 7 verbs in `routeVerbMethod`; `__route` is the internal lowering target, fn-pointer-based.)
-- [x] `web/routing.nova` deleted; `RequestHandler` + pipeline traits in `web/mediator.nova`.
+- [x] `web/routing.ky` deleted; `RequestHandler` + pipeline traits in `web/mediator.ky`.
 - [x] Route stores a reified dispatcher fn-pointer — dispatch calls it directly, no public string switch. (enabled by generated-fn-as-value fix `d19699c`.)
 - [x] Gate `69_app_typed_routing`: `app.get<T>` → typed JSON; `@fromRoute` over `@fromBody`; 404/405; auto-JSON.
 - [x] Gate `69` (pipeline): `app.use(behavior)` — a `PipelineBehavior` wraps the response, short-circuits without running the handler, and two behaviors nest in order.
@@ -387,20 +387,20 @@ behaviors would need per-request-type codegen — a documented future refinement
 # ⭐ X2 — Crypto folder refactor
 
 **Why.** You asked for a `crypto/` folder with focused files; instead the code piled into a single naive
-`crypto.nova`, and MySQL auth scrambles were dumped there (they don't belong in a general crypto module).
+`crypto.ky`, and MySQL auth scrambles were dumped there (they don't belong in a general crypto module).
 
 **Target layout:**
 ```
 src/std/crypto/
-  sha.nova      # sha1, sha256, sha512, hmacSha256 (+ hmacSha1 if a driver needs it)
-  md5.nova      # md5 (build currently sets NO_MD5 — wrapper + honest "unavailable" error)
-  base64.nova   # encode / decode, standard + url-safe (implemented in Nova over bytes)
-  random.nova   # BOTH generators (see below): CSPRNG + seedable PRNG
+  sha.ky      # sha1, sha256, sha512, hmacSha256 (+ hmacSha1 if a driver needs it)
+  md5.ky      # md5 (build currently sets NO_MD5 — wrapper + honest "unavailable" error)
+  base64.ky   # encode / decode, standard + url-safe (implemented in Kyte over bytes)
+  random.ky   # BOTH generators (see below): CSPRNG + seedable PRNG
 ```
 Import as `crypto.sha` / `crypto.md5` / `crypto.base64` / `crypto.random`; call `sha.sha256(...)`,
 `base64.encode(...)`, etc.
 
-**`random.nova` must provide BOTH an RNG and a PRNG (user, 2026-07-22) — they are different tools, do not
+**`random.ky` must provide BOTH an RNG and a PRNG (user, 2026-07-22) — they are different tools, do not
 conflate them:**
 - **CSPRNG (true/secure RNG)** — OS entropy via wolfCrypt (`randomBytes(n)` / `randomHex(n)` / `randomInt`).
   UNSEEDABLE and unpredictable; the ONLY correct source for salts, nonces, tokens, session/CSRF ids, SCRAM
@@ -414,10 +414,10 @@ conflate them:**
   liveness/uniqueness check only (its output is by definition unpredictable).
 
 **Moves / deletions:**
-- **Delete `crypto.nova`.** Split its contents into the files above.
+- **Delete `crypto.ky`.** Split its contents into the files above.
 - **Move `mysqlNativeScramble` / `mysqlSha2Scramble` OUT of crypto** → private helpers in the MySQL driver
-  (`data/sql/mysql.nova`, or `data/sql/mysql_auth.nova`). The raw runtime primitives (`nova_mysql_scramble`,
-  `nova_mysql_sha2_scramble`) stay in the runtime; only the Nova wrapper relocates.
+  (`data/sql/mysql.ky`, or `data/sql/mysql_auth.ky`). The raw runtime primitives (`kyte_mysql_scramble`,
+  `kyte_mysql_sha2_scramble`) stay in the runtime; only the Kyte wrapper relocates.
 - Update **every** `import crypto` / `crypto.*` call site across the stdlib to the new module paths.
 - Register the new modules in `src/main.zig` (`std_modules` + aliases).
 
@@ -425,10 +425,10 @@ conflate them:**
 over `bytes`. KAT against RFC 4648 vectors.
 
 **Definition of Done:**
-- [x] `crypto/{sha,md5,base64,random}.nova` exist; `crypto.nova` deleted.
-- [x] `random.nova` exposes **both** a CSPRNG (`randomBytes`/`randomHex`/`randomInt`) and a seedable `Prng`
+- [x] `crypto/{sha,md5,base64,random}.ky` exist; `crypto.ky` deleted.
+- [x] `random.ky` exposes **both** a CSPRNG (`randomBytes`/`randomHex`/`randomInt`) and a seedable `Prng`
       (PCG32, verified against published reference vectors).
-- [x] MySQL scrambles no longer in crypto; moved into `data/sql/mysql.nova` (now `pub`, driver-owned); gate 67
+- [x] MySQL scrambles no longer in crypto; moved into `data/sql/mysql.ky` (now `pub`, driver-owned); gate 67
       green.
 - [x] All stdlib `crypto.*` call sites updated; nothing imports the old `crypto` module.
 - [x] Gate `25_crypto` (SHA-1/256/512 + HMAC KATs, CSPRNG liveness, **PCG32 reference vectors + determinism**) +
@@ -443,10 +443,10 @@ crypto; **Windows/NTLM** auth (if/when supported) additionally needs **MD4 + HMA
 C1 (PBKDF2 + SCRAM) → drivers; MD4/HMAC-MD5 only enter if NTLM is taken up.
 
 **Dependencies:** none. **Precedes** C1 (SCRAM primitives extend `crypto/sha`) and D2/D3 (driver auth).
-**Tracking:** ✅ 2026-07-22 · `crypto/{sha,md5,base64,random}.nova` (crypto.nova deleted); base64 in Nova over
+**Tracking:** ✅ 2026-07-22 · `crypto/{sha,md5,base64,random}.ky` (crypto.ky deleted); base64 in Kyte over
 `bytes` (RFC 4648); random = wolfCrypt CSPRNG + seedable **PCG32** (reference-vector KAT); MySQL scrambles
 relocated into the driver. Gates `25_crypto` + `87_crypto_base64`; corpus 109/109 + ASAN clean. **Note:** MD5 is
-`NO_MD5` in this wolfSSL build — `md5.nova` wraps it with an honest abort; enabling it (for MSSQL/NTLM) is a
+`NO_MD5` in this wolfSSL build — `md5.ky` wraps it with an honest abort; enabling it (for MSSQL/NTLM) is a
 build-flag flip + re-add the KAT.
 
 ---
@@ -455,7 +455,7 @@ build-flag flip + re-add the KAT.
 
 **Problem.** `run.sh` `expect_fail` treats any non-zero exit as "correctly rejected" — **a segfault reads as
 a pass**. `return_type_mismatch` has silently regressed (compiles + crashes). The corpus never sets
-`NOVA_ARC_AUDIT` by default in FUNC mode.
+`KYTE_ARC_AUDIT` by default in FUNC mode.
 
 **Design:**
 - `expect_fail` must assert the **reason**: the compiler prints a machine-checkable diagnostic tag (e.g.
@@ -474,7 +474,7 @@ a pass**. `return_type_mismatch` has silently regressed (compiles + crashes). Th
 - [x] The 4 crash-negatives emit user diagnostics: `undefined_variable`/`undefined_function`/`ambiguous_bare_call`
       → `typecheck`; `method_shadowed_by_global_fn` → `codegen` (clean rejection, honest-debt span). None crash.
 - [x] **Harness self-test** (`conformance/harness-selftest/` + a pre-flight in `run.sh`): two fixtures with
-      KNOWN outcomes — `compiles-then-crashes.nova` must classify `COMPILED-THEN-CRASHED`, `compiles-and-runs.nova`
+      KNOWN outcomes — `compiles-then-crashes.ky` must classify `COMPILED-THEN-CRASHED`, `compiles-and-runs.ky`
       must classify `COMPILED-AND-RAN`. If either is mislabeled as a reject kind, the classifier is broken and
       the run **ABORTS (exit 2)** — "every negative result is UNTRUSTWORTHY." **Proven**: neutering the crash-
       detection grep makes the self-test FAIL and abort with exit 2; the correct classifier passes both and
@@ -509,8 +509,8 @@ fixtures; guard proven to abort on regression; corpus 112/112.
 - [x] Full suite green (stdlib migrated to `at()`/`??`/narrowing). Corpus **114/114**, ARC + ASAN clean.
 
 **What landed (2026-07-22):**
-- **Trapping accessors** `List.at(i): T` / `Map.at(k): V` — return the value directly, LOUD `nova: panic`
-  (new `nova_panic` runtime primitive) on absent, never a silent read. The ergonomic "I know it's valid" path.
+- **Trapping accessors** `List.at(i): T` / `Map.at(k): V` — return the value directly, LOUD `kyte: panic`
+  (new `kyte_panic` runtime primitive) on absent, never a silent read. The ergonomic "I know it's valid" path.
 - **`??` now strips the optional** — `xs.get(i) ?? d` is `T`, not `T | undefined` (it wasn't; even the guarded
   form still "saw through"). This one fix cleared ~half the sites.
 - **Early-exit narrowing** (specs §3.4a) — `if (x == undefined) { return; } … x.field` narrows `x` to `T` for the
@@ -518,7 +518,7 @@ fixtures; guard proven to abort on regression; corpus 112/112.
   `if (x != undefined) { x.field }`.
 - **The flip**: `fieldType`/`methodReturn` no longer see through an optional receiver — they record a hard error
   (`optional_deref_errors`, surfaced in `shadow.zig` like the visibility/const errors). The P2-14 runtime guard
-  (`nova_optional_deref_fail`) remains as a backstop but is now unreachable for direct access.
+  (`kyte_optional_deref_fail`) remains as a backstop but is now unreachable for direct access.
 - **Migrated all 137 sites**: bson `entries.get→at`, web/app + routing + multipart bounded loops → `at`, routing
   `for-in`→indexed `at`, db drivers already used `??` (fixed by the coalesce change), field-optionals bound to a
   local + narrowed, corpus 30/38/43/44/81 reframed to the sound forms.
@@ -609,16 +609,16 @@ rejected); positive still works; full suite green. **Deps:** none. **Tracking:**
 
 **Depends on X2** (extends `crypto/sha`). **Design:** add `pbkdf2HmacSha256(pw, salt, iters, dkLen)` and the
 SCRAM-SHA-256 building blocks (client-first/server-first/client-final message helpers, `Hi`, `H`, `HMAC`,
-`XOR`) — shared by PostgreSQL SCRAM auth and MongoDB. Primitives in `crypto/sha.nova` + a `crypto/scram.nova`.
+`XOR`) — shared by PostgreSQL SCRAM auth and MongoDB. Primitives in `crypto/sha.ky` + a `crypto/scram.ky`.
 
 **What landed (2026-07-22):**
-- **Runtime, byte-accurate.** The existing `nova_sha256`/`nova_hmac_sha256` are binary-safe on INPUT (Nova
+- **Runtime, byte-accurate.** The existing `kyte_sha256`/`kyte_hmac_sha256` are binary-safe on INPUT (Kyte
   strings carry their length) but return HEX — no good for a key chain that XORs/re-hashes 32-byte binary
-  blocks. Added three RAW-byte wolfCrypt primitives: `nova_pbkdf2_hmac_sha256` (wc_PBKDF2), `nova_hmac_sha256_raw`,
-  `nova_sha256_raw`. Declared native in codegen; fallback stubs abort honestly without wolfSSL.
-- **`crypto/sha.nova`** now exposes `pbkdf2HmacSha256`, `hmacSha256Raw`, `sha256Raw`, `toHex`. PBKDF2 KATs
+  blocks. Added three RAW-byte wolfCrypt primitives: `kyte_pbkdf2_hmac_sha256` (wc_PBKDF2), `kyte_hmac_sha256_raw`,
+  `kyte_sha256_raw`. Declared native in codegen; fallback stubs abort honestly without wolfSSL.
+- **`crypto/sha.ky`** now exposes `pbkdf2HmacSha256`, `hmacSha256Raw`, `sha256Raw`, `toHex`. PBKDF2 KATs
   (published `"password"`/`"salt"` vectors, 1 / 2 / 4096 iters) green.
-- **`crypto/scram.nova`** — the full SCRAM-SHA-256 client: low-level primitives (`saltedPassword`/`clientKey`/
+- **`crypto/scram.ky`** — the full SCRAM-SHA-256 client: low-level primitives (`saltedPassword`/`clientKey`/
   `storedKey`/`clientSignature`/`clientProof`/`serverKey`/`serverSignature`, `clientProof` = `ClientKey ^
   ClientSignature` using the new `^`), plus a high-level `ScramClient` (clientFirstMessage / clientFinalMessage
   that parses the server-first-message and emits `c=biws,r=…,p=…`).
@@ -629,14 +629,14 @@ SCRAM-SHA-256 building blocks (client-first/server-first/client-final message he
 **DoD:** [x] PBKDF2 KATs; [x] known SCRAM exchange (RFC 7677); [x] gate `89_crypto_scram`; [x] corpus 111/111,
 ASAN + ARC-audit clean. [ ] Postgres SCRAM auth against a live SCRAM-only server (manual — deferred to D-series
 driver verification, where the driver calls `ScramClient`). **Deps:** X2 (done), `^` (done). **Tracking:**
-✅ 2026-07-22 · `crypto/scram.nova` + raw-byte runtime primitives · gate `89_crypto_scram` · RFC 7677 verified.
+✅ 2026-07-22 · `crypto/scram.ky` + raw-byte runtime primitives · gate `89_crypto_scram` · RFC 7677 verified.
 
 ---
 
 # D1 — MySQL live verification (P3) ✅
 
 **State:** codec + auth were golden-verified but never live. **Now LIVE-VERIFIED against MySQL 9.7** (Homebrew)
-via the D5 YCSB runner (`repro/ycsb/ycsb_mysql.nova`): full A–F, correct query/scan rows, ARC + ASAN clean.
+via the D5 YCSB runner (`repro/ycsb/ycsb_mysql.ky`): full A–F, correct query/scan rows, ARC + ASAN clean.
 
 **What the live run revealed + fixed (the handshake flow):**
 - **AuthSwitchRequest (0xfe).** MySQL 8/9 replies to the handshake response with an AuthSwitchRequest naming the
@@ -670,7 +670,7 @@ against the std seam.
 **DoD:** gate `mssql_codec` (PRELOGIN + LOGIN7 + token-stream row decode offline); SQL-auth login works live;
 NTLM deferred; live optional. **Deps:** X2 (crypto/random, TLS), TLS-in-handshake. **Tracking:** ✅ 2026-07-22 ·
 gate `100_mssql_codec` · commits `d72dac1`/`d377cf1`/`1f8448b` + TLS live.
-**Landed:** the TDS 7.4 driver (`data/sql/mssql.nova`) — packet framing/reassembly, PRELOGIN, LOGIN7 (94-byte
+**Landed:** the TDS 7.4 driver (`data/sql/mssql.ky`) — packet framing/reassembly, PRELOGIN, LOGIN7 (94-byte
 header + UTF-16LE, nibble-swap+XOR password obfuscation), SQLBatch, token-stream decode (COLMETADATA/ROW/DONE/
 ERROR) → typed `DbValue`: INT (INTN 1/2/4/8), BIT, VARCHAR/NVARCHAR (unicode UTF-16→UTF-8), DECIMAL/NUMERIC and
 MONEY (**scale-preserving**, exact decimal128), GUID/blob. **LIVE-VERIFIED (cleartext, ENCRYPT_NOT_SUP)** against
@@ -678,12 +678,12 @@ SQL Server 2022: PRELOGIN→LOGIN7→DDL/DML/SELECT round-trip, ARC+ASAN clean, 
 -50.0000/int/nvarchar/bit. Offline gate `100_mssql_codec` (obfuscation vector + full row decode).
 En route fixed the S3-deferred decimal-arith inference bug (a `9.99m` literal typed `null` in
 `type_checker.resolveExprType` → `decimal <op> decimal` mis-typed i32; added the `.decimal` literal arm).
-**TLS (ENCRYPT_ON) — LIVE-VERIFIED.** TDS-tunneled TLS: custom wolfSSL I/O callbacks (`nova_tds_tls_*` in io.cpp)
+**TLS (ENCRYPT_ON) — LIVE-VERIFIED.** TDS-tunneled TLS: custom wolfSSL I/O callbacks (`kyte_tds_tls_*` in io.cpp)
 that wrap the TLS handshake in PRELOGIN packets, then raw TLS; driver `?encrypt=true` DSN option + TLS channel
 (`chanSend`/`tfill`). Two things were load-bearing and diagnosed via wolfSSL debug logging + an OpenSSL reference:
 (1) wolfSSL rebuilt with **`WOLFSSL_SECURE_RENEGOTIATION`** (build.zig) so the ClientHello carries
 `renegotiation_info` (Schannel requires it); (2) **coalescing each TLS FLIGHT into ONE PRELOGIN packet**
-(`nova_tds_flush` buffers wolfSSL's per-record sends, flushed before each read) — SQL Server 2022 rejects a
+(`kyte_tds_flush` buffers wolfSSL's per-record sends, flushed before each read) — SQL Server 2022 rejects a
 flight split across packets. Verified: encrypted CREATE/INSERT/SELECT round-trip (`?encrypt=true`), TLS 1.2
 ECDHE, exact decimal/money/unicode, ARC+ASAN clean. **Deferred:** NTLM (MD4+HMAC-MD5).
 
@@ -693,8 +693,8 @@ ECDHE, exact decimal/money/unicode, ARC+ASAN clean. **Deferred:** NTLM (MD4+HMAC
 SCRAM-SHA-256 (reuses C1). Offline byte-verify wire+BSON first; live vs `mongod`.
 
 **What landed (2026-07-22) — `packages/nova-mongodb/`, a real package:**
-- **Scaffolded with `nova init console`**, imports stdlib only (`serde.bson`, `crypto.scram`, `net.tcp`, `db`).
-  `src/mongodb.nova` is the importable module; `tests/main_test.nova` is the offline codec gate.
+- **Scaffolded with `kyte init console`**, imports stdlib only (`serde.bson`, `crypto.scram`, `net.tcp`, `db`).
+  `src/mongodb.ky` is the importable module; `tests/main_test.ky` is the offline codec gate.
 - **OP_MSG wire codec** — `encodeOpMsg`/`decodeOpMsg` (16-byte header + flagBits + section-kind-0 + BSON body),
   byte-verified (opcode 2013, length prefix, requestID, round-trip).
 - **Command builders** — `helloCommand`, `insertCommand` (documents array), `findCommand` (filter),
@@ -704,18 +704,18 @@ SCRAM-SHA-256 (reuses C1). Offline byte-verify wire+BSON first; live vs `mongod`
 - **db seam** — `MongoDriver impl Driver` + `MongoConnection impl Connection` (+ the native `runCommand`).
   (Finding: the SQL-shaped `exec/query` seam is a poor fit for a document DB; the native `runCommand`/command
   builders are the real interface, and the seam is a thin adapter.)
-- **Enabling std work:** added **BSON binary (type 0x05)** to `serde/bson.nova` (`entryBinary`/`docGetBinary`),
+- **Enabling std work:** added **BSON binary (type 0x05)** to `serde/bson.ky` (`entryBinary`/`docGetBinary`),
   and fixed a latent **ARC leak in BSON embedded docs/arrays** — `entryDoc`/`entryArray` now adopt the sub-doc
   bytes as an ARC-owned string (`str_val`) instead of a leaking raw `ptr` in `int_val`. `docGetDoc`/`docGetArray`
   return the embedded bytes as a string. Gate `90_bson_binary`.
-- **Package flow proven end to end:** `nova-mongodb` as a git repo → consumer `project.json` deps → `nova get`
-  fetches it into `~/.nova/cache/` → `import mongodb` resolves from the cache → consumer tests pass + a binary
+- **Package flow proven end to end:** `nova-mongodb` as a git repo → consumer `project.json` deps → `kyte get`
+  fetches it into `~/.kyte/cache/` → `import mongodb` resolves from the cache → consumer tests pass + a binary
   runs, using the driver's codec. (The package source lives at `packages/nova-mongodb/`; publish to a remote to
-  `nova get` it elsewhere.)
+  `kyte get` it elsewhere.)
 
 **DoD:** [x] OP_MSG framing + hello/insert/find offline; [x] BSON binary + embedded round-trips
 (`90_bson_binary`); [x] SCRAM via C1 (RFC 7677 through the driver); [x] package fetched + consumed via
-`nova get`; [x] package tests ARC + ASAN clean; corpus 112/112. [ ] live vs `mongod` (deferred — no server);
+`kyte get`; [x] package tests ARC + ASAN clean; corpus 112/112. [ ] live vs `mongod` (deferred — no server);
 [ ] full cursor decode of `find` results into `DbValue` rows (follow-up). **Deps:** X2/C1, seam, T4 package
 manager (all done). **Tracking:** ✅ 2026-07-22 · `packages/nova-mongodb` · gate `90_bson_binary` + the
 package's own `tests/` · fetch-and-consume demonstrated.
@@ -726,9 +726,9 @@ package's own `tests/` · fetch-and-consume demonstrated.
 **Recommendation: NO for the third-party engines; keep only the SEAM + the first-party NovaDB driver in std.**
 
 - **In std (blessed, versioned with the language):** the DB abstraction — `db.Connection`/`db.Driver` traits,
-  `DbValue`, the binary-protocol helpers, `decimal128`/BSON codecs — plus **NovaDB** (Nova's own engine, the
-  batteries-included default so `nova init` apps work with zero deps).
-- **As packages (`nova get`):** PostgreSQL, MySQL, **MSSQL**, MongoDB. Each is a security-sensitive network
+  `DbValue`, the binary-protocol helpers, `decimal128`/BSON codecs — plus **NovaDB** (Kyte's own engine, the
+  batteries-included default so `kyte init` apps work with zero deps).
+- **As packages (`kyte get`):** PostgreSQL, MySQL, **MSSQL**, MongoDB. Each is a security-sensitive network
   client that tracks a database's own release cadence (new auth methods, protocol features); as a package it
   patches and versions independently of the compiler, doesn't bloat the std/compile surface, and keeps the
   language's trust surface small.
@@ -740,9 +740,9 @@ package's own `tests/` · fetch-and-consume demonstrated.
   packages too; keep them in-tree until the package flow is battle-tested via MongoDB, then extract. NovaDB
   stays. (Not urgent — record the direction; don't churn working drivers yet.)
 
-# D4 — YCSB benchmarks in Nova vs NovaDB (P2, CLAUDE.md goal) ✅
+# D4 — YCSB benchmarks in Kyte vs NovaDB (P2, CLAUDE.md goal) ✅
 
-**Design:** YCSB core workloads (A–F) written in Nova against the NovaDB driver: load phase + transaction
+**Design:** YCSB core workloads (A–F) written in Kyte against the NovaDB driver: load phase + transaction
 phase, Zipfian (Gray et al., θ=0.99) / uniform key distributions via an LCG PRNG, latency/throughput reporting.
 **DoD:**
 - [x] Workloads **A–F** run against a live NovaDB and report throughput+latency.
@@ -750,9 +750,9 @@ phase, Zipfian (Gray et al., θ=0.99) / uniform key distributions via an LCG PRN
 - [x] ARC-clean under sustained load; release build ~20–30K ops/sec.
 - [x] Numbers recorded; **faster than the Python YCSB baseline**.
 
-**Status: ✅ COMPLETE.** NovaDB (releasefast) + YCSB Nova (release), 10K-record run + full A–F sweep.
+**Status: ✅ COMPLETE.** NovaDB (releasefast) + YCSB Kyte (release), 10K-record run + full A–F sweep.
 **Deps:** NovaDB driver (done), running engine. **Tracking:** ✅ 2026-07-21 · commits `4c17abd` `8a5da75` ·
-bench A–F live · Nova+NovaDB both beat Python.
+bench A–F live · Kyte+NovaDB both beat Python.
 
 # D5 — YCSB over the `Driver` trait: PostgreSQL / MySQL / MSSQL (⭐user P3, driver test harness) ◑
 
@@ -772,10 +772,10 @@ MSSQL bulk insert / `TVP`, Mongo aggregation) — pair it with a small per-drive
 those. YCSB is the PRIMARY driver test, not the only one.
 
 **What landed (2026-07-22) — driver-generic core + two live engines:**
-- **`repro/ycsb/ycsb_core.nova`** — the whole A–F suite factored onto a `db.Connection` + portable SQL, exposed
+- **`repro/ycsb/ycsb_core.ky`** — the whole A–F suite factored onto a `db.Connection` + portable SQL, exposed
   as `runSuite(engineName, conn, createTableSql, records, ops, theta)`. The D4 benchmark's `Bench` already ran on
   the seam; this lifts the connect/schema/load/run driver out of it so ONE implementation drives every engine.
-- **Thin per-driver runners** — `ycsb_btree.nova`, `ycsb_postgres.nova`, `ycsb_mysql.nova`: each connects with its
+- **Thin per-driver runners** — `ycsb_btree.ky`, `ycsb_postgres.ky`, `ycsb_mysql.ky`: each connects with its
   driver + DSN and passes the engine's CREATE-TABLE dialect (Postgres/BTree `TEXT PK`; MySQL `VARCHAR(64) PK`).
 - **Verified live against THREE engines by swapping only the driver** (proves the abstraction is real; same
   `runSuite`, same workload code, different `Driver`):
@@ -784,7 +784,7 @@ those. YCSB is the PRIMARY driver test, not the only one.
     without an index, as expected).
   - **MySQL 9** — A 16.8K / B 15.2K / C 19.4K / D 15.7K / E 10.3K / F 11.2K ops/sec (caching_sha2, fast-auth).
   - **MSSQL (SQL Server 2022)** — LOAD 692 / A 1.15K / B 2.62K / C 2.23K / D 1.62K / E 0.93K / F 0.95K ops/sec
-    (`ycsb_mssql.nova`, SQL auth). Slower than the others: every statement is a full SQLBatch TDS round-trip
+    (`ycsb_mssql.ky`, SQL auth). Slower than the others: every statement is a full SQLBatch TDS round-trip
     (COLMETADATA + token stream) with no prepared statements/batching, and SQL Server autocommit fsyncs per
     INSERT. ARC clean under the full A–F workload (the driver leak test). The scan (E) uses the MSSQL dialect
     `SELECT TOP n … ORDER BY` (no `LIMIT`) via `runSuite`'s new `scanTop` flag — a portable-SQL exception the
@@ -809,7 +809,7 @@ the real production question (and the one that decides the "is NovaDB fast enoug
 `readAll` is a synchronous blocking `recv`, so in-process `spawn` would need one OS thread per in-flight op and
 is fragile; the robust design (like pgbench/sysbench/memtier) is **multi-process**: C independent client
 PROCESSES, each its own connection, all running a fixed-duration workload at once, op-counts summed → aggregate
-ops/sec. `repro/ycsb/`: `ycsb_client_core.nova` (env-configured load/run modes) + `client_{btree,postgres,mysql}.nova`
+ops/sec. `repro/ycsb/`: `ycsb_client_core.ky` (env-configured load/run modes) + `client_{btree,postgres,mysql}.ky`
 (`fn main()` binaries) + `conc_scaling.sh` (loads once, sweeps C=1,2,4,…, prints aggregate + per-client + scaling).
 
 **Findings (8-core box, 2026-07-22):**
@@ -821,7 +821,7 @@ ops/sec. `repro/ycsb/`: `ycsb_client_core.nova` (env-configured load/run modes) 
   `db.rw_lock` / ~5-thread ceiling, but the failure mode is a CRASH, not a plateau.)
 - **Read-only scaling is machine-bound here, not cleanly engine-bound** — NovaDB and PostgreSQL BOTH plateau at
   ~3.2–3.6× (BTree ~105K, PG ~74K ops/s) around C=4–8. Since both hit the wall at the same place on an 8-core box,
-  that plateau is the **heavy Nova clients + server competing for 8 cores**, NOT each engine's internal lock —
+  that plateau is the **heavy Kyte clients + server competing for 8 cores**, NOT each engine's internal lock —
   can't attribute NovaDB's read plateau to the rw_lock without lighter clients or a separate load machine.
   Honest read: read-concurrency is inconclusive on this single-box setup; the WRITE crash is the real result.
 - **PostgreSQL handles concurrent writes fine** — mixed 50/50 scales to 4.5×+ at C=16 and keeps climbing, never
@@ -835,13 +835,13 @@ dead socket. (MySQL's u24 length is self-bounding, already safe.)
 
 **Remaining:** the read-scaling measurement needs lighter clients (or a separate load box) to decouple client
 CPU from engine concurrency; and NovaDB's WAL-rotation-under-concurrent-writes crash is a btree-side fix.
-**Tracking:** ⭐ 2026-07-22 · `repro/ycsb/conc_scaling.sh` + `client_*.nova`; found the NovaDB concurrent-write
+**Tracking:** ⭐ 2026-07-22 · `repro/ycsb/conc_scaling.sh` + `client_*.ky`; found the NovaDB concurrent-write
 crash + hardened two drivers against dead-socket segfaults.
 
 > **NovaDB is PARKED (separate project).** The concurrency crash + the go-forward engine plan (Phase 1 stop-
 > the-crash: WAL mutex + BgWriter under the DB lock; Phase 2 lightweight latches + group-commit WAL for write
 > concurrency; Phase 3 multi-model SQL **and** NoSQL/document) are documented in **`btree/execution-plan-btree.md`**.
-> Not a Nova-language task — Nova's driver + benchmark harness are done and hardened. This plan resumes NOVA work.
+> Not a Kyte-language task — Kyte's driver + benchmark harness are done and hardened. This plan resumes KYTE work.
 
 ## D6 — Driver hardening & completeness (found under concurrent load, 2026-07-22) ✅
 
@@ -859,16 +859,16 @@ clients that are fine for a benchmark or a simple app but not yet production-gra
       empty scramble; fast-auth-success (`AuthMoreData 0x01 0x03`). Without these, auth silently desynced and
       every command spuriously "OK"d. (D1/D5.)
 - [x] **Live-path ARC leaks** (MyReader 64 KB buffer + per-packet payload; BtReader earlier). ARC + ASAN clean.
-- [x] **Timeouts / cancellation (connect + per-op).** Two runtime primitives — `nova_socket_connect_timeout(host,
+- [x] **Timeouts / cancellation (connect + per-op).** Two runtime primitives — `kyte_socket_connect_timeout(host,
       port, ms)` (non-blocking connect + `select` deadline; restores blocking mode on success) and
-      `nova_socket_set_timeout(fd, ms)` (SO_RCVTIMEO/SO_SNDTIMEO) — surfaced as `TcpClient.connectTimeout` /
+      `kyte_socket_set_timeout(fd, ms)` (SO_RCVTIMEO/SO_SNDTIMEO) — surfaced as `TcpClient.connectTimeout` /
       `TcpStream.setTimeout` and, at the seam, `Connection.setTimeout(ms)` (a new trait method, implemented by all
       four drivers). Every driver's `connect` now uses a **10 s connect deadline** by default (a black-hole host
       returns fd -1 in ~ms instead of hanging ~75 s), and an app bounds per-op I/O with `conn.setTimeout(ms)` so a
       hung-but-not-closed server returns instead of blocking forever. Verified: black-hole connect bounded to
       ~305 ms; live PG connect+`setTimeout(30000)`+query still returns rows. (commit `f6650c3`)
 
-- [x] **Connection pooling.** `data/sql/pool.nova` — a driver-generic `Pool` over the `Driver`/`Connection`
+- [x] **Connection pooling.** `data/sql/pool.ky` — a driver-generic `Pool` over the `Driver`/`Connection`
       seam: `acquire()` reuses a warm idle connection (LIFO) or opens a new one; `release(c)` returns it (or
       closes the surplus past `maxIdle`); `closeAll()` drains at shutdown; `opened`/`live`/`idle` diagnostics.
       Programs against the traits, so the same pool serves NovaDB/PG/MySQL/MSSQL by swapping the driver. Reuse
@@ -893,8 +893,8 @@ clients that are fine for a benchmark or a simple app but not yet production-gra
 
 - [x] **Circuit-breaker resilience (ResilientPool).** Timeouts stop one call hanging, but a DB that is DOWN still
       gets hammered — every request pays the full connect+timeout. Extracted the pure `CircuitBreaker` state
-      machine to `resilience/breaker.nova` (datetime-only, so the DB layer shares it without pulling the web
-      client stack), and added `ResilientPool` = `Pool` + breaker to `data/sql/pool.nova`. Every query/exec
+      machine to `resilience/breaker.ky` (datetime-only, so the DB layer shares it without pulling the web
+      client stack), and added `ResilientPool` = `Pool` + breaker to `data/sql/pool.ky`. Every query/exec
       fast-fails with a `CIRCUIT_OPEN` tag while OPEN (backend untouched); a failing call DISCARDS its connection
       (new `Pool.discard` — a dead socket must not re-enter the idle set); after the cooldown a probe reopens the
       path (HALF_OPEN → CLOSED). Failure read from the empty command tag drivers leave on a broken connection.
@@ -904,12 +904,12 @@ clients that are fine for a benchmark or a simple app but not yet production-gra
 - [x] **PostgreSQL SCRAM-SHA-256 auth.** The pg driver did only cleartext/trust; a server requiring
       `scram-sha-256` (the PostgreSQL default for password auth since v14) could not be reached. Now speaks the
       full `AuthenticationSASL`→`SASLContinue`→`SASLFinal` exchange via the RFC 7677-verified `ScramClient` (C1);
-      new `buildSASLInitial`/`buildSASLResponse` builders; client nonce from the CSPRNG builtin `nova_random_hex`.
+      new `buildSASLInitial`/`buildSASLResponse` builders; client nonce from the CSPRNG builtin `kyte_random_hex`.
       **Verified LIVE against PostgreSQL 18** (scram-password role behind a user-specific pg_hba line, connected +
       queried, then reverted). Gate `107_pg_scram_auth` (offline SASL frame shapes + RFC 7677 client-first/final).
       ARC+ASAN clean. (commit `8b6922f`)
 
-- [x] **MySQL caching_sha2 FULL auth (uncached password).** New runtime `nova_rsa_oaep_encrypt` (crypto.cpp:
+- [x] **MySQL caching_sha2 FULL auth (uncached password).** New runtime `kyte_rsa_oaep_encrypt` (crypto.cpp:
       PEM → DER via Base64_Decode → `wc_RsaPublicKeyDecode`, then `wc_RsaPublicEncrypt_ex` with
       WC_RSA_OAEP_PAD/SHA-1/MGF1-SHA1 = MySQL's RSA_PKCS1_OAEP_PADDING). On AuthMoreData 0x04 the driver requests
       the server's public key (0x02), XORs (password+NUL) with the nonce cyclically, RSA-OAEP-encrypts, and sends
@@ -917,7 +917,7 @@ clients that are fine for a benchmark or a simple app but not yet production-gra
       fast-auth + no-password paths still work. Gate `108_mysql_rsa_auth`. (commit `0058512`)
 - [x] **Real server-side prepared statements — MySQL** (`COM_STMT_PREPARE`/`EXECUTE`, binary protocol incl. the
       full BINARY row decoder: null bitmap, two's-complement signed ints, IEEE FLOAT/DOUBLE via new
-      `nova_ieee_le_to_str`, lenenc decimals/strings, binary date/time). Live vs MySQL 9.7; gate
+      `kyte_ieee_le_to_str`, lenenc decimals/strings, binary date/time). Live vs MySQL 9.7; gate
       `109_mysql_binary_protocol`; caught + fixed a real 1-byte/execute null-bitmap leak. (commit `b57b12f`)
       **and MSSQL** (`sp_prepare`/`sp_execute` over TDS RPC, `$N`→`@PN`, NVARCHAR-bound params, RETURNVALUE handle
       parse). En route fixed a real PRE-EXISTING bug: SQL Server sends NBCROW (0xD2) for any row with NULLs, which
@@ -978,7 +978,7 @@ mechanism. (E1 landed — see above.)
 is storable in `List<future<T>>`, passable, and awaitable out of a container. This is the enabling keystone for
 concurrent fan-out (spawn N, collect futures, await each). Gate `102_future_first_class`, ARC+ASAN clean.
 
-**LANDED (2026-07-22) — `when_all`/`parallel_for` fan-out/join (commit `bdf60f2`):** `concurrency/async_util.nova`
+**LANDED (2026-07-22) — `when_all`/`parallel_for` fan-out/join (commit `bdf60f2`):** `concurrency/async_util.ky`
 ships `when_all<T>`, `wait_all<T>`, `when_first_n<T>` — the fan-out/join layer over `spawn`/`await`. The
 spawn-loop + `when_all` IS the parallel-map / parallel-for pattern (launch N tasks concurrently, collect results
 in order). Gate `103_async_when_all` (8 assertions: ordered collect, sum, bounded join, mixed fanout), ARC+ASAN
@@ -1035,7 +1035,7 @@ Gate 97 was the FIRST conformance case to `import serde.yaml`, exposing two late
 clean tree, no decimal involved). NOT destructor/mono cross-contamination as first suspected — the real roots:
 1. **Co-import crash — FIXED.** `str`/`number`/`object` are defined in BOTH serde.json and serde.yaml, and
    sema's bare-call return-type resolution used a GLOBAL first-match (`findFunction`), so a bare `str("x")` in
-   yaml.nova was TYPED as json's `str` (return JsonValue) while codegen dispatched module-scoped to yaml's `str`
+   yaml.ky was TYPED as json's `str` (return JsonValue) while codegen dispatched module-scoped to yaml's `str`
    (YamlValue). That divergence released a YamlValue temp through `__destruct_JsonValue` (a co-import BUS). Fix
    (`src/sema/infer.zig`): resolve a bare call's function MODULE-SCOPED first (`findFunctionIn(current_module,…)`),
    matching codegen's dispatch.
@@ -1053,7 +1053,7 @@ clean tree, no decimal involved). NOT destructor/mono cross-contamination as fir
 # S2 — regex engine (P4/Tier3)
 
 **Design:** a bytecode-VM regex: pattern → flat instruction program with RELATIVE jump offsets (sub-programs
-splice trivially) → BACKTRACKING VM. `src/std/text/regex.nova`. Features: literals, `.`, classes `[...]`/`[^...]`
+splice trivially) → BACKTRACKING VM. `src/std/text/regex.ky`. Features: literals, `.`, classes `[...]`/`[^...]`
 with ranges + `\d\w\s\D\W\S`, quantifiers `*+?` and `{n}`/`{n,}`/`{n,m}` (greedy), alternation `|`, capturing
 `(...)` + non-capturing `(?:...)` groups, anchors `^`/`$`, escapes. API: `compile`/`test`/`find`/`exec`/`findAll`/
 `replaceAll` (`$n` group refs in the template). **DoD:** gate `92_regex` (literals, classes, `*+?`, `{n,m}`,
@@ -1068,10 +1068,10 @@ fixed by nulling an owned local's slot after its block-scope release. Regression
 **Design:** div-by-zero policy (trap vs current 0-stub — recommend trap), explicit `int↔decimal` conversion
 functions, decimal in more numeric contexts. **DoD:** gate `decimal_conv` (int↔decimal explicit, div-by-zero
 traps). **Deps:** none. **Tracking:** ✅ 2026-07-22 (gate `94_decimal_conv`).
-**Landed:** (1) divide- AND modulo-by-zero now TRAP loudly (`nova: panic`, _Exit(134)) via a new
-`nova_panic_cstr` C-string runtime abort (core.cpp) — the silent `0`-stub returned a wrong answer.
+**Landed:** (1) divide- AND modulo-by-zero now TRAP loudly (`kyte: panic`, _Exit(134)) via a new
+`kyte_panic_cstr` C-string runtime abort (core.cpp) — the silent `0`-stub returned a wrong answer.
 (2) `decimal.fromInt(n)` / `decimal.toInt(d)` — a new `decimal` builtin namespace (sema/builtins.zig table +
-codegen dispatch + `nova_decimal_from_int`/`nova_decimal_to_int` runtime). `toInt` truncates toward zero and
+codegen dispatch + `kyte_decimal_from_int`/`kyte_decimal_to_int` runtime). `toInt` truncates toward zero and
 TRAPS on out-of-i64 range (no silent wrap). `isFatalUnresolvedIdent` now exempts any builtin-table receiver so
 `decimal.*` isn't flagged undefined. Corpus 118/118 functional, 212/212 ASAN. **Deferred (not S3):** the
 `let x: decimal = <decimal arith>` annotation path mis-types (works un-annotated / inline `${}`); decimal in
@@ -1082,12 +1082,12 @@ more numeric contexts (mixed int/decimal expr) still needs the no-implicit-coerc
 **Problem.** No `string → decimal128` exists, so DB `numeric`/`DECIMAL` columns come back as text, not exact
 decimals (open across NovaDB, Postgres, MySQL, and BSON/JSON serde). **Design:** parse a decimal string
 (sign, integer, fraction, exponent) into the 128-bit BID representation, round-half-even to 34 digits —
-mirror the existing decimal literal path. Runtime primitive `nova_decimal_from_string` (or Nova-side).
+mirror the existing decimal literal path. Runtime primitive `kyte_decimal_from_string` (or Kyte-side).
 **DoD:** KAT `decimal_parse` (`"3.14"`, `"-0.1"`, `"1e10"`, edge exponents) exact; DB drivers switch numeric
 columns to real `DbValue.dec`. **Deps:** none — **unblocks exact decimal everywhere**. **Tracking:** ✅ 2026-07-22
 (gate `95_decimal_parse`).
 **Landed:** `decimal.fromString(s: string): decimal` — a new entry in the `decimal` builtin namespace routing
-to the existing BID parser `nova_decimal_from_string` (Nova strings are NUL-terminated and decimal text is pure
+to the existing BID parser `kyte_decimal_from_string` (Kyte strings are NUL-terminated and decimal text is pure
 ASCII, so the runtime pointer is C-compatible — no length-aware variant needed). Handles sign / integer / fraction
 / `e`/`E` exponents, round-half-even to 34 digits, exact (no f64 hop). **Consumer switch:** `decodeCell` in all
 three SQL drivers (`postgres`/`mysql`/`btreedb`) now build `DbValue(Decimal, …, decimal.fromString(raw), raw)` —
@@ -1100,17 +1100,17 @@ public `db.dbDecimal(decimal.fromString(...))` seam. Corpus 119/119 functional, 
 
 **State:** static LLVM + in-process LLD (native+wasm) landed. **CROSS-COMPILATION LANDED (Linux x86_64 + arm64).**
 Insight (user): the bundled **Zig toolchain** (`zig c++`) ships libc (musl/glibc) + CRT and cross-links ELF/COFF, so
-a macOS host can produce — and, via musl `-static`, run anywhere — a Linux binary. `nova build --target
-linux-x86_64|linux-arm64` now: (1) emits the Nova object for the triple (LLVM TargetMachine already honours it);
-(2) cross-builds the single-TU C++ runtime for the target ONCE via `zig c++ -target <t> -DNOVA_DROP_ARENA
--I<boost>/include` (Boost.Asio is header-only here; cached at `~/.nova/lib/nova_runtime_<t>.o`, invalidated on
+a macOS host can produce — and, via musl `-static`, run anywhere — a Linux binary. `kyte build --target
+linux-x86_64|linux-arm64` now: (1) emits the Kyte object for the triple (LLVM TargetMachine already honours it);
+(2) cross-builds the single-TU C++ runtime for the target ONCE via `zig c++ -target <t> -DKYTE_DROP_ARENA
+-I<boost>/include` (Boost.Asio is header-only here; cached at `~/.kyte/lib/kyte_runtime_<t>.o`, invalidated on
 `zig build`); (3) static-links via `zig c++ -target <t> -static`. `crossLinkViaZig`/`mapCrossTarget` in `main.zig`;
-`NOVA_KEEP_OBJ`/build-cache honoured. **PROVEN build+run under Docker** (busybox amd64 + arm64, colima): heap/ARC
+`KYTE_KEEP_OBJ`/build-cache honoured. **PROVEN build+run under Docker** (busybox amd64 + arm64, colima): heap/ARC
 (structs), range loops, string interpolation all correct. **Windows:** the toolchain path is wired
 (`x86_64-windows-gnu`) but the runtime's raw POSIX socket layer (`sys/socket.h`/`netinet/in.h`/`arpa/inet.h`) needs
 a winsock2 port — a tracked follow-on (guarded `dlfcn.h`; a clear hint prints on the attempt). **Remaining design:**
 Windows winsock2 shim; TLS on cross targets (wolfSSL cross-build — today TLS is stubbed off-host); bundle Boost
-headers into `~/.nova` to drop the Homebrew dependency; bundle macOS SDK stubs. **DoD:** Linux/ELF builds+runs ✅
+headers into `~/.kyte` to drop the Homebrew dependency; bundle macOS SDK stubs. **DoD:** Linux/ELF builds+runs ✅
 (x86_64+arm64); no-Xcode mac build ◑. **Deps:** none. **Tracking:** ● 2026-07-24 Linux cross done.
 
 # T2 — WASM pointer-width audit (P5)
@@ -1126,11 +1126,11 @@ string, not `0x20_0000_001F`); baseline ratcheted. **Deps:** none. **Tracking:**
 **Why now.** FFI is no longer a "someday P5" — it is the **keystone** for the product surface the user just
 requested: the **webview (W1)** binds a native webview lib; **`useStatic` (W2)** and the **outbound circuit
 breaker (W3)** can *bind* the proven Zig implementations in `~/plancksystems` (LRU cache 430 lines, static
-content store 134 lines, circuit breaker 109 lines) instead of re-porting ~670 lines into Nova. Do FFI first
-and the rest become thin Nova wrappers over battle-tested code.
+content store 134 lines, circuit breaker 109 lines) instead of re-porting ~670 lines into Kyte. Do FFI first
+and the rest become thin Kyte wrappers over battle-tested code.
 
-**Design:** `extern("lib") fn name(args): ret;` — C-ABI marshalling (Nova types ↔ C types), ownership boundary
-rules (who frees across the seam — reuse the ARC/heap-header discipline from `nova-runtime-abi-seam`),
+**Design:** `extern("lib") fn name(args): ret;` — C-ABI marshalling (Kyte types ↔ C types), ownership boundary
+rules (who frees across the seam — reuse the ARC/heap-header discipline from `kyte-runtime-abi-seam`),
 dlopen/link the named lib. The Zig deps expose C-ABI entry points (or a thin `extern "C"` shim per lib).
 Enables embedding wasmtime, using system libs, and the W-items below.
 
@@ -1141,10 +1141,10 @@ no mangling.
 **DoD:**
 - [x] Parse `extern("lib") fn sig;` (bodiless); lexer `extern` keyword; AST `FunctionDecl.extern_lib`.
 - [x] Codegen emits an LLVM external with a C-mapped signature; reuses runtime-shared symbols (no `malloc.57`).
-- [x] Linker collects distinct libs → `-l<lib>` on native (in-process LLD + clang) and `nova test` paths.
+- [x] Linker collects distinct libs → `-l<lib>` on native (in-process LLD + clang) and `kyte test` paths.
 - [x] Marshal **scalars** (int→i32, long→i64, bool→i8) + **ptr** + **void** — boundary casts via buildCallWithCasts.
-- [x] Marshal **string** both directions (Nova↔C `char*`: arg→NUL-term temp then freed; return→copied Nova string).
-- [x] **struct-by-pointer** — Nova struct value (heap ptr, C-compatible layout) passes as `void*`.
+- [x] Marshal **string** both directions (Kyte↔C `char*`: arg→NUL-term temp then freed; return→copied Kyte string).
+- [x] **struct-by-pointer** — Kyte struct value (heap ptr, C-compatible layout) passes as `void*`.
 - [x] Gate `82_ffi_extern` (libc abs/labs/malloc/memset/free/strlen/getenv/memcmp); corpus 104/104; ARC + ASAN clean.
 
 **Status: ✅ v1 COMPLETE.** Only **float/double** marshalling deferred (maps to i64 today; FP must not yet
@@ -1152,19 +1152,19 @@ cross FFI — a small follow-up adding FPTrunc/SIToFP at the boundary). **Deps:*
 **Tracking:** ✅ 2026-07-21 · commits `97ba8ef` (stage 1: scalars/ptr/void) `1e31ad1` (stage 2/3: string +
 struct) · gate `82_ffi_extern` · unblocks W1/W2/W3.
 
-# T4 — Tooling: LSP, `nova fmt`, package manager (P5/6) ◑
+# T4 — Tooling: LSP, `kyte fmt`, package manager (P5/6) ◑
 
-**Design:** mature the LSP (diagnostics, hover, go-to-def, completion on the real type info); `nova fmt` (the
+**Design:** mature the LSP (diagnostics, hover, go-to-def, completion on the real type info); `kyte fmt` (the
 formatter exists — wire a CLI + idempotence gate); a package manager (module resolution, a manifest, fetch).
 
-**What landed (2026-07-21, `4e4571c`) — `nova fmt` made NON-DESTRUCTIVE:**
+**What landed (2026-07-21, `4e4571c`) — `kyte fmt` made NON-DESTRUCTIVE:**
 - Fixed real formatter corruption bugs: `extern("lib") fn` was rewritten to an empty `fn {}`, `async` was
   dropped, and `struct Pair<A,B>` / `fn map<T>` lost their type params. Now emitted correctly (generics from
   the AST, not a source-span scrape); `pub` emitted instead of `export`.
 - **Non-destructive guard:** `formatFile` compares the meaningful TOKEN STREAM of the output to the original
   and only writes when identical — otherwise it SKIPS the file (reports it) and leaves it byte-unchanged. So
-  `nova fmt` can never corrupt code. Gate `conformance/fmt-check.sh`: wrote=44 skipped=41 **corruptions=0**.
-- `nova get <git-url>` (package manager — clones a dep into `~/.nova/cache`) and the `nls` LSP already exist.
+  `kyte fmt` can never corrupt code. Gate `conformance/fmt-check.sh`: wrote=44 skipped=41 **corruptions=0**.
+- `kyte get <git-url>` (package manager — clones a dep into `~/.kyte/cache`) and the `nls` LSP already exist.
 
 **What landed (2026-07-22) — LSP made FULLY FUNCTIONAL:**
 The `nls` server was a stub: completion returned two hard-coded strings, hover only covered top-level fns/structs,
@@ -1192,17 +1192,17 @@ Python harnesses) plus 7 in-tree unit tests:
   tested) + a rewritten `server.zig`.
 
 **What landed (2026-07-22) — package manager made manifest-driven:**
-`nova get` was git-clone-only and fetched deps were **unusable** (nothing resolved `import <dep>` against them).
+`kyte get` was git-clone-only and fetched deps were **unusable** (nothing resolved `import <dep>` against them).
 Now:
-- **`nova get` (no URL)** restores every dependency in `project.json` into `~/.nova/cache/<repo>/` (idempotent —
-  a present cache dir is a hit, no re-clone/clobber). **`nova get <url>`** clones + records it in the manifest.
-- **Import resolution** searches each cached package's `src/<module>.nova` (then its root) — so the manifest
+- **`kyte get` (no URL)** restores every dependency in `project.json` into `~/.kyte/cache/<repo>/` (idempotent —
+  a present cache dir is a hit, no re-clone/clobber). **`kyte get <url>`** clones + records it in the manifest.
+- **Import resolution** searches each cached package's `src/<module>.ky` (then its root) — so the manifest
   drives *fetching* and the cache drives *resolution* (the resolver needs no manifest parse).
 - Verified e2e by a **2-package example** (`conformance/pkg-manager-check.sh`): a `mathlib` library package + a
-  `consumer` that depends on it — restore → resolve → `nova test` passes using symbols that exist ONLY in the
+  `consumer` that depends on it — restore → resolve → `kyte test` passes using symbols that exist ONLY in the
   fetched package → the consumer's `main` also compiles to a native binary and runs. Corpus 108/108 unchanged.
 
-**What landed (2026-07-22) — `nova fmt` made COMMENT-PRESERVING + wider coverage:**
+**What landed (2026-07-22) — `kyte fmt` made COMMENT-PRESERVING + wider coverage:**
 The formatter silently **deleted every comment** on write (the guard compared only CODE tokens, so comment loss
 passed it — active data loss on real files). Now:
 - **Comment re-injection.** After the AST format, `reinjectComments` splices the source's `//` comments back
@@ -1211,90 +1211,90 @@ passed it — active data loss on real files). Now:
   so their offset can't come from the lexeme pointer). Verified comment-preserving + **idempotent** across all
   53 written corpus files.
 - **Fixed construct round-trip bugs** that made the guard skip: template strings (backtick + `${…}`, was `"…"` +
-  `{…}`), the invalid invented `static ` keyword (Nova infers static from no-`self`), **for-in loops** (`for (x
+  `{…}`), the invalid invented `static ` keyword (Kyte infers static from no-`self`), **for-in loops** (`for (x
   in xs)` was emitted as an empty C-style header), braceless single-statement `if`/branches, and generic-trait
   type params (`trait T<Q, R>`). Coverage rose **44 → 53** of 85 checked files, still **0 corruptions**.
-- Gate `fmt-check.sh` now also asserts comment preservation + idempotence. `NOVA_FMT_DEBUG=1` prints the first
+- Gate `fmt-check.sh` now also asserts comment preservation + idempotence. `KYTE_FMT_DEBUG=1` prints the first
   token divergence for any skipped file.
 
 **Remaining (why ◑, not ✅):**
-- [x] `nova fmt` CLI + non-destructive gate.
+- [x] `kyte fmt` CLI + non-destructive gate.
 - [x] **LSP maturity: completion / hover / go-to-def / document-symbols / signature-help** — done 2026-07-22.
 - [x] **Package manager: manifest-driven resolution of a 2-package example** — done 2026-07-22
       (`pkg-manager-check.sh`).
-- [x] **`nova fmt` comment preservation + idempotence** — done 2026-07-22 (data-loss bug fixed).
-- [ ] `nova fmt` **remaining construct coverage** — 32/85 corpus files still SKIP (left byte-unchanged, never
+- [x] **`kyte fmt` comment preservation + idempotence** — done 2026-07-22 (data-loss bug fixed).
+- [ ] `kyte fmt` **remaining construct coverage** — 32/85 corpus files still SKIP (left byte-unchanged, never
       corrupted) on deeper constructs: trait-widening struct inits, module-qualified generic types (`list.List<T>`
       — a parser AST limitation: the `list.` prefix isn't retained), JSX/NSX, the mediator/routing and DB-codec
       files. Also `->` vs `=>` for a function type both parse to one AST (no arrow record), so only the majority
       style round-trips. Closing these needs per-construct emit fixes (and a couple of small AST additions).
 - [ ] LSP semantic diagnostics beyond the first parse error (undefined names, type errors) — would run the
       checker; left out to avoid pulling the checker's global state into the server. NOTE: a dev-machine `nls`
-      re-syncing `~/.nova/std` under concurrent builds caused flaky `nextPowerOfTwo` failures — the LSP should
+      re-syncing `~/.kyte/std` under concurrent builds caused flaky `nextPowerOfTwo` failures — the LSP should
       not touch the shared std tree while a build reads it.
 - [ ] Package manager follow-ups (nice-to-have, not blocking): version pinning / a lockfile, transitive deps.
 
-**Deps:** F5 (module scoping). **Tracking:** ◑ 2026-07-22 · LSP FULL + package manager manifest-driven + `nova
+**Deps:** F5 (module scoping). **Tracking:** ◑ 2026-07-22 · LSP FULL + package manager manifest-driven + `kyte
 fmt` comment-preserving/idempotent (44→53 coverage), all e2e-verified (`fmt-check.sh` + nls e2e +
 `pkg-manager-check.sh`). Remaining: the fmt construct long-tail (32 skips) + LSP semantic diagnostics.
 
-# T5 — `nova init` templates: `web` (VSA) + `desktop` (webview) (⭐P3, user-specified)
+# T5 — `kyte init` templates: `web` (VSA) + `desktop` (webview) (⭐P3, user-specified)
 
-**Two templates replace `nova init app`** (user, 2026-07-21): **`nova init web`** = the vertical-slice web app
-below; **`nova init desktop`** = a webview-based desktop app (W1) — `import webview;`, a `Webview` window that
-renders NSX and binds Nova handlers to JS, optionally driving an in-process `App` for local data. Keep `app`
+**Two templates replace `kyte init app`** (user, 2026-07-21): **`kyte init web`** = the vertical-slice web app
+below; **`kyte init desktop`** = a webview-based desktop app (W1) — `import webview;`, a `Webview` window that
+renders NSX and binds Kyte handlers to JS, optionally driving an in-process `App` for local data. Keep `app`
 as a deprecated alias that prints a hint. `src/main.zig` `cmdInit` dispatches on the subcommand.
 
 **Why re-do it.** The current scaffold (`src/main.zig` ~764–794, `src/templates.zig`) emits the old
 `features/home/{views,services,handlers,controllers}` layer-per-type shape with `req: any` controllers. The
 user specified a **vertical-slice** layout (ASP.NET VSA style) where each feature slice is self-contained.
 
-**Target layout (user-provided, mapped to Nova):**
+**Target layout (user-provided, mapped to Kyte):**
 ```
 MyApp/
 ├── Features/                       # MAIN entry point for features
 │   ├── Products/                   # feature group / aggregate root
 │   │   ├── CreateProduct/          # one vertical slice = one folder
-│   │   │   ├── endpoint.nova       # app.post<CreateProduct>("/products") registration
-│   │   │   ├── command.nova        # @serializable CreateProduct { ... }
-│   │   │   ├── handler.nova        # impl RequestHandler<CreateProduct, CreateProductResponse>
-│   │   │   ├── validator.nova      # validate(cmd) -> errors
-│   │   │   └── response.nova       # @serializable CreateProductResponse
+│   │   │   ├── endpoint.ky       # app.post<CreateProduct>("/products") registration
+│   │   │   ├── command.ky        # @serializable CreateProduct { ... }
+│   │   │   ├── handler.ky        # impl RequestHandler<CreateProduct, CreateProductResponse>
+│   │   │   ├── validator.ky      # validate(cmd) -> errors
+│   │   │   └── response.ky       # @serializable CreateProductResponse
 │   │   ├── GetProductById/         # query slice (Query/Handler/Response)
 │   │   └── views/                  # ⭐ PER-FEATURE JSX/NSX templates (user emphasis)
-│   │       ├── product_card.nova
-│   │       └── product_list.nova
-│   └── Orders/PlaceOrder/place_order.nova   # single-file slice style (alternative)
+│   │       ├── product_card.ky
+│   │       └── product_list.ky
+│   └── Orders/PlaceOrder/place_order.ky   # single-file slice style (alternative)
 ├── Domain/
-│   ├── entities/ (product.nova, order.nova)
-│   └── exceptions/ (domain_exception.nova)
+│   ├── entities/ (product.ky, order.ky)
+│   └── exceptions/ (domain_exception.ky)
 ├── Shared/
-│   ├── database/ (app_db.nova)              # DB context / connection wiring (NovaDB driver)
-│   ├── behaviors/ (validation.nova, logging.nova)   # pipeline behaviors (X1 PipelineBehavior)
-│   └── middleware/ (exception_handling.nova)
-├── main.nova                       # = Program.cs: DI registration + pipeline setup + app.run
-└── nova.json
+│   ├── database/ (app_db.ky)              # DB context / connection wiring (NovaDB driver)
+│   ├── behaviors/ (validation.ky, logging.ky)   # pipeline behaviors (X1 PipelineBehavior)
+│   └── middleware/ (exception_handling.ky)
+├── main.ky                       # = Program.cs: DI registration + pipeline setup + app.run
+└── kyte.json
 ```
 **Key points:**
 - **Per-slice files**: endpoint + command|query + handler + validator + response, built on the X1 typed API
   (`app.get/post<T>`, `RequestHandler<Q,R>`, `@serializable`, `ValueSource`).
 - **⭐ Per-feature `views/`** holding JSX/NSX templates — each feature owns its view templates, NOT one
   global views dir (explicit user requirement).
-- **`Shared/behaviors/`** = X1 pipeline behaviors (validation, logging) wired in `main.nova`.
-- `main.nova` maps to `Program.cs`: register handlers/behaviors, `app.useStatic(...)` (W2), `app.run(port)`.
+- **`Shared/behaviors/`** = X1 pipeline behaviors (validation, logging) wired in `main.ky`.
+- `main.ky` maps to `Program.cs`: register handlers/behaviors, `app.useStatic(...)` (W2), `app.run(port)`.
 
 **Files:** `src/templates.zig` (new template strings per slice file + per-feature view), `src/main.zig`
 scaffold (replace the flat `features/home/...` writes with the VSA tree; generate a sample `Products/CreateProduct`
 + `GetProductById` slice + a per-feature view).
 
 **DoD:**
-- [x] `nova init web foo` scaffolds the VSA tree; builds native + dispatches both routes; `nova test` passes.
-- [x] `nova init desktop foo` scaffolds a webview app; builds native.
-- [x] `nova init console` still works; `app` is a deprecated alias → web.
+- [x] `kyte init web foo` scaffolds the VSA tree; builds native + dispatches both routes; `kyte test` passes.
+- [x] `kyte init desktop foo` scaffolds a webview app; builds native.
+- [x] `kyte init console` still works; `app` is a deprecated alias → web.
 
 **Status: ✅ COMPLETE.** Fixed two foundation bugs en route: a project-root `src/<module>` import fallback
-(so a `tests/` tree can import project modules), and — significant — **`nova test` was broken for EVERY user
-project** (a std module read from `~/.nova/std` took its absolute HOME path as identity, so under the
+(so a `tests/` tree can import project modules), and — significant — **`kyte test` was broken for EVERY user
+project** (a std module read from `~/.kyte/std` took its absolute HOME path as identity, so under the
 test-harness merge a stdlib free function was collected under one spelling and called under another →
 `nextPowerOfTwo not found`); loadProgram now keeps the canonical `src/std/…` spelling. **Deps:** X1, W2 (done).
 **Tracking:** ✅ 2026-07-21 · commit `c13fb7c`.
@@ -1305,19 +1305,19 @@ test-harness merge a stdlib free function was collected under one spelling and c
 
 The FFI-enabled product track is done: **T3** FFI ✅ · **W1** webview ✅ (100%) · **W2** useStatic ✅ ·
 **W3** circuit breaker ✅ · **T5** init web/desktop ✅. Recurring theme: each surfaced a latent stdlib/compiler
-bug that had never been exercised (nova_file_read_all `.string`→`.int` SIGSEGV, client.nova missing `cookies`,
-logger's `io.file.File`, the user-project `nova test` std-identity bug) — all now fixed and gated. Corpus grew
+bug that had never been exercised (kyte_file_read_all `.string`→`.int` SIGSEGV, client.ky missing `cookies`,
+logger's `io.file.File`, the user-project `kyte test` std-identity bug) — all now fixed and gated. Corpus grew
 103 → 108. Remaining open items are the non-product foundation/driver/tooling backlog (H1, H2, F1–F5, S/D).
 
 ---
 
 # W1 — Webview in the runtime (⭐P3, user-requested) ✅ v1
 
-**Goal.** Let a Nova app open a native desktop window rendering HTML/JS/NSX (not just serve HTTP) — a GUI
+**Goal.** Let a Kyte app open a native desktop window rendering HTML/JS/NSX (not just serve HTTP) — a GUI
 target alongside the server target.
 
 **What landed:** vendored `webview/webview` 0.10.0 (single-header, MIT) → `deps/webview/`, built by build.zig
-into `libwebview.a` (macOS Cocoa/WKWebView, ObjC++). Nova `Webview` struct (`src/std/webview.nova`) over
+into `libwebview.a` (macOS Cocoa/WKWebView, ObjC++). Kyte `Webview` struct (`src/std/webview.ky`) over
 `extern("webview")` FFI bindings: create / setTitle / setSize / navigate / setHtml / initScript / eval / run /
 terminate / delete. Linker `appendFfiLib` links the vendored `.a` by path + `-framework WebKit -framework
 Cocoa` (frameworks aren't `-l`).
@@ -1326,28 +1326,28 @@ Cocoa` (frameworks aren't `-l`).
 - [x] `import webview;` → `Webview(debug)` opens/configures a window; setHtml/navigate/eval work.
 - [x] Links libwebview.a + WebKit/Cocoa; all webview symbols resolve; a real WKWebView instantiates at runtime.
 - [x] Builds from scratch via build.zig; corpus 105/105.
-- [x] **JS→Nova callbacks** — `bind(name, handler)`: JS `window.name(args)` invokes a Nova `(string)->string`
-      handler (JSON req in, JSON result out) via a C trampoline; `dispatch(task)` runs a Nova `()->void` on the
-      UI thread; `unbind`. Built on `nova_invoke_str_closure` (invoke a Nova closure from C via box{fn_ptr,env}),
+- [x] **JS→Kyte callbacks** — `bind(name, handler)`: JS `window.name(args)` invokes a Kyte `(string)->string`
+      handler (JSON req in, JSON result out) via a C trampoline; `dispatch(task)` runs a Kyte `()->void` on the
+      UI thread; `unbind`. Built on `kyte_invoke_str_closure` (invoke a Kyte closure from C via box{fn_ptr,env}),
       headlessly gated (`83_ffi_callback`, ARC+ASAN clean).
-- [x] **NSX/JSX → setHtml** — JSX renders to a Nova string; `w.setHtml(<html>…</html>)` works.
+- [x] **NSX/JSX → setHtml** — JSX renders to a Kyte string; `w.setHtml(<html>…</html>)` works.
 - [x] Natural idioms all work: qualified/unqualified `Webview(...)` ctor, `webview.HINT_*` const, typed-lambda
       OR named-fn `bind` handlers. (Closed the enabling language gaps — see below.)
-- [ ] The *visible* `run()` loop + an interactive JS→Nova round-trip updating the DOM — **manual GUI gate**
+- [ ] The *visible* `run()` loop + an interactive JS→Kyte round-trip updating the DOM — **manual GUI gate**
       (headless corpus can't display); the mechanism is verified end-to-end, only the pixels need a desktop.
 
-**Status: ✅ COMPLETE (100%).** Display + Nova→JS eval + JS→Nova bind/dispatch + NSX rendering, with every
+**Status: ✅ COMPLETE (100%).** Display + Kyte→JS eval + JS→Kyte bind/dispatch + NSX rendering, with every
 natural idiom working. Closing W1 to 100% drove three GENERAL language fixes (commit `29a1f07`): typed lambda
 params `(s: string) => …` (§10 #19 — parser+AST+codegen), module-qualified const access `mod.CONST`, and
 confirmed function-type return annotations. The FFI callback need was met via a runtime closure-invoke
 primitive + in-libwebview trampolines (gate `83`), not general FFI fn-pointer marshalling.
 
 The ONLY thing not automatable is the visible window (a headless corpus can't open a GUI) — the full
-mechanism (bind trampoline → Nova handler → webview_return) is verified; a desktop run of `repro/webview_demo.nova`
+mechanism (bind trampoline → Kyte handler → webview_return) is verified; a desktop run of `repro/webview_demo.ky`
 shows it. **Not W1 gaps (unrelated features):** general FFI fn-pointer marshalling for arbitrary C callback
 signatures; float/double FFI. **Deps:** T3 (done). **Tracking:** ✅ 2026-07-21 · commits `513ecf2` (display)
 `6119c79` (bind/dispatch) `29a1f07` (enabling language fixes) · gates `83_ffi_callback` + `84_typed_lambda_params`
-+ manual demo `repro/webview_demo.nova`.
++ manual demo `repro/webview_demo.ky`.
 
 ---
 
@@ -1355,18 +1355,18 @@ signatures; float/double FFI. **Deps:** T3 (done). **Tracking:** ✅ 2026-07-21 
 
 **Goal.** `app.useStatic("/static", "./wwwroot")` serves files from disk, cached.
 
-**Decision (2026-07-21): REIMPLEMENTED IN NOVA, not bound from Zig.** On inspection the referenced Zig files
+**Decision (2026-07-21): REIMPLEMENTED IN KYTE, not bound from Zig.** On inspection the referenced Zig files
 are comptime-generic + `std.Io`/allocator-heavy (`LruCache(comptime K,V)`, `StaticContentStore` over
-`StringHashMap`) — a C-ABI FFI shim over them would be fragile, and Nova already has `Map`/`List`/`bytes`/
-`io.file`/`web.mime`. The Nova version is ~130 lines, portable (wasm-ready), and dogfoods the stdlib. (FFI
+`StringHashMap`) — a C-ABI FFI shim over them would be fragile, and Kyte already has `Map`/`List`/`bytes`/
+`io.file`/`web.mime`. The Kyte version is ~130 lines, portable (wasm-ready), and dogfoods the stdlib. (FFI
 stays the path for genuinely-C libraries like webview.)
 
-**What landed** (`src/std/web/static_content.nova`):
+**What landed** (`src/std/web/static_content.ky`):
 - **LruCache** — bounded key→content, LRU eviction, hit/miss stats + `hitRate()`.
 - **StaticMount** — `prefix`→`dir`; `serve(reqPath)` derives Content-Type from the extension, rejects `..`
   traversal (403), maps `/`→`index.html`, checks cache then disk.
 - **App.useStatic(prefix, dir)** + `dispatch()` falls through to the mounts for GET requests that match no API
-  route (routes win). `web/mime.nova` gained a `contentType(ext)` free function so the mime lookup crosses
+  route (routes win). `web/mime.ky` gained a `contentType(ext)` free function so the mime lookup crosses
   module boundaries without hitting the cross-module enum-method codegen gap.
 
 **DoD:**
@@ -1374,10 +1374,10 @@ stays the path for genuinely-C libraries like webview.)
 - [x] `../` traversal rejected (403); missing file → 404; API routes take precedence.
 - [x] Gate `85_static_content`; corpus 107/107; ARC-audit + ASAN clean.
 
-Fixed a latent crash en route: `nova_file_read_all` was typed `.string` in the sema builtins table but returns
+Fixed a latent crash en route: `kyte_file_read_all` was typed `.string` in the sema builtins table but returns
 an int byte-count, so codegen ARC-released the count as a pointer → SIGSEGV (broke `File.readText` for every
 caller). Now `.int`. **Deferred (not W2):** etag/304, binary large files streamed (readText loads whole file),
-`loadDirectory` pre-index. **Deps:** none (Nova-native). **Tracking:** ✅ 2026-07-21 · commit `ddd2c08` · gate
+`loadDirectory` pre-index. **Deps:** none (Kyte-native). **Tracking:** ✅ 2026-07-21 · commit `ddd2c08` · gate
 `85_static_content`.
 
 ---
@@ -1387,10 +1387,10 @@ caller). Now `.int`. **Deferred (not W2):** etag/304, binary large files streame
 **Goal.** Wrap the client that calls **external services** so a failing upstream trips the breaker instead of
 being hammered — a resilience primitive on the outbound path, **separate from static serving**.
 
-**Decision: REIMPLEMENTED IN NOVA** (like W2) — it is a pure state machine + a millisecond clock, so an FFI
+**Decision: REIMPLEMENTED IN KYTE** (like W2) — it is a pure state machine + a millisecond clock, so an FFI
 bind of `circuit_breaker.zig` would be pointless. Modelled on `~/plancksystems/utils/src/circuit_breaker.zig`.
 
-**What landed** (`src/std/web/circuit_breaker.nova`):
+**What landed** (`src/std/web/circuit_breaker.ky`):
 - **CircuitBreaker** — CLOSED/OPEN/HALF_OPEN; `failureThreshold`/`successThreshold`/`timeoutMs`;
   `shouldAllow` / `recordSuccess` / `recordFailure` / `getState` / `reset`. OPEN fails fast until `timeoutMs`
   elapses (`datetime.nowNs`/1e6), then a HALF_OPEN probe; M successes close it, any probe failure re-opens.
@@ -1404,10 +1404,10 @@ bind of `circuit_breaker.zig` would be pointless. Modelled on `~/plancksystems/u
 - [x] `ResilientClient` returns 503 without network when OPEN; 5xx trips it, 4xx does not.
 - [x] Gate `86_circuit_breaker` (6 tests); corpus 108/108; ARC + ASAN clean.
 
-Fixed a latent bug en route: `client.nova`'s `Request{...}` literals omitted the required `cookies` field
-(client.nova was never compiled). **Deferred:** live integration against a flaky upstream (manual); wiring the
+Fixed a latent bug en route: `client.ky`'s `Request{...}` literals omitted the required `cookies` field
+(client.ky was never compiled). **Deferred:** live integration against a flaky upstream (manual); wiring the
 breaker into TLS/socket-level errors (currently keys off connection failure + HTTP 5xx). **Deps:** none
-(Nova-native). **Tracking:** ✅ 2026-07-21 · commit `a63ffa4` · gate `86_circuit_breaker`.
+(Kyte-native). **Tracking:** ✅ 2026-07-21 · commit `a63ffa4` · gate `86_circuit_breaker`.
 
 ---
 
@@ -1431,14 +1431,14 @@ stated rationale need adjusting so we build the right thing:
    What it *does* change, and why it's worth doing:
    - **Incremental rebuilds** — cache each `.o` by a content hash; an unchanged file is a cache hit, so a
      one-line edit stops recompiling all of std. This is the real prize (today every build reparses+recodegens
-     the entire merged program — see the `merged.nova` write in `loadProgram`).
+     the entire merged program — see the `merged.ky` write in `loadProgram`).
    - **Parallelism** — object files build concurrently.
-   - **Honest diagnostics** — errors carry the true file/line, not an offset into a synthetic `merged.nova`.
+   - **Honest diagnostics** — errors carry the true file/line, not an offset into a synthetic `merged.ky`.
    - **Function-level dead-code** — link with `--gc-sections` (+ `internal`/COMDAT linkage) to drop unused
      functions of an imported file. *This* is the grain of truth in "don't compile everything": today an
      imported file's every function is codegen'd even if one symbol is used; link-time GC trims that.
 
-2. **True cross-unit separate *type-checking* is a big dependency, so phase it.** Nova currently type-checks,
+2. **True cross-unit separate *type-checking* is a big dependency, so phase it.** Kyte currently type-checks,
    resolves names, monomorphizes generics (type-erased → instantiated), and decides ARC ownership **across the
    whole merged program in one pass**. You cannot naively compile file B in isolation because it needs A's
    types and the monomorphized instances A/B share. Splitting the *checker* per-unit needs interface/signature
@@ -1452,10 +1452,10 @@ stated rationale need adjusting so we build the right thing:
   **emit one LLVM module → one `.o` per source file** instead of one giant module, and **cache each `.o` by a
   content hash**. Link the cached objects into the final binary. This delivers incrementality + parallelism +
   honest diagnostics + link-time GC with **no change to the type system** — the lowest-risk, highest-value step,
-  and it retires `merged.nova`.
+  and it retires `merged.ky`.
   - **F4-6 — retire the serde/mediator source-gen+reparse (relocated here from S1).** `generateSerdeBinders`
     (`<Struct>__bind`/`__toJson`) and `generateMediatorDispatch` (`__mediator_dispatch_<Q>` + by-name switch)
-    currently emit Nova SOURCE TEXT and RE-PARSE it against the merged program (`main.zig`, label
+    currently emit Kyte SOURCE TEXT and RE-PARSE it against the merged program (`main.zig`, label
     `<serde-generated>`). That is the last pass that *requires* the whole merged program, so it must move as part
     of the per-file split — either by building the AST directly (no reparse) or by emitting the generated units as
     their own cacheable `.o`. **Deliberately NOT done ahead of this phase:** it is behavior-neutral (the reparse
@@ -1468,11 +1468,11 @@ stated rationale need adjusting so we build the right thing:
   monomorphization. Gated on F2-6/F4/F5. Only pursue once Phase 1/2 pay off and the foundation is solid.
 
 ## On debug/release folders — **yes, split them (do it from Phase 1).**
-Debug and release are **different codegen** — opt level, symbols, ASAN, and the `NOVA_ARC_AUDIT`/coverage
+Debug and release are **different codegen** — opt level, symbols, ASAN, and the `KYTE_ARC_AUDIT`/coverage
 instrumentation — so their objects must **never share a cache directory**. Mixing them silently serves stale or
 mismatched objects; this repo has already been bitten by stale-binary measurement traps
-(see [[nova-arc-measurement-traps]], [[nova-buildzig-must-rebuild]]). Keying the object cache by profile is the
-fix, and it matches what Nova devs expect from Cargo (`target/debug`, `target/release`) and CMake. Layout:
+(see [[kyte-arc-measurement-traps]], [[kyte-buildzig-must-rebuild]]). Keying the object cache by profile is the
+fix, and it matches what Kyte devs expect from Cargo (`target/debug`, `target/release`) and CMake. Layout:
 
 ```
 build/
@@ -1480,21 +1480,21 @@ build/
   release/ { obj/*.o , bin/<exe> }     # -O2/3, no debug instrumentation
 ```
 
-Selected by `nova build` (default debug) vs `nova build --release`. The object cache lives under the profile
-dir, so switching profiles never reuses the wrong objects. A future `nova clean` just removes `build/`.
+Selected by `kyte build` (default debug) vs `kyte build --release`. The object cache lives under the profile
+dir, so switching profiles never reuses the wrong objects. A future `kyte clean` just removes `build/`.
 
 ## DoD
-**Phase 1a — LANDED 2026-07-22** (`nova build` + `build/<profile>` layout + whole-program content-hash cache):
-- [x] `nova build` creates `build/<profile>/{obj,bin}` (mkdir-p, idempotent); `merged.nova` no longer written
-      (opt-in via `NOVA_DUMP_MERGED=1`).
+**Phase 1a — LANDED 2026-07-22** (`kyte build` + `build/<profile>` layout + whole-program content-hash cache):
+- [x] `kyte build` creates `build/<profile>/{obj,bin}` (mkdir-p, idempotent); `merged.ky` no longer written
+      (opt-in via `KYTE_DUMP_MERGED=1`).
 - [x] The object is emitted into `build/<profile>/obj/<name>.o` and the binary linked into `build/<profile>/bin/<name>`
-      (name from `project.json`; entry defaults to `src/main.nova`). `nova init` now writes a `.gitignore` with `build/`.
+      (name from `project.json`; entry defaults to `src/main.ky`). `kyte init` now writes a `.gitignore` with `build/`.
 - [x] **Content-hash cache**: an unchanged build is SKIPPED ("… is up to date — nothing to rebuild"); editing any
       source → rebuild. Key = order-independent XOR of every input file's (path+content), folded with profile +
       `CACHE_VERSION`. Cache HIT requires the binary to still exist. (Whole-program granularity — see Phase 1b.)
 - [x] `--release` / `--debug` select separate `build/release` vs `build/debug` trees (distinct codegen: `-O3`
       vs `-O0 -g`); they never cross-read (keyed by profile dir).
-- [x] The direct `nova <file> -o out` path is **untouched** (all changes gated on `build_mode`), so the test
+- [x] The direct `kyte <file> -o out` path is **untouched** (all changes gated on `build_mode`), so the test
       harness + scripts keep their simple behaviour. Corpus **115/115**.
 
 **Phase 1b — DEFERRED (the per-file object split).** Codegen is deeply single-module (shared `heap_ptr`/string
@@ -1510,7 +1510,7 @@ past sound-beta.
   **Stage A** (emission loop, commit `7077596`): flag-gated, corpus 148/148 + 270/270 ASAN under split, behavior
   byte-identical. **Stage B** (per-file content-hash cache, commit `0e19e62`): each clone keyed by a hash of its
   IR, minimised by `globaldce` BEFORE hashing so an edit in file X doesn't invalidate file Y's object. **Stage C**
-  (default-on): split is now the DEFAULT for `nova build`; `NOVA_T6_NOSPLIT=1` forces single-module (~18% faster
+  (default-on): split is now the DEFAULT for `kyte build`; `KYTE_T6_NOSPLIT=1` forces single-module (~18% faster
   cold). Measured: one-handler-body edit → **25/26 objects cached, 1 rebuilt**, correct output.
   - [x] **F4-6 SATISFIED (via option b) — no reparse removal needed.** The plan offered "build the AST directly
     OR emit the generated units as their own cacheable `.o`". The split does the latter: `<serde-generated>` and
@@ -1524,44 +1524,44 @@ past sound-beta.
 
 **Deps:** Phase 1a+1b landed. Phase 3 depends on F2-6 typed IR + F4 mono + F5 scoping. **Tracking:**
 ● 2026-07-24 · Phase 1b DONE (per-file `.o` split, content-hash cache, default-on, F4-6 satisfied). Phase 1a done
-2026-07-22 (`nova build`, `build/<profile>/{obj,bin}`, content-hash cache, debug/release, merged.nova retired).
+2026-07-22 (`kyte build`, `build/<profile>/{obj,bin}`, content-hash cache, debug/release, merged.ky retired).
 
 ---
 
-# ⭐ W4 — Dependency injection: wire `di.nova` into `App` + constructor injection into handlers
+# ⭐ W4 — Dependency injection: wire `di.ky` into `App` + constructor injection into handlers
 
-**Why (user, 2026-07-24).** Nova's web stack is ASP.NET-shaped (VSA + MediatR-style `app.get<T>`), but the DI
-story is a stub. `web/di.nova` exists yet is **completely isolated** — nothing imports it. Handlers are constructed
+**Why (user, 2026-07-24).** Kyte's web stack is ASP.NET-shaped (VSA + MediatR-style `app.get<T>`), but the DI
+story is a stub. `web/di.ky` exists yet is **completely isolated** — nothing imports it. Handlers are constructed
 as bare `H{}` (no fields, no deps), so a handler cannot receive a logger, a DB connection, or a Dapper-style query
 object. To be a real framework, services must be registered once at startup and injected into handler constructors,
 exactly like ASP.NET's `IServiceCollection` + constructor injection.
 
 **Current state (measured 2026-07-24):**
-- `web/di.nova` — `ServiceCollection.addSingleton(key, factory)` / `addTransient(...)` / `buildServiceProvider()`
+- `web/di.ky` — `ServiceCollection.addSingleton(key, factory)` / `addTransient(...)` / `buildServiceProvider()`
   → `ServiceProvider.resolve(key): Resolved`. **String-keyed**, services typed `any`, factory `(ServiceProvider)
   -> any`. **No `addScoped`, no generic `addSingleton<T>()`, no per-request scope** (lifetime is a single
   `singleton_keys: Map<string,bool>` boolean). Isolated — zero imports across the stdlib.
-- `web/app.nova` — `App` holds routes + `AppMediator` + static + cache; **no provider field**, does not import
+- `web/app.ky` — `App` holds routes + `AppMediator` + static + cache; **no provider field**, does not import
   `web.di`.
 - Handler construction — the ONLY auto-construction site is the compiler-generated dispatcher: `main.zig:735`
   emits `let __h = H{};`. The runtime `AppMediator`/`Mediator` register pre-built instances
   (`app.handle<T>(GetUserHandler{})`), also field-less. Nothing populates handler fields anywhere.
-- **The `nova init app` template ALREADY does manual DI** (`src/templates.zig:20`, `app_main_sample`): it builds a
+- **The `kyte init app` template ALREADY does manual DI** (`src/templates.zig:20`, `app_main_sample`): it builds a
   `ServiceCollection`, `addSingleton("Logger", …)` / `addTransient("IndexHandler", …)` with string keys + `sp as
   ServiceProvider` + `provider.resolve("X") as T`, then `buildServiceProvider()`. **But it wires the OLD stack** —
   `HttpServer`/`Router`/`Mediator`/`Controller`/`Middleware` (`web.server`/`web.router`/`web.controller`/…), NOT the
   new `App` + `app.get<T>` flagship. So W4 is a **reconciliation**, not greenfield: lift that manual, string-keyed,
   cast-heavy wiring INTO the `App` struct (typed, generic) and regenerate the template to the clean surface.
 
-**🔨 Enabling compiler fix LANDED (2026-07-24) — `di.nova` now compiles.** Merely importing `web.di` used to
-**abort the compile**: `any` lowered to `.unresolved` (`lower.zig`), so `Map<string, any>` (di.nova's core type →
+**🔨 Enabling compiler fix LANDED (2026-07-24) — `di.ky` now compiles.** Merely importing `web.di` used to
+**abort the compile**: `any` lowered to `.unresolved` (`lower.zig`), so `Map<string, any>` (di.ky's core type →
 `Storage<any>`) had a `.unresolved` element, and the storage slot-release ownership decision hit the F2-5
 `.unresolved` tripwire (`arc.zig` → `isOwnedTypeId`) and exited. The same root cause made a closure returning into a
 `(T)->any` map fail to LINK. **Fix:** `any` now lowers to `.ptr` (opaque, word-sized, explicitly UNOWNED) — a
 resolved, non-owned type; the ownership answer is identical (non-owned either way) so it's behavior-preserving for
 existing code (corpus **149/149 + 272/272 ASAN**), it just stops the crash. Gate `123_any_container`.
 
-**✅ RESOLVED + LANDED (user, 2026-07-24) — use the `Service` TRAIT, NOT `any`, and NOT boxing.** di.nova now stores
+**✅ RESOLVED + LANDED (user, 2026-07-24) — use the `Service` TRAIT, NOT `any`, and NOT boxing.** di.ky now stores
 services as **owned `Service` trait objects** (`Map<string, Service>`), ARC-correct by construction (the fat pointer
 co-owns its struct; the trait destructor frees it). So the singleton **cache correctly retains heap services** — the
 gap `.ptr` left is closed with ZERO new machinery. **Landed this session (corpus 149/149 + 272/272 ASAN, ARC-audit
@@ -1572,13 +1572,13 @@ clean):**
   replacing the hardcoded `"i32"` lambda return); (2) **closure-collection recursion** into `??`/`.cast`
   (`collectClosuresFromExpr`) — a closure inside `map.get(k) ?? ((sp)=>Impl())` was never registered →
   `LambdaNotFound`, now fixed.
-- **di.nova rewritten** `any`→`Service` (factories `(ServiceProvider) -> Service`, singletons `Map<string,Service>`,
+- **di.ky rewritten** `any`→`Service` (factories `(ServiceProvider) -> Service`, singletons `Map<string,Service>`,
   `Resolved.Ok(Service)`); registered services `impl Service`.
 - **Gate `123_any_container`** extended: singleton **cache re-resolve** (broken under `.ptr`, now works) + ARC clean.
 
 The `any`→`.ptr` crash-fix + the pure-`any`-container tests in gate 123 STAY (general soundness, DI-independent). The
-boxed-`any` runtime primitives (`nova_any_box` etc.) are now unused scaffolding for a future true dynamic `any`
-(`docs/design/boxed-any.md` kept as that future design) — NOT needed for DI. See `nova-any-ownership-model`.
+boxed-`any` runtime primitives (`kyte_any_box` etc.) are now unused scaffolding for a future true dynamic `any`
+(`docs/design/boxed-any.md` kept as that future design) — NOT needed for DI. See `kyte-any-ownership-model`.
 **✅ App INTEGRATION LANDED (this session) — DI is exposed through `App` + constructor injection works.**
 - `App` owns a `di.ServiceProvider` (`provider` field; `App()` builds an empty one; `app.useServices(sc)` installs a
   configured one). `di.ServiceProvider.require(key): Service` added (ergonomic resolve — traps on miss).
@@ -1595,14 +1595,14 @@ boxed-`any` runtime primitives (`nova_any_box` etc.) are now unused scaffolding 
   above sidesteps it and is the shipped API. Also deferred: type-keyed generic `addSingleton<T>`, `addScoped` +
   per-request scope.
 
-**⭐ Primary user ask (2026-07-24): expose DI *through* `App`.** The `App` struct (`web/app.nova`) must own the
-service container so a `nova init app` user registers services once and `app.get<T>` handlers are injected — the
+**⭐ Primary user ask (2026-07-24): expose DI *through* `App`.** The `App` struct (`web/app.ky`) must own the
+service container so a `kyte init app` user registers services once and `app.get<T>` handlers are injected — the
 manual `ServiceCollection`/`resolve … as T` boilerplate in `templates.zig:20` collapses to `App.withServices(sc)`.
 The template is regenerated to the new stack as part of the DoD (retiring the `HttpServer`/`Router`/`Controller`
 hand-wiring, or bridging it onto `App`).
 
 **Target public surface (ASP.NET parity):**
-```nova
+```kyte
 let services = ServiceCollection();
 services.addSingleton<Logger>((sp) => ConsoleLogger());
 services.addScoped<Db>((sp) => pool.acquire());       // per-request lifetime
@@ -1620,14 +1620,14 @@ app.run(8080);
 
 **Design — three coupled pieces:**
 
-1. **Type-keyed generic registration** (`di.nova`). Add `addSingleton<T>(factory)` / `addTransient<T>(factory)` /
+1. **Type-keyed generic registration** (`di.ky`). Add `addSingleton<T>(factory)` / `addTransient<T>(factory)` /
    **`addScoped<T>(factory)`** deriving the registry key from `serde.typeName<T>()` — the SAME key scheme
    app/mediator already use — so registration and resolution meet. Keep the string-keyed forms as the low-level
    primitive. Replace the `singleton_keys` boolean with a real `Lifetime { Singleton, Scoped, Transient }`. Add
    `ServiceProvider.resolve<T>(): T` (concrete return, no call-site downcast — leans on the A1 generic-return
    typecheck, done).
 
-2. **Per-request scope** (`di.nova`). `ServiceProvider.createScope(): ServiceScope` — a scope caches `Scoped`
+2. **Per-request scope** (`di.ky`). `ServiceProvider.createScope(): ServiceScope` — a scope caches `Scoped`
    instances for one request and disposes them at end (a scoped DB connection is acquired once per request, shared
    across the handler + collaborators, released after). Singletons resolve from the root; transients always fresh.
 
@@ -1653,8 +1653,8 @@ returning a concrete `T` from an `any` store needs the generic-return typecheck 
 scoped disposal wants deterministic cleanup — pair with `errdefer`. Additive by design: with an empty provider,
 `H{}` semantics are unchanged, so the corpus stays green throughout.
 
-**Files:** `web/di.nova` (generic + scoped + `resolve<T>`), `web/app.nova` (`provider` field, `withServices`,
-scope-per-dispatch), `web/mediator.nova` (handlers may carry fields), `src/main.zig` `generateMediatorDispatch`
+**Files:** `web/di.ky` (generic + scoped + `resolve<T>`), `web/app.ky` (`provider` field, `withServices`,
+scope-per-dispatch), `web/mediator.ky` (handlers may carry fields), `src/main.zig` `generateMediatorDispatch`
 (provider-threaded construction), `src/codegen/expressions.zig` (verb lowering carries the provider). **Spec-first:**
 write the `docs/specs.md` DI section before implementing.
 
@@ -1664,7 +1664,7 @@ write the `docs/specs.md` DI section before implementing.
 - [ ] A mediator handler with `init(logger, db)` gets those injected at dispatch — proven with a real `Logger` + a real DB connection (NovaDB or a pooled PG conn) in a gate.
 - [ ] Per-request scope: a `Scoped` service is resolved once per request, reused within it, disposed after (observable via a counting factory).
 - [ ] New gate `NNN_di_handler_injection` (singleton logger + scoped db injected; transient freshness; scope disposal count) + full suite green + ASAN clean.
-- [ ] **DI is reached through `App`** — a `nova init app` scaffold registers services via the App-owned container and its `app.get<T>` handlers get injected; the `src/templates.zig:20` boilerplate is regenerated to the clean surface (no manual `resolve … as T` in user code).
+- [ ] **DI is reached through `App`** — a `kyte init app` scaffold registers services via the App-owned container and its `app.get<T>` handlers get injected; the `src/templates.zig:20` boilerplate is regenerated to the clean surface (no manual `resolve … as T` in user code).
 - [ ] `docs/specs.md` DI section written first.
 
 **Dependencies:** A1 generic-return typecheck (done), E1 `errdefer` (done), X1 mediator dispatch (done).
@@ -1675,36 +1675,36 @@ write the `docs/specs.md` DI section before implementing.
 # H3 — Test infrastructure: project-wide `@test` runner + relocate corpus into stdlib
 
 **Why (user, 2026-07-24).** Two asks: (1) "a test harness that gathers all `@test` functions and runs them via
-`nova test`"; (2) "move corpus tests into their respective stdlib files."
+`kyte test`"; (2) "move corpus tests into their respective stdlib files."
 
-**Finding — (1) largely already exists.** `nova test` with no file arg **already** recursively scans the working
-dir for `.nova` files (`findNovaFiles`, main.zig:1141), collects every `@test` fn (`collectTestFunctions`,
+**Finding — (1) largely already exists.** `kyte test` with no file arg **already** recursively scans the working
+dir for `.ky` files (`findKyteFiles`, main.zig:1141), collects every `@test` fn (`collectTestFunctions`,
 main.zig:1075), and generates one harness `main` (`generateTestHarness`, main.zig:1099) that runs each with
-PASS/FAIL + a `Results: N passed, M failed` line + an ARC-audit exit. `nova test <file>` also pulls in imported
+PASS/FAIL + a `Results: N passed, M failed` line + an ARC-audit exit. `kyte test <file>` also pulls in imported
 modules' `@test`s via the import graph. So the "gather all `@test` and run" engine is real; the gap is
 **UX/consolidation**, not a missing runner:
-- A first-class **project-wide** invocation (`nova test` at a project root runs the whole suite with per-module
+- A first-class **project-wide** invocation (`kyte test` at a project root runs the whole suite with per-module
   grouping + a summary), documented and stable.
-- Assertion ergonomics pass on `assert.nova` (solid today: `equalInt`/`equalStr`/`isTrue`/…; consider a generic
+- Assertion ergonomics pass on `assert.ky` (solid today: `equalInt`/`equalStr`/`isTrue`/…; consider a generic
   `assert.equal`).
-- Pin the dir-scan roots (today it skips `.`-dirs, `zig-cache`, `lang`, `merged.nova`) so a project's `src/` +
+- Pin the dir-scan roots (today it skips `.`-dirs, `zig-cache`, `lang`, `merged.ky`) so a project's `src/` +
   `tests/` are canonical.
 
-**Design — (2) relocate corpus → stdlib.** ~half the 123 `cases/*.nova` already `import` exactly one stdlib module
-and are `@test`-based — they can move **inline** next to the code they exercise (and `nova test` still finds them
+**Design — (2) relocate corpus → stdlib.** ~half the 123 `cases/*.ky` already `import` exactly one stdlib module
+and are `@test`-based — they can move **inline** next to the code they exercise (and `kyte test` still finds them
 via the import graph), matching the existing convention (fs/env/string/math/crypto/collections already carry inline
 `@test`s). Split:
-- **Move inline (have a stdlib home):** collections (`01`/`14`/`40`/`61` → `collections/{list,map,set}.nova`),
+- **Move inline (have a stdlib home):** collections (`01`/`14`/`40`/`61` → `collections/{list,map,set}.ky`),
   string/utf8 (`03`/`24`/`26`), math/float (`08`/`09`/`18`), serde (`13`/`37`/`96`–`99` →
-  `serde/{json,yaml,bson,source}.nova`), crypto (`25`/`87`/`88`/`89`), concurrency (`31`/`11`/`118`), decimal
+  `serde/{json,yaml,bson,source}.ky`), crypto (`25`/`87`/`88`/`89`), concurrency (`31`/`11`/`118`), decimal
   (`50`/`52`/`94`/`95`), regex (`92`), process (`54`), web (`29`/`58`–`60`/`69`/`85` → `web/*`), async I/O
-  (`10`/`103`/`113`–`117`/`62` → `net/asyncio.nova`), db **seam** (`63`/`64`/`117` + generic pool/breaker
-  `104`–`106`/`86` → `data/db.nova`).
+  (`10`/`103`/`113`–`117`/`62` → `net/asyncio.ky`), db **seam** (`63`/`64`/`117` + generic pool/breaker
+  `104`–`106`/`86` → `data/db.ky`).
 - **⭐ ALL DB-DRIVER tests move to their DRIVER PACKAGE, not corpus/std (user, 2026-07-24)** — each driver is tested
-  **independently** in its own `packages/nova-<driver>/tests/`, run by that package's own `nova test` (the D3
+  **independently** in its own `packages/kyte-<driver>/tests/`, run by that package's own `kyte test` (the D3
   MongoDB precedent). Route the engine-specific cases: MySQL `66`/`108`/`109` → `packages/nova-mysql`; Postgres
   `67`/`107` → `packages/nova-postgres`; MSSQL `100`/`110` → `packages/nova-mssql`; MongoDB driver-level OP_MSG/BSON
-  `90` → `packages/nova-mongodb` (the BSON *codec* itself stays in std `serde/bson.nova`, so `51_bson_decimal` stays
+  `90` → `packages/nova-mongodb` (the BSON *codec* itself stays in std `serde/bson.ky`, so `51_bson_decimal` stays
   with serde); NovaDB `65` → the NovaDB driver's own tests (NovaDB driver stays in std per the distribution
   policy, so its tests sit beside it). **Net: the corpus keeps ZERO engine-specific driver cases**; the std keeps
   only the seam + BSON-codec tests.
@@ -1713,15 +1713,15 @@ via the import graph), matching the existing convention (fs/env/string/math/cryp
   (`28`/`39`/`41`–`48`/`61`/`78`/`93`), core semantics
   (`00`/`15`–`17`/`19`/`21`–`23`/`30`/`32`–`34`/`36`/`53`/`77`/`79`/`80`/`82`–`84`/`102`/`121`/`56`/`57`).
 - **Dedup** relocated cases against `@test`s a module already carries.
-- **The corpus stays green throughout** — `run.sh` runs `nova test <file>` per case; a relocated test is still
+- **The corpus stays green throughout** — `run.sh` runs `kyte test <file>` per case; a relocated test is still
   executed either by `run.sh` iterating the stdlib file or by a new "stdlib suite" step. `run.sh` remains the
   authority (H1's self-testing negative gate is unaffected — negatives stay in `expect_fail/`).
 
 **Definition of Done:**
-- [ ] `nova test` at a project root runs the whole `@test` suite with per-module grouping + a single summary; documented in CLAUDE.md.
+- [ ] `kyte test` at a project root runs the whole `@test` suite with per-module grouping + a single summary; documented in CLAUDE.md.
 - [ ] The ~half of corpus cases with a stdlib home moved inline (`@test` next to the code), deduped; compiler/language-only cases remain in `conformance/cases/`.
 - [ ] `run.sh` still green at the same or higher count (no test lost in the move); ASAN gate green.
-- [ ] Any relocated test that implicitly covered a module is now discoverable via `nova test <module>`.
+- [ ] Any relocated test that implicitly covered a module is now discoverable via `kyte test <module>`.
 
 **Dependencies:** none (H1 negative-gate integrity already done). **Tracking:** _pending._
 
@@ -1734,26 +1734,26 @@ via the import graph), matching the existing convention (fs/env/string/math/cryp
 `awrite`; there is no `awrite` in the tree — the write side is `asend`, so `async_write` maps to `asend`.
 
 **Sites (measured 2026-07-24):**
-- Nova stdlib: `net/asyncio.nova` `pub fn arecv`/`arecvDeadline`/`asend` (:57/:63/:67); call sites
-  `asyncio.nova:108/109/117`, `web/app.nova:542/551/558/582`.
-- Codegen name-matching dispatch: `codegen/expressions.zig:550–592` (recognizes the Nova names
+- Kyte stdlib: `net/asyncio.ky` `pub fn arecv`/`arecvDeadline`/`asend` (:57/:63/:67); call sites
+  `asyncio.ky:108/109/117`, `web/app.ky:542/551/558/582`.
+- Codegen name-matching dispatch: `codegen/expressions.zig:550–592` (recognizes the Kyte names
   `arecv`/`arecvDeadline`/`asend`).
 - Codegen intrinsic registration: `codegen/declarations.zig:1963–1973` (registers the C symbols).
-- Runtime C: `runtime/concurrency.cpp:753/770/798`, `runtime/nova_abi.h:131–133` — C symbols
-  `nova_arecv`/`nova_arecv_deadline`/`nova_asend`.
+- Runtime C: `runtime/concurrency.cpp:753/770/798`, `runtime/kyte_abi.h:131–133` — C symbols
+  `kyte_arecv`/`kyte_arecv_deadline`/`kyte_asend`.
 
-**Decision to make:** rename **just the Nova-facing names** (cheap — C symbols `nova_arecv`/… stay, only the Nova
-`pub fn` + the codegen name-match strings change) **OR** also rename the C ABI symbols (keep the Nova↔C map in sync
-in `declarations.zig`, rebuild the runtime). **Recommend Nova-facing only first** — zero runtime-rebuild risk, and
+**Decision to make:** rename **just the Kyte-facing names** (cheap — C symbols `kyte_arecv`/… stay, only the Kyte
+`pub fn` + the codegen name-match strings change) **OR** also rename the C ABI symbols (keep the Kyte↔C map in sync
+in `declarations.zig`, rebuild the runtime). **Recommend Kyte-facing only first** — zero runtime-rebuild risk, and
 the ABI names are internal. Optionally keep old names as thin deprecated `pub fn` aliases for one release for any
 package that imports them.
 
 **Definition of Done:**
-- [x] `net/asyncio.nova` exposes `async_read`/`async_write`/`async_read_deadline`; call sites updated (`app.nova`, `asyncio.nova`, gate `113`).
-- [x] Codegen dispatch (`expressions.zig`) matches the new names; intrinsics still resolve (C ABI symbols `nova_arecv`/`nova_arecv_deadline`/`nova_asend` unchanged — Nova-facing rename only, zero runtime rebuild risk).
-- [x] Corpus green (async gates `113`/`115`/`116`/`62`/`114` verified) + ASAN clean. Old names **removed** (no aliases — the only callers were `asyncio.nova` internals + `app.nova` + gate `113`; drivers use the `AsyncIO` trait).
+- [x] `net/asyncio.ky` exposes `async_read`/`async_write`/`async_read_deadline`; call sites updated (`app.ky`, `asyncio.ky`, gate `113`).
+- [x] Codegen dispatch (`expressions.zig`) matches the new names; intrinsics still resolve (C ABI symbols `kyte_arecv`/`kyte_arecv_deadline`/`kyte_asend` unchanged — Kyte-facing rename only, zero runtime rebuild risk).
+- [x] Corpus green (async gates `113`/`115`/`116`/`62`/`114` verified) + ASAN clean. Old names **removed** (no aliases — the only callers were `asyncio.ky` internals + `app.ky` + gate `113`; drivers use the `AsyncIO` trait).
 
-**Dependencies:** none. **Tracking:** ✅ 2026-07-24 · Nova-facing rename (`arecv`→`async_read`, `asend`→`async_write`,
+**Dependencies:** none. **Tracking:** ✅ 2026-07-24 · Kyte-facing rename (`arecv`→`async_read`, `asend`→`async_write`,
 `arecvDeadline`→`async_read_deadline`); C ABI symbols kept; corpus **148/148 + 270/270 ASAN** clean. Note: `async_read`
 lexes cleanly as one identifier (the `async` keyword prefix does not split it — maximal-munch).
 
@@ -1773,7 +1773,7 @@ go/no-go assessment.
 - **Timeouts / resilience** — `Connection.setTimeout` (awaited-deadline recv), `withTimeout<T>`/`selectTimeout<T>`,
   `selectAny<T>`, the outbound circuit breaker (W3), and "dead socket never segfaults" are all done (A1/D6). M4 is
   wiring these into Mongo + a retryable-write `txnNumber`.
-- **TLS** — fd-based `nova_tls_new`/`handshake`/`read`/`write` (verify-peer, SNI) already drive the SQL drivers;
+- **TLS** — fd-based `kyte_tls_new`/`handshake`/`read`/`write` (verify-peer, SNI) already drive the SQL drivers;
   Mongo is *plain* TLS over the socket (no TDS-style tunneling), so M1 is a direct reuse.
 - **Typed errors** — the E1 `T | Error` model + `errdefer` give M5 its structured-error surface.
 - **Async, non-blocking, one seam** — all five drivers are already non-blocking over `db.Connection`/`db.Driver`;
@@ -1812,7 +1812,7 @@ tracking, no migrations (those are explicit non-goals, roadmap §6).
 
 **Are we in a position? YES — it reuses machinery that already exists:**
 - The compiler already generates **`<Struct>__bind(src: ValueSource)`** deserializers for `@serializable` structs
-  (source-gen, recursive, zero reflection — see `nova-serde-codegen` memory), and **`ValueSource`** is already
+  (source-gen, recursive, zero reflection — see `kyte-serde-codegen` memory), and **`ValueSource`** is already
   implemented for JSON/form/multipart. The micro-ORM is a new **`ValueSource` adapter over a DB row/doc**, not new
   compiler work.
 - The write/bind mirror (`__toBson` / struct → command params) gives the injection-safe parameter path; SQL's
@@ -1831,7 +1831,7 @@ tracking, no migrations (those are explicit non-goals, roadmap §6).
   papering over their absence.
 
 **Definition of Done:**
-- [x] **READ SIDE DONE** (`src/std/data/orm.nova`): `RowSource impl ValueSource` (column name→index→DbValue,
+- [x] **READ SIDE DONE** (`src/std/data/orm.ky`): `RowSource impl ValueSource` (column name→index→DbValue,
       case-insensitive) + `queryAs<T>(conn, sql, params): List<T>` / `queryOne<T>(...): T | undefined` materialize
       typed rows via the existing `<T>__bind`, params bound out-of-band (no string interpolation). Gate
       `159_micro_orm` (mock Connection → typed rows; present-0 survives). Corpus 159/159, ASAN 289/289.
@@ -1851,21 +1851,21 @@ side + Mongo + live gate sequenced after D7 M2–M5. **Tracking:** read-side lan
 
 # ⭐ W5 — HTTP REST client with automatic TLS
 
-**Why (user, 2026-07-24).** Nova web/desktop apps need to CALL external services. The current `web/client.nova`
+**Why (user, 2026-07-24).** Kyte web/desktop apps need to CALL external services. The current `web/client.ky`
 `HttpClient` is plaintext-only, takes `(host, port)` not a URL, has no `https://` detection, only GET/POST/`send`,
 no keep-alive (`Connection: close` forced), a hard 64 KB response cap, and no JSON convenience. It **literally
 cannot make an HTTPS call today** — yet almost every real external API is HTTPS.
 
-**Current state (measured):** `web/client.nova` — `HttpClient.get(host,port,path)` / `post(…,body)` /
+**Current state (measured):** `web/client.ky` — `HttpClient.get(host,port,path)` / `post(…,body)` /
 `send(host,port,req)` over plaintext `client.TcpClient.connect`; `response.Response.parse` for the reply;
-`circuit_breaker.nova` `ResilientClient` wraps it (the "outbound TCP/**TLS** client" of W3 — the TLS half was
+`circuit_breaker.ky` `ResilientClient` wraps it (the "outbound TCP/**TLS** client" of W3 — the TLS half was
 aspirational, none is wired). **The hard part is already done:** outbound TLS is complete and secure-by-default —
-`net/asynctls.nova` `async fn tlsConnect(host, port, verify): TlsStream` (parks the coroutine through the
-handshake; `verify`⇒`WOLFSSL_VERIFY_PEER` + SNI + hostname cert check) and blocking `net/tls.nova` `TlsStream`.
+`net/asynctls.ky` `async fn tlsConnect(host, port, verify): TlsStream` (parks the coroutine through the
+handshake; `verify`⇒`WOLFSSL_VERIFY_PEER` + SNI + hostname cert check) and blocking `net/tls.ky` `TlsStream`.
 The client just never calls them.
 
 **Design — net-new wiring, not new crypto:**
-1. **URL parser** (`net/url.nova` or extend the existing url module) — split `scheme://host[:port]/path?query`;
+1. **URL parser** (`net/url.ky` or extend the existing url module) — split `scheme://host[:port]/path?query`;
    default port 80 (http) / 443 (https); **scheme `https` ⇒ TLS automatically** (the core ask). Also honor an
    explicit port.
 2. **Transport selection by scheme** — `http` ⇒ async plaintext (`asyncio`); `https` ⇒ `asynctls.tlsConnect(host,
@@ -1878,17 +1878,17 @@ The client just never calls them.
    (`withTimeout`/`selectTimeout`, done); redirect following (3xx, bounded hop count).
 6. **Keep the circuit breaker** — `ResilientClient` now genuinely wraps a TLS-capable client.
 
-**Files:** `net/url.nova` (parser), `web/client.nova` (rewrite over `AsyncIO` + scheme routing), `web/response.nova`
-(chunked/Content-Length response framing — shared with W6), `web/circuit_breaker.nova` (unchanged surface).
+**Files:** `net/url.ky` (parser), `web/client.ky` (rewrite over `AsyncIO` + scheme routing), `web/response.ky`
+(chunked/Content-Length response framing — shared with W6), `web/circuit_breaker.ky` (unchanged surface).
 
 **Definition of Done:**
-- [x] `client.Http.get("https://api.example.com/v1/x")` performs a **verified** TLS call with zero manual TLS setup (`nova_tls_new` = VERIFY_PEER + system-CA + SNI + hostname check, fail-closed); `http://…` stays plaintext; port inferred from scheme. **Live-proven** vs `https://example.com`.
+- [x] `client.Http.get("https://api.example.com/v1/x")` performs a **verified** TLS call with zero manual TLS setup (`kyte_tls_new` = VERIFY_PEER + system-CA + SNI + hostname check, fail-closed); `http://…` stays plaintext; port inferred from scheme. **Live-proven** vs `https://example.com`.
 - [x] All six verbs (`get`/`post`/`put`/`patch`/`del`/`head`) + generic `request(...)` / `requestTimeout(...)`.
-- [x] Response framing handles Content-Length (read-to-EOF) AND **chunked** decode; any body size (string-accumulation, no 64 KB cap); a per-request timeout aborts a stalled call (`nova_socket_connect_timeout` + `set_timeout`); **bounded redirect following** (301/302/303/307/308, hop cap, 303/301/302→GET, 307/308 preserve method).
+- [x] Response framing handles Content-Length (read-to-EOF) AND **chunked** decode; any body size (string-accumulation, no 64 KB cap); a per-request timeout aborts a stalled call (`kyte_socket_connect_timeout` + `set_timeout`); **bounded redirect following** (301/302/303/307/308, hop cap, 303/301/302→GET, 307/308 preserve method).
 - [x] Gate `157_http_client` (hermetic: URL parse + auto-TLS routing + chunked/Content-Length framing @tests + a fail-closed connection error) + ASAN clean (285/285). Live verified-TLS GET proven manually.
 - [x] **`getJson<T>`/`postJson<T>`** — typed JSON round-trip via serde `__bind`. **Live-proven**: `client.getJson<Info>("https://httpbin.org/get")` deserializes the JSON reply into a struct. Required closing the module-qualified generic-CALL routing gap: `findNamespacedSpec` + a hook in the field-access `.generic_call` path routes `client.getJson<T>()` to the monomorphized spec `web_client_getJson__T` (async fns are skipped — they dispatch via the coroutine ramp). Now ANY `module.genericFreeFn<T>()` routes to its spec.
 
-**Implementation:** synchronous over the blocking, VERIFIED transports (`net/tls.nova` for https, `net/tcp` for http) — simpler and correct, no async context needed. `net/url.nova` (parser), `web/client.nova` (`Http` struct + `HttpConn` transport shim + `frame`/`dechunk`). Async-over-`AsyncIO` is a future enhancement. Files: `net/url.nova`, `web/client.nova`; `main.zig` std_modules += `net/url`.
+**Implementation:** synchronous over the blocking, VERIFIED transports (`net/tls.ky` for https, `net/tcp` for http) — simpler and correct, no async context needed. `net/url.ky` (parser), `web/client.ky` (`Http` struct + `HttpConn` transport shim + `frame`/`dechunk`). Async-over-`AsyncIO` is a future enhancement. Files: `net/url.ky`, `web/client.ky`; `main.zig` std_modules += `net/url`.
 
 **Dependencies:** blocking verified TLS (done), serde (for the deferred JSON convenience). **Tracking:** CORE DONE 2026-07-24; JSON convenience deferred.
 
@@ -1896,22 +1896,22 @@ The client just never calls them.
 
 # ⭐ W6 — HTTP server hardening (production-grade)
 
-**Why (user, 2026-07-24).** "Is the server in app.nova sufficient, or should we have a robust HTTP server?" The
-`App` server (`web/app.nova` `handleConn`) is genuinely good — async, keep-alive, Content-Length, 100-continue,
-pipelining, zero-copy framing, ~108k rps — but it is **not production-hardened**, and the `nova init` template
+**Why (user, 2026-07-24).** "Is the server in app.ky sufficient, or should we have a robust HTTP server?" The
+`App` server (`web/app.ky` `handleConn`) is genuinely good — async, keep-alive, Content-Length, 100-continue,
+pipelining, zero-copy framing, ~108k rps — but it is **not production-hardened**, and the `kyte init` template
 ships the *weaker* server, not this one.
 
 **Current state (measured):**
-- **`App` server (`app.nova`)** — the fast one. **Missing for production:** (1) **no chunked transfer-encoding**
+- **`App` server (`app.ky`)** — the fast one. **Missing for production:** (1) **no chunked transfer-encoding**
   (request framed only by Content-Length; a chunked request body is mis-framed — `bufContentLength` returns 0 and
   the chunk bytes leak into the next pipelined request); (2) **no request/idle timeout** — `handleConn` awaits
   `arecv` with no deadline (`arecvDeadline` EXISTS but is unused) → slow-loris parks a coroutine forever; (3)
   **no header/body size cap** beyond the implicit 64 KB buffer, and an over-size header just drops the connection
-  (no 413/431); (4) **no inbound TLS/HTTPS** — `nova_aserver_listen` is plaintext; `nova_mtls_new_server` exists
+  (no 413/431); (4) **no inbound TLS/HTTPS** — `kyte_aserver_listen` is plaintext; `kyte_mtls_new_server` exists
   in the runtime but nothing wires it into `runServer`.
-- **`server.nova` `HttpServer`** — the template one. Serial/inline (no spawn), no keep-alive (closes every
+- **`server.ky` `HttpServer`** — the template one. Serial/inline (no spawn), no keep-alive (closes every
   request), a single 8 KB `read` (truncates larger requests), no timeouts/TLS, leftover debug `console.log`.
-  **Not production-grade.** The `nova init app` scaffold (`my_app/src/main.nova:65`) uses THIS one.
+  **Not production-grade.** The `kyte init app` scaffold (`my_app/src/main.ky:65`) uses THIS one.
 
 **Design:**
 1. **Chunked transfer-encoding** — three hook points: (a) request decode in `handleConn` after `bufContentLength`
@@ -1922,21 +1922,21 @@ ships the *weaker* server, not this one.
    timeout; a stalled client is closed, not parked forever. Configurable on `App`.
 3. **Size limits** — configurable max header block + max body; over-limit returns **431** (headers) / **413**
    (body) instead of dropping the socket. Guards against memory-exhaustion.
-4. **Inbound TLS/HTTPS** — wire `nova_mtls_new_server` (async memory-BIO, the right seam) into `runServer` so
+4. **Inbound TLS/HTTPS** — wire `kyte_mtls_new_server` (async memory-BIO, the right seam) into `runServer` so
    `App.runTls(port, certPath, keyPath)` serves HTTPS; the request codec is transport-agnostic over `AsyncIO`.
-5. **Template swap** — regenerate `nova init` (`templates.zig`) to serve on the `App` server (or bridge
-   `HttpServer` onto it); retire/relegate the weak `server.nova`. (Ties to W4's template regeneration.)
+5. **Template swap** — regenerate `kyte init` (`templates.zig`) to serve on the `App` server (or bridge
+   `HttpServer` onto it); retire/relegate the weak `server.ky`. (Ties to W4's template regeneration.)
 
-**Files:** `web/app.nova` (chunked decode + timeouts + limits + TLS accept), `web/response.nova` (chunked write +
-shared chunked/Content-Length parse), `src/runtime` (wire `nova_mtls_new_server` into the async listener if not
+**Files:** `web/app.ky` (chunked decode + timeouts + limits + TLS accept), `web/response.ky` (chunked write +
+shared chunked/Content-Length parse), `src/runtime` (wire `kyte_mtls_new_server` into the async listener if not
 already reachable), `src/templates.zig` (scaffold on `App`).
 
 **Definition of Done:**
 - [x] A `Transfer-Encoding: chunked` request body is decoded correctly (bufIsChunked/bufChunkedEnd/bufDechunk over the zero-copy buffer; the client (W5) decodes chunked responses). **Live-proven** (chunked POST → echoed body). Chunked response STREAMING write deferred (the server has the full body, so Content-Length suffices today).
 - [x] A slow/stalled client hits the per-read timeout and is closed (`async_read_deadline(readTimeoutMs)`, no coroutine leak); an over-size header→431, over-size body→413 (`App.configureServer`). **Live-proven** (slow-loris → closed; oversized → 413).
-- [ ] `App.runTls(...)` inbound TLS — DEFERRED (fully scoped; own pass). The seam EXISTS: `nova_mtls_new_server(cert,len,key,len)` (io.cpp) + `asynctls.tlsAccept` + the memory-BIO pump (`nova_mtls_pull/feed/pending_out/read/write` + handshake). Design: a `Conn` carrying either a plaintext fd or the TLS ctx+scratch, with `async readInto`/`writeStr`/`close` that call `async_read`/`nova_mtls_read` DIRECTLY with a `long` buffer (NOT `AsyncStream.recvInto`, whose `buf: int` truncates 64-bit heap addresses — the latent bug the App buffer must avoid); one `handleConn` over `Conn`. Held off ONLY because it touches the perf-critical plaintext hot path (or duplicates ~100 framing lines) + needs self-signed-cert testing — worth an isolated pass, not a rushed one.
-- [ ] `nova init` template swap onto the App server — DEFERRED (ties to templates.zig regeneration).
-- [x] Gate: offline `test_chunked_request_decode` (in app.nova) + a live echo-server harness (normal/chunked/413/timeout). Corpus 158/158, ASAN 287/287.
+- [ ] `App.runTls(...)` inbound TLS — DEFERRED (fully scoped; own pass). The seam EXISTS: `kyte_mtls_new_server(cert,len,key,len)` (io.cpp) + `asynctls.tlsAccept` + the memory-BIO pump (`kyte_mtls_pull/feed/pending_out/read/write` + handshake). Design: a `Conn` carrying either a plaintext fd or the TLS ctx+scratch, with `async readInto`/`writeStr`/`close` that call `async_read`/`kyte_mtls_read` DIRECTLY with a `long` buffer (NOT `AsyncStream.recvInto`, whose `buf: int` truncates 64-bit heap addresses — the latent bug the App buffer must avoid); one `handleConn` over `Conn`. Held off ONLY because it touches the perf-critical plaintext hot path (or duplicates ~100 framing lines) + needs self-signed-cert testing — worth an isolated pass, not a rushed one.
+- [ ] `kyte init` template swap onto the App server — DEFERRED (ties to templates.zig regeneration).
+- [x] Gate: offline `test_chunked_request_decode` (in app.ky) + a live echo-server harness (normal/chunked/413/timeout). Corpus 158/158, ASAN 287/287.
 
 **Dependencies:** `async_read_deadline` (done). Inbound TLS blocked on a runtime accept seam. **Tracking:**
 CORE DONE 2026-07-24; inbound-TLS + template-swap + chunked-response-write deferred.
@@ -1949,7 +1949,7 @@ CORE DONE 2026-07-24; inbound-TLS + template-swap + chunked-response-write defer
 compression anywhere (grep for zlib/gzip/deflate/Content-Encoding across `src/` is empty). Every HTTP response ships
 uncompressed.
 
-**Current state (measured):** **zlib (`libz`) is ALREADY LINKED into every `nova` binary** — `build.zig` links
+**Current state (measured):** **zlib (`libz`) is ALREADY LINKED into every `kyte` binary** — `build.zig` links
 `-lz` (macOS SDK dylib / Linux static from the LLVM prefix) to satisfy LLVM, and `<zlib.h>` ships with both SDKs. So
 gzip/deflate is a **thin runtime wrapper over an already-present library — no new dependency**. (vendored `zstd`
 static archive is also present but header-not-exposed; lz4 is absent. **Boost.IOStreams is NOT available** — Boost
@@ -1957,10 +1957,10 @@ here is a header-only Asio subset, so the Boost.IOStreams path is out.)
 
 **Design:**
 1. **Runtime primitives** (`src/runtime/io.cpp` or a new `compress.cpp` in the unity build; declared in
-   `nova_abi.h`) — `nova_gzip_compress`/`nova_gzip_decompress` (+ raw `deflate`/`inflate`) over `<zlib.h>`,
-   returning **length-prefixed binary buffers** (follow the `nova_sha256_raw` convention — gzip output contains
-   NULs, so NOT NUL-terminated C strings). Mirror the `nova_tls_*`/`nova_sha256` ABI pattern.
-2. **Nova wrapper** (`src/std/compress/gzip.nova` or `std/io/compress.nova`) — `gzip.compress(bytes)` /
+   `kyte_abi.h`) — `kyte_gzip_compress`/`kyte_gzip_decompress` (+ raw `deflate`/`inflate`) over `<zlib.h>`,
+   returning **length-prefixed binary buffers** (follow the `kyte_sha256_raw` convention — gzip output contains
+   NULs, so NOT NUL-terminated C strings). Mirror the `kyte_tls_*`/`kyte_sha256` ABI pattern.
+2. **Kyte wrapper** (`src/std/compress/gzip.ky` or `std/io/compress.ky`) — `gzip.compress(bytes)` /
    `gzip.decompress(bytes)`; KAT against known vectors.
 3. **HTTP negotiation** — server: read `Accept-Encoding`, if it lists `gzip` and the body is compressible + over a
    threshold, gzip it and set `Content-Encoding: gzip` (hook in `Response.serialize`, W6). Client (W5): send
@@ -1968,8 +1968,8 @@ here is a header-only Asio subset, so the Boost.IOStreams path is out.)
 4. **Optional later:** expose zstd (archive already linked, just needs the header) for non-HTTP internal use.
 
 **Definition of Done:**
-- [x] `nova_gzip_compress`/`decompress` runtime primitives (src/runtime/compress.cpp) over the already-linked zlib (`-lz` added to both link paths); Nova `compress/gzip.nova` wrapper; round-trip + KAT + binary-safety gate `158_gzip`.
-- [x] Server gzips responses when the client advertises `Accept-Encoding: gzip` (≥256-byte threshold + shrinks + Content-Encoding set, not cached); the client sends `Accept-Encoding: gzip` and transparently decompresses `Content-Encoding: gzip` replies. **Live-proven** (1800→80 bytes, 22×; curl --compressed and the Nova client both round-trip).
+- [x] `kyte_gzip_compress`/`decompress` runtime primitives (src/runtime/compress.cpp) over the already-linked zlib (`-lz` added to both link paths); Kyte `compress/gzip.ky` wrapper; round-trip + KAT + binary-safety gate `158_gzip`.
+- [x] Server gzips responses when the client advertises `Accept-Encoding: gzip` (≥256-byte threshold + shrinks + Content-Encoding set, not cached); the client sends `Accept-Encoding: gzip` and transparently decompresses `Content-Encoding: gzip` replies. **Live-proven** (1800→80 bytes, 22×; curl --compressed and the Kyte client both round-trip).
 - [x] Gate `158_gzip` (round-trip + binary buffers, no NUL truncation) + ASAN clean (287/287).
 
 **Dependencies:** none (zlib linked). **Tracking:** DONE 2026-07-24.
@@ -1978,39 +1978,39 @@ here is a header-only Asio subset, so the Boost.IOStreams path is out.)
 
 # ⭐ R1 — Runtime process primitives (foundational; blocks the orchestrator)
 
-**Why (user, 2026-07-24, via the orchestrator ask).** The Nova stdlib DECLARES a process API
-(`src/std/process.nova` — `Process.spawn/write/read/wait/close`), but the **runtime backend is a STUB**:
-`io.cpp:805` `nova_process_spawn` returns `nullptr`, `_write_stdin`/`_read_stdout`/`_wait` return `-1`, `_free` is a
+**Why (user, 2026-07-24, via the orchestrator ask).** The Kyte stdlib DECLARES a process API
+(`src/std/process.ky` — `Process.spawn/write/read/wait/close`), but the **runtime backend is a STUB**:
+`io.cpp:805` `kyte_process_spawn` returns `nullptr`, `_write_stdin`/`_read_stdout`/`_wait` return `-1`, `_free` is a
 no-op. **Spawning a child binary does not function today** — and it is the single most important primitive for the
 orchestrator (I2). There is also no `kill`/signal primitive at all (needed for graceful stop).
 
-**Design:** implement in the C++ runtime (POSIX first; Windows later), mirroring the `nova_*` ABI pattern:
-- `nova_process_spawn(cmd, args)` → `fork` + `execve` with `stdout`/`stderr` `pipe`s (and optional `stdin` pipe);
+**Design:** implement in the C++ runtime (POSIX first; Windows later), mirroring the `kyte_*` ABI pattern:
+- `kyte_process_spawn(cmd, args)` → `fork` + `execve` with `stdout`/`stderr` `pipe`s (and optional `stdin` pipe);
   return a `ProcessContext*` holding pid + fds.
-- `nova_process_write_stdin` / `nova_process_read_stdout` (non-blocking-friendly for the async loop) / `nova_process_wait`
-  (`waitpid`, return exit status + term signal) / `nova_process_free` (close fds, reap).
-- **New:** `nova_process_kill(pid, sig)` for `SIGTERM`/`SIGKILL` graceful stop.
+- `kyte_process_write_stdin` / `kyte_process_read_stdout` (non-blocking-friendly for the async loop) / `kyte_process_wait`
+  (`waitpid`, return exit status + term signal) / `kyte_process_free` (close fds, reap).
+- **New:** `kyte_process_kill(pid, sig)` for `SIGTERM`/`SIGKILL` graceful stop.
 The Zig PoC's `native-k8s/src/supervisor.zig` is a faithful reference for the exact semantics (argv, pipe
 plumbing, wait/term status, kill).
 
 **Definition of Done:**
-- [ ] `nova_process_spawn` really forks/execs a binary with piped stdout/stderr; `wait` returns the true exit code + signal; `kill(pid, sig)` delivers the signal; `_free` reaps without leaking fds/zombies.
-- [ ] `process.nova`'s `@test test_process_spawn` (currently would fail against the stub) passes against a real child (e.g. spawn `/bin/echo`, capture stdout, wait exit 0).
+- [ ] `kyte_process_spawn` really forks/execs a binary with piped stdout/stderr; `wait` returns the true exit code + signal; `kill(pid, sig)` delivers the signal; `_free` reaps without leaking fds/zombies.
+- [ ] `process.ky`'s `@test test_process_spawn` (currently would fail against the stub) passes against a real child (e.g. spawn `/bin/echo`, capture stdout, wait exit 0).
 - [ ] Gate `NNN_process_spawn` (spawn + capture + wait + kill) + ASAN clean (no fd/zombie leak under repeated spawns).
 
 **Dependencies:** none. **Blocks:** I2 (orchestrator). **Tracking:** _pending._
 
 ---
 
-# ⭐ I1 — Nova reverse proxy + load balancer + PID autoscaler (the flagship "most important" app)
+# ⭐ I1 — Kyte reverse proxy + load balancer + PID autoscaler (the flagship "most important" app)
 
-**Why (user, 2026-07-24, "the most important feature").** Prove Nova's async runtime at infrastructure scale by
-building a real **reverse proxy / load balancer** in Nova — with pluggable balancing algorithms and **PID-controller
-autoscaling**. This is a Nova *application* (like YCSB/D4), not compiler work: it exercises and showcases the
+**Why (user, 2026-07-24, "the most important feature").** Prove Kyte's async runtime at infrastructure scale by
+building a real **reverse proxy / load balancer** in Kyte — with pluggable balancing algorithms and **PID-controller
+autoscaling**. This is a Kyte *application* (like YCSB/D4), not compiler work: it exercises and showcases the
 runtime rather than extending it.
 
 **Are we in a position? YES — every primitive exists:** the async scheduler (io_context + coroutines, multi-core,
-proven), the async TCP server (`net/tcp/server.nova` + `asyncio.serverListen`/`aaccept`), non-blocking client
+proven), the async TCP server (`net/tcp/server.ky` + `asyncio.serverListen`/`aaccept`), non-blocking client
 sockets + TLS (`asynctls`), timers/`selectTimeout`/`when_all`, channels/actors, and (with W5) a real HTTP client for
 health checks. Load-balancing algorithms and a PID controller are pure logic/arithmetic — no new primitive.
 
@@ -2035,24 +2035,24 @@ health checks. Load-balancing algorithms and a PID controller are pure logic/ari
 - [ ] L7 HTTP proxy: routes by host/path, pools upstream connections, health-checks backends (unhealthy ejected + re-probed).
 - [ ] ≥3 balancing algorithms behind a `Balancer` trait (round-robin, least-conn, consistent-hash) — swappable by config; a test shows distribution + stickiness.
 - [ ] PID autoscaler drives replica count toward a setpoint from a live metric (anti-windup, clamped); KAT on the controller's step response.
-- [ ] A live demo: proxy in front of K Nova web-app replicas, load applied, autoscaler adds/removes replicas; throughput + fairness recorded.
+- [ ] A live demo: proxy in front of K Kyte web-app replicas, load applied, autoscaler adds/removes replicas; throughput + fairness recorded.
 
 **Dependencies:** async runtime + TCP server + `asynctls` (done), W5 (health-check client), R1 (if it
 spawns/kills backends standalone) or I2 (if it delegates scaling). **Tracking:** _pending._
 
 ---
 
-# ⭐ I2 — Nova orchestrator (native-k8s MVP)
+# ⭐ I2 — Kyte orchestrator (native-k8s MVP)
 
-**Why (user, 2026-07-24).** Build a Kubernetes-style orchestrator **in Nova** that runs apps deployed as **native
+**Why (user, 2026-07-24).** Build a Kubernetes-style orchestrator **in Kyte** that runs apps deployed as **native
 binaries, not Docker containers** — porting the naive Zig PoC (`native-k8s/`, ~600 LoC) and the vision in
 `native-k8s.md`. The value proposition (from the doc): direct `execve`, sub-ms startup, <1 MB overhead, no
 container runtime.
 
 **Are we in a position? YES for the MVP — once R1 lands.** The Zig PoC is a clean blueprint: watch-dir reconcile +
-spawn + restart + cgroups + file-heartbeat. Nova already has the async control loop (timers/`spawn`), JSON/YAML
+spawn + restart + cgroups + file-heartbeat. Kyte already has the async control loop (timers/`spawn`), JSON/YAML
 manifest parsing, NovaDB for desired-state, channels/actors for per-workload supervisors, an HTTP client for real
-health probes, and cgroups-v2 via plain `fs.nova` writes to `/sys/fs/cgroup/…` (exactly the Zig trick). **The one
+health probes, and cgroups-v2 via plain `fs.ky` writes to `/sys/fs/cgroup/…` (exactly the Zig trick). **The one
 hard blocker is R1** (process spawn/kill is a stub today).
 
 **Design — MVP (maps ~line-for-line onto the Zig PoC + three additions it lacks):**
@@ -2065,7 +2065,7 @@ hard blocker is R1** (process spawn/kill is a stub today).
 4. **Replicas** — spawn N copies (the PoC's gap; the doc wants `replicas: 3`).
 5. **Health probes** — real **HTTP `GET /healthz`** (via W5) + TCP-connect + the PoC's file-heartbeat; unhealthy
    ⇒ restart. (The PoC only does file-heartbeat.)
-6. **Resource limits** — cgroups-v2 (`cpu.max`/`memory.max`/`pids.max`) via `fs.nova` writes on Linux, no-op
+6. **Resource limits** — cgroups-v2 (`cpu.max`/`memory.max`/`pids.max`) via `fs.ky` writes on Linux, no-op
    elsewhere (port of `isolation.zig`).
 7. **PID autoscaler** — reuse I1's controller to adjust `replicas` from a metric (cgroup `cpu.stat` / request rate).
 
@@ -2079,7 +2079,7 @@ userspace proxy building block); artifact fetch + Sigstore verify; tmpfs secrets
 - [ ] Restart-on-crash per policy; graceful `SIGTERM`→`SIGKILL` stop; stdout/stderr captured to logs.
 - [ ] `replicas: N` spawns N copies; an HTTP `/healthz` probe restarts an unhealthy replica.
 - [ ] cgroups-v2 limits applied on Linux; PID autoscaler adjusts replica count from a live metric.
-- [ ] A live demo: deploy a Nova web-app binary at `replicas: 3`, kill one (auto-restarts), drive load (autoscaler adds replicas), delete the manifest (all stop). ARC/ASAN clean over a sustained run.
+- [ ] A live demo: deploy a Kyte web-app binary at `replicas: 3`, kill one (auto-restarts), drive load (autoscaler adds replicas), delete the manifest (all stop). ARC/ASAN clean over a sustained run.
 
 **Dependencies:** **R1 (hard blocker)**, W5 (health probes), serde YAML (done), async runtime (done), optionally
 NovaDB (desired-state) + I1 (proxy/autoscaler). **Tracking:** _pending._
@@ -2116,7 +2116,7 @@ until it is the measured bottleneck under a realistic load.**
 - **Phase 0 — wire the disconnected knob (trivial, do first).** `main.zig:151` hard-codes
   `concurrent_limit = .unlimited`; feed it (+ a bounded fiber pool) from config so a connection flood can't spawn
   unbounded threads. ~1 day, low risk. Makes behaviour predictable; does NOT raise the ceiling.
-- **Phase M — re-benchmark under a realistic client** (YCSB over the Nova driver, keep-alive, non-co-located,
+- **Phase M — re-benchmark under a realistic client** (YCSB over the Kyte driver, keep-alive, non-co-located,
   release build) to confirm whether `db.rw_lock` is the measured wall. **This decides whether Phases 1–2 are worth
   it.**
 - **Phase 1 — reader fast path (moderate, high payoff IF measured).** Replace per-row `isVisible`-under-mutex with
@@ -2161,13 +2161,13 @@ membership, ejection of unhealthy backends — **without kernel networking**. Tw
   TCP server.
 - **IP-per-service (a small runtime add + host setup):** each Service gets its own virtual IP (e.g. a `127.0.0.x` /
   configured-range loopback alias). Needs (a) an OS-level alias (`ifconfig lo0 alias …` / `ip addr add` — a host
-  setup step, root, OUTSIDE Nova) and (b) a **small runtime change**: `nova_socket_listen`/the async listener bind
+  setup step, root, OUTSIDE Kyte) and (b) a **small runtime change**: `kyte_socket_listen`/the async listener bind
   `INADDR_ANY` only today (`io.cpp:355`) — add a bind-address argument so the proxy can bind a specific VIP.
 - **Service discovery / resolution:** a registry (NovaDB or in-memory) maps `service-name → VIP:port`; the
   orchestrator (I2) updates it as replicas come and go. Resolution options: **(i)** inject the endpoint into each
   spawned app's env/config (no new primitive — simplest); **(ii)** a `/etc/hosts`-style file the apps read; **(iii)**
   a real **DNS responder** (`service.local → VIP`) — this needs **UDP**, which does NOT exist in the runtime today
-  (TCP/TLS only) → a new `nova_udp_*` primitive (small, but a real gap). Start with (i)/(ii); add DNS if wanted.
+  (TCP/TLS only) → a new `kyte_udp_*` primitive (small, but a real gap). Start with (i)/(ii); add DNS if wanted.
 
 **Tier 2 — kernel network isolation (DEFERRED, the "real CNI").** Per-app **network namespaces** + `veth` pairs +
 a bridge or overlay (VXLAN/WireGuard) + kernel service routing (`iptables`/`IPVS`/**eBPF**), per the `native-k8s.md`
@@ -2180,7 +2180,7 @@ as the deferred namespaces/seccomp work in I2. **Out of near-term scope**; Tier 
 2. **Proxy binds each Service's stable address (I1):** accepts on `VIP:port` (or `proxy:service_port`), picks a
    healthy backend via the `Balancer` trait, splices/forwards. Unhealthy backends ejected (health from I1's checks).
 3. **Registry + resolution:** NovaDB/in-memory `name→endpoint`; env-injection into spawned apps first, DNS later.
-4. **Small runtime adds (only if IP-per-service / DNS wanted):** bind-to-address on the listener; `nova_udp_*` for a
+4. **Small runtime adds (only if IP-per-service / DNS wanted):** bind-to-address on the listener; `kyte_udp_*` for a
    DNS responder.
 
 **Definition of Done (Tier 1):**
@@ -2192,7 +2192,7 @@ as the deferred namespaces/seccomp work in I2. **Out of near-term scope**; Tier 
 - [ ] Kernel tier (netns/veth/overlay/eBPF) explicitly documented as deferred.
 
 **Dependencies:** **I1** (proxy/LB/health) + **I2** (orchestrator/replica lifecycle) — I3 is the network abstraction
-that ties them into a k8s-like Service. Optional small runtime adds (bind-address; `nova_udp_*`). **Tracking:**
+that ties them into a k8s-like Service. Optional small runtime adds (bind-address; `kyte_udp_*`). **Tracking:**
 _pending._
 
 ---
@@ -2209,13 +2209,13 @@ cgroups, seccomp, capabilities, LSM). Replicating it = calling those syscalls ou
 work is doing them correctly, in order, in the forked child before `execve`.
 
 **Design — a runtime isolation shim (extends R1).** The child-side setup must run between `fork` and `execve` with
-async-signal-safe operations, so it CANNOT be high-level Nova — it is a C++ runtime primitive
-`nova_spawn_isolated(spec)` that performs the ordered sequence, driven by an `IsolationSpec` from the orchestrator
+async-signal-safe operations, so it CANNOT be high-level Kyte — it is a C++ runtime primitive
+`kyte_spawn_isolated(spec)` that performs the ordered sequence, driven by an `IsolationSpec` from the orchestrator
 (I2):
 1. `unshare`/`clone` the requested **namespaces** — PID (own process view, becomes PID 1), mount (private FS view),
    UTS (own hostname), IPC (private shm), net (private stack — ties to I3 Tier-2), user (uid/gid maps → rootless).
 2. **Filesystem:** mount a private **rootfs** and `pivot_root` into it (+ bind-mount volumes, `tmpfs` for secrets,
-   optional read-only root). For a static Nova binary the rootfs is tiny (binary + `/tmp` + a couple of `/etc`
+   optional read-only root). For a static Kyte binary the rootfs is tiny (binary + `/tmp` + a couple of `/etc`
    files) — far smaller than a Docker image.
 3. Attach to the **cgroup v2** subtree (`cpu.max`/`memory.max`/`pids.max`/`io.max`) — the I2 MVP already writes these.
 4. Install a **seccomp-bpf** syscall filter (default-deny or a curated allowlist).
@@ -2236,8 +2236,8 @@ host) none exist** (Docker-on-Mac runs a Linux VM), so on macOS the orchestrator
 supervision (I2's no-op path). Needs **root** (or user-namespaces for rootless, which some distros restrict). The
 child-side sequence is delicate (async-signal-safe, correct ordering) — hence the C++ shim, tested hard.
 
-**Files:** `src/runtime/` (new `nova_spawn_isolated` + `IsolationSpec` marshalling, declared in `nova_abi.h`),
-Nova-side `std/os/isolation.nova` (spec builder), and the orchestrator (I2) drives it per workload.
+**Files:** `src/runtime/` (new `kyte_spawn_isolated` + `IsolationSpec` marshalling, declared in `kyte_abi.h`),
+Kyte-side `std/os/isolation.ky` (spec builder), and the orchestrator (I2) drives it per workload.
 
 **Definition of Done:**
 - [ ] **Level 1 proven on Linux:** a spawned binary cannot see host PIDs (own PID namespace) nor the host filesystem (private rootfs via `pivot_root`); capabilities dropped; cgroup limits enforced. A gate asserts `/proc` shows only the child's process tree and the host root is invisible.
@@ -2252,13 +2252,13 @@ Level-2 overlaps **I3** Tier-2 (net namespace). **Tracking:** _pending (infra ti
 
 # Z1 — Documentation: technical architecture + contributor onboarding
 
-**Why (user, 2026-07-24).** The ecosystem (Nova language, NovaDB, orchestrator) needs (a) **technical architecture**
+**Why (user, 2026-07-24).** The ecosystem (Kyte language, NovaDB, orchestrator) needs (a) **technical architecture**
 deep-dives so the design is captured beyond code + this plan, and (b) **contributor onboarding** guides so someone
 new can start on a given project — e.g. "I want to work on the compiler + LLVM; what are the steps to add a feature
 to the language?" — and the equivalents for NovaDB and the orchestrator.
 
 **Scope:**
-- **Technical architecture docs (one per project)** — Nova language (lexer→parser→checker→sema→codegen→runtime
+- **Technical architecture docs (one per project)** — Kyte language (lexer→parser→checker→sema→codegen→runtime
   pipeline; ARC; monomorphization; traits/vtables; async coroutines; module scoping; C++ runtime + stdlib), NovaDB
   (pager/segmented-pool → B+tree + latching → WAL/group-commit → MVCC → SQL parser/executor → binary+JSON protocol →
   wasmer embedding), and the orchestrator (control loop/reconcile → supervisor → isolation → proxy/LB → service
@@ -2273,7 +2273,7 @@ ecosystem index + the three contributor guides, incl. the compiler's end-to-end 
 
 **Definition of Done:**
 - [x] Onboarding guides for compiler (+LLVM), btree, and orchestrator, each with a concrete "add a feature" flow; an ecosystem README tying them together. (`docs/onboarding/`, 2026-07-24.)
-- [ ] Technical architecture deep-dive per project (Nova / NovaDB / orchestrator).
+- [ ] Technical architecture deep-dive per project (Kyte / NovaDB / orchestrator).
 - [ ] Cross-linked from each project's CLAUDE.md / README.
 
 **Dependencies:** none. **Tracking:** 🔨 2026-07-24 · onboarding v1 authored (`docs/onboarding/`); architecture
@@ -2291,7 +2291,7 @@ its section above. Items already ✅ are omitted. **Next pick: V1** (a real soun
    (`int|undefined`/`long?`/`float?`/`double?`/`bool?`) are now BOXED (non-null=present even for 0/0.0/false,
    null=absent), so `Map<K,int>`/`List<int>` storing `0` is correct. Landed as one atomic pass (no flag). Corpus
    153/153, ASAN 280/280, value-optional ARC audit clean. Gate `127_value_optional_zero`. Design (marked COMPLETE) +
-   the exact box/unbox/own wiring in **`docs/design/value-optional-boxing.md`**. **`nova-value-optional-zero-bug`**.
+   the exact box/unbox/own wiring in **`docs/design/value-optional-boxing.md`**. **`kyte-value-optional-zero-bug`**.
    Known pre-existing erasure gap (non-crashing): a FREE generic fn returning `T|undefined` (`maybe<T>`) is type-erased
    and can't box — a present `0` from it still reads absent; needs free-fn monomorphization.
 2. **F4** ✅ **DONE 2026-07-24.** F1-7 unresolved-call is a hard error (was already satisfied by F2-5) +
@@ -2299,7 +2299,7 @@ its section above. Items already ✅ are omitted. **Next pick: V1** (a real soun
    (they silently collided → garbage). Itanium mangling is unnecessary (module-prefix scheme is collision-free).
    Gates `unresolved_call`/`duplicate_function`/`duplicate_method`. Corpus 156/156, ASAN 283/283.
 3. **H3** — test infrastructure: a first-class project-wide `@test` runner (the engine exists) + relocate corpus cases
-   into their owning stdlib modules; **all db-driver tests → their `packages/nova-<driver>/tests/`**. See H3 design.
+   into their owning stdlib modules; **all db-driver tests → their `packages/kyte-<driver>/tests/`**. See H3 design.
 4. **F3** — overflow-trap: DEFERRED by design (wrapping is defined/energy-cheap); revisit only if we adopt the Rust
    checked-in-debug model. Leave ◑ unless prioritized.
 
@@ -2307,22 +2307,22 @@ its section above. Items already ✅ are omitted. **Next pick: V1** (a real soun
 5. **W5** — HTTP REST client with auto-TLS (URL parser → `https`⇒verified TLS; verbs/JSON/keep-alive/timeouts/chunked).
    TLS plumbing already done — mostly wiring.
 6. **W6** — HTTP server hardening (chunked transfer-encoding, request/idle timeouts, size caps + 413/431, inbound
-   HTTPS via `nova_mtls_new_server`; swap the `nova init` template onto the fast `App` server).
+   HTTPS via `kyte_mtls_new_server`; swap the `kyte init` template onto the fast `App` server).
 7. **W7** — HTTP compression (gzip/deflate over the already-linked zlib; `Accept-`/`Content-Encoding` negotiation).
 8. **D8** — Dapper-style micro-ORM READ-SIDE prototype (`RowSource`/`DocSource impl ValueSource` → `query<T>`→`List<T>`).
    Safe now (no injection risk); reuses the serde `__bind` machinery.
 9. **D7** — DB production-readiness, MongoDB pilot: **M1** (TLS/Atlas) + **M2** (cursors) first. Foundations done.
 
 ### 🥉 Tier 3 — Infrastructure (the demonstration; built ON a finished language)
-10. **R1** — process runtime primitives (`nova_process_spawn`/`_kill`/…; currently STUBS). Blocks I2.
-11. **I1** — Nova reverse proxy + load balancer + PID autoscaler (⭐ flagship app; every primitive exists).
+10. **R1** — process runtime primitives (`kyte_process_spawn`/`_kill`/…; currently STUBS). Blocks I2.
+11. **I1** — Kyte reverse proxy + load balancer + PID autoscaler (⭐ flagship app; every primitive exists).
 12. **I2** — orchestrator MVP (needs R1) → **I3** virtual network / k8s-Service VIPs → **I4** native container-grade
     isolation.
 13. **BT1** — NovaDB concurrency (SEPARATE repo): Phase 0 wire the thread knob + **re-benchmark first**; gate the
     latch-safe rewrite on measured evidence.
 
 ### 📚 Docs
-- **Z1** — technical-architecture deep-dives (Nova / NovaDB / orchestrator). Onboarding v1 already authored.
+- **Z1** — technical-architecture deep-dives (Kyte / NovaDB / orchestrator). Onboarding v1 already authored.
 
 **Done this session (autonomous, language-first):** T7 ✅ · `any`-in-container crash fix ✅ · **W4 DI ✅ 100%** (Service
 container, 3 lifetimes + per-request scope, type-keyed generics, `handleFrom` transient factories) · 4 general

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # M0 of the C++ runtime retirement plan (docs/design/cpp-runtime-retirement-plan.md): audit which
-# nova_* symbols the C++ runtime EXPORTS versus which the compiler and standard library REFERENCE.
+# kyte_* symbols the C++ runtime EXPORTS versus which the compiler and standard library REFERENCE.
 # The point is that "what still depends on C++" is a fact, and that a symbol proposed for removal is
 # proven unreferenced before it is deleted.
 #
@@ -8,17 +8,17 @@
 #         tools/runtime-symbol-audit.sh <name>     # is this one symbol referenced, and where
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-LIB="$HOME/.nova/lib/libnovacore.a"
+LIB="$HOME/.kyte/lib/libkytecore.a"
 [ -f "$LIB" ] || { echo "runtime not built: $LIB missing (run: zig build)"; exit 2; }
 
 # EXPORTED: defined text symbols in the runtime archive (macOS prefixes with an underscore).
-exported() { nm -g "$LIB" 2>/dev/null | grep -E ' T _?nova_' | sed -E 's/.* _?(nova_[A-Za-z0-9_]+).*/\1/' | sort -u; }
+exported() { nm -g "$LIB" 2>/dev/null | grep -E ' T _?kyte_' | sed -E 's/.* _?(kyte_[A-Za-z0-9_]+).*/\1/' | sort -u; }
 
-# REFERENCED: every nova_* token in the compiler (codegen + main) and the standard library, minus
+# REFERENCED: every kyte_* token in the compiler (codegen + main) and the standard library, minus
 # the runtime's own source (self-references do not count as an external dependency).
 referenced() {
-  { grep -rhoE 'nova_[A-Za-z0-9_]+' "$HERE/src/codegen" "$HERE/src/main.zig" "$HERE/src/sema" 2>/dev/null
-    grep -rhoE 'nova_[A-Za-z0-9_]+' "$HERE/src/std" 2>/dev/null
+  { grep -rhoE 'kyte_[A-Za-z0-9_]+' "$HERE/src/codegen" "$HERE/src/main.zig" "$HERE/src/sema" 2>/dev/null
+    grep -rhoE 'kyte_[A-Za-z0-9_]+' "$HERE/src/std" 2>/dev/null
   } | sort -u
 }
 
@@ -34,7 +34,7 @@ fi
 EXP="$(exported)"; REF="$(referenced)"
 nexp=$(printf '%s\n' "$EXP" | grep -c .)
 echo "=== runtime symbol audit ==="
-echo "exported nova_* symbols: $nexp"
+echo "exported kyte_* symbols: $nexp"
 echo ""
 echo "--- exported but NOT referenced by compiler or stdlib (removal candidates) ---"
 unref="$(comm -23 <(printf '%s\n' "$EXP") <(printf '%s\n' "$REF"))"

@@ -1,4 +1,4 @@
-// A per-feature NSX view. View code lives in `.nsx` files (same language as `.nova`, just filed apart
+// A per-feature NSX view. View code lives in `.nsx` files (same language as `.ky`, just filed apart
 // so markup stays separate from logic) and returns an HTML string the handler or a page route renders.
 // An NSX element is a `string`, so expressions embed inline with `{...}` and views compose directly.
 //

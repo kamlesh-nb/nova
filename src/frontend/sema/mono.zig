@@ -1,6 +1,6 @@
 //! Monomorphisation worklist: which concrete generic instantiations exist.
 //!
-//! Nova monomorphises generics rather than erasing them: `List<int>` and
+//! Kyte monomorphises generics rather than erasing them: `List<int>` and
 //! `List<string>` become two distinct emitted bodies (`List_int_*`,
 //! `List_string_*`), not one type-erased body that boxes its element. Before
 //! codegen can emit those bodies it must know the exact SET of concrete
@@ -195,12 +195,12 @@ pub fn baseIsNeeded(owner: []const u8, method: []const u8) bool {
     return base_needed.contains(key);
 }
 
-/// Debug dump of [`method_insts`], gated behind `NOVA_SEMA_SHADOW`.
+/// Debug dump of [`method_insts`], gated behind `KYTE_SEMA_SHADOW`.
 ///
 /// Prints each recorded generic method call as `Recv.method<args...>`. A no-op
 /// unless the environment variable is set, so it is safe to leave on any path.
 pub fn dumpMethodInsts() void {
-    if (std.c.getenv("NOVA_SEMA_SHADOW") == null) return;
+    if (std.c.getenv("KYTE_SEMA_SHADOW") == null) return;
     const out = std.debug.print;
     out("\n=== F4-5 method-instantiation worklist ({d}) ===\n", .{method_insts.items.len});
     for (method_insts.items) |mi| {

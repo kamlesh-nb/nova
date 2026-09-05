@@ -1,6 +1,6 @@
 # Vendored `libzstd.a`
 
-Prebuilt static Zstandard library, vendored into the Nova toolchain so a **static** `nova`
+Prebuilt static Zstandard library, vendored into the Kyte toolchain so a **static** `kyte`
 (in-process LLVM + LLD, path (b)) links without depending on a Homebrew install.
 
 ## Why this is here
@@ -16,7 +16,7 @@ The static LLVM 22.1.0 drop (`/Users/kamlesh/LLVM-22.1.0-macOS-ARM64`) was built
 - `-lz`, `-lxml2` → satisfied by the macOS SDK stubs (`libz.tbd`, `libxml2.tbd`).
 - **`/opt/homebrew/lib/libzstd.a`** → a hardcoded **Homebrew** path. macOS has **no** zstd equivalent
   (it ships `libcompression`, not zstd), so this is the one static lib with no OS/SDK fallback. Vendoring
-  it removes the Homebrew dependency and makes "users deploy only `nova`" achievable.
+  it removes the Homebrew dependency and makes "users deploy only `kyte`" achievable.
 
 Rebuilding the prebuilt LLVM drop with `LLVM_ENABLE_ZSTD=OFF` would drop the dependency instead, but that
 requires recompiling LLVM — vendoring the 750 KB archive is the pragmatic path.
@@ -39,5 +39,5 @@ Homebrew path). Substitute the zstd entry with this vendored copy, e.g.:
 -L <repo>/lang/deps/zstd  -lzstd     # or the absolute path lang/deps/zstd/libzstd.a
 ```
 
-Other arches: this archive is arm64-only. Vendor the matching slice (or a universal `.a`) when Nova
+Other arches: this archive is arm64-only. Vendor the matching slice (or a universal `.a`) when Kyte
 targets x86_64 macOS / Linux.

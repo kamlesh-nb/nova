@@ -7,16 +7,16 @@
 #
 #   lang/docs/guide/examples/run-live.sh
 #
-# Requirements: a built toolchain (`nova` on PATH or ~/.nova/bin), a reachable PostgreSQL, `psql`, and
-# curl. Point it at your server with NOVA_DB_DSN (default: postgresql://postgres@127.0.0.1:5432/shop);
+# Requirements: a built toolchain (`kyte` on PATH or ~/.kyte/bin), a reachable PostgreSQL, `psql`, and
+# curl. Point it at your server with KYTE_DB_DSN (default: postgresql://postgres@127.0.0.1:5432/shop);
 # create the database first, e.g. `createdb shop`.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"          # examples -> guide -> docs -> lang -> repo root
-NOVA="${NOVA:-$HOME/.nova/bin/nova}"
+KYTE="${KYTE:-$HOME/.kyte/bin/kyte}"
 WEBAPP="$HERE/webapp"
 ORCH="$REPO/packages/nova-orchestrator"
-DSN="${NOVA_DB_DSN:-postgresql://postgres@127.0.0.1:5432/shop}"
+DSN="${KYTE_DB_DSN:-postgresql://postgres@127.0.0.1:5432/shop}"
 WORK="$(mktemp -d)"
 PIDS=()
 
@@ -51,13 +51,13 @@ psql "$DSN" -v ON_ERROR_STOP=1 -f "$WEBAPP/schema.sql" >"$WORK/seed.log" 2>&1 \
 note "seeded products 1..3 into $DSN"
 
 # ---------------------------------------------------------------------------------------------------
-say "2/5  build the PostgreSQL-backed web app (main_postgres.nova)"
-# main_postgres.nova lives at the project root so it never clashes with the in-memory src/main.nova.
-# Build it in a throwaway copy: swap it in as src/main.nova, wire the nova-postgres dependency, and point
+say "2/5  build the PostgreSQL-backed web app (main_postgres.ky)"
+# main_postgres.ky lives at the project root so it never clashes with the in-memory src/main.ky.
+# Build it in a throwaway copy: swap it in as src/main.ky, wire the nova-postgres dependency, and point
 # packages/ at the monorepo so `import postgres` resolves with no network.
 BUILDDIR="$WORK/webapp-src"
 cp -r "$WEBAPP" "$BUILDDIR"; ( cd "$BUILDDIR" && rm -rf build packages )
-mv "$BUILDDIR/main_postgres.nova" "$BUILDDIR/src/main.nova"
+mv "$BUILDDIR/main_postgres.ky" "$BUILDDIR/src/main.ky"
 python3 - "$BUILDDIR/project.json" <<'PY'
 import json,sys
 p=sys.argv[1]; d=json.load(open(p))
@@ -65,14 +65,14 @@ d["dependencies"]=["https://github.com/kamlesh-nb/nova-postgres"]
 json.dump(d,open(p,"w"),indent=2)
 PY
 ln -sfn "$REPO/packages" "$BUILDDIR/packages"           # so `import postgres` resolves
-( cd "$BUILDDIR" && "$NOVA" build -o "$WORK/webapp" ) \
+( cd "$BUILDDIR" && "$KYTE" build -o "$WORK/webapp" ) \
   || { note "web app build failed"; exit 1; }
 WEBAPP="$BUILDDIR"                                       # replicas below run from here (static assets)
 note "built $WORK/webapp"
 
-say "     start two replicas (NOVA_PORT) on 8080 and 8081"
-( cd "$WEBAPP" && NOVA_DB_DSN="$DSN" NOVA_PORT=8080 "$WORK/webapp" ) >"$WORK/app8080.log" 2>&1 & PIDS+=($!)
-( cd "$WEBAPP" && NOVA_DB_DSN="$DSN" NOVA_PORT=8081 "$WORK/webapp" ) >"$WORK/app8081.log" 2>&1 & PIDS+=($!)
+say "     start two replicas (KYTE_PORT) on 8080 and 8081"
+( cd "$WEBAPP" && KYTE_DB_DSN="$DSN" KYTE_PORT=8080 "$WORK/webapp" ) >"$WORK/app8080.log" 2>&1 & PIDS+=($!)
+( cd "$WEBAPP" && KYTE_DB_DSN="$DSN" KYTE_PORT=8081 "$WORK/webapp" ) >"$WORK/app8081.log" 2>&1 & PIDS+=($!)
 wait_port 127.0.0.1 8080 "app replica A" || exit 1
 wait_port 127.0.0.1 8081 "app replica B" || exit 1
 

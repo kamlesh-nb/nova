@@ -1,8 +1,8 @@
-# Nova Foundation — design program
+# Kyte Foundation — design program
 
 **Status: design phase. No implementation until the document for a piece is agreed.**
 
-This directory exists because of a specific, repeated failure: **Nova's compiler decides semantics by
+This directory exists because of a specific, repeated failure: **Kyte's compiler decides semantics by
 pattern-matching on the spelling of type names at codegen time.** There is no resolved, typed
 representation between the AST and LLVM. Every foundational defect below is a consequence of that one
 fact, and every previous fix has been a patch applied at the point where the missing information was
@@ -57,11 +57,11 @@ None of the above is new information. It was written down and deferred:
   namespaced** (checker keys functions by bare name, but the merged stdlib has cross-module name
   collisions → false positives)."* — That is exactly the bug that later cost months as "string heap
   corruption."
-- Roadmap **A1**, remaining: *"env/box use `nova_bytes_alloc_persistent` (they leak) → add ARC on
+- Roadmap **A1**, remaining: *"env/box use `kyte_bytes_alloc_persistent` (they leak) → add ARC on
   environments + retain captured ref-counted values."* — That is the measured closure leak.
 - Spec **§4.5**: *"Prefix your helpers. (It is also why the arg-count checker skips ambiguous names.)"*
   — A documented workaround standing in for a symbol table.
-- `list.nova:165`: *"ARC: elements are reference-counted; **ARC releases them, NOT this method**."*
+- `list.ky:165`: *"ARC: elements are reference-counted; **ARC releases them, NOT this method**."*
   — A comment asserting a mechanism that was never built.
 - Roadmap **§1**: *"**Compiler foundations must lead.**"*
 
@@ -173,7 +173,7 @@ Set deliberately, because "superficial" is the failure mode being corrected:
 1. **Measured, not asserted.** Every claim about current behaviour cites `file:line` or a measurement
    with its method. No adjectives standing in for numbers.
 2. **The design states its invariants.** What must be true after this lands, phrased so a violation is
-   detectable. An invariant nobody can check is a comment, and `list.nova:165` is what comments are
+   detectable. An invariant nobody can check is a comment, and `list.ky:165` is what comments are
    worth.
 3. **Staged, each stage corpus-green.** A foundation change that cannot land incrementally will not
    land at all. Every stage names the conformance cases that must stay green and the new ones it adds.
@@ -184,10 +184,10 @@ Set deliberately, because "superficial" is the failure mode being corrected:
    green". A flaky case destroys that gate in both directions: a real regression gets waved through as
    "just the flake", and a phantom sends someone hunting for hours. **`10_async_go` was that flake and is FIXED** (2026-07-15,
    ~20% → 0/50; corpus 25/25 × 3 full runs). It was four distinct scheduler bugs — see specs §10 #22 and
-   `repro/async_scheduler_race.nova`. **The gate is usable; F1 may start.** A residual race survives
+   `repro/async_scheduler_race.ky`. **The gate is usable; F1 may start.** A residual race survives
    (1 bad `await` in ~18k drives) but cannot realistically flake a 2-drive case. If a corpus run ever
    fails in an async case, suspect that residual before suspecting your change — and reach for
-   `NOVA_THREADS=1` as the control, not ASAN, which is blind to it.
+   `KYTE_THREADS=1` as the control, not ASAN, which is blind to it.
 6. **The migration is named.** How the 329 stdlib annotations / 53 pointer sites / 9 scan sites are
    moved, and what breaks. "Mechanical migration" is not a plan until the mechanism is written down.
 7. **What this does NOT fix** is stated explicitly, so the next person doesn't assume it.
@@ -201,6 +201,6 @@ F3/F4/F5 are what F2 is *for*. If you only read one, read **F2**.
 
 The corresponding "what exists today" reference is `../specs.md` (inventory + reference + spec, and
 the source of truth for current behaviour). The sequencing context is
-`../nova-readiness-roadmap.md` (workstream A) and `../nova-language-evolution-plan.md` (L1, L3).
+`../kyte-readiness-roadmap.md` (workstream A) and `../kyte-language-evolution-plan.md` (L1, L3).
 Where those disagree with a document here, **the document here is the design and specs.md is the
 present tense**; update specs.md as each stage lands.

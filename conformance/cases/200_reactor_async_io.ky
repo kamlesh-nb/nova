@@ -1,0 +1,82 @@
+import assert;
+import bytes;
+import os.sys;
+import net.poller;
+import net.eventedio;
+
+fn bump(cell: long): void {
+    bytes.write_i32(cell, 0, (bytes.read_i32(cell, 0) as int) + 1);
+}
+fn count(cell: long): int {
+    return bytes.read_i32(cell, 0) as int;
+}
+
+async fn echoConn(fd: int, kq: int, done: long): void {
+    let s = eventedio.ReactorStream(fd, kq);
+    let buf = bytes.alloc(64);
+    let n = await s.recvInto(buf, 64);
+    if (n > 0) {
+        await s.sendBuf(buf, n);
+    }
+    bytes.free(buf);
+    bump(done);
+}
+
+async fn clientConn(fd: int, kq: int, done: long, result: long, gotLen: long): void {
+    let s = eventedio.ReactorStream(fd, kq);
+    let msg = bytes.alloc(4);
+    bytes.write_byte(msg, 0, 80);
+    bytes.write_byte(msg, 1, 73);
+    bytes.write_byte(msg, 2, 78);
+    bytes.write_byte(msg, 3, 71);
+    await s.sendBuf(msg, 4);
+    bytes.free(msg);
+
+    let n = await s.recvInto(result, 64);
+    bytes.write_i32(gotLen, 0, n as long);
+    bump(done);
+}
+
+@test
+fn test_reactor_async_round_trip(): void {
+    let (a, b) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    assert.isTrue(a >= 0 && b >= 0);
+    sys.setNonBlocking(a);
+    sys.setNonBlocking(b);
+
+    let r = poller.Reactor(64, 4096, 16);
+    let done = bytes.alloc(4);
+    bytes.write_i32(done, 0, 0);
+    let result = bytes.alloc(64);
+    let gotLen = bytes.alloc(4);
+    bytes.write_i32(gotLen, 0, 0);
+
+    coroStart(echoConn(b, r.kq, done));
+    coroStart(clientConn(a, r.kq, done, result, gotLen));
+
+    let guard = 0;
+    while (count(done) < 2 && guard < 1000) {
+        let nev = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) {
+            kyte_reactor_resume(r.completedToken(i));
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(count(done), 2);
+    assert.equalInt(bytes.read_i32(gotLen, 0) as int, 4);
+    assert.equalInt(bytes.read_byte(result, 0) as int, 80);
+    assert.equalInt(bytes.read_byte(result, 1) as int, 73);
+    assert.equalInt(bytes.read_byte(result, 2) as int, 78);
+    assert.equalInt(bytes.read_byte(result, 3) as int, 71);
+
+    bytes.free(done);
+    bytes.free(result);
+    bytes.free(gotLen);
+    r.destroy();
+    sys.close(a);
+    sys.close(b);
+}

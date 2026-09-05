@@ -1,0 +1,51 @@
+// Middleware in the Kyte web framework: cross-cutting logic that wraps every handler.
+//
+// A middleware implements `RouteMiddleware` (from web.routing): one `handle(ctx, next)` method that may
+// run code before and after the handler, and calls `next.proceed(ctx)` to continue the chain. You install
+// it with `app.use(mw)`. Here a tiny middleware stamps a header onto every response; the handler itself
+// knows nothing about it. `app.dispatch(req)` runs a request through the middleware chain and the handler
+// with no socket open, so this is a fully offline test.
+import web.app;
+import web.routing;
+import web.request;
+import web.response;
+import web.status;
+import string;
+import assert;
+
+// The handler: a plain RouteHandler returning a body.
+pub struct HelloHandler impl RouteHandler {
+    init() {}
+    async fn serve(self: HelloHandler, ctx: Context): Response {
+        return response.Response(Status.Ok, "hello");
+    }
+}
+
+// The middleware: run the rest of the chain, then add a header to whatever response comes back.
+pub struct StampHeader impl RouteMiddleware {
+    init() {}
+    async fn handle(self: StampHeader, ctx: Context, next: Chain): Response {
+        let res = await next.proceed(ctx);
+        return res.setHeader("X-Powered-By", "kyte");
+    }
+}
+
+fn buildApp(): App {
+    let app = App();
+    app.use(StampHeader());               // wraps every route
+    app.get("/", HelloHandler());
+    return app;
+}
+
+@test
+fn middleware_wraps_the_handler(): void {
+    let app = buildApp();
+    let req = Request.fromString("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let res = app.dispatch(req);
+
+    // The handler produced the body...
+    assert.equalInt(res.status.toCode(), 200);
+    assert.isTrue(string.indexOf(res.body, "hello") != -1);
+    // ...and the middleware added the header, without the handler knowing.
+    assert.isTrue((res.getHeader("X-Powered-By") ?? "") == "kyte");
+}

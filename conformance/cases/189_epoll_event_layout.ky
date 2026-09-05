@@ -1,0 +1,18 @@
+import assert;
+import bytes;
+import os.linux.epoll;
+
+@test
+fn test_epoll_event_build_and_read(): void {
+    let evs = bytes.alloc(epoll.EPOLL_EVENT_SIZE() * 2);
+
+    epoll.setEvent(evs, 0, epoll.EPOLLIN | epoll.EPOLLET, 7);
+    epoll.setEvent(evs, 1, epoll.EPOLLOUT, 4242);
+
+    assert.equalInt(epoll.evEvents(evs, 0), epoll.EPOLLIN | epoll.EPOLLET);
+    assert.equalInt(epoll.evData(evs, 0) as int, 7);
+    assert.equalInt(epoll.evEvents(evs, 1), epoll.EPOLLOUT);
+    assert.equalInt(epoll.evData(evs, 1) as int, 4242);
+
+    bytes.free(evs);
+}

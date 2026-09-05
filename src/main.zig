@@ -1,4 +1,4 @@
-//! Process entry point for the `nova` compiler driver.
+//! Process entry point for the `kyte` compiler driver.
 //!
 //! This file is deliberately tiny: it is nothing but the `main` shim that Zig's
 //! runtime calls, and every ounce of real work lives in [`cli.run`] (argument
@@ -8,7 +8,7 @@
 //! process globals.
 //!
 //! The only behaviour this file owns is the top-level error presentation. A
-//! Nova program that fails to compile should exit with a clean, red `error:`
+//! Kyte program that fails to compile should exit with a clean, red `error:`
 //! line and status 1, NOT a Zig stack trace with an internal error tag. So
 //! `main` catches whatever [`cli.run`] propagates and asks
 //! [`cli.userErrorHint`] whether that error is a recognised user-facing

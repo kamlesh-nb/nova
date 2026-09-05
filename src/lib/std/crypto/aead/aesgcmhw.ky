@@ -1,0 +1,698 @@
+//! Hardware-accelerated AES-GCM (AEAD) using AES-NI and carryless multiply.
+//!
+//! This file is the fast path for AES-128/192/256 in Galois/Counter Mode, the
+//! AEAD cipher that carries almost all of Kyte's TLS and at-rest encryption
+//! traffic. It combines AES-CTR for confidentiality with GHASH (a keyed hash
+//! over GF(2^128)) for authentication, exactly as specified in NIST SP 800-38D.
+//! The output is a ciphertext of the same length as the plaintext plus a 16-byte
+//! authentication tag.
+//!
+//! WHY it exists as its own module: the generic, portable AES-GCM lives
+//! elsewhere; this one is written entirely around SIMD intrinsics so it can run
+//! at multiple GB/s on any CPU with the AES and CLMUL extensions. It does the
+//! block cipher with the `aesenc`/`aesenclast` instructions (through Kyte's
+//! `simd.*` builtins) and the finite-field multiply with `clmulU64x2`
+//! (PCLMULQDQ), so there are no S-box table lookups on the hot path and no
+//! data-dependent branches that would leak timing.
+//!
+//! Two acceleration layers stack here. First, the `simd.*` builtins give a pure
+//! Kyte AES-NI/CLMUL implementation that always works when the target has the
+//! extensions. Second, an optional hand-written assembly kernel (the `extern "c"`
+//! `kyte_*` functions) is used when `kyte_has_asm_crypto()` reports it is present,
+//! which fuses the counter-mode encrypt and the GHASH multiply into one pass over
+//! the data and is faster still. Every public entry point checks that flag and
+//! falls back to the SIMD path when the kernel is absent, so behaviour is
+//! identical either way. See [`gctrHw`], [`computeS`] and [`sealWith`] for the
+//! three places the fork appears.
+//!
+//! KEY DESIGN DECISION, the bit-reflection trick. GHASH is defined over GF(2^128)
+//! with bits in the "reflected" order that hardware PCLMULQDQ does not use
+//! natively. Rather than reflect inside the inner loop, this module keeps the
+//! hash subkey H and every data block in a bit-reversed representation, does the
+//! carryless multiply and modular reduction in that domain (the reduction
+//! constant becomes 135, i.e. the reversed GCM polynomial), and reflects only
+//! once when it reads the final result out. [`buildBrev`] builds the byte-reversal
+//! table, [`reflect`] applies it through the table, and [`reflectVec`] does the
+//! same bit reversal on a 16-byte SIMD lane in-register. This is why the field
+//! multiply routines ([`gfmul`], [`gfmulVec`], [`reduceAcc`]) look unlike a
+//! textbook GHASH: they operate in the reflected domain throughout.
+//!
+//! PERFORMANCE STRUCTURE. Counter-mode encryption processes eight 16-byte blocks
+//! at a time ([`gctrHw`]) to hide AES-NI latency behind its own throughput, and
+//! GHASH is aggregated four blocks at a time ([`ghUpdateAgg`]) using precomputed
+//! powers H, H^2, H^3, H^4 so four multiplies share a single reduction (Karatsuba
+//! plus deferred reduction). The powers are computed once per key in [`setup`] and
+//! passed down; callers that encrypt many messages under one key should call
+//! [`setup`] once and reuse [`sealWith`] / [`openWith`] rather than the
+//! one-shot [`seal`] / [`open`].
+//!
+//! INVARIANTS the caller must uphold. All buffer arguments are raw `ptr`/`long`
+//! addresses into caller-owned memory; nothing here allocates the input or output
+//! buffers or bounds-checks them. `ctOut` must have room for `ptLen` bytes,
+//! `tagOut` for 16 bytes, and the round-key/subkey scratch buffers passed to
+//! [`setup`] must be sized as [`seal`] sizes them (240 for `rk`, 16 for `hStd`,
+//! 256 for `brev`, 64 for `hpows`). The tag comparison in [`openWith`] is
+//! constant-time (it ORs all 16 byte differences before testing for zero) so a
+//! forged tag cannot be probed byte by byte, and the plaintext is only written
+//! out when the tag verifies.
+
+import bytes;
+import mem.endian;
+import mem.memory;
+
+/// Reports whether the hand-written assembly crypto kernel is available on this
+/// CPU, returning 1 if so and 0 otherwise.
+///
+/// Every acceleration fork in this file keys off this. When it returns 1 the
+/// fused `kyte_*` kernels below are used; when 0 the pure-Kyte `simd.*` path
+/// runs instead. The result is a property of the host, so it is cheap to call
+/// repeatedly.
+extern("c") fn kyte_has_asm_crypto(): int;
+/// Assembly AES counter-mode kernel: encrypts `len` bytes of `dataIn` under
+/// round keys `rk` (with `nr` rounds) and the 16-byte counter block `ctr`,
+/// writing the keystream-XORed result to `out` and advancing `ctr` in place.
+///
+/// Used by [`gctrHw`] and by [`sealWith`]'s tail when the assembly kernel is
+/// present. `ctr` must already be the ICB (the initial counter, i.e. J0 + 1).
+extern("c") fn kyte_aes_ctr(rk: ptr, nr: int, ctr: ptr, dataIn: ptr, len: int, out: ptr): void;
+/// Assembly GHASH kernel: folds `len` bytes of `data` into the running 16-byte
+/// accumulator `y` under hash subkey `hStd` (bit-reflected H).
+///
+/// Partial final blocks are treated as zero-padded by the kernel. Called
+/// repeatedly to hash AAD, then ciphertext, then the length block, matching the
+/// GCM authentication order in [`computeS`] and [`sealWith`].
+extern("c") fn kyte_ghash(hStd: ptr, data: ptr, len: int, y: ptr): void;
+/// Assembly fused seal kernel: for `len` bytes (a multiple of 64) it encrypts in
+/// counter mode AND folds the resulting ciphertext into `y` in a single pass,
+/// using the precomputed H powers `hpows`.
+///
+/// This is the fastest path because it reads the data once and interleaves the
+/// AES-CTR and GHASH pipelines. [`sealWith`] calls it for the 64-byte-aligned
+/// bulk of the plaintext and handles the tail separately.
+extern("c") fn kyte_gcm_seal(rk: ptr, nr: int, hpows: ptr, ctr: ptr, dataIn: ptr, len: int, out: ptr, y: ptr): void;
+
+/// The 256-byte AES substitution box, encoded as hex so it can live as a
+/// compile-time string literal.
+///
+/// [`buildSbox`] decodes this into a byte table at runtime. Storing it as text
+/// avoids needing a byte-array literal form and keeps the constant readable as a
+/// single line. Each pair of hex nibbles is one S-box entry.
+const SBOX_HEX: string = "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b27509832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cfd0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdbe0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9ee1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16";
+
+/// Decodes one ASCII hex nibble character `c` into its 0..15 value.
+///
+/// Accepts digits '0'..'9' (ASCII 48..57) and lowercase 'a'..'f' (97..102);
+/// anything else returns 0. Only used to parse [`SBOX_HEX`], which contains only
+/// those characters, so the fall-through is never hit in practice.
+fn sbHexNib(c: int): int { if (c >= 48 && c <= 57) { return c - 48; } if (c >= 97 && c <= 102) { return c - 87; } return 0; }
+/// Fills the 256-byte buffer `sbox` with the AES S-box by decoding [`SBOX_HEX`].
+///
+/// Each S-box entry is two hex characters, so entry `i` is read from characters
+/// `2*i` and `2*i+1`. Built once per key expansion in [`expandKey`]; the SIMD
+/// [`encBlock`] path does not use it (AES-NI has the S-box in hardware), but the
+/// key schedule still needs it in software.
+fn buildSbox(sbox: ptr): void {
+    let i = 0;
+    while (i < 256) { bytes.write_byte(sbox, i, sbHexNib(SBOX_HEX[i*2]) * 16 + sbHexNib(SBOX_HEX[i*2+1])); i = i + 1; }
+}
+
+/// Multiplies `a` by x (i.e. 2) in GF(2^8) with the AES reduction polynomial.
+///
+/// A left shift, reduced modulo 0x11b (represented by the XOR with 0x1b) when the
+/// high bit overflows. Used to advance the round constant `rcon` in [`expandKey`].
+fn xtime(a: int): int { let r = (a << 1) & 0xff; if ((a & 0x80) != 0) { r = r ^ 0x1b; } return r; }
+
+/// Expands an AES key into the round-key schedule `rk` and returns the round
+/// count `nr`.
+///
+/// Implements the standard AES key schedule for 128/192/256-bit keys, where
+/// `nr` is 10/12/14 respectively (derived as `keyLen/4 + 6`). The schedule is
+/// `4*(nr+1)` 32-bit words; `rk` must therefore be at least `16*(nr+1)` bytes
+/// (240 bytes covers AES-256). The RotWord/SubWord/Rcon step runs every `nk`
+/// words, and the extra SubWord at `w % nk == 4` applies only for AES-256
+/// (`nk > 6`). Allocates and frees a temporary S-box and word buffer internally.
+/// Returns `nr` so callers know how many rounds [`encBlock`] should run.
+pub fn expandKey(key: ptr, keyLen: int, rk: ptr): int {
+    let nk = keyLen / 4;
+    let nr = nk + 6;
+    let total = 4 * (nr + 1);
+    let sbox = bytes.alloc(256);
+    buildSbox(sbox);
+    let tmp = bytes.alloc(4);
+    let i = 0; while (i < keyLen) { bytes.write_byte(rk, i, bytes.read_byte(key, i)); i = i + 1; }
+    let w = nk;
+    let rcon = 1;
+    while (w < total) {
+        bytes.write_byte(tmp, 0, bytes.read_byte(rk, (w-1)*4+0));
+        bytes.write_byte(tmp, 1, bytes.read_byte(rk, (w-1)*4+1));
+        bytes.write_byte(tmp, 2, bytes.read_byte(rk, (w-1)*4+2));
+        bytes.write_byte(tmp, 3, bytes.read_byte(rk, (w-1)*4+3));
+        if (w % nk == 0) {
+            let t0 = bytes.read_byte(tmp, 0);
+            bytes.write_byte(tmp, 0, bytes.read_byte(sbox, bytes.read_byte(tmp, 1)) ^ rcon);
+            bytes.write_byte(tmp, 1, bytes.read_byte(sbox, bytes.read_byte(tmp, 2)));
+            bytes.write_byte(tmp, 2, bytes.read_byte(sbox, bytes.read_byte(tmp, 3)));
+            bytes.write_byte(tmp, 3, bytes.read_byte(sbox, t0));
+            rcon = xtime(rcon);
+        } else if (nk > 6 && w % nk == 4) {
+            bytes.write_byte(tmp, 0, bytes.read_byte(sbox, bytes.read_byte(tmp, 0)));
+            bytes.write_byte(tmp, 1, bytes.read_byte(sbox, bytes.read_byte(tmp, 1)));
+            bytes.write_byte(tmp, 2, bytes.read_byte(sbox, bytes.read_byte(tmp, 2)));
+            bytes.write_byte(tmp, 3, bytes.read_byte(sbox, bytes.read_byte(tmp, 3)));
+        }
+        bytes.write_byte(rk, w*4+0, bytes.read_byte(rk, (w-nk)*4+0) ^ bytes.read_byte(tmp, 0));
+        bytes.write_byte(rk, w*4+1, bytes.read_byte(rk, (w-nk)*4+1) ^ bytes.read_byte(tmp, 1));
+        bytes.write_byte(rk, w*4+2, bytes.read_byte(rk, (w-nk)*4+2) ^ bytes.read_byte(tmp, 2));
+        bytes.write_byte(rk, w*4+3, bytes.read_byte(rk, (w-nk)*4+3) ^ bytes.read_byte(tmp, 3));
+        w = w + 1;
+    }
+    bytes.free(sbox); bytes.free(tmp);
+    return nr;
+}
+
+/// Encrypts a single 16-byte block `inb` under round keys `rk` (`nr` rounds) to
+/// `out`, using the AES-NI SIMD builtins.
+///
+/// The whitening XOR with round key 0, then `nr-1` `aesenc` rounds, then a final
+/// `aesenclast`, exactly the AES-NI recipe. This is the single-block primitive
+/// used for the GHASH subkey (encrypting the zero block in [`setup`]), the
+/// tag mask (encrypting J0 in [`sealWith`] / [`openWith`]), and the counter-mode
+/// tail in [`gctrHw`]. Bulk data goes through the eight-wide loop in [`gctrHw`]
+/// instead.
+pub fn encBlock(rk: ptr, nr: int, inb: ptr, out: ptr): void {
+    let s = simd.xorU8x16(simd.loadU8x16(inb, 0), simd.loadU8x16(rk, 0));
+    let r = 1;
+    while (r < nr) { s = simd.aesencU8x16(s, simd.loadU8x16(rk, r*16)); r = r + 1; }
+    s = simd.aesenclastU8x16(s, simd.loadU8x16(rk, nr*16));
+    simd.storeU8x16(out, 0, s);
+}
+
+/// Increments the 32-bit big-endian counter in the last 4 bytes of the 16-byte
+/// block `ctr`, in place, with wraparound.
+///
+/// GCM's counter mode increments only the low 32 bits (bytes 12..15) and leaves
+/// the leading 12 bytes (the fixed IV portion) untouched, which is what the
+/// `i >= 12` bound enforces. The carry ripples from byte 15 upward; on overflow
+/// it wraps modulo 2^32, as the spec requires.
+fn inc32(ctr: ptr): void {
+    let i = 15; let carry = 1;
+    while (i >= 12) { let v = bytes.read_byte(ctr, i) + carry; bytes.write_byte(ctr, i, v & 0xff); carry = v >> 8; i = i - 1; }
+}
+/// Writes the 64-bit value `bits` as 8 big-endian bytes at offset `off` in `buf`.
+///
+/// GCM's final GHASH block encodes the AAD and ciphertext bit-lengths as two
+/// 64-bit big-endian integers; this lays down one of them. See [`computeS`] and
+/// [`sealWith`], which build the length block with two calls to this.
+fn putLen64(buf: ptr, off: int, bits: long): void {
+    let i = 0; while (i < 8) { bytes.write_byte(buf, off + i, ((bits >> ((7 - i) * 8)) & 0xff) as int); i = i + 1; }
+}
+
+/// AES counter-mode over `len` bytes: encrypts `dataIn` to `out` starting from
+/// the initial counter block `icb`, advancing the counter as it goes.
+///
+/// When the assembly kernel is present it delegates the whole thing to
+/// [`kyte_aes_ctr`]. Otherwise it runs the SIMD path: an eight-block-wide loop
+/// (128 bytes at a time) that generates eight keystream blocks in parallel to
+/// keep the AES-NI pipeline full, then a scalar tail via [`encBlock`] for the
+/// last partial 128-byte chunk down to the final sub-16-byte fragment. `icb` is
+/// copied into a local counter so the caller's block is not mutated. GCM uses the
+/// same routine to encrypt and to decrypt, since CTR is symmetric.
+fn gctrHw(rk: ptr, nr: int, icb: ptr, dataIn: ptr, len: int, out: ptr): void {
+    if (kyte_has_asm_crypto() == 1) { kyte_aes_ctr(rk, nr, icb, dataIn, len, out); return; }
+    let ctr = bytes.alloc(16);
+    let i = 0; while (i < 16) { bytes.write_byte(ctr, i, bytes.read_byte(icb, i)); i = i + 1; }
+    let cb = bytes.alloc(128);
+    let done = 0;
+    while (len - done >= 128) {
+        let j = 0;
+        while (j < 8) {
+            let m = 0; while (m < 16) { bytes.write_byte(cb, j * 16 + m, bytes.read_byte(ctr, m)); m = m + 1; }
+            inc32(ctr);
+            j = j + 1;
+        }
+        let k0 = simd.loadU8x16(rk, 0);
+        let s0 = simd.xorU8x16(simd.loadU8x16(cb, 0), k0);
+        let s1 = simd.xorU8x16(simd.loadU8x16(cb, 16), k0);
+        let s2 = simd.xorU8x16(simd.loadU8x16(cb, 32), k0);
+        let s3 = simd.xorU8x16(simd.loadU8x16(cb, 48), k0);
+        let s4 = simd.xorU8x16(simd.loadU8x16(cb, 64), k0);
+        let s5 = simd.xorU8x16(simd.loadU8x16(cb, 80), k0);
+        let s6 = simd.xorU8x16(simd.loadU8x16(cb, 96), k0);
+        let s7 = simd.xorU8x16(simd.loadU8x16(cb, 112), k0);
+        let r = 1;
+        while (r < nr) {
+            let kr = simd.loadU8x16(rk, r * 16);
+            s0 = simd.aesencU8x16(s0, kr); s1 = simd.aesencU8x16(s1, kr);
+            s2 = simd.aesencU8x16(s2, kr); s3 = simd.aesencU8x16(s3, kr);
+            s4 = simd.aesencU8x16(s4, kr); s5 = simd.aesencU8x16(s5, kr);
+            s6 = simd.aesencU8x16(s6, kr); s7 = simd.aesencU8x16(s7, kr);
+            r = r + 1;
+        }
+        let kl = simd.loadU8x16(rk, nr * 16);
+        s0 = simd.aesenclastU8x16(s0, kl); s1 = simd.aesenclastU8x16(s1, kl);
+        s2 = simd.aesenclastU8x16(s2, kl); s3 = simd.aesenclastU8x16(s3, kl);
+        s4 = simd.aesenclastU8x16(s4, kl); s5 = simd.aesenclastU8x16(s5, kl);
+        s6 = simd.aesenclastU8x16(s6, kl); s7 = simd.aesenclastU8x16(s7, kl);
+        simd.storeU8x16(out, done + 0, simd.xorU8x16(s0, simd.loadU8x16(dataIn, done + 0)));
+        simd.storeU8x16(out, done + 16, simd.xorU8x16(s1, simd.loadU8x16(dataIn, done + 16)));
+        simd.storeU8x16(out, done + 32, simd.xorU8x16(s2, simd.loadU8x16(dataIn, done + 32)));
+        simd.storeU8x16(out, done + 48, simd.xorU8x16(s3, simd.loadU8x16(dataIn, done + 48)));
+        simd.storeU8x16(out, done + 64, simd.xorU8x16(s4, simd.loadU8x16(dataIn, done + 64)));
+        simd.storeU8x16(out, done + 80, simd.xorU8x16(s5, simd.loadU8x16(dataIn, done + 80)));
+        simd.storeU8x16(out, done + 96, simd.xorU8x16(s6, simd.loadU8x16(dataIn, done + 96)));
+        simd.storeU8x16(out, done + 112, simd.xorU8x16(s7, simd.loadU8x16(dataIn, done + 112)));
+        done = done + 128;
+    }
+    let ks = bytes.alloc(16);
+    while (done < len) {
+        encBlock(rk, nr, ctr, ks);
+        let n = if (len - done < 16) (len - done) else 16;
+        let k = 0;
+        while (k < n) { bytes.write_byte(out, done + k, bytes.read_byte(dataIn, done + k) ^ bytes.read_byte(ks, k)); k = k + 1; }
+        inc32(ctr);
+        done = done + n;
+    }
+    bytes.free(ctr); bytes.free(cb); bytes.free(ks);
+}
+
+
+
+/// Fills the 256-entry table `t` where `t[i]` is `i` with its 8 bits reversed.
+///
+/// This is the byte-level half of the GHASH bit-reflection scheme: [`reflect`]
+/// uses it to reverse the bits of every byte (and, combined with reversing byte
+/// order, the whole 128-bit block) when converting to and from the reflected
+/// domain. Built once per key in [`setup`].
+fn buildBrev(t: ptr): void {
+    let i = 0;
+    while (i < 256) {
+        let b = i; let r = 0; let k = 0;
+        while (k < 8) { r = (r << 1) | (b & 1); b = b >> 1; k = k + 1; }
+        bytes.write_byte(t, i, r & 0xff);
+        i = i + 1;
+    }
+}
+/// Bit-reflects a 16-byte block `e` into `out` through the reversal table `brev`.
+///
+/// Writing byte `i` of the input to byte `i` of the output after bit-reversing
+/// each byte. Note this reverses bits within each byte but keeps byte positions,
+/// which is the transform the reflected-domain GHASH ([`gfmul`] and friends) is
+/// paired with. Used to move the hash subkey and the final GHASH result across
+/// the domain boundary in [`setup`], [`computeJ0`], [`computeS`] and [`sealWith`].
+fn reflect(brev: ptr, e: ptr, out: ptr): void {
+    let i = 0; while (i < 16) { bytes.write_byte(out, i, bytes.read_byte(brev, bytes.read_byte(e, i))); i = i + 1; }
+}
+/// Bit-reflects a 16-byte SIMD lane `v` entirely in registers, returning the
+/// reversed vector.
+///
+/// The register-resident equivalent of [`reflect`], done with the classic
+/// swap-by-mask ladder: swap nibbles (0xF0/0x0F), then bit-pairs (0xCC/0x33),
+/// then adjacent bits (0xAA/0x55). Kept in-register because it sits on the GHASH
+/// hot path, where routing every block through the byte table in [`reflect`]
+/// would be far slower. Used by [`ghBlock`] and [`ghUpdateAgg`] to reflect data
+/// blocks before the field multiply.
+fn reflectVec(v: u8x16): u8x16 {
+    let mF0 = simd.splatU8x16(0xF0); let m0F = simd.splatU8x16(0x0F);
+    let mCC = simd.splatU8x16(0xCC); let m33 = simd.splatU8x16(0x33);
+    let mAA = simd.splatU8x16(0xAA); let m55 = simd.splatU8x16(0x55);
+    let r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(v, mF0), 4), simd.shlU8x16(simd.andU8x16(v, m0F), 4));
+    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mCC), 2), simd.shlU8x16(simd.andU8x16(r, m33), 2));
+    r = simd.orU8x16(simd.shrU8x16(simd.andU8x16(r, mAA), 1), simd.shlU8x16(simd.andU8x16(r, m55), 1));
+    return r;
+}
+
+
+/// Carryless-multiplies the reflected block `a8` by the reflected subkey power at
+/// `hb` and XOR-accumulates the UNREDUCED 256-bit product into `acc` (32 bytes).
+///
+/// This is the per-block core of the aggregated GHASH in [`ghUpdateAgg`]. It uses
+/// three 64x64 carryless multiplies (low, high, and the Karatsuba middle term
+/// `(a0^a1)*(b0^b1)`) to form the four 64-bit product words p0..p3, then folds
+/// them into the running 256-bit accumulator. Deferring the modular reduction to
+/// [`reduceAcc`] lets four blocks share one reduction, which is the whole point
+/// of the aggregation. `acc` must be pre-zeroed for each aggregation group.
+fn clmulAccV(a8: u8x16, hb: ptr, acc: ptr): void {
+    let le = endian.Endian.little;
+    let av = simd.castU64x2(a8);
+    let a0 = simd.laneU64x2(av, 0) as ulong; let a1 = simd.laneU64x2(av, 1) as ulong;
+    let b0 = mem.load<ulong>(hb, 0, le); let b1 = mem.load<ulong>(hb, 8, le);
+    let lp = simd.clmulU64x2(a0 as long, b0 as long);
+    let l0 = simd.laneU64x2(lp, 0) as ulong; let l1 = simd.laneU64x2(lp, 1) as ulong;
+    let hp = simd.clmulU64x2(a1 as long, b1 as long);
+    let h0 = simd.laneU64x2(hp, 0) as ulong; let h1 = simd.laneU64x2(hp, 1) as ulong;
+    let mp = simd.clmulU64x2((a0 ^ a1) as long, (b0 ^ b1) as long);
+    let m0 = (simd.laneU64x2(mp, 0) as ulong) ^ l0 ^ h0; let m1 = (simd.laneU64x2(mp, 1) as ulong) ^ l1 ^ h1;
+    let p0 = l0; let p1 = l1 ^ m0; let p2 = h0 ^ m1; let p3 = h1;
+    mem.store<ulong>(acc, 0, mem.load<ulong>(acc, 0, le) ^ p0, le);
+    mem.store<ulong>(acc, 8, mem.load<ulong>(acc, 8, le) ^ p1, le);
+    mem.store<ulong>(acc, 16, mem.load<ulong>(acc, 16, le) ^ p2, le);
+    mem.store<ulong>(acc, 24, mem.load<ulong>(acc, 24, le) ^ p3, le);
+}
+
+/// Full GF(2^128) multiply in the reflected domain: multiplies the reflected
+/// SIMD block `a8` by the reflected subkey at `b` and writes the reduced 16-byte
+/// product to `out`.
+///
+/// Same Karatsuba carryless multiply as [`clmulAccV`] to get the 256-bit product
+/// p0..p3, but this one immediately reduces modulo the reflected GCM polynomial.
+/// The reduction folds the high words p2/p3 back down using `clmul` by the
+/// constant 135 (0x87, the bit-reversed low byte of the field polynomial),
+/// including the second-order fold `op` from the carry-out `d1`. This is the
+/// single-block GHASH step ([`ghBlock`] calls it); the aggregated path splits the
+/// multiply ([`clmulAccV`]) and reduce ([`reduceAcc`]) apart instead.
+fn gfmulVec(a8: u8x16, b: ptr, out: ptr): void {
+    let le = endian.Endian.little;
+    let av = simd.castU64x2(a8);
+    let a0 = simd.laneU64x2(av, 0) as ulong; let a1 = simd.laneU64x2(av, 1) as ulong;
+    let b0 = mem.load<ulong>(b, 0, le); let b1 = mem.load<ulong>(b, 8, le);
+    let lp = simd.clmulU64x2(a0 as long, b0 as long);
+    let l0 = simd.laneU64x2(lp, 0) as ulong; let l1 = simd.laneU64x2(lp, 1) as ulong;
+    let hp = simd.clmulU64x2(a1 as long, b1 as long);
+    let h0 = simd.laneU64x2(hp, 0) as ulong; let h1 = simd.laneU64x2(hp, 1) as ulong;
+    let mp = simd.clmulU64x2((a0 ^ a1) as long, (b0 ^ b1) as long);
+    let m0 = (simd.laneU64x2(mp, 0) as ulong) ^ l0 ^ h0; let m1 = (simd.laneU64x2(mp, 1) as ulong) ^ l1 ^ h1;
+    let p0 = l0; let p1 = l1 ^ m0; let p2 = h0 ^ m1; let p3 = h1;
+    let cp = simd.clmulU64x2(p2 as long, 135 as long);
+    let c0 = simd.laneU64x2(cp, 0) as ulong; let c1 = simd.laneU64x2(cp, 1) as ulong;
+    let dp = simd.clmulU64x2(p3 as long, 135 as long);
+    let d0 = simd.laneU64x2(dp, 0) as ulong; let d1 = simd.laneU64x2(dp, 1) as ulong;
+    let r0 = p0 ^ c0; let r1 = p1 ^ c1 ^ d0;
+    let op = simd.clmulU64x2(d1 as long, 135 as long); let o0 = simd.laneU64x2(op, 0) as ulong;
+    r0 = r0 ^ o0;
+    mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
+}
+
+/// Reduces the accumulated 256-bit product in `acc` modulo the reflected GCM
+/// polynomial, writing the 16-byte field element to `out`.
+///
+/// The reduction half of the split multiply-then-reduce: [`clmulAccV`] leaves the
+/// four unreduced product words p0..p3 in `acc`, and this folds p2/p3 back down
+/// with `clmul` by 135, exactly as the tail of [`gfmulVec`] does. The `t`
+/// argument is an unused scratch pointer kept for signature symmetry with the
+/// other field routines. Called once per four-block group in [`ghUpdateAgg`].
+fn reduceAcc(acc: ptr, out: ptr, t: ptr): void {
+    let le = endian.Endian.little;
+    let p0 = mem.load<ulong>(acc, 0, le); let p1 = mem.load<ulong>(acc, 8, le);
+    let p2 = mem.load<ulong>(acc, 16, le); let p3 = mem.load<ulong>(acc, 24, le);
+    let cp = simd.clmulU64x2(p2 as long, 135 as long);
+    let c0 = simd.laneU64x2(cp, 0) as ulong; let c1 = simd.laneU64x2(cp, 1) as ulong;
+    let dp = simd.clmulU64x2(p3 as long, 135 as long);
+    let d0 = simd.laneU64x2(dp, 0) as ulong; let d1 = simd.laneU64x2(dp, 1) as ulong;
+    let r0 = p0 ^ c0; let r1 = p1 ^ c1 ^ d0;
+    let op = simd.clmulU64x2(d1 as long, 135 as long); let o0 = simd.laneU64x2(op, 0) as ulong;
+    r0 = r0 ^ o0;
+    mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
+}
+
+/// Full GF(2^128) reflected-domain multiply of two in-memory 16-byte elements
+/// `a` and `b`, writing the reduced product to `out`.
+///
+/// The all-pointer counterpart to [`gfmulVec`] (which takes its first operand as
+/// a SIMD lane): same Karatsuba multiply and reduce-by-135. Used off the hot path
+/// to precompute the subkey powers H, H^2, H^3, H^4 in [`setup`] and to hash the
+/// IV length block in [`computeJ0`]. The `t` argument is unused scratch, present
+/// only for a uniform signature.
+fn gfmul(a: ptr, b: ptr, out: ptr, t: ptr): void {
+    let le = endian.Endian.little;
+    let a0 = mem.load<ulong>(a, 0, le); let a1 = mem.load<ulong>(a, 8, le);
+    let b0 = mem.load<ulong>(b, 0, le); let b1 = mem.load<ulong>(b, 8, le);
+    let lp = simd.clmulU64x2(a0 as long, b0 as long);
+    let l0 = simd.laneU64x2(lp, 0) as ulong; let l1 = simd.laneU64x2(lp, 1) as ulong;
+    let hp = simd.clmulU64x2(a1 as long, b1 as long);
+    let h0 = simd.laneU64x2(hp, 0) as ulong; let h1 = simd.laneU64x2(hp, 1) as ulong;
+    let mp = simd.clmulU64x2((a0 ^ a1) as long, (b0 ^ b1) as long);
+    let m0 = (simd.laneU64x2(mp, 0) as ulong) ^ l0 ^ h0; let m1 = (simd.laneU64x2(mp, 1) as ulong) ^ l1 ^ h1;
+    let p0 = l0; let p1 = l1 ^ m0; let p2 = h0 ^ m1; let p3 = h1;
+    let cp = simd.clmulU64x2(p2 as long, 135 as long);
+    let c0 = simd.laneU64x2(cp, 0) as ulong; let c1 = simd.laneU64x2(cp, 1) as ulong;
+    let dp = simd.clmulU64x2(p3 as long, 135 as long);
+    let d0 = simd.laneU64x2(dp, 0) as ulong; let d1 = simd.laneU64x2(dp, 1) as ulong;
+    let r0 = p0 ^ c0; let r1 = p1 ^ c1 ^ d0;
+    let op = simd.clmulU64x2(d1 as long, 135 as long); let o0 = simd.laneU64x2(op, 0) as ulong;
+    r0 = r0 ^ o0;
+    mem.store<ulong>(out, 0, r0, le); mem.store<ulong>(out, 8, r1, le);
+}
+
+/// Folds one 16-byte block at offset `off` in `data` into the GHASH accumulator
+/// `y`: `y = (y XOR reflect(block)) * H`.
+///
+/// The textbook GHASH step, done in the reflected domain. The incoming block is
+/// bit-reflected in-register by [`reflectVec`], XORed into the running hash, and
+/// multiplied by the reflected subkey `hStd` via [`gfmulVec`]. `brev`, `t` and
+/// `scr` are carried for signature symmetry but are not used by this SIMD form.
+fn ghBlock(y: ptr, hStd: ptr, brev: ptr, data: ptr, off: int, t: ptr, scr: ptr): void {
+    let rv = simd.xorU8x16(reflectVec(simd.loadU8x16(data, off)), simd.loadU8x16(y, 0));
+    gfmulVec(rv, hStd, y);
+}
+/// Hashes `len` bytes of `data` into `y` one block at a time, zero-padding a final
+/// partial block.
+///
+/// The simple (non-aggregated) GHASH driver: it loops [`ghBlock`] over whole
+/// 16-byte blocks, then, if `len` is not a multiple of 16, copies the remaining
+/// bytes into `pad`, zero-fills the rest of that 16-byte block, and hashes it.
+/// Used where the aggregated path is not worth it, e.g. hashing a short IV in
+/// [`computeJ0`].
+fn ghUpdate(y: ptr, hStd: ptr, brev: ptr, data: ptr, len: int, t: ptr, scr: ptr, pad: ptr): void {
+    let i = 0;
+    while (len - i >= 16) { ghBlock(y, hStd, brev, data, i, t, scr); i = i + 16; }
+    let rem = len - i;
+    if (rem > 0) {
+        let k = 0; while (k < 16) { bytes.write_byte(pad, k, if (k < rem) bytes.read_byte(data, i + k) else 0); k = k + 1; }
+        ghBlock(y, hStd, brev, pad, 0, t, scr);
+    }
+}
+
+/// Aggregated GHASH over `len` bytes of `data`, folding four blocks per modular
+/// reduction using precomputed subkey powers H, H^2, H^3, H^4.
+///
+/// This is the throughput path. For each group of four blocks it computes
+/// `(y XOR b0)*H^4 + b1*H^3 + b2*H^2 + b3*H` by XOR-accumulating four unreduced
+/// carryless products into `acc` with [`clmulAccV`] and reducing once with
+/// [`reduceAcc`]. Only the first block of each group is XORed with the running
+/// `y`, which is the standard Horner-with-powers reordering. Blocks beyond the
+/// last multiple of 64 fall back to per-block [`ghBlock`], and a final partial
+/// block is zero-padded through `pad`. `acc` (32 bytes) and `gb` (scratch) are
+/// caller-provided; `acc` is re-zeroed each group.
+fn ghUpdateAgg(y: ptr, hStd: ptr, h2: ptr, h3: ptr, h4: ptr, brev: ptr, data: ptr, len: int,
+               acc: ptr, gb: ptr, t: ptr, pad: ptr): void {
+    let le = endian.Endian.little;
+    let i = 0;
+    while (len - i >= 64) {
+        let r0 = simd.xorU8x16(reflectVec(simd.loadU8x16(data, i)), simd.loadU8x16(y, 0));
+        let r1 = reflectVec(simd.loadU8x16(data, i + 16));
+        let r2 = reflectVec(simd.loadU8x16(data, i + 32));
+        let r3 = reflectVec(simd.loadU8x16(data, i + 48));
+        mem.store<ulong>(acc, 0, 0 as ulong, le); mem.store<ulong>(acc, 8, 0 as ulong, le);
+        mem.store<ulong>(acc, 16, 0 as ulong, le); mem.store<ulong>(acc, 24, 0 as ulong, le);
+        clmulAccV(r0, h4, acc);
+        clmulAccV(r1, h3, acc);
+        clmulAccV(r2, h2, acc);
+        clmulAccV(r3, hStd, acc);
+        reduceAcc(acc, y, t);
+        i = i + 64;
+    }
+    while (len - i >= 16) { ghBlock(y, hStd, brev, data, i, t, gb); i = i + 16; }
+    let rem = len - i;
+    if (rem > 0) {
+        let k = 0; while (k < 16) { bytes.write_byte(pad, k, if (k < rem) bytes.read_byte(data, i + k) else 0); k = k + 1; }
+        ghBlock(y, hStd, brev, pad, 0, t, gb);
+    }
+}
+
+/// Derives the pre-counter block J0 from the IV, writing the 16-byte result to
+/// `j0`.
+///
+/// GCM has two IV cases. For the common 96-bit (12-byte) IV, J0 is simply the IV
+/// followed by the 32-bit integer 1, which the fast branch writes directly. For
+/// any other IV length, J0 is `GHASH(IV || 0^s || len64(IV))`: the branch hashes
+/// the IV with [`ghUpdate`], appends the bit-length block, and reflects the GHASH
+/// result out with [`reflect`]. `t`, `scr` and `pad` are scratch buffers the
+/// GHASH helpers need.
+fn computeJ0(hStd: ptr, brev: ptr, iv: ptr, ivLen: int, j0: ptr, t: ptr, scr: ptr, pad: ptr): void {
+    if (ivLen == 12) {
+        let i = 0; while (i < 12) { bytes.write_byte(j0, i, bytes.read_byte(iv, i)); i = i + 1; }
+        bytes.write_byte(j0, 12, 0); bytes.write_byte(j0, 13, 0); bytes.write_byte(j0, 14, 0); bytes.write_byte(j0, 15, 1);
+    } else {
+        let y = bytes.alloc(16); let k = 0; while (k < 16) { bytes.write_byte(y, k, 0); k = k + 1; }
+        ghUpdate(y, hStd, brev, iv, ivLen, t, scr, pad);
+        let lb = bytes.alloc(16); k = 0; while (k < 8) { bytes.write_byte(lb, k, 0); k = k + 1; }
+        putLen64(lb, 8, (ivLen as long) * 8);
+        ghBlock(y, hStd, brev, lb, 0, t, scr);
+        reflect(brev, y, j0);
+        bytes.free(y); bytes.free(lb);
+    }
+}
+/// Computes the GHASH value S over the AAD and ciphertext, writing the 16-byte
+/// result to `s`.
+///
+/// S is `GHASH(AAD || 0-pad || CT || 0-pad || len64(AAD) || len64(CT))`, the value
+/// that gets masked to form the tag. When the assembly kernel is present it uses
+/// three [`kyte_ghash`] calls (AAD, then ciphertext, then the length block).
+/// Otherwise it precomputes the subkey powers H^2, H^3, H^4 with [`gfmul`] and
+/// runs the aggregated [`ghUpdateAgg`] over the AAD and ciphertext, finishing with
+/// the length block via [`ghBlock`]. Either way the accumulator is reflected out
+/// with [`reflect`] before returning. Used by [`openWith`] for verification and by
+/// the SIMD branch of [`sealWith`].
+fn computeS(hStd: ptr, brev: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, s: ptr, t: ptr, scr: ptr, pad: ptr): void {
+    let y = bytes.alloc(16); let k = 0; while (k < 16) { bytes.write_byte(y, k, 0); k = k + 1; }
+    if (kyte_has_asm_crypto() == 1) {
+        kyte_ghash(hStd, aad, aadLen, y);
+        kyte_ghash(hStd, ct, ctLen, y);
+        let lens = bytes.alloc(16);
+        putLen64(lens, 0, (aadLen as long) * 8); putLen64(lens, 8, (ctLen as long) * 8);
+        kyte_ghash(hStd, lens, 16, y);
+        reflect(brev, y, s);
+        bytes.free(y); bytes.free(lens);
+        return;
+    }
+    let h2 = bytes.alloc(16); gfmul(hStd, hStd, h2, t);
+    let h3 = bytes.alloc(16); gfmul(h2, hStd, h3, t);
+    let h4 = bytes.alloc(16); gfmul(h3, hStd, h4, t);
+    let acc = bytes.alloc(32); let gb = bytes.alloc(64);
+    ghUpdateAgg(y, hStd, h2, h3, h4, brev, aad, aadLen, acc, gb, t, pad);
+    ghUpdateAgg(y, hStd, h2, h3, h4, brev, ct, ctLen, acc, gb, t, pad);
+    let lens = bytes.alloc(16);
+    putLen64(lens, 0, (aadLen as long) * 8); putLen64(lens, 8, (ctLen as long) * 8);
+    ghBlock(y, hStd, brev, lens, 0, t, scr);
+    reflect(brev, y, s);
+    bytes.free(y); bytes.free(lens); bytes.free(h2); bytes.free(h3); bytes.free(h4); bytes.free(acc); bytes.free(gb);
+}
+
+
+
+/// One-time per-key precomputation for AES-GCM, returning the round count `nr`.
+///
+/// Runs the AES key schedule into `rk` via [`expandKey`], derives the GHASH hash
+/// subkey H by encrypting the zero block, reflects it into `hStd` (the reflected
+/// representation used everywhere else), builds the byte-reversal table `brev`
+/// with [`buildBrev`], and precomputes the powers H, H^2, H^3, H^4 into `hpows`
+/// (64 bytes, four 16-byte elements) with [`gfmul`] for the aggregated GHASH.
+/// Callers that seal or open many messages under one key should call this once and
+/// reuse [`sealWith`] / [`openWith`]; the one-shot [`seal`] / [`open`] call it
+/// every time. Buffer sizes: `rk` 240, `hStd` 16, `brev` 256, `hpows` 64.
+pub fn setup(key: ptr, keyLen: int, rk: ptr, hStd: ptr, brev: ptr, hpows: ptr): int {
+    let nr = expandKey(key, keyLen, rk);
+    let zero = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(zero, i, 0); i = i + 1; }
+    let h = bytes.alloc(16); encBlock(rk, nr, zero, h);
+    buildBrev(brev);
+    reflect(brev, h, hStd);
+    let t = bytes.alloc(16); let cur = bytes.alloc(16); let nxt = bytes.alloc(16);
+    let z = 0; while (z < 16) { let hv = bytes.read_byte(hStd, z); bytes.write_byte(hpows, z, hv); bytes.write_byte(cur, z, hv); z = z + 1; }
+    let hk = 1;
+    while (hk < 4) {
+        gfmul(cur, hStd, nxt, t);
+        z = 0; while (z < 16) { let hv = bytes.read_byte(nxt, z); bytes.write_byte(hpows, hk * 16 + z, hv); bytes.write_byte(cur, z, hv); z = z + 1; }
+        hk = hk + 1;
+    }
+    bytes.free(zero); bytes.free(h); bytes.free(t); bytes.free(cur); bytes.free(nxt);
+    return nr;
+}
+
+/// Seals (encrypts and authenticates) a message under an already-prepared key,
+/// writing the ciphertext to `ctOut` and the 16-byte tag to `tagOut`.
+///
+/// The core AEAD encrypt path, taking the round keys and GHASH material produced
+/// by [`setup`] so it can be reused across messages. It derives J0 from the IV
+/// with [`computeJ0`], forms the initial counter block (J0 + 1), and then either:
+/// takes the fused assembly path ([`kyte_gcm_seal`] over the 64-byte-aligned bulk
+/// plus a [`kyte_aes_ctr`] + [`kyte_ghash`] tail); or the SIMD path ([`gctrHw`]
+/// to encrypt, then [`computeS`] to hash). The tag is `S XOR AES(J0)`. `ctOut`
+/// must hold `ptLen` bytes and `tagOut` 16 bytes; the AAD is authenticated but
+/// not encrypted. See [`openWith`] for the inverse.
+pub fn sealWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, hpows: ptr, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+                pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+    let t = bytes.alloc(16); let scr = bytes.alloc(16); let pad = bytes.alloc(16);
+    let j0 = bytes.alloc(16); computeJ0(hStd, brev, iv, ivLen, j0, t, scr, pad);
+    let icb = bytes.alloc(16); let i = 0; while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+    inc32(icb);
+    let s = bytes.alloc(16);
+    if (kyte_has_asm_crypto() == 1) {
+        let y = bytes.alloc(16); let z = 0; while (z < 16) { bytes.write_byte(y, z, 0); z = z + 1; }
+        kyte_ghash(hStd, aad, aadLen, y);
+        let fused = ptLen - (ptLen % 64);
+        kyte_gcm_seal(rk, nr, hpows, icb, pt, fused, ctOut, y);
+        let rem = ptLen - fused;
+        if (rem > 0) {
+            kyte_aes_ctr(rk, nr, icb, (pt as long + fused) as ptr, rem, (ctOut as long + fused) as ptr);
+            kyte_ghash(hStd, (ctOut as long + fused) as ptr, rem, y);
+        }
+        let lens = bytes.alloc(16);
+        putLen64(lens, 0, (aadLen as long) * 8); putLen64(lens, 8, (ptLen as long) * 8);
+        kyte_ghash(hStd, lens, 16, y);
+        reflect(brev, y, s);
+        let ej0a = bytes.alloc(16); encBlock(rk, nr, j0, ej0a);
+        i = 0; while (i < 16) { bytes.write_byte(tagOut, i, bytes.read_byte(s, i) ^ bytes.read_byte(ej0a, i)); i = i + 1; }
+        bytes.free(y); bytes.free(lens); bytes.free(ej0a);
+        bytes.free(t); bytes.free(scr); bytes.free(pad); bytes.free(j0); bytes.free(icb); bytes.free(s);
+        return;
+    }
+    gctrHw(rk, nr, icb, pt, ptLen, ctOut);
+    computeS(hStd, brev, aad, aadLen, ctOut, ptLen, s, t, scr, pad);
+    let ej0 = bytes.alloc(16); encBlock(rk, nr, j0, ej0);
+    i = 0; while (i < 16) { bytes.write_byte(tagOut, i, bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)); i = i + 1; }
+    bytes.free(t); bytes.free(scr); bytes.free(pad); bytes.free(j0); bytes.free(icb); bytes.free(s); bytes.free(ej0);
+}
+
+/// Opens (verifies and decrypts) a message under an already-prepared key,
+/// returning `true` only if the tag is authentic.
+///
+/// The inverse of [`sealWith`]. It recomputes J0 from the IV, computes the GHASH
+/// value S over the AAD and the received ciphertext with [`computeS`], and
+/// compares the expected tag `S XOR AES(J0)` against the supplied `tag` in
+/// CONSTANT TIME: the loop ORs all 16 byte differences into `diff` and tests once
+/// for zero, so a partial match reveals nothing through timing. Only when the tag
+/// verifies does it decrypt the ciphertext into `ptOut` with [`gctrHw`]. On a tag
+/// mismatch it returns `false` and leaves `ptOut` untouched, so callers must check
+/// the return value before trusting the plaintext.
+pub fn openWith(rk: ptr, nr: int, hStd: ptr, brev: ptr, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+                ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    let t = bytes.alloc(16); let scr = bytes.alloc(16); let pad = bytes.alloc(16);
+    let j0 = bytes.alloc(16); computeJ0(hStd, brev, iv, ivLen, j0, t, scr, pad);
+    let s = bytes.alloc(16); computeS(hStd, brev, aad, aadLen, ct, ctLen, s, t, scr, pad);
+    let ej0 = bytes.alloc(16); encBlock(rk, nr, j0, ej0);
+    let diff = 0; let i = 0;
+    while (i < 16) { diff = diff | ((bytes.read_byte(s, i) ^ bytes.read_byte(ej0, i)) ^ bytes.read_byte(tag, i)); i = i + 1; }
+    let ok = diff == 0;
+    if (ok) {
+        let icb = bytes.alloc(16); i = 0; while (i < 16) { bytes.write_byte(icb, i, bytes.read_byte(j0, i)); i = i + 1; }
+        inc32(icb);
+        gctrHw(rk, nr, icb, ct, ctLen, ptOut);
+        bytes.free(icb);
+    }
+    bytes.free(t); bytes.free(scr); bytes.free(pad); bytes.free(j0); bytes.free(s); bytes.free(ej0);
+    return ok;
+}
+
+/// One-shot AES-GCM seal: encrypts and authenticates `pt` under `key` in a single
+/// call, writing ciphertext to `ctOut` and the 16-byte tag to `tagOut`.
+///
+/// A convenience wrapper that allocates the round-key and GHASH scratch, calls
+/// [`setup`] then [`sealWith`], and frees the scratch. Convenient for a single
+/// message but wasteful for many, since it re-runs the whole key schedule and
+/// subkey-power precomputation every call. To seal repeatedly under one key, call
+/// [`setup`] once and [`sealWith`] per message instead. `keyLen` selects
+/// AES-128/192/256 (16/24/32 bytes).
+pub fn seal(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+            pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+    let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256); let hpows = bytes.alloc(64);
+    let nr = setup(key, keyLen, rk, hStd, brev, hpows);
+    sealWith(rk, nr, hStd, brev, hpows, iv, ivLen, aad, aadLen, pt, ptLen, ctOut, tagOut);
+    bytes.free(rk); bytes.free(hStd); bytes.free(brev); bytes.free(hpows);
+}
+
+/// One-shot AES-GCM open: verifies and decrypts `ct` under `key` in a single
+/// call, returning `true` only when the tag is authentic.
+///
+/// The counterpart to [`seal`]: it allocates scratch, runs [`setup`] then
+/// [`openWith`], frees the scratch, and returns the verification result. The
+/// plaintext is written to `ptOut` only on success; on failure the return is
+/// `false` and callers must not use `ptOut`. As with [`seal`], prefer [`setup`]
+/// plus [`openWith`] when opening many messages under one key.
+pub fn open(key: ptr, keyLen: int, iv: ptr, ivLen: int, aad: ptr, aadLen: int,
+            ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    let rk = bytes.alloc(240); let hStd = bytes.alloc(16); let brev = bytes.alloc(256); let hpows = bytes.alloc(64);
+    let nr = setup(key, keyLen, rk, hStd, brev, hpows);
+    let ok = openWith(rk, nr, hStd, brev, iv, ivLen, aad, aadLen, ct, ctLen, tag, ptOut);
+    bytes.free(rk); bytes.free(hStd); bytes.free(brev); bytes.free(hpows);
+    return ok;
+}

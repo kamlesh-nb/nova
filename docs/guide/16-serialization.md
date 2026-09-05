@@ -1,6 +1,6 @@
 # 16. Serialization
 
-Turning structs into JSON and back is a compile-time feature in Nova, not a runtime reflection trick.
+Turning structs into JSON and back is a compile-time feature in Kyte, not a runtime reflection trick.
 Annotate a struct with **`@serializable`** and the compiler generates two free functions for it:
 
 - **`<Struct>__bind(src: ValueSource): Struct`**: deserialize from a `ValueSource`. It recurses into
@@ -16,8 +16,8 @@ One requirement: an `@serializable` struct must have a zero-argument `init()` th
 every field. `__bind` starts from those defaults and overwrites whatever it finds in the source, so a
 missing key keeps its default instead of crashing.
 
-```nova
-// examples/23_serde.nova
+```kyte
+// examples/23_serde.ky
 // Marking a struct `@serializable` makes the COMPILER generate binders for it at
 // compile time: no reflection, no hand-written parsing:
 //

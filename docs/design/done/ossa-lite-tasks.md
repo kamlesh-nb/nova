@@ -11,16 +11,16 @@ and is the highest-value item — it converts "ASAN-tested safe" into "compile-t
 - `src/frontend/sema/ownership.zig` (532 LOC) — a move/use-after-move BALANCE check over AST+TypedIr.
   Computes `balance_violations`, `deferred_cfg`, `deferred_untyped`, drop/move/dup ops. REPORT-ONLY today.
 - It is ALREADY wired to a build gate — `shadow.zig:560` exits(1) on `balance_violations>0` OR unaccounted
-  temporaries — but ONLY when the `NOVA_SEMA_SHADOW` report path runs. Not a standalone verifier.
+  temporaries — but ONLY when the `KYTE_SEMA_SHADOW` report path runs. Not a standalone verifier.
 - `src/frontend/sema/escape.zig` (431 LOC) — interprocedural may-escape analysis, report-only. = borrow seed.
 - `discards/optimiser-2026-08-16/src/optimiser/{mir.zig(358),verify.zig(97),arc_elision.zig(208)}` — a
   reusable typed-SSA + a verifier skeleton + the (0/44-firing) ARC pass. Salvage, don't resurrect wholesale.
 
 ## Track V — ownership VERIFIER (soundness). Buildable now. HIGHEST VALUE.
 - [x] **V1** DONE. Extracted the move-check into a standalone `verify()` (structured diagnostics) +
-      `runVerify()` reporter in `ownership.zig`, wired opt-in via `NOVA_OWN_VERIFY` in builder.zig+tester.zig.
+      `runVerify()` reporter in `ownership.zig`, wired opt-in via `KYTE_OWN_VERIFY` in builder.zig+tester.zig.
       Pure refactor; `analyze()` behaviour identical; build clean; shadow gate still runs; sample case green.
-- [x] **V2** DONE (report wired + measured). `NOVA_OWN_VERIFY=1` runs report-only; `=hard` fails the build.
+- [x] **V2** DONE (report wired + measured). `KYTE_OWN_VERIFY=1` runs report-only; `=hard` fails the build.
       Corpus sweep: 0 violations everywhere. BUT — see the load-bearing finding below — that 0 is VACUOUS.
 
 ### ⛔ LOAD-BEARING HONEST FINDING (2026-08-16) — the move-check is vacuous, and it is the WRONG property
@@ -30,18 +30,18 @@ Proven at the code level, not assumed:
    input branch. The walk always ENTERS at `.live` and NO base transition sets `.moved`, so by induction
    `.moved` is never produced and every `state == .moved` violation check is dead code. "0 violations" =
    "the check never fires", NOT "proven safe". Reporting it as a soundness result would be an overclaim.
-2. **A move / use-after-move verifier is the WRONG property for an ARC language.** Nova is
+2. **A move / use-after-move verifier is the WRONG property for an ARC language.** Kyte is
    reference-counted, not affine, and has NO move-only / noncopyable types. `let y = x` retains; a later
    use of `x` is safe by construction (the dup comment at `ownership.zig:242` says exactly this). Swift's
    OSSA move-verifier matters because Swift has `owned`/consuming/noncopyable values where use-after-consume
-   IS a bug. Nova has none, so there is nothing for a move verifier to prove. This is not a bug to fix in
+   IS a bug. Kyte has none, so there is nothing for a move verifier to prove. This is not a bug to fix in
    the walk; it is the wrong verifier.
 3. **The temp-accounting half is a pass-COVERAGE self-check, not a balance proof.** `accounted==total`
    means the walk VISITED every owned temporary; the move/drop labels are assigned by syntactic position
    and never checked for exactly-once release. It proves nothing about leaks or double-frees.
 
-### Corrected Track V — the property that IS meaningful for Nova = ARC RELEASE-BALANCE
-The Nova memory hazards are leak / double-free / UAF from UNBALANCED codegen retain/release (the
+### Corrected Track V — the property that IS meaningful for Kyte = ARC RELEASE-BALANCE
+The Kyte memory hazards are leak / double-free / UAF from UNBALANCED codegen retain/release (the
 string→TypeId class), NOT source-level use-after-move. So the meaningful OSSA-lite verifier proves:
 **every owned value (local + temporary) is released exactly once on every control-flow path** — matching
 the retain/release codegen (`arc.zig`) actually inserts. That is a real, non-vacuous, ARC-appropriate
@@ -49,16 +49,16 @@ soundness property, and NEITHER existing analysis proves it.
 - [ ] **V3'** Define the ARC-balance property precisely against what `arc.zig` emits (retain on
       acquire/dup, release on scope-end/consume). Enumerate the acquire/consume sites per owned value.
 - [~] **V4'** IN PROGRESS — slice 1 built. `arc.zig:verifyArcBalance` runs on the RAW codegen module
-      (before LLVM -O), gated by NOVA_OWN_VERIFY (=hard fails). For each alloca slot it PROVES
+      (before LLVM -O), gated by KYTE_OWN_VERIFY (=hard fails). For each alloca slot it PROVES
       non-escaping + owned, it checks acquires==releases. Findings, verified empirically:
       - It FIRES (non-vacuous): the first cut reported 31/31 checkable slots imbalanced — the
         `acquires != releases` branch is reachable, unlike the dead move-check. That was a real
         false-positive (a retained value stored into a local slot ALSO escaped via `ret %sv`); fixed
         with `storedValueStaysLocal` (the stored value's only uses must be retain/store/compare).
       - After the fix: 0 false positives, 0 crashes on the corpus — BUT **checkable slots ≈ 0**. Slice 1
-        only recognises an owned value that enters a slot via `nova_retain` AND stays purely local. That
+        only recognises an owned value that enters a slot via `kyte_retain` AND stays purely local. That
         intersection is nearly empty in real code: a fresh `List.new()` local is born +1 by the ALLOCATOR,
-        not via nova_retain, so it is not counted; borrowed/dup values that stay local are rare.
+        not via kyte_retain, so it is not counted; borrowed/dup values that stay local are rare.
       - CONCLUSION (the real V3' prerequisite, now proven concrete): a balance verifier with useful
         coverage MUST recognise every OWNED-PRODUCTION site — allocator births, constructor returns,
         retained borrows — i.e. the ownership-production catalog. That catalog IS V3', and building it is
@@ -69,7 +69,7 @@ soundness property, and NEITHER existing analysis proves it.
         allocator call shape to an owned birth), which is where real coverage starts.
 - [ ] **V5'** expect_fail case = a program `arc.zig` would MIS-balance (e.g. a known string→TypeId shape),
       confirm the balance checker rejects it; clean corpus passes. THEN consider default-on.
-- Note: keep `NOVA_OWN_VERIFY` infra (V1/V2) — the structured-diagnostic + reporter plumbing is reused by
+- Note: keep `KYTE_OWN_VERIFY` infra (V1/V2) — the structured-diagnostic + reporter plumbing is reused by
   V4'. Only the PROPERTY being checked changes (from the dead move-walk to real ARC-balance).
 
 ## Track I — ownership IR (OSSA-lite). The SHARED substrate for BOTH gaps (verifier + ownership-forwarding).
@@ -83,8 +83,8 @@ soundness property, and NEITHER existing analysis proves it.
 - [~] **I2** SLICE 1 DONE — end-to-end lowering + verify on REAL code. `ossa/lower.zig` lowers
       straight-line functions (owned let-locals modelled: make_owned births, copy dups, destroy/ret_owned
       consumes; uses skipped as balance-irrelevant), defers anything with control flow / a local flowing
-      into a call/store/return-expr (sound-by-deferral, no wrong lowering). Report via NOVA_OSSA runs
-      lower->verify per fn. MEASURED (nova test on a case, ~121 fns): **37 lowered = 30% coverage, all 37
+      into a call/store/return-expr (sound-by-deferral, no wrong lowering). Report via KYTE_OSSA runs
+      lower->verify per fn. MEASURED (kyte test on a case, ~121 fns): **37 lowered = 30% coverage, all 37
       verified BALANCED, 0 imbalanced**. This is the FIRST run of the real (non-vacuous) verifier on
       actual functions. lower.zig unit test passes; corpus green; no regressions. This solved the V4'
       blocker: ownership comes from sema's TypedIr (ownedOf/isOwnedSafe = codegen's ARC info), recorded as
@@ -97,7 +97,7 @@ soundness property, and NEITHER existing analysis proves it.
       still ALL BALANCED, 0 imbalanced; scanned 12 varied cases (struct/enum/closure/trait/option/generic/…)
       = 0 false positives. Unit tests pass.
       SLICE 3 DONE — calls/borrows. KEY: the E2 census showed caller-side call args carry NO retain/release,
-      i.e. in Nova's ARC model passing an owned value to a call is a BORROW from the caller (the callee
+      i.e. in Kyte's ARC model passing an owned value to a call is a BORROW from the caller (the callee
       retains its own copies; the caller keeps its +1 and drops at scope end). So owned-local-into-call
       needs NO escape.zig consume/borrow distinction — it is always a borrow. The ONLY move is a bare
       `return x`. Lifted the defers: let-init mentioning a local (borrow -> makeOwned/copy), return-expr
@@ -153,7 +153,7 @@ soundness property, and NEITHER existing analysis proves it.
 - [ ] **I3** OSSA VERIFIER on the IR: every owned value consumed exactly once; no use-after-consume; no
       double-consume. IR-level restatement of Track V; this is the REAL, non-vacuous soundness verifier.
 - [ ] **I4** Extend lowering coverage function-by-function until it matches AST codegen's ARC decisions
-      (cross-check `NOVA_ARC_AUDIT`). Then ownership-forwarding (Track A) becomes possible ON this IR.
+      (cross-check `KYTE_ARC_AUDIT`). Then ownership-forwarding (Track A) becomes possible ON this IR.
 
 ## Track A — ARC optimisation (perf). GATED on measured delta. LOWEST priority.
 - [ ] **A1** borrow-skip / release-sink pass on the OSSA IR (the one non-redundant-with-LLVM opt).

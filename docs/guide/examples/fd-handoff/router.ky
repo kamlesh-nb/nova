@@ -1,0 +1,54 @@
+
+import os.socket;
+import os.sys;
+import bytes;
+import string;
+import env;
+import list;
+
+const SOCK_PATH: string = "/tmp/kyte_handoff.sock";
+
+fn main(): int {
+    let cp = sys.cstr(SOCK_PATH);
+    sys.unlink(cp);
+    bytes.free(cp);
+
+    let u = socket.newUnix();
+    let ua = socket.makeSockaddrUn(SOCK_PATH);
+    let br = socket.bindSock(u, ua, socket.sockaddrUnLen());
+    bytes.free(ua);
+    if (br != 0) { console.log("router: AF_UNIX bind failed"); return 1; }
+    socket.listenSock(u, 16);
+
+    let lfd = socket.listenAny(8099);
+    if (lfd < 0) { console.log("router: TCP :8099 bind failed"); return 1; }
+    console.log("router: TCP :8099 up; waiting for a worker on " + SOCK_PATH);
+
+    let ws = env.get("WORKERS");
+    let want = if (ws == "9") 9 else (if (ws == "3") 3 else (if (ws == "2") 2 else 1));
+    let workers = list.List<int>();
+    let w = 0;
+    while (w < want) {
+        let wf = socket.acceptSock(u, 0, 0);
+        if (wf < 0) { console.log("router: worker accept failed"); return 1; }
+        workers.push(wf);
+        w = w + 1;
+    }
+    console.log(`router: ${want} worker(s) connected; round-robin fd-passing`);
+
+    let served = 0;
+    while (served < 1000000) {
+        let c = socket.acceptOne(lfd);
+        if (c < 0) { continue; }
+        let buf = bytes.alloc(8192);
+        let n = socket.recvOnce(c, buf as long, 8192);
+        let req = if (n > 0) bytes.read_string(buf, n as int) else "";
+        bytes.free(buf);
+        let target = workers.get(served % want);
+        let sent = socket.sendFd(target, c, req);
+        socket.close(c);
+        if (sent < 0) { console.log("router: fd handoff failed"); }
+        served = served + 1;
+    }
+    return 0;
+}

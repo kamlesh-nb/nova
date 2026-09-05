@@ -1,10 +1,10 @@
-// Run a nova-compiled wasm module under Node and report whether its @test
+// Run a kyte-compiled wasm module under Node and report whether its @test
 // functions pass. Turns the --wasm gate from "compiles+links" into "executes".
 //
-// nova wasm modules delegate a small set of runtime functions to host imports
+// kyte wasm modules delegate a small set of runtime functions to host imports
 // (env.*). This harness implements them against the module's own memory +
-// exported allocator (nova_bytes_alloc writes the 8-byte header {refcount@0,
-// length@4} and returns base+8; a nova string is that byte pointer, length at
+// exported allocator (kyte_bytes_alloc writes the 8-byte header {refcount@0,
+// length@4} and returns base+8; a kyte string is that byte pointer, length at
 // [ptr-4]). Decimal128 is stubbed — those cases fail here but still link.
 //
 // Usage:  node wasm-run.mjs <module.wasm>
@@ -28,7 +28,7 @@ let failed = false, failMsg = '';
 const u8 = () => new Uint8Array(memory.buffer);
 const view = () => new DataView(memory.buffer);
 
-// wasm32 ABI: a pointer is 32-bit, but nova's universal value handle is i64 (it must hold an f64).
+// wasm32 ABI: a pointer is 32-bit, but kyte's universal value handle is i64 (it must hold an f64).
 // A pointer therefore travels in the LOW 32 bits of that i64; the high bits are don't-care (inside
 // wasm, `inttoptr i64->ptr` truncates to i32, so memory access is correct even when they are dirty —
 // e.g. a re-entrant alloc leaves stack garbage there). But a HOST import receives the full i64, so it
@@ -36,7 +36,7 @@ const view = () => new DataView(memory.buffer);
 // a workaround: every offset above is < 4GB, so the low 32 bits are the whole address.
 const ptr32 = (x) => Number((typeof x === 'bigint' ? x : BigInt(x)) & 0xffffffffn);
 
-// Read a nova string (byte ptr; length at [ptr-4]).
+// Read a kyte string (byte ptr; length at [ptr-4]).
 function readStr(ptr) {
   ptr = ptr32(ptr);
   if (ptr === 0) return '';
@@ -49,7 +49,7 @@ function readN(ptr, len) {
   return new TextDecoder().decode(u8().subarray(ptr, ptr + len));
 }
 // Read a NUL-terminated C string (an LLVM global, e.g. a decimal literal handed to
-// nova_decimal_from_string) — NOT length-prefixed like a nova string.
+// kyte_decimal_from_string) — NOT length-prefixed like a kyte string.
 function readCStr(ptr) {
   ptr = ptr32(ptr);
   if (ptr === 0) return '';
@@ -58,10 +58,10 @@ function readCStr(ptr) {
   while (end < mem.length && mem[end] !== 0) end++;
   return new TextDecoder().decode(mem.subarray(ptr, end));
 }
-// Allocate a nova string via the module allocator, return its byte ptr (BigInt).
+// Allocate a kyte string via the module allocator, return its byte ptr (BigInt).
 function makeStr(s) {
   const b = new TextEncoder().encode(s);
-  const ptr = ptr32(exports.nova_bytes_alloc(BigInt(b.length)));
+  const ptr = ptr32(exports.ky_bytes_alloc(BigInt(b.length)));
   u8().set(b, ptr);
   return BigInt(ptr);
 }
@@ -73,7 +73,7 @@ function bitsToF64(bits) {
 }
 
 // Atomics: the pointer is i32 (a plain Number offset); i32 values are Numbers,
-// i64 values are BigInts. CAS returns a *bool* (1 if swapped, 0 if not) — nova's
+// i64 values are BigInts. CAS returns a *bool* (1 if swapped, 0 if not) — kyte's
 // compareAndSwap(expected, desired): bool — NOT the old value.
 const atomicRW = {
   load_i32: (p) => view().getInt32(ptr32(p), true),
@@ -90,7 +90,7 @@ const atomicRW = {
   cas_bool: (p, e, d) => { p = ptr32(p); const o = u8()[p] ? 1 : 0; if (o === e) { u8()[p] = d ? 1 : 0; return 1; } return 0; },
 };
 
-// decimal128 (BID) — a faithful BigInt port of src/runtime/decimal.cpp. A nova `decimal` is a POINTER
+// decimal128 (BID) — a faithful BigInt port of src/runtime/decimal.cpp. A kyte `decimal` is a POINTER
 // to a 16-byte little-endian BID128: number = (-1)^sign * coeff * 10^(biasedExp - 6176), with
 // sign=bit127, biasedExp=bits126..113 (14b), coeff=bits112..0 (113b). BigInt is exact, so no u128
 // overflow bookkeeping is needed except to match the C++ rounding at encode/align/div.
@@ -118,7 +118,7 @@ function decPack(sign, coeff, exp) {
   if (biased < 0) biased = 0; if (biased > DEC_MAXBIASED) biased = DEC_MAXBIASED;
   let v = (coeff & MASK113) | (BigInt(biased & 0x3fff) << 113n);
   if (sign) v |= 1n << 127n;
-  const p = ptr32(exports.nova_bytes_alloc(16n));
+  const p = ptr32(exports.ky_bytes_alloc(16n));
   view().setBigUint64(p, v & MASK64, true);
   view().setBigUint64(p + 8, (v >> 64n) & MASK64, true);
   return BigInt(p);
@@ -238,80 +238,80 @@ const dec = {
 
 const env = {
   log: () => {},                       // stdout suppressed for the gate
-  nova_test_fail: (p) => { failed = true; failMsg = readStr(p); },
-  nova_optional_deref_fail: (p) => { failed = true; failMsg = 'optional-deref: ' + readStr(p); },
-  nova_panic: (p) => { failed = true; failMsg = 'panic: ' + readStr(p); },
+  kyte_test_fail: (p) => { failed = true; failMsg = readStr(p); },
+  kyte_optional_deref_fail: (p) => { failed = true; failMsg = 'optional-deref: ' + readStr(p); },
+  kyte_panic: (p) => { failed = true; failMsg = 'panic: ' + readStr(p); },
 
   // Value-optional boxing (fixes the value-0-reads-as-undefined bug): a box is a plain 8-byte ARC
-  // cell holding one i64 word; null/0 = undefined. Mirror alloc.cpp's nova_valopt_box/unbox exactly,
+  // cell holding one i64 word; null/0 = undefined. Mirror alloc.cpp's kyte_valopt_box/unbox exactly,
   // allocating in the module's own linear memory via its exported allocator.
-  nova_valopt_box: (value) => {
-    const ptr = ptr32(exports.nova_bytes_alloc(8n));
+  kyte_valopt_box: (value) => {
+    const ptr = ptr32(exports.ky_bytes_alloc(8n));
     if (ptr === 0) return 0n;
     view().setBigInt64(ptr, BigInt.asIntN(64, value), true);   // `value` is the boxed word — NOT a ptr, no mask
     return BigInt(ptr);
   },
-  nova_valopt_unbox: (box) => {
+  kyte_valopt_unbox: (box) => {
     const p = ptr32(box);
     if (p === 0) return 0n;
     return view().getBigInt64(p, true);
   },
 
-  nova_i64_to_string: (n) => makeStr(BigInt.asIntN(64, n).toString()),
-  // f64_to_string receives the f64 DIRECTLY (a JS Number), not i64 bits. nova
+  kyte_i64_to_string: (n) => makeStr(BigInt.asIntN(64, n).toString()),
+  // f64_to_string receives the f64 DIRECTLY (a JS Number), not i64 bits. kyte
   // prints 3.0 as "3", 2.5 as "2.5" — the shortest round-trip repr, == String(f).
-  nova_f64_to_string: (f) => makeStr(String(f)),
-  nova_bool_to_string: (b) => makeStr(Number(b) ? 'true' : 'false'),
-  nova_f64_bits: (d) => { const dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, d, true); return dv.getBigInt64(0, true); },
+  kyte_f64_to_string: (f) => makeStr(String(f)),
+  kyte_bool_to_string: (b) => makeStr(Number(b) ? 'true' : 'false'),
+  kyte_f64_bits: (d) => { const dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, d, true); return dv.getBigInt64(0, true); },
 
-  nova_getenv: (p) => makeStr(process.env[readStr(p)] ?? ''),
-  nova_setenv: () => {},
-  nova_arg_count: () => 0n,
-  nova_arg_at: () => makeStr(''),
+  kyte_getenv: (p) => makeStr(process.env[readStr(p)] ?? ''),
+  kyte_setenv: () => {},
+  kyte_arg_count: () => 0n,
+  kyte_arg_at: () => makeStr(''),
 
-  nova_sha256: (p) => makeStr(crypto.createHash('sha256').update(readStr(p)).digest('hex')),
-  nova_sha512: (p) => makeStr(crypto.createHash('sha512').update(readStr(p)).digest('hex')),
-  nova_hmac_sha256: (k, m) => makeStr(crypto.createHmac('sha256', readStr(k)).update(readStr(m)).digest('hex')),
-  nova_random_hex: (n) => makeStr(crypto.randomBytes(Number(n)).toString('hex')),
+  kyte_sha256: (p) => makeStr(crypto.createHash('sha256').update(readStr(p)).digest('hex')),
+  kyte_sha512: (p) => makeStr(crypto.createHash('sha512').update(readStr(p)).digest('hex')),
+  kyte_hmac_sha256: (k, m) => makeStr(crypto.createHmac('sha256', readStr(k)).update(readStr(m)).digest('hex')),
+  kyte_random_hex: (n) => makeStr(crypto.randomBytes(Number(n)).toString('hex')),
 
   // decimal128 (BID) — faithful BigInt port of decimal.cpp (see `dec` above).
-  nova_decimal_from_string: (p) => dec.fromStr(readCStr(p)),   // literal path: NUL-terminated C string
-  nova_decimal_from_string_n: (p, n) => dec.fromStr(readN(p, n)),
-  nova_decimal_to_string: (p) => makeStr(dec.toStr(p)),
-  nova_decimal_add: dec.add, nova_decimal_sub: dec.sub, nova_decimal_mul: dec.mul,
-  nova_decimal_div: dec.div, nova_decimal_mod: dec.mod, nova_decimal_cmp: dec.cmp,
-  nova_decimal_from_int: dec.fromInt, nova_decimal_to_int: dec.toInt,
+  kyte_decimal_from_string: (p) => dec.fromStr(readCStr(p)),   // literal path: NUL-terminated C string
+  kyte_decimal_from_string_n: (p, n) => dec.fromStr(readN(p, n)),
+  kyte_decimal_to_string: (p) => makeStr(dec.toStr(p)),
+  kyte_decimal_add: dec.add, kyte_decimal_sub: dec.sub, kyte_decimal_mul: dec.mul,
+  kyte_decimal_div: dec.div, kyte_decimal_mod: dec.mod, kyte_decimal_cmp: dec.cmp,
+  kyte_decimal_from_int: dec.fromInt, kyte_decimal_to_int: dec.toInt,
 
-  nova_atomic_load_i32: atomicRW.load_i32, nova_atomic_load_i64: atomicRW.load_i64, nova_atomic_load_bool: atomicRW.load_bool,
-  nova_atomic_store_i32: atomicRW.store_i32, nova_atomic_store_i64: atomicRW.store_i64, nova_atomic_store_bool: atomicRW.store_bool,
-  nova_atomic_add_i32: atomicRW.add_i32, nova_atomic_add_i64: atomicRW.add_i64, nova_atomic_sub_i32: atomicRW.sub_i32,
-  nova_atomic_cas_i32: atomicRW.cas_i32, nova_atomic_cas_i64: atomicRW.cas_i64, nova_atomic_cas_bool: atomicRW.cas_bool,
+  kyte_atomic_load_i32: atomicRW.load_i32, kyte_atomic_load_i64: atomicRW.load_i64, kyte_atomic_load_bool: atomicRW.load_bool,
+  kyte_atomic_store_i32: atomicRW.store_i32, kyte_atomic_store_i64: atomicRW.store_i64, kyte_atomic_store_bool: atomicRW.store_bool,
+  kyte_atomic_add_i32: atomicRW.add_i32, kyte_atomic_add_i64: atomicRW.add_i64, kyte_atomic_sub_i32: atomicRW.sub_i32,
+  kyte_atomic_cas_i32: atomicRW.cas_i32, kyte_atomic_cas_i64: atomicRW.cas_i64, kyte_atomic_cas_bool: atomicRW.cas_bool,
 
   // Non-zeroed persistent allocation: delegate to the module's own exported allocator (persistent if it
   // exports one, else the plain bump allocator). The gate does not free, so "persistent" is a no-op here.
-  nova_bytes_alloc_persistent_nz: (size) =>
-    (exports.nova_bytes_alloc_persistent ? exports.nova_bytes_alloc_persistent(size) : exports.nova_bytes_alloc(size)),
+  kyte_bytes_alloc_persistent_nz: (size) =>
+    (exports.ky_bytes_alloc_persistent ? exports.ky_bytes_alloc_persistent(size) : exports.ky_bytes_alloc(size)),
 
   // Bulk memory primitives over the module's own linear memory (memmove/memset/memcmp/memchr). These are
   // imported by any module that uses RawBuffer/string copies or the mem.memory module.
-  nova_bytes_copy: (dst, src, len) => {
+  kyte_bytes_copy: (dst, src, len) => {
     const d = ptr32(dst), s = ptr32(src), n = Number(len);
     if (!d || !s || n <= 0) return;
     u8().copyWithin(d, s, s + n);          // copyWithin is overlap-safe (memmove semantics)
   },
-  nova_mem_set: (dst, val, len) => {
+  kyte_mem_set: (dst, val, len) => {
     const d = ptr32(dst), n = Number(len);
     if (!d || n <= 0) return;
     u8().fill(Number(val) & 0xff, d, d + n);
   },
-  nova_mem_cmp: (a, b, len) => {
+  kyte_mem_cmp: (a, b, len) => {
     const pa = ptr32(a), pb = ptr32(b), n = Number(len);
     if (n <= 0) return 0n;
     const arr = u8();
     for (let i = 0; i < n; i++) { const d = arr[pa + i] - arr[pb + i]; if (d !== 0) return BigInt(d < 0 ? -1 : 1); }
     return 0n;
   },
-  nova_mem_find: (p, val, len) => {
+  kyte_mem_find: (p, val, len) => {
     const pp = ptr32(p), n = Number(len), v = Number(val) & 0xff;
     if (!pp || n <= 0) return -1n;
     const arr = u8();
@@ -326,7 +326,7 @@ const mod = await WebAssembly.instantiate(wasmBytes, { env }).catch((e) => {
 exports = mod.instance.exports;
 memory = exports.memory;
 
-// nova @test functions: exported, no params, name contains "test".
+// kyte @test functions: exported, no params, name contains "test".
 const tests = Object.keys(exports).filter(
   (k) => typeof exports[k] === 'function' && exports[k].length === 0 && /(^|_)test/i.test(k),
 );

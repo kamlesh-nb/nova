@@ -16,7 +16,7 @@ Dose-response on the TEST BINARY, compile verified PASS each time:
 
 ## Repro
 
-```nova
+```kyte
 fn churn(n: int): int {
     var i = 0; var total = 0;
     while (i < n) {
@@ -35,7 +35,7 @@ fn churn(n: int): int {
 Erasure. There is **one** `__destruct_List` body for every `List<T>`:
 
 ```
-$ grep -c '^define .*__destruct_List' __nova_test.ll
+$ grep -c '^define .*__destruct_List' __kyte_test.ll
 1
 ```
 
@@ -52,8 +52,8 @@ before-figure that was measured rather than remembered.
 
 ## Measurement traps hit while getting this number
 
-1. **`/usr/bin/time -l ./zig-out/bin/nova test x.nova` measures the COMPILER.**
-   `nova test` compiles and then spawns `./__nova_test` as a child; the parent's
+1. **`/usr/bin/time -l ./zig-out/bin/kyte test x.ky` measures the COMPILER.**
+   `kyte test` compiles and then spawns `./__kyte_test` as a child; the parent's
    peak RSS is the compiler's. Measure the test binary directly.
 2. **A `sed` that rewrote `fn test_churn()` into `fn test_churn(400000)`** made every
    run after the first compile-fail, so four "measurements" timed one stale binary.

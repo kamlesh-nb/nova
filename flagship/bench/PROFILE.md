@@ -6,7 +6,7 @@ is the second, and by a wide margin.
 
 ## Method
 
-`sample` (macOS, no instrumentation) on the release server (`headtohead/nova/server.nova`,
+`sample` (macOS, no instrumentation) on the release server (`headtohead/kyte/server.ky`,
 uncached path) for 10 seconds while `oha -c 128` saturated it. Samples are wall-clock
 stack captures across all threads, so threads parked in the reactor show up as `kevent`.
 
@@ -50,7 +50,7 @@ this profile confirms it and names the specific costs.
 
 Pass 1 done (commit lands with this file): removed the per-allocation audit guard (item 3)
 and cut the eager per-request map capacities (a first slice of item 1). Measured result:
-Nova 48,737 -> 55,409 rps at c=64 (+14 percent), corpus 180/180 and ASAN 329/329 green.
+Kyte 48,737 -> 55,409 rps at c=64 (+14 percent), corpus 180/180 and ASAN 329/329 green.
 The larger levers (2, 4, and the rest of 1) remain open.
 
 ## Ranked, actionable wins (all on the current runtime, no rewrite)

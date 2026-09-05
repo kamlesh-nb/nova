@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# Compiler robustness fuzzer (X4). Mutates small, valid Nova sources and feeds each to `nova test`,
+# Compiler robustness fuzzer (X4). Mutates small, valid Kyte sources and feeds each to `kyte test`,
 # asserting the COMPILER never crashes (segfault / panic / abort) or hangs on malformed input. A mutation
-# that produces invalid Nova must be REJECTED cleanly (a diagnostic + non-signal exit), never a crash.
-# Complements NovaDB's in-process SQL/wire fuzz (D9); the Nova front-end + codegen is the fuzz target here.
+# that produces invalid Kyte must be REJECTED cleanly (a diagnostic + non-signal exit), never a crash.
+# Complements NovaDB's in-process SQL/wire fuzz (D9); the Kyte front-end + codegen is the fuzz target here.
 #
-#   conformance/fuzz.sh              # default NOVA_FUZZ_N iterations
-#   NOVA_FUZZ_N=500 conformance/fuzz.sh
-#   NOVA_FUZZ_SEED=1234 conformance/fuzz.sh
+#   conformance/fuzz.sh              # default KYTE_FUZZ_N iterations
+#   KYTE_FUZZ_N=500 conformance/fuzz.sh
+#   KYTE_FUZZ_SEED=1234 conformance/fuzz.sh
 #
 # Exit non-zero (and keep the offending input under fuzz-artifacts/) if any input CRASHED the compiler.
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 lang="$(cd "$here/.." && pwd)"
 cd "$lang"
-export PATH="$HOME/.nova/bin:$PATH"
+export PATH="$HOME/.kyte/bin:$PATH"
 
-N="${NOVA_FUZZ_N:-80}"
-SEED="${NOVA_FUZZ_SEED:-1337}"
-TMO="${NOVA_FUZZ_TIMEOUT:-20}"
+N="${KYTE_FUZZ_N:-80}"
+SEED="${KYTE_FUZZ_SEED:-1337}"
+TMO="${KYTE_FUZZ_TIMEOUT:-20}"
 artifacts="$here/fuzz-artifacts"
 rm -rf "$artifacts"; mkdir -p "$artifacts"
 
 # Small, fast-compiling seeds (mutating real sources reaches deeper code paths than pure random bytes).
 seeds=(
-  conformance/cases/00_smoke.nova
-  conformance/cases/80_struct_init_typeargs.nova
-  conformance/cases/05_closures_capture.nova
-  conformance/cases/79_heterogeneous_ifexpr_lub.nova
-  conformance/cases/01_collections_list.nova
+  conformance/cases/00_smoke.ky
+  conformance/cases/80_struct_init_typeargs.ky
+  conformance/cases/05_closures_capture.ky
+  conformance/cases/79_heterogeneous_ifexpr_lub.ky
+  conformance/cases/01_collections_list.ky
 )
 
 # Portable per-run timeout (stock macOS has no `timeout`): gtimeout > timeout > a perl alarm wrapper.
@@ -40,11 +40,11 @@ run_to() {
 }
 
 crashes=0; hangs=0; ok=0; i=0
-echo ">>> nova compiler fuzz: $N iterations, seed $SEED [$(uname -s)-$(uname -m)]"
+echo ">>> kyte compiler fuzz: $N iterations, seed $SEED [$(uname -s)-$(uname -m)]"
 while [ "$i" -lt "$N" ]; do
   i=$((i+1))
   seed="${seeds[$(( (SEED + i) % ${#seeds[@]} ))]}"
-  tmp="$artifacts/candidate_$i.nova"
+  tmp="$artifacts/candidate_$i.ky"
   # Deterministic byte-level mutation (flip / insert / delete) OR, 1-in-4, pure random bytes.
   python3 - "$seed" "$tmp" "$((SEED + i))" <<'PY'
 import sys, random
@@ -63,11 +63,11 @@ else:
 with open(out_path, "wb") as f: f.write(data)
 PY
   outf="$artifacts/out_$i.txt"
-  run_to "$TMO" nova test "$tmp" >"$outf" 2>&1; ec=$?
+  run_to "$TMO" kyte test "$tmp" >"$outf" 2>&1; ec=$?
   if [ "$ec" -eq 124 ] || [ "$ec" -eq 137 ]; then
-    hangs=$((hangs+1)); echo "  HANG   #$i ($(basename "$seed")) -> $tmp"; cp "$tmp" "$artifacts/HANG_$i.nova"
+    hangs=$((hangs+1)); echo "  HANG   #$i ($(basename "$seed")) -> $tmp"; cp "$tmp" "$artifacts/HANG_$i.ky"
   elif [ "$ec" -ge 128 ] || grep -qiE "panic:|segmentation fault|SIGSEGV|SIGABRT|Assertion .* failed|unreachable code" "$outf"; then
-    crashes=$((crashes+1)); echo "  CRASH  #$i ($(basename "$seed")) ec=$ec -> $tmp"; cp "$tmp" "$artifacts/CRASH_$i.nova"; tail -5 "$outf" | tr -d '\0' | sed 's/^/    /'
+    crashes=$((crashes+1)); echo "  CRASH  #$i ($(basename "$seed")) ec=$ec -> $tmp"; cp "$tmp" "$artifacts/CRASH_$i.ky"; tail -5 "$outf" | tr -d '\0' | sed 's/^/    /'
   else
     ok=$((ok+1))   # 0 = compiled/ran, 1 = cleanly rejected: both are robust
   fi

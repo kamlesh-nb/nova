@@ -1,12 +1,12 @@
-# Nova DB drivers: gap analysis and fix plan
+# Kyte DB drivers: gap analysis and fix plan
 
-Comparison of the four Nova SQL/NoSQL drivers against their canonical Go counterparts, with a
+Comparison of the four Kyte SQL/NoSQL drivers against their canonical Go counterparts, with a
 phased plan to close the gaps. Reviewed 2026-08-06.
 
 References: `lib/pq` (postgres), `go-sql-driver/mysql`, `microsoft/go-mssqldb`, `mongodb/mongo-go-driver`.
 
-Scope: `packages/nova-{postgres,mysql,mssql,mongodb}/src/`, the shared seam
-`lang/src/std/data/db.nova` + `lang/src/std/data/sql/pool.nova`, and `lang/src/std/serde/bson.nova`.
+Scope: `packages/kyte-{postgres,mysql,mssql,mongodb}/src/`, the shared seam
+`lang/src/std/data/db.ky` + `lang/src/std/data/sql/pool.ky`, and `lang/src/std/serde/bson.ky`.
 
 ## Status (reconciled 2026-08-07)
 
@@ -29,15 +29,15 @@ The final round closed the Phase-4 items that actually affect a running app:
 - **PostgreSQL** (`nova-postgres` origin `bd813b5`): the DSN percent-decodes credentials and the database
   name and parses IPv6 bracket hosts (`[::1]:5432`); isolation levels, read-only transactions and
   savepoints are first-class (`beginIsolation`/`beginReadOnly`/`savepoint`/`rollbackTo`/`releaseSavepoint`).
-- **BSON / MongoDB** (nova lang `d7b5af4`, `src/std/serde/bson.nova`): the scanner decodes every remaining
+- **BSON / MongoDB** (kyte lang `d7b5af4`, `src/std/serde/bson.ky`): the scanner decodes every remaining
   element type (regex, code, symbol, code_w_scope, dbpointer, undefined, min/max key); previously it
   bailed at the first such element and silently dropped it and every field after it.
-- **Connect deadline** (nova lang `0fc45fd` + all four drivers `ca2a810`/`cdc041c`/`cc41217`/`502134f`):
+- **Connect deadline** (kyte lang `0fc45fd` + all four drivers `ca2a810`/`cdc041c`/`cc41217`/`502134f`):
   a reactor-native `asyncConnectDeadline` (arm the connect op + a one-shot timer, abandon the op on
   timeout) — a dead/firewalled host used to hang the connecting coroutine forever. Each driver bounds
   the connect with `?connect_timeout=<seconds>` (default 10 s) and returns a failed connection instead
   of hanging. Verified live (unroutable host → failure in ~2 s; real host still connects).
-- **Compiler enablers** (nova lang `57a026c`, `c41ee53`): importing two driver packages in one program
+- **Compiler enablers** (kyte lang `57a026c`, `c41ee53`): importing two driver packages in one program
   now compiles (was a module-scoping name clash), and the checker no longer validates a colliding struct
   name against the wrong module's decl (`data.db.Cursor` vs a driver's own `Cursor`).
 
@@ -71,7 +71,7 @@ has since been implemented and pushed. Current state per driver:
   uuid, TDS packet chunking, sp_reset_connection on pooled reuse, query cancellation via ATTENTION.
 
 **What remains for the three SQL drivers**, cross-cutting:
-- **X4 streaming ResultSet (Phase 3): DONE.** Async `Cursor`/`RowBatchSource` seam in `db.nova` + native
+- **X4 streaming ResultSet (Phase 3): DONE.** Async `Cursor`/`RowBatchSource` seam in `db.ky` + native
   streaming on postgres (portals), mysql (server-side cursor), mssql (incremental TDS decode); mongodb
   already lazy. All verified live.
 - **X5 connection robustness (Phase 3): DONE.** Hard pool cap with an async wait queue (aio.delay backoff,
@@ -116,17 +116,17 @@ These are not feature gaps, they are latent defects that corrupt data or the con
 - **mssql: date/time columns desync the entire token stream.** `parseTypeInfo` has no case for
   DATE / TIME / DATETIME / DATETIME2 / DATETIMEOFFSET / SMALLDATETIME, so `readValue` returns null
   without advancing the cursor and every subsequent column/row is garbage. Our comparison app only
-  dodged this by storing timestamps as `NVARCHAR`. (`codec.nova` parseTypeInfo/readValue)
+  dodged this by storing timestamps as `NVARCHAR`. (`codec.ky` parseTypeInfo/readValue)
 - **mssql: VARBINARY(MAX) / XML / SQL_VARIANT / TEXT / NTEXT / IMAGE also desync** the same way
   (no PLP path for MAX binary; no type-info case for the others).
 - **mssql: a failed login returns a live-looking but dead connection** (logs to stderr, still
-  returns the object). The caller gets no error. (`mssql.nova` msConnectAsync)
+  returns the object). The caller gets no error. (`mssql.ky` msConnectAsync)
 - **mssql: query cancellation is fire-and-forget** — ATTENTION is sent but the attention-ack is
   never drained, leaving unread tokens on the socket so the next request desyncs.
 - **mysql: binary-protocol TIME (type 11) is mis-decoded** as a lenenc string, desyncing the row
-  stream. (`codec.nova` decodeBinaryCell)
+  stream. (`codec.ky` decodeBinaryCell)
 - **mysql: a single value/packet larger than the 64 KB reader ring cannot be read** (common for
-  TEXT/BLOB/JSON). (`proto.nova`)
+  TEXT/BLOB/JSON). (`proto.ky`)
 - **mysql: unsigned BIGINT > 2^63 wraps to a negative number.**
 - **mongodb: `exec()` performs no write** — it runs a `find` and returns `rowsAffected = ok ? 1 : 0`.
   The driver cannot write through its public API.
@@ -166,7 +166,7 @@ read then discarded), mssql TDS error number (currently discarded). Add helpers 
 `isUniqueViolation()`, `isTransient()`. This unblocks retry logic. Effort: S per driver + S in the seam.
 
 ### X4. Streaming ResultSet in the seam
-Introduce an iterator/cursor abstraction in `db.nova` so drivers can yield rows instead of buffering
+Introduce an iterator/cursor abstraction in `db.ky` so drivers can yield rows instead of buffering
 the whole set. Then: postgres uses portals with a batch size, mysql stops pushing all rows, mssql
 streams tokens, mongodb drains the cursor via getMore lazily. This is the one workstream blocked on a
 seam/runtime change (and an async wait primitive for idle delivery). Effort: L (seam) + M per driver.
@@ -174,7 +174,7 @@ seam/runtime change (and an async wait primitive for idle delivery). Effort: L (
 ### X5. Connection robustness in the seam and drivers
 - Hard pool cap with an async wait queue (blocked on `aio.sleep`/an async wait primitive), plus
   bad-connection eviction (mark a connection poisoned after a protocol desync / broken frame so it is
-  not returned to the pool). (`pool.nova` maxOpen is a soft cap today)
+  not returned to the pool). (`pool.ky` maxOpen is a soft cap today)
 - Per-driver liveness: mysql COM_PING / COM_RESET_CONNECTION and graceful COM_QUIT on close; a
   postgres/mysql/mssql connect+handshake deadline (today an unresponsive host hangs the connecting
   coroutine with no bound).
@@ -274,7 +274,7 @@ infra, e.g. mysql ed25519, mssql integrated auth, mongodb AWS/LDAP/OIDC, roll in
 
 **Phase 3 - streaming and architecture. DONE (X4 + X5).** The mongodb native document API + lazy cursors
 + SRV/topology + sessions/transactions is DONE. **X4 streaming ResultSet is DONE**: the async `Cursor` /
-`RowBatchSource` seam in `db.nova`, with native streaming on postgres (portals + Flush), mysql (server-side
+`RowBatchSource` seam in `db.ky`, with native streaming on postgres (portals + Flush), mysql (server-side
 cursor + COM_STMT_FETCH) and mssql (incremental TDS token decode), all verified live; mongodb already had a
 lazy cursor. **X5 pool hard-cap + bad-connection eviction is DONE** (aio.delay-backoff wait queue, slot reserved
 before connect, Pool.evict). Phase 3 complete; only the Phase 4 long-tail remains per driver.
@@ -292,7 +292,7 @@ streams, GridFS and indexes, originally listed here, are DONE.)
 
 Several gaps cannot be closed inside a driver package:
 
-- A **streaming ResultSet / cursor** abstraction in `db.nova` (blocks X4 and mongodb lazy cursors).
+- A **streaming ResultSet / cursor** abstraction in `db.ky` (blocks X4 and mongodb lazy cursors).
 - An **async wait primitive** (`aio.sleep` is a stub) — blocks the pool hard-cap wait queue and
   postgres idle LISTEN/NOTIFY delivery.
 - A wider **`DbError`** (numeric code + severity + detail) — blocks X3.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Codegen SOUNDNESS fuzzer (F2-6 W11). Distinct from conformance/fuzz.sh, which is a FRONT-END crash
-# fuzzer (mutate -> the compiler must not crash). This one generates WELL-TYPED Nova programs whose
-# result is known independently (a Python oracle computing Nova's exact integer semantics), compiles and
+# fuzzer (mutate -> the compiler must not crash). This one generates WELL-TYPED Kyte programs whose
+# result is known independently (a Python oracle computing Kyte's exact integer semantics), compiles and
 # runs each, and reports a MISCOMPILE when the program's answer differs from the oracle -- the class of
 # bug fuzz.sh cannot see.
 #
@@ -19,7 +19,7 @@
 #
 #   conformance/codegen_fuzz.py [--n N] [--seed S] [--keep]
 #
-# Exit non-zero and keep the offending .nova under fuzz-artifacts/ on the first miscompile or unexpected
+# Exit non-zero and keep the offending .ky under fuzz-artifacts/ on the first miscompile or unexpected
 # compile error (the program is well-typed, so it MUST compile and run).
 #
 # Deliberately avoided (separately-tracked OPEN items, would be false positives): divide/modulo by zero
@@ -270,12 +270,12 @@ def make_program(rnd):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=int(os.environ.get("NOVA_CGFUZZ_N", "200")))
-    ap.add_argument("--seed", type=int, default=int(os.environ.get("NOVA_CGFUZZ_SEED", "1")))
+    ap.add_argument("--n", type=int, default=int(os.environ.get("KYTE_CGFUZZ_N", "200")))
+    ap.add_argument("--seed", type=int, default=int(os.environ.get("KYTE_CGFUZZ_SEED", "1")))
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
-    nova = os.path.expanduser("~/.nova/bin/nova")
+    kyte = os.path.expanduser("~/.kyte/bin/kyte")
     lang = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     artifacts = os.path.join(lang, "fuzz-artifacts")
 
@@ -283,16 +283,16 @@ def main():
     for i in range(args.n):
         rnd = random.Random(args.seed + i)
         prog = make_program(rnd)
-        with tempfile.NamedTemporaryFile("w", suffix=".nova", delete=False) as f:
+        with tempfile.NamedTemporaryFile("w", suffix=".ky", delete=False) as f:
             path = f.name
             f.write(prog)
         try:
-            res = subprocess.run([nova, "test", path], capture_output=True, text=True, timeout=60)
+            res = subprocess.run([kyte, "test", path], capture_output=True, text=True, timeout=60)
             out = res.stdout + res.stderr
             ok = ("0 failed" in out) and ("MISCOMPILE" not in out) and res.returncode == 0
             if not ok:
                 os.makedirs(artifacts, exist_ok=True)
-                keep = os.path.join(artifacts, f"cgfuzz_seed{args.seed + i}.nova")
+                keep = os.path.join(artifacts, f"cgfuzz_seed{args.seed + i}.ky")
                 with open(keep, "w") as kf:
                     kf.write(prog)
                 sys.stderr.write(

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Head-to-head: Nova (web.App) vs Go (net/http) vs Rust (axum) vs C# (ASP.NET minimal API).
+# Head-to-head: Kyte (web.App) vs Go (net/http) vs Rust (axum) vs C# (ASP.NET minimal API).
 # Each serves the SAME constant JSON at GET /. We build release, warm up, then load with `oha`.
 # Missing toolchains and failed builds are skipped, not fatal. Requires `oha` for the load phase.
 set -u
@@ -39,12 +39,12 @@ run_one() {  # $1=name  $2=port  $3=start-command (backgrounded)
 
 if ! have oha; then echo "oha not installed — install it to run the load phase (brew install oha)"; exit 1; fi
 
-# ---- Nova (web.App) ----
-if have nova; then
-  echo "building Nova (release)..."
-  if nova "$HERE/nova/server.nova" --release -o /tmp/h2h_nova >/tmp/h2h_nova_build.log 2>&1; then
-    run_one nova 8080 "/tmp/h2h_nova"
-  else echo "nova build FAILED (see /tmp/h2h_nova_build.log)"; fi
+# ---- Kyte (web.App) ----
+if have kyte; then
+  echo "building Kyte (release)..."
+  if kyte "$HERE/kyte/server.ky" --release -o /tmp/h2h_kyte >/tmp/h2h_kyte_build.log 2>&1; then
+    run_one kyte 8080 "/tmp/h2h_kyte"
+  else echo "kyte build FAILED (see /tmp/h2h_kyte_build.log)"; fi
 fi
 
 # ---- Go (net/http) ----

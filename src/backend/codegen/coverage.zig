@@ -1,6 +1,6 @@
 //! Code-coverage block registry for the LLVM codegen backend.
 //!
-//! When Nova is compiled with coverage instrumentation enabled, codegen needs
+//! When Kyte is compiled with coverage instrumentation enabled, codegen needs
 //! to (a) assign a small, stable integer ID to every source construct it wants
 //! to count, and (b) emit a durable, out-of-band description of what each ID
 //! means so a post-run report can map raw counters back to file/line/column.
@@ -22,7 +22,7 @@
 //! The metadata writer deliberately uses libc `fwrite`/`fopen` via `extern`
 //! rather than Zig's `std.fs`/`std.json`: it hand-rolls a tiny JSON emitter with
 //! manual escaping so it has no dependency on the JSON stringifier and stays a
-//! self-contained C-FFI leaf. The output filename `__nova_cov_metadata.json` is
+//! self-contained C-FFI leaf. The output filename `__kyte_cov_metadata.json` is
 //! fixed and written to the process's current working directory.
 
 const std = @import("std");
@@ -31,7 +31,7 @@ const std = @import("std");
 /// currently unreferenced by the code below but kept for that adjacency.
 const ast = @import("../../frontend/ast.zig");
 
-/// libc `fopen`: opens `__nova_cov_metadata.json` for writing. Used instead of
+/// libc `fopen`: opens `__kyte_cov_metadata.json` for writing. Used instead of
 /// `std.fs` so the metadata emitter stays a pure C-FFI leaf. Returns null on
 /// failure, which [`CoverageRegistry.writeMetadataFile`] maps to an error.
 extern fn fopen(filename: [*c]const u8, modes: [*c]const u8) ?*anyopaque;
@@ -137,7 +137,7 @@ pub const CoverageRegistry = struct {
         return id;
     }
 
-    /// Serialises the whole block table to `__nova_cov_metadata.json` in the
+    /// Serialises the whole block table to `__kyte_cov_metadata.json` in the
     /// current working directory.
     ///
     /// Emits a JSON array of objects, each carrying `id`, `file_path`, `line`,
@@ -152,8 +152,8 @@ pub const CoverageRegistry = struct {
     /// `error.FileOpenFailed` if the output file cannot be opened, or a
     /// formatting error from `bufPrint`; the handle is always closed via `defer`.
     pub fn writeMetadataFile(self: *CoverageRegistry) !void {
-        const file = fopen("__nova_cov_metadata.json", "w") orelse {
-            std.debug.print("Failed to open __nova_cov_metadata.json for writing\n", .{});
+        const file = fopen("__kyte_cov_metadata.json", "w") orelse {
+            std.debug.print("Failed to open __kyte_cov_metadata.json for writing\n", .{});
             return error.FileOpenFailed;
         };
         defer _ = fclose(file);

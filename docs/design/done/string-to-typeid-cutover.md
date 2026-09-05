@@ -133,7 +133,7 @@ codegen paths. The result is uniform: decisions on TypeId, names from one mangle
 
 Done and gated (corpus + --asan + shadow gate + lint, all green):
 
-- **Phase 0**: `NOVA_TID_CENSUS` instrument added; the null-coverage census is 0 corpus-wide (every
+- **Phase 0**: `KYTE_TID_CENSUS` instrument added; the null-coverage census is 0 corpus-wide (every
   expression the string engine resolves, the TypeId engine now resolves too). Shadow gate wired into
   `gate.sh` (`conformance/shadow-gate.sh`), asserting 0 ownership + keystone disagreements.
 - **Phase 1 (partial)**: `typeOfExprConcrete` gained an ident fallback to `current_local_type_ids` and now

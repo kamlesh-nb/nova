@@ -6,8 +6,8 @@ A function is declared with `fn`. Parameters are typed, and the return type foll
 list. A function that returns nothing is annotated `void`. Generic functions take type parameters in
 angle brackets; at the call site the type argument is written **explicitly** (`identity<int>(...)`).
 
-```nova
-// examples/08_functions.nova
+```kyte
+// examples/08_functions.ky
 
 // A plain function: typed parameters, a declared return type.
 fn add(a: int, b: int): int {
@@ -40,7 +40,7 @@ struct Counter {
 
 fn main(): void {
     console.log(`add(2, 3) = ${add(2, 3)}`);
-    greet("Nova");
+    greet("Kyte");
 
     // identity works at any type; each call is a distinct instantiation.
     console.log(`identity<int>(42) = ${identity<int>(42)}`);
@@ -57,7 +57,7 @@ Output:
 
 ```
 add(2, 3) = 5
-hello, Nova
+hello, Kyte
 identity<int>(42) = 42
 identity<string>("hi") = hi
 firstOf<int>(10, 20) = 10
@@ -85,8 +85,8 @@ value** (a snapshot at creation time).
 The most common use is passing a closure to a higher-order method such as `List.map`, `filter`, or
 `reduce`.
 
-```nova
-// examples/09_closures.nova
+```kyte
+// examples/09_closures.ky
 import collections.list;
 
 fn main(): void {

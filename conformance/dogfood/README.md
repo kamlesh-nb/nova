@@ -8,7 +8,7 @@ compiler bug" net: it catches crashes and miscompiles that only appear when feat
 Run:
 
     conformance/run.sh --dogfood                 # crash net (a hard SEGV exits non-zero)
-    NOVA_ASAN=1 conformance/run.sh --dogfood      # + use-after-free detection (needs NOVA_ASAN=1 zig build)
+    KYTE_ASAN=1 conformance/run.sh --dogfood      # + use-after-free detection (needs KYTE_ASAN=1 zig build)
 
 It is part of `gate.sh`. Grown from the last-lap crash hunt (2026-08-15): 44 programs, all green.
 **When a new crash class is found and fixed, add a program here so it can never silently return.**

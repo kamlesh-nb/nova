@@ -1,24 +1,24 @@
 name: release
 
-# Build the 4 Nova toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows x86_64 -- and publish
+# Build the 4 Kyte toolchain bundles -- macOS arm64, Linux {x86_64, arm64}, Windows x86_64 -- and publish
 # them to a GitHub Release. (macOS Intel and Windows arm64 are NOT shipped; the orchestrator ships from
-# its own repo's release workflow, since it needs a built `nova` to compile.)
+# its own repo's release workflow, since it needs a built `kyte` to compile.)
 # Windows arm64 is dropped: the native `zig build` on windows-11-arm crashes with an access violation
-# (0xC0000005) in Zig 0.16's build system before Nova ever compiles -- an upstream Zig aarch64-windows
-# issue, not a Nova one. See lang/CLAUDE.md.
+# (0xC0000005) in Zig 0.16's build system before Kyte ever compiles -- an upstream Zig aarch64-windows
+# issue, not a Kyte one. See lang/CLAUDE.md.
 #
 #   * macOS/Linux: LLVM 21 from the OS package manager (build.zig globs the install's libLLVM*.a),
-#     pointed at via NOVA_LLVM_PREFIX, statically linked.
+#     pointed at via KYTE_LLVM_PREFIX, statically linked.
 #   * Windows x86_64: DYNAMIC LLVM (Chocolatey LLVM-C); the build-windows job bundles LLVM-C.dll beside
-#     nova.exe. Windows arm64: DYNAMIC LLVM from the LLVM.org clang+llvm aarch64-windows drop (LLVM 22),
+#     kyte.exe. Windows arm64: DYNAMIC LLVM from the LLVM.org clang+llvm aarch64-windows drop (LLVM 22),
 #     built natively on a windows-11-arm runner and bundled the same way. The DLL-free static path
 #     (WIN_STATIC_LLVM_{X64,ARM64}_URL) is a later upgrade; see CLAUDE.md.
 #   * nls (the language server) IS bundled: each runner checks out the sibling `nls` repo and the
-#     archive step builds it from that source, pinned to THIS lang checkout via `-Dnova-src`. nls is
+#     archive step builds it from that source, pinned to THIS lang checkout via `-Dkyte-src`. nls is
 #     pure-Zig (no LLVM link), so it builds on every runner without extra toolchain. If the `nls` repo
 #     is private, set the `NLS_TOKEN` secret to a PAT with read access (else the checkout falls back to
 #     the workflow's GITHUB_TOKEN, which only works when nls is in the same repo/owner and permitted).
-#     To ship a nova-only bundle, set the repo variable `SKIP_NLS=1`.
+#     To ship a kyte-only bundle, set the repo variable `SKIP_NLS=1`.
 #   * NOTE: the arm64 Linux runner is BILLED on private repos.
 #
 # Trigger: push a tag `v*`, or run manually (Actions -> release -> Run workflow) with a version.
@@ -37,9 +37,9 @@ permissions:
   contents: write
 
 env:
-  NOVA_VERSION: ${{ github.event.inputs.version || github.ref_name }}
-  # Bundle nls unless the repo variable SKIP_NLS is set to 1 (archive step reads NOVA_ARCHIVE_SKIP_NLS).
-  NOVA_ARCHIVE_SKIP_NLS: ${{ vars.SKIP_NLS || '0' }}
+  KYTE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+  # Bundle nls unless the repo variable SKIP_NLS is set to 1 (archive step reads KYTE_ARCHIVE_SKIP_NLS).
+  KYTE_ARCHIVE_SKIP_NLS: ${{ vars.SKIP_NLS || '0' }}
 
 jobs:
   build-macos:
@@ -49,7 +49,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: lang }
       # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
-      # source, version-pinned to this lang checkout via -Dnova-src. Skipped only if SKIP_NLS=1.
+      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_NLS=1.
       - uses: actions/checkout@v4
         if: ${{ vars.SKIP_NLS != '1' }}
         with:
@@ -62,7 +62,7 @@ jobs:
         run: |
           brew install llvm@21 || brew install llvm
           PREFIX="$(brew --prefix llvm@21 2>/dev/null || brew --prefix llvm)"
-          echo "NOVA_LLVM_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          echo "KYTE_LLVM_PREFIX=$PREFIX" >> "$GITHUB_ENV"
           "$PREFIX/bin/llvm-config" --version
           # arm64 uses the vendored deps/zstd, so no Homebrew zstd is needed.
       - name: Build archive
@@ -70,10 +70,10 @@ jobs:
         run: zig build archive -Dstatic-llvm=true
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-macos-arm64
+          name: kyte-macos-arm64
           path: |
-            lang/zig-out/nova-*-macos-*.tar.gz
-            lang/zig-out/nova-*-macos-*.tar.gz.sha256
+            lang/zig-out/kyte-*-macos-*.tar.gz
+            lang/zig-out/kyte-*-macos-*.tar.gz.sha256
 
   build-linux:
     strategy:
@@ -85,7 +85,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: lang }
       # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
-      # source, version-pinned to this lang checkout via -Dnova-src. Skipped only if SKIP_NLS=1.
+      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_NLS=1.
       - uses: actions/checkout@v4
         if: ${{ vars.SKIP_NLS != '1' }}
         with:
@@ -98,35 +98,35 @@ jobs:
         run: |
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
           sudo apt-get install -y llvm-21-dev libzstd-dev zlib1g-dev libxml2-dev liblzma-dev
-          echo "NOVA_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+          echo "KYTE_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
           /usr/lib/llvm-21/bin/llvm-config --version
           # apt's LLVM does not bundle libstdc++.so/libgcc_s.so (system libs); expose them under the
-          # exact names the static link expects and point NOVA_LLVM_STDCXX_DIR at them.
+          # exact names the static link expects and point KYTE_LLVM_STDCXX_DIR at them.
           mkdir -p "$HOME/stdcxx"
           ln -sf "$(g++ -print-file-name=libstdc++.so)" "$HOME/stdcxx/libstdc++.so"
           ln -sf "$(gcc -print-file-name=libgcc_s.so.1)" "$HOME/stdcxx/libgcc_s.so"
-          echo "NOVA_LLVM_STDCXX_DIR=$HOME/stdcxx" >> "$GITHUB_ENV"
+          echo "KYTE_LLVM_STDCXX_DIR=$HOME/stdcxx" >> "$GITHUB_ENV"
       - name: Build archive
         working-directory: lang
         run: zig build archive -Dstatic-llvm=true
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-linux-${{ matrix.runner }}
+          name: kyte-linux-${{ matrix.runner }}
           path: |
-            lang/zig-out/nova-*-linux-*.tar.gz
-            lang/zig-out/nova-*-linux-*.tar.gz.sha256
+            lang/zig-out/kyte-*-linux-*.tar.gz
+            lang/zig-out/kyte-*-linux-*.tar.gz.sha256
 
   build-windows:
     # x86_64 only. windows-arm64 is NOT shipped: the native `zig build` on windows-11-arm crashes with an
     # access violation (0xC0000005) while evaluating build.zig -- a Zig-0.16 aarch64-windows build-system
-    # bug (zig version/env work; the Nova compiler never even builds). Parked; needs upstream Zig or local
+    # bug (zig version/env work; the Kyte compiler never even builds). Parked; needs upstream Zig or local
     # debugging on an arm64 box, not a workflow change.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
       # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
-      # source, version-pinned to this lang checkout via -Dnova-src. Skipped only if SKIP_NLS=1.
+      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_NLS=1.
       - uses: actions/checkout@v4
         if: ${{ vars.SKIP_NLS != '1' }}
         with:
@@ -136,8 +136,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
       # DYNAMIC Windows build: link the LLVM C API (LLVM-C.dll) that Chocolatey ships, rather than a
-      # self-hosted static LLVM. The resulting nova.exe needs LLVM-C.dll at run time, so the bundling step
-      # below drops that DLL next to nova.exe inside the archive. (The DLL-free static path -- zig build
+      # self-hosted static LLVM. The resulting kyte.exe needs LLVM-C.dll at run time, so the bundling step
+      # below drops that DLL next to kyte.exe inside the archive. (The DLL-free static path -- zig build
       # archive -Dstatic-llvm=true against a prebuilt static LLVM via WIN_STATIC_LLVM_X64_URL -- is the
       # eventual upgrade; see CLAUDE.md.)
       - name: Install LLVM (dynamic LLVM-C)
@@ -158,8 +158,8 @@ jobs:
             $prefix = Find-Prefix
             if (-not $prefix) { $prefix = "C:/Program Files/LLVM" }
           }
-          echo "NOVA_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
-          # The dynamic build needs exactly two files: lib/LLVM-C.lib to link nova.exe against and
+          echo "KYTE_LLVM_PREFIX=$prefix" >> $env:GITHUB_ENV
+          # The dynamic build needs exactly two files: lib/LLVM-C.lib to link kyte.exe against and
           # bin/LLVM-C.dll to bundle for run time. Verify THOSE, not llvm-config.exe -- the official LLVM
           # Windows distribution (and Chocolatey's package) does not ship llvm-config.exe, so calling it
           # always fails even though the build is fine.
@@ -173,28 +173,28 @@ jobs:
       - name: Bundle LLVM-C.dll into the Windows archive
         shell: pwsh
         run: |
-          $zip = Get-ChildItem lang/zig-out/nova-*-windows-*.zip | Select-Object -First 1
+          $zip = Get-ChildItem lang/zig-out/kyte-*-windows-*.zip | Select-Object -First 1
           if (-not $zip) { Write-Error "no windows archive produced"; exit 1 }
-          $dll = Join-Path $env:NOVA_LLVM_PREFIX "bin/LLVM-C.dll"
+          $dll = Join-Path $env:KYTE_LLVM_PREFIX "bin/LLVM-C.dll"
           if (-not (Test-Path $dll)) { Write-Error "LLVM-C.dll not found at $dll"; exit 1 }
           $work = "$env:RUNNER_TEMP/zipwork"
           Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
           Expand-Archive -Path $zip.FullName -DestinationPath $work
-          $exe = Get-ChildItem -Path $work -Recurse -Filter nova.exe | Select-Object -First 1
-          if (-not $exe) { Write-Error "nova.exe not found in the archive"; exit 1 }
+          $exe = Get-ChildItem -Path $work -Recurse -Filter kyte.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "kyte.exe not found in the archive"; exit 1 }
           Copy-Item $dll (Split-Path $exe.FullName)
           Remove-Item $zip.FullName
           Compress-Archive -Path (Join-Path $work '*') -DestinationPath $zip.FullName
           # Refresh the per-file sha256 sidecar (the aggregate SHA256SUMS.txt is recomputed in the release job).
           $sha = (Get-FileHash -Algorithm SHA256 $zip.FullName).Hash.ToLower()
           "$sha  $($zip.Name)" | Set-Content -NoNewline -Path ($zip.FullName + ".sha256")
-          Write-Host "bundled LLVM-C.dll beside nova.exe; sha256=$sha"
+          Write-Host "bundled LLVM-C.dll beside kyte.exe; sha256=$sha"
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-windows-x64
+          name: kyte-windows-x64
           path: |
-            lang/zig-out/nova-*-windows-*.zip
-            lang/zig-out/nova-*-windows-*.zip.sha256
+            lang/zig-out/kyte-*-windows-*.zip
+            lang/zig-out/kyte-*-windows-*.zip.sha256
 
   # Publish a GitHub Release ONLY on a real version tag. A manual `workflow_dispatch` run just builds
   # and archives (the bundles are downloadable as workflow artifacts); it does not cut a release.
@@ -209,17 +209,17 @@ jobs:
         run: |
           mkdir -p out
           find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} out/ \;
-          ( cd out && sha256sum nova-*.tar.gz nova-*.zip 2>/dev/null > SHA256SUMS.txt || true )
+          ( cd out && sha256sum kyte-*.tar.gz kyte-*.zip 2>/dev/null > SHA256SUMS.txt || true )
           ls -la out
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.NOVA_VERSION }}
-          name: Nova ${{ env.NOVA_VERSION }}
+          tag_name: ${{ env.KYTE_VERSION }}
+          name: Kyte ${{ env.KYTE_VERSION }}
           generate_release_notes: true
           files: |
-            out/nova-*.tar.gz
-            out/nova-*.tar.gz.sha256
-            out/nova-*.zip
-            out/nova-*.zip.sha256
+            out/kyte-*.tar.gz
+            out/kyte-*.tar.gz.sha256
+            out/kyte-*.zip
+            out/kyte-*.zip.sha256
             out/SHA256SUMS.txt

@@ -1,4 +1,4 @@
-//! Front-end, name-and-type sanity pass over a whole Nova [`ast.Program`].
+//! Front-end, name-and-type sanity pass over a whole Kyte [`ast.Program`].
 //!
 //! This is the FIRST checker the compiler runs, before the authoritative typed
 //! IR in `sema/` (infer/mono/ownership/lower). Its job is deliberately narrow:
@@ -12,7 +12,7 @@
 //! false positive is a bug because it rejects valid code.
 //!
 //! What it actually enforces, roughly in the order the checks fire:
-//!   - Declaration hygiene: duplicate functions (Nova has NO overloading, see
+//!   - Declaration hygiene: duplicate functions (Kyte has NO overloading, see
 //!     [`TypeChecker.check`]), duplicate methods/variants/type-params, structs
 //!     that would be infinite-size by containing themselves by value
 //!     ([`TypeChecker.checkValueStructCycles`]).
@@ -61,7 +61,7 @@ const builtins = @import("sema/builtins.zig");
 /// `s.len()` resolves to `i32` and participates in later type checks.
 ///
 /// Returns `null` only for `builtins.Ret` variants that carry no meaningful
-/// Nova type. Note the SIMD lanes map to Nova's vector spellings (`f64x4`,
+/// Kyte type. Note the SIMD lanes map to Kyte's vector spellings (`f64x4`,
 /// `u8x16`, ...), which the rest of the checker treats as plain idents.
 fn builtinRetType(r: builtins.Ret) ?ast.TypeRef {
     return switch (r) {
@@ -158,7 +158,7 @@ fn isNarrowingInt(from: ast.TypeRef, to: ast.TypeRef) bool {
 /// Decided from the ORIGINAL spelling, not the canonical name, because
 /// canonicalisation collapses `u32`→`i32` and loses the sign. The rule is:
 /// signed unless the name starts with `u` (`uint`, `u8`, `ulong`, ...) or is
-/// exactly `byte` (which Nova treats as unsigned).
+/// exactly `byte` (which Kyte treats as unsigned).
 fn intNameSigned(name: []const u8) bool {
     return !(std.mem.startsWith(u8, name, "u") or std.mem.eql(u8, name, "byte"));
 }
@@ -615,7 +615,7 @@ pub const TypeChecker = struct {
     /// Runs in two phases. First it INDEXES every top-level declaration into the
     /// symbol tables (enums, structs, unions, traits, functions), detecting
     /// cross-file name collisions and same-file duplicate function definitions
-    /// as it goes (Nova has no overloading, so a second definition of a name on
+    /// as it goes (Kyte has no overloading, so a second definition of a name on
     /// a different line in the same module is an error; generated files such as
     /// `<serde-generated>` are exempt). Then it runs the value-struct cycle
     /// check and walks each function/struct/enum/const/trait body.
@@ -655,13 +655,13 @@ pub const TypeChecker = struct {
                 try self.functions.put(decl.fn_decl.name, decl.fn_decl);
 
                 const gen_file = std.mem.eql(u8, decl.fn_decl.span.file, "<serde-generated>") or
-                    std.mem.eql(u8, decl.fn_decl.span.file, "helpers.nova") or
-                    std.mem.eql(u8, decl.fn_decl.span.file, "test_harness.nova");
+                    std.mem.eql(u8, decl.fn_decl.span.file, "helpers.ky") or
+                    std.mem.eql(u8, decl.fn_decl.span.file, "test_harness.ky");
                 const key = try std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ decl.fn_decl.span.file, decl.fn_decl.name });
                 if (self.fn_def_sites.contains(key)) {
                     if (self.fn_first_line.get(key)) |ln| {
                         if (!gen_file and ln != decl.fn_decl.span.line) {
-                            self.addError(decl.fn_decl.span, "duplicate function '{s}', already defined at line {d} in this module (Nova has no overloading)", .{ decl.fn_decl.name, ln });
+                            self.addError(decl.fn_decl.span, "duplicate function '{s}', already defined at line {d} in this module (Kyte has no overloading)", .{ decl.fn_decl.name, ln });
                         }
                     }
                     self.allocator.free(key);
@@ -846,7 +846,7 @@ pub const TypeChecker = struct {
     }
 
     /// Recursively validates that every named type inside `t` exists, and
-    /// rejects the types Nova has removed.
+    /// rejects the types Kyte has removed.
     ///
     /// Two rules fire: the 128-bit integer types `i128`/`u128` were removed in
     /// F3 §3.1 and always error; and, when `check_unknown_in` is set and the
@@ -1014,7 +1014,7 @@ pub const TypeChecker = struct {
     /// declared.
     ///
     /// A trait value may hold any implementation, so handing it to a parameter
-    /// typed as one specific struct would be an unchecked downcast; Nova
+    /// typed as one specific struct would be an unchecked downcast; Kyte
     /// requires an explicit `as` instead. Fires only when the parameter type is
     /// a declared struct that is NOT itself a trait, the argument resolves to a
     /// trait type, and the two names differ. See [`rejectNarrowingArgsSubst`]
@@ -1066,7 +1066,7 @@ pub const TypeChecker = struct {
     }
 
     /// Whether a value of type `from` may be stored/returned into a slot of type
-    /// `to`, applying Nova's assignment rules.
+    /// `to`, applying Kyte's assignment rules.
     ///
     /// It first REJECTS the F3 numeric-safety violations (narrowing int,
     /// signedness flip), then accepts structural compatibility
@@ -2324,7 +2324,7 @@ pub const TypeChecker = struct {
         for (s.methods, 0..) |m1, i| {
             for (s.methods[i + 1 ..]) |m2| {
                 if (std.mem.eql(u8, m1.decl.name, m2.decl.name)) {
-                    self.addError(m2.decl.span, "duplicate method '{s}' in '{s}', Nova has no overloading", .{ m2.decl.name, s.name });
+                    self.addError(m2.decl.span, "duplicate method '{s}' in '{s}', Kyte has no overloading", .{ m2.decl.name, s.name });
                 }
             }
         }

@@ -1,7 +1,7 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
   content: [
-    "./src/**/*.{nsx,nova}",
+    "./src/**/*.{nsx,kyte}",
     "./wwwroot/*.html",
   ],
 };

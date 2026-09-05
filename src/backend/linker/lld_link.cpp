@@ -30,15 +30,15 @@ int run(bool (*link)(llvm::ArrayRef<const char *>, llvm::raw_ostream &,
 
 extern "C" {
 
-int nova_lld_link_macho(const char **argv, int argc) {
+int kyte_lld_link_macho(const char **argv, int argc) {
   return run(lld::macho::link, argv, argc);
 }
 
-int nova_lld_link_wasm(const char **argv, int argc) {
+int kyte_lld_link_wasm(const char **argv, int argc) {
   return run(lld::wasm::link, argv, argc);
 }
 
-int nova_lld_link_elf(const char **argv, int argc) {
+int kyte_lld_link_elf(const char **argv, int argc) {
   return run(lld::elf::link, argv, argc);
 }
 

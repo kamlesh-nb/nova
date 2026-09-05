@@ -1,6 +1,6 @@
 # 11. Error handling
 
-Nova has no thrown exceptions in the traditional sense. A function that can fail returns `T | E`, where
+Kyte has no thrown exceptions in the traditional sense. A function that can fail returns `T | E`, where
 `E` is a user-defined error type, and the natural error type is an `exception`. Errors are ordinary
 values you return, and the error carries its reason to the caller. Nothing unwinds the stack. Every
 failure is a branch on a value, which is why it is safe under coroutines and never leaks.
@@ -21,7 +21,7 @@ explaining what went wrong, plus a `message(self): string` method that the compi
 method turns any variant into text, so every caller reads the reason back the same way, with
 `e.message()`, and never has to `switch` on the error itself.
 
-```nova
+```kyte
 exception ConfigError {
     Empty,
     NotANumber(string),
@@ -76,11 +76,11 @@ and on failure it stops and hands the very same error back to its own caller.
 > for the stdlib's `string.parseI64` for the number and add just the range check; the point here is the
 > `T | E` and `try` mechanics, not a hand-rolled integer parser.
 
-```nova
-// examples/17_errors.nova
+```kyte
+// examples/17_errors.ky
 import string;
 
-// An `exception` is Nova's error type: a tagged union whose variants carry the
+// An `exception` is Kyte's error type: a tagged union whose variants carry the
 // reason, plus a compiler-required `message(self): string` that turns any variant
 // into text. Leaving out `message` is a compile error. Every caller then reports a
 // failure with a single `catch (e) e.message()`, whichever variant occurred.
@@ -155,7 +155,7 @@ point of the model, the reason is never lost.
 ## Cleanup: `defer` and `errdefer`
 
 A function often acquires something (a lock, a connection, a file) and then does work that might fail.
-Nova gives you two cleanup hooks:
+Kyte gives you two cleanup hooks:
 
 - `defer expr` runs `expr` at every exit from the scope, on success or on failure.
 - `errdefer expr` runs `expr` only when the function leaves on the error path: an explicit error-side
@@ -165,8 +165,8 @@ Both run in last-registered-first (LIFO) order. On the error path the `errdefer`
 `defer`s, so a rollback happens before the resource it depended on is released. This pairing is the
 common case: always release the lock, but only roll back the transaction if something went wrong.
 
-```nova
-// examples/26_defer.nova
+```kyte
+// examples/26_defer.ky
 import list;
 
 enum TxError { Conflict }
@@ -225,8 +225,8 @@ When you hold more than one resource, each gets its own `errdefer`, and because 
 back in the reverse of the order they were acquired. This example uses a struct error type to show that
 the error side of `T | E` is not limited to exceptions.
 
-```nova
-// examples/25_errdefer.nova
+```kyte
+// examples/25_errdefer.ky
 import list;
 
 // A struct error type. Its fields carry the reason to the caller.
@@ -318,8 +318,8 @@ Here is the pattern in its own right. `LookupError` can fail two ways, and becau
 `catch` (see the same-type rule above). The caller never switches on the error itself, the exception
 describes itself.
 
-```nova
-// examples/27_exception.nova
+```kyte
+// examples/27_exception.ky
 exception LookupError {
     NotFound(string),
     Forbidden(string),
@@ -366,7 +366,7 @@ exception 'LookupError' must define a `message(self): string` method
 The `exception` module also gives you `stackTrace(): string`, the current call stack as text (one
 frame per line, works on macOS, Linux, and Windows), which you can log or fold into a `message()`:
 
-```nova
+```kyte
 import exception;
 // inside a handler or a message() method:
 let trace = exception.stackTrace();
@@ -375,7 +375,7 @@ let trace = exception.stackTrace();
 `stackTrace()` is not free, so treat it as a diagnostic, not something to call on the hot path. It walks
 the live call frames and turns their return addresses into text, and the quality of that text depends on
 what symbol information the binary carries: an unstripped build names the functions, while a stripped
-release build may give you addresses without names. Because Nova is compiled and optimised, frames that
+release build may give you addresses without names. Because Kyte is compiled and optimised, frames that
 were inlined do not appear as separate lines, an aggressively optimised build shows a shorter, flatter
 trace than the source would suggest. It is exactly what you want when logging a genuine failure, and not
 something to put in a tight loop.

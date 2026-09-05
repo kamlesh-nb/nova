@@ -1,13 +1,13 @@
 # The Compiler
 
-The Nova compiler is written in **Zig 0.16** and resides in `src/`. It is a classic multi pass compiler:
+The Kyte compiler is written in **Zig 0.16** and resides in `src/`. It is a classic multi pass compiler:
 tokenise, parse, semantically analyse (in several passes), monomorphise, generate LLVM IR, and link. This
 document walks through the pipeline in the very order in which source flows through it. Code generation is
 large enough that it has been given [its own document](02-codegen.md).
 
 `src/main.zig` (about 2500 lines) is the driver. It parses the CLI arguments, resolves the import graph,
-runs every pass in sequence, and links the result. The two hot paths are `cmdTest` (for `nova test`) and
-`compileProgram` (for `nova <file>` and `nova build`); both of them run the same pass sequence, which is
+runs every pass in sequence, and links the result. The two hot paths are `cmdTest` (for `kyte test`) and
+`compileProgram` (for `kyte <file>` and `kyte build`); both of them run the same pass sequence, which is
 shown below.
 
 ## Pass Sequence (from `main.zig`)
@@ -26,7 +26,7 @@ link                                 // in-process LLD (Mach-O, WASM) or clang++
 
 ## 1. Lexing, `src/lexer.zig` (about 680 lines)
 
-This is a hand written scanner that turns source bytes into a `Token` stream. The Nova specific rules
+This is a hand written scanner that turns source bytes into a `Token` stream. The Kyte specific rules
 worth noting are as follows.
 
 - **There are two declaration keywords only,** namely `let` (mutable) and `const` (enforced immutable).
@@ -52,19 +52,19 @@ Two behaviours of the parser are worth an understanding.
   code that cannot exist on a given target, for example sockets on WASM. The excluded block is brace
   counted and skipped.
 - **Generated code is re-parsed.** The serde binders (`<Struct>__bind`) and the mediator dispatchers are
-  emitted as Nova *source*, then parsed afresh with a new `Parser`, and folded into the declaration list
+  emitted as Kyte *source*, then parsed afresh with a new `Parser`, and folded into the declaration list
   (see `generateSerdeBinders` and `generateMediatorDispatch` in `main.zig`). This keeps generated code
   honest, since it passes through the same type checking and codegen as hand written code.
 
 `main.zig:loadProgram` walks the `import` declarations depth first. It reads each module (from the local
-`src/std/...`, or the installed `~/.nova/std/...`, or a fetched package under `~/.nova/cache/...`), dedups
+`src/std/...`, or the installed `~/.kyte/std/...`, or a fetched package under `~/.kyte/cache/...`), dedups
 by a **canonical path spelling** (so that a module read from two locations retains ONE identity), and
 concatenates all declarations into a single `Program`. The import edges are preserved for the symbol
 table.
 
 ## 3. The Semantic Passes, `src/type_checker.zig` and `src/sema/`
 
-Nova divides semantic analysis into two parts: the **diagnostics** (the type checker) and the
+Kyte divides semantic analysis into two parts: the **diagnostics** (the type checker) and the
 **authoritative typed IR** (the `sema/` pipeline). The historical reason is the so called "F2-6"
 migration. Codegen used to *guess* types from name strings; now `sema/` writes a complete typed IR, and
 codegen ceases to guess.
@@ -114,7 +114,7 @@ as follows.
 | `symbols.zig` (about 690) | The symbol table and module resolution as a lookup (import edges via `findModuleBySegment` and `findFunctionBySegment`). |
 | `ownership.zig` (about 520) | The ARC ownership model. It decides, per edge, which values are owned, borrowed, or dropped, so that codegen may emit balanced retains and releases. |
 | `subst`, `ids`, `alpha`, `inst_disp` | The supporting machinery. |
-| `shadow.zig` (about 1040) | Orchestrates the above and, under `NOVA_SEMA_SHADOW`, diffs the two type engines so as to catch any divergence. |
+| `shadow.zig` (about 1040) | Orchestrates the above and, under `KYTE_SEMA_SHADOW`, diffs the two type engines so as to catch any divergence. |
 
 The guiding principle (per F2-6) is this: **the checker writes a COMPLETE typed IR, and codegen does not
 re-derive types.** A leftover `unresolved` at the end of sema is fatal, by design, since a guess would be
@@ -138,7 +138,7 @@ intended path.
 This is covered in depth in **[02-codegen.md](02-codegen.md)**. In one paragraph: `declarations.zig`
 declares every function, global, vtable, and the emitted allocator; `expressions.zig` and `statements.zig`
 lower the expression and statement IR to LLVM instructions; `arc.zig` emits the retain, release, and
-destructor machinery that `ownership.zig` planned; and `types.zig` maps Nova types to LLVM types. The
+destructor machinery that `ownership.zig` planned; and `types.zig` maps Kyte types to LLVM types. The
 module is then verified, run through `CoroSplit` (which turns async into real coroutines) and `globalDCE`,
 and written to an object file.
 
@@ -146,19 +146,19 @@ and written to an object file.
 
 `main.zig` finishes the job by linking the object or objects into an executable.
 
-- **Native macOS.** In-process `ld64.lld` via `nova_lld_link_macho` (from `src/linker/`, linked against
+- **Native macOS.** In-process `ld64.lld` via `kyte_lld_link_macho` (from `src/linker/`, linked against
   LLVM's `liblld*`), reconstructing the very arguments that the clang driver would pass. There is no shell
   out.
 - **Native (general), the runtime link.** `clang++` links the object against the prebuilt C++ runtime
-  (`~/.nova/lib/libnova_runtime.a`), along with Boost, `-lz`, and wolfSSL.
+  (`~/.kyte/lib/libkyte_runtime.a`), along with Boost, `-lz`, and wolfSSL.
 - **Cross compilation (T1).** From macOS, `zig c++` produces Linux x86_64 and arm64 (a static musl ELF),
   and Windows x86_64 (a PE32+). The runtime is compiled for the target once and cached at
-  `~/.nova/lib/nova_runtime_<triple>.o`.
-- **WASM.** In-process `wasm-ld` (`nova_lld_link_wasm`), freestanding (`--no-entry`, with host imports).
+  `~/.kyte/lib/kyte_runtime_<triple>.o`.
+- **WASM.** In-process `wasm-ld` (`kyte_lld_link_wasm`), freestanding (`--no-entry`, with host imports).
 
 ### Incremental Builds (T6)
 
-`nova build` writes to `build/<profile>/{obj,bin}` and maintains a **content hash cache**. `sourcesHash`
+`kyte build` writes to `build/<profile>/{obj,bin}` and maintains a **content hash cache**. `sourcesHash`
 digests every input file's path and content, the profile, a `CACHE_VERSION`, and, most importantly, the
 **mtimes of the linked runtime libraries** (`linkLibsStamp`), so that editing `src/runtime/` forces a
 relink instead of serving a stale binary. T6 additionally splits emission per source file into separate
@@ -166,11 +166,11 @@ relink instead of serving a stale binary. T6 additionally splits emission per so
 
 ## Debugging the Compiler
 
-- `NOVA_DUMP_MERGED=1` writes the merged pre-codegen IR to `merged.nova`.
-- `NOVA_SEMA_SHADOW=1` diffs the two type engines; it reports divergence and resolution traces.
-- `NOVA_ARC_AUDIT=1 nova test f` performs a per-run ARC audit (reporting either "ARC audit: clean" or the
+- `KYTE_DUMP_MERGED=1` writes the merged pre-codegen IR to `merged.ky`.
+- `KYTE_SEMA_SHADOW=1` diffs the two type engines; it reports divergence and resolution traces.
+- `KYTE_ARC_AUDIT=1 kyte test f` performs a per-run ARC audit (reporting either "ARC audit: clean" or the
   survivors).
-- `NOVA_KEEP_OBJ=1` keeps the intermediate `.o` (useful, for instance, to hand relink against the ASAN
+- `KYTE_KEEP_OBJ=1` keeps the intermediate `.o` (useful, for instance, to hand relink against the ASAN
   runtime).
 - `build.zig` recovers from the Zig build runner cache. Kindly **never `git reset`** in this repo (a git
   stash is perfectly fine).

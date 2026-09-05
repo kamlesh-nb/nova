@@ -1,0 +1,564 @@
+//! POSIX-shaped syscall shim for Windows: the same surface `os/sys` exposes on
+//! macOS, but built on Win32/Winsock underneath so callers elsewhere in the
+//! standard library (file, socket, directory helpers) do not need to know
+//! which platform they are compiling for.
+//!
+//! Windows has no `<unistd.h>`/`<dirent.h>`, its UCRT `O_CREAT`/`O_TRUNC` values
+//! differ from the ones `os/sys` hardcodes for macOS, `struct stat` places
+//! `st_mode` at a different offset, and there is no native `setenv`. This file
+//! reimplements the needed subset on top of `os.windows.fs` (CreateFileW,
+//! FindFirstFileW, VirtualAlloc and friends) and `os.windows.winsock`
+//! (WSAStartup-gated sockets), translating Win32 error codes back to the
+//! POSIX errno values (`ENOENT`, `EACCES`, and so on) that callers expect.
+//! `errno()`/`clearErrno()` read and reset a thread-local FFI errno cell that
+//! the failure paths here populate via `kyte_ffi_set_errno`.
+
+import bytes;
+import os.windows.fs;
+import os.windows.winsock;
+
+/// Reads the last error code set by a failing call in this file (POSIX-style errno, not a raw Win32 code).
+pub extern("c") fn kyte_ffi_errno(): int;
+/// Sets the errno cell that `errno()` later reads; used by the POSIX-style failure paths in this file.
+pub extern("c") fn kyte_ffi_set_errno(v: int): void;
+/// Blocks the current OS thread for the given number of milliseconds.
+pub extern("c") fn kyte_sleep_ms(ms: long): void;
+/// Puts a socket into non-blocking mode; the runtime helper backing `setNonBlocking`.
+pub extern("c") fn kyte_set_nonblock(fd: int): int;
+
+/// Creates a socket, starting Winsock first if it has not been started yet.
+pub fn socket(domain: int, type_: int, protocol: int): int {
+    winsock.startup();
+    return winsock.socket(domain, type_, protocol) as int;
+}
+/// Resolves a host/service name into addrinfo results, starting Winsock first if needed.
+pub fn getaddrinfo(node: ptr, service: ptr, hints: ptr, res: ptr): int {
+    winsock.startup();
+    return winsock.getaddrinfo(node, service, hints, res);
+}
+
+/// Binds a socket to a local address. Thin extern wrapper over the Winsock call of the same name.
+pub extern("c") fn bind(fd: int, addr: ptr, addrlen: int): int;
+pub extern("c") fn listen(fd: int, backlog: int): int;
+pub extern("c") fn accept(fd: int, addr: ptr, addrlen: ptr): int;
+pub extern("c") fn connect(fd: int, addr: ptr, addrlen: int): int;
+pub extern("c") fn setsockopt(fd: int, level: int, optname: int, optval: ptr, optlen: int): int;
+pub extern("c") fn getsockopt(fd: int, level: int, optname: int, optval: ptr, optlen: ptr): int;
+pub extern("c") fn getsockname(fd: int, addr: ptr, addrlen: ptr): int;
+pub extern("c") fn freeaddrinfo(res: ptr): void;
+
+/// Reads a process environment variable, mirroring the C `getenv` return convention (null pointer if unset).
+pub extern("c") fn getenv(name: ptr): ptr;
+
+pub extern("c") fn memchr(s: ptr, c: int, n: long): ptr;
+pub extern("c") fn memcmp(a: ptr, b: ptr, n: long): int;
+pub extern("c") fn memcpy(dst: ptr, src: ptr, n: long): ptr;
+pub extern("c") fn memmove(dst: ptr, src: ptr, n: long): ptr;
+
+/// Flag for `mmap`: pages may be read.
+pub const PROT_READ: int = 1;
+/// Flag for `mmap`: pages may be written.
+pub const PROT_WRITE: int = 2;
+/// Flag for `mmap`: changes are private to the mapping (there is no real file-backed sharing on this shim).
+pub const MAP_PRIVATE: int = 2;
+/// Flag for `mmap`: anonymous mapping (not backed by a file descriptor). Always 0 here since Windows has no matching bit to mirror.
+pub fn MAP_ANON(): int { return 0; }
+
+pub const O_RDONLY: int = 0;
+pub const O_WRONLY: int = 1;
+pub const O_RDWR: int = 2;
+/// `open` flag: create the file if it does not exist. A function, not a constant, because it carries the UCRT bit value (256), which differs from the POSIX value `os/sys` uses.
+pub fn O_CREAT(): int { return 256; }
+/// `open` flag: truncate an existing file to zero length. UCRT bit value (512).
+pub fn O_TRUNC(): int { return 512; }
+/// `open` flag: writes append to the end of the file. UCRT bit value (8).
+pub fn O_APPEND(): int { return 8; }
+pub const SEEK_SET: int = 0;
+pub const SEEK_CUR: int = 1;
+pub const SEEK_END: int = 2;
+/// `access` mode: test for existence only.
+pub const F_OK: int = 0;
+
+/// Mask isolating the file-type bits of a `stat`/`lstat` mode value.
+pub const S_IFMT: int = 61440;
+/// File-type bit for directories.
+pub const S_IFDIR: int = 16384;
+/// File-type bit for regular files.
+pub const S_IFREG: int = 32768;
+/// File-type bit for symbolic links (reparse points), only ever set by `lstat`.
+pub const S_IFLNK: int = 40960;
+
+/// Byte offset of `st_mode` inside the `stat` buffer this shim writes; differs from the native UCRT layout by design, matched to what callers in this file expect.
+fn STAT_MODE_OFF(): int { return 4; }
+/// Byte offset of the file-name field inside a `readdir` entry record.
+pub fn DIRENT_NAME_OFF(): int { return 21; }
+
+pub const AF_INET: int = 2;
+pub const SOCK_STREAM: int = 1;
+pub const SOCK_DGRAM: int = 2;
+/// `setsockopt`/`getsockopt` level for socket-layer (as opposed to protocol-layer) options.
+pub fn SOL_SOCKET(): int { return 65535; }
+/// `fcntl`/status flag placeholder for non-blocking mode. Always 0: non-blocking is set via `kyte_set_nonblock`, not this flag, on Windows.
+pub fn O_NONBLOCK(): int { return 0; }
+pub const F_GETFL: int = 3;
+pub const F_SETFL: int = 4;
+pub const AF_UNIX: int = 1;
+/// The loopback address `127.0.0.1`, already in the byte order `makeSockaddrIn`'s `addrBE` parameter expects.
+pub const INADDR_LOOPBACK_BE: long = 16777343;
+/// `getsockopt` option name for reading a socket's pending error (`SO_ERROR`).
+pub fn SO_ERROR(): int { return 4103; }
+/// `setsockopt` option name for `SO_REUSEPORT`-style port reuse.
+pub fn SO_REUSEPORT(): int { return 4; }
+
+const ENOENT: int = 2;
+const EIO: int = 5;
+const EBADF: int = 9;
+const EACCES: int = 13;
+const EEXIST: int = 17;
+const ENOTEMPTY: int = 41;
+
+const ERROR_FILE_NOT_FOUND: int = 2;
+const ERROR_PATH_NOT_FOUND: int = 3;
+const ERROR_ACCESS_DENIED: int = 5;
+const ERROR_INVALID_HANDLE: int = 6;
+const ERROR_FILE_EXISTS: int = 80;
+const ERROR_DIR_NOT_EMPTY: int = 145;
+const ERROR_ALREADY_EXISTS: int = 183;
+
+/// Sets errno to the given POSIX code and returns the conventional -1 failure result.
+fn failWith(e: int): int {
+    kyte_ffi_set_errno(e);
+    return -1;
+}
+
+/// Translates the last Win32 error (`GetLastError`) into the closest POSIX errno and fails with it.
+fn fail(): int {
+    let w = fs.GetLastError();
+    if (w == ERROR_FILE_NOT_FOUND || w == ERROR_PATH_NOT_FOUND) { return failWith(ENOENT); }
+    if (w == ERROR_ACCESS_DENIED) { return failWith(EACCES); }
+    if (w == ERROR_INVALID_HANDLE) { return failWith(EBADF); }
+    if (w == ERROR_FILE_EXISTS || w == ERROR_ALREADY_EXISTS) { return failWith(EEXIST); }
+    if (w == ERROR_DIR_NOT_EMPTY) { return failWith(ENOTEMPTY); }
+    return failWith(EIO);
+}
+
+/// Copies a Kyte `string` out as a fresh NUL-terminated byte buffer, for passing to Win32/C-style APIs. Caller owns the returned buffer and must `bytes.free` it.
+pub fn cstr(s: string): ptr {
+    let n = s.length;
+    let b = bytes.alloc(n + 1);
+    let i = 0;
+    while (i < n) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    bytes.write_byte(b, n, 0);
+    return b;
+}
+
+/// Maps POSIX-style open flags to a Win32 `CreateFileW` desired-access mask.
+fn accessFor(flags: int): int {
+    if ((flags & O_APPEND()) != 0) {
+        let a = fs.FILE_APPEND_DATA;
+        return if ((flags & O_RDWR) != 0) (a | fs.GENERIC_READ) else a;
+    }
+    if ((flags & O_RDWR) != 0) { return fs.GENERIC_READ | fs.GENERIC_WRITE; }
+    if ((flags & O_WRONLY) != 0) { return fs.GENERIC_WRITE; }
+    return fs.GENERIC_READ;
+}
+
+/// Maps POSIX-style open flags to a Win32 `CreateFileW` creation-disposition value.
+fn dispositionFor(flags: int): int {
+    let creat = (flags & O_CREAT()) != 0;
+    let trunc = (flags & O_TRUNC()) != 0;
+    if (creat && trunc) { return fs.CREATE_ALWAYS; }
+    if (creat) { return fs.OPEN_ALWAYS; }
+    if (trunc) { return fs.TRUNCATE_EXISTING; }
+    return fs.OPEN_EXISTING;
+}
+
+/// Opens or creates a file, POSIX `open`-style. `mode` is accepted for signature parity but ignored: Windows ACLs are not POSIX permission bits. Returns a `HANDLE` cast to `int`, or -1 with errno set on failure.
+pub fn kyte_open(path: ptr, flags: int, mode: int): int {
+    let w = fs.widen(path);
+    if (w == (0 as ptr)) { return -1; }
+    let share = fs.FILE_SHARE_READ | fs.FILE_SHARE_WRITE | fs.FILE_SHARE_DELETE;
+    let h = fs.CreateFileW(w, accessFor(flags), share, 0 as ptr,
+                              dispositionFor(flags), fs.FILE_ATTRIBUTE_NORMAL, 0 as long);
+    bytes.free(w);
+    if (h == fs.INVALID_HANDLE) { return fail(); }
+    return h as int;
+}
+
+/// Reads up to `count` bytes from `fd` into `buf`. `fd` may be either a file HANDLE or a socket: this tries `ReadFile` first and falls back to `winsock.recv` when that fails, since the two are not interchangeable on Windows.
+pub fn read(fd: int, buf: ptr, count: long): long {
+    let got = bytes.alloc(4);
+    bytes.write_i32(got, 0, 0);
+    let ok = fs.ReadFile(fd as long, buf, count as int, got, 0 as ptr);
+    let n = bytes.read_i32(got, 0) as int;
+    bytes.free(got);
+    if (ok != 0) { return n as long; }
+    let r = winsock.recv(fd as long, buf, count as int, 0);
+    return if (r >= 0) (r as long) else (-1 as long);
+}
+
+/// Writes up to `count` bytes from `buf` to `fd`. Same file-then-socket fallback strategy as `read`.
+pub fn write(fd: int, buf: ptr, count: long): long {
+    let wrote = bytes.alloc(4);
+    bytes.write_i32(wrote, 0, 0);
+    let ok = fs.WriteFile(fd as long, buf, count as int, wrote, 0 as ptr);
+    let n = bytes.read_i32(wrote, 0) as int;
+    bytes.free(wrote);
+    if (ok != 0) { return n as long; }
+    let r = winsock.send(fd as long, buf, count as int, 0);
+    return if (r >= 0) (r as long) else (-1 as long);
+}
+
+/// Closes a file HANDLE or socket, whichever `fd` turns out to be; tries `closesocket` first, then `CloseHandle`.
+pub fn close(fd: int): int {
+    if (fd < 0) { return failWith(EBADF); }
+    if (winsock.closesocket(fd as long) == 0) { return 0; }
+    if (fs.CloseHandle(fd as long) != 0) { return 0; }
+    return fail();
+}
+
+/// Repositions the file pointer of `fd`, POSIX `lseek`-style, via `SetFilePointerEx`. Returns the new absolute position, or -1 on failure.
+pub fn lseek(fd: int, offset: long, whence: int): long {
+    let out = bytes.alloc(8);
+    bytes.write_ptr(out, 0, 0);
+    let ok = fs.SetFilePointerEx(fd as long, offset, out, whence);
+    let pos = bytes.read_ptr(out, 0);
+    bytes.free(out);
+    return if (ok != 0) (pos as long) else (-1 as long);
+}
+
+/// Flushes buffered writes for `fd` to disk via `FlushFileBuffers`.
+pub fn fsync(fd: int): int {
+    return if (fs.FlushFileBuffers(fd as long) != 0) 0 else fail();
+}
+
+/// Looks up the Win32 file attributes for `path`, widening it to UTF-16 first.
+fn attrsOf(path: ptr): int {
+    let w = fs.widen(path);
+    if (w == (0 as ptr)) { return fs.INVALID_FILE_ATTRIBUTES; }
+    let a = fs.GetFileAttributesW(w);
+    bytes.free(w);
+    return a;
+}
+
+/// Creates a directory at `path`. `mode` is accepted for signature parity with POSIX `mkdir` but ignored.
+pub fn mkdir(path: ptr, mode: int): int {
+    let w = fs.widen(path);
+    if (w == (0 as ptr)) { return -1; }
+    let r = fs.CreateDirectoryW(w, 0 as ptr);
+    bytes.free(w);
+    return if (r != 0) 0 else fail();
+}
+
+/// Removes an empty directory at `path`.
+pub fn rmdir(path: ptr): int {
+    let w = fs.widen(path);
+    if (w == (0 as ptr)) { return -1; }
+    let r = fs.RemoveDirectoryW(w);
+    bytes.free(w);
+    return if (r != 0) 0 else fail();
+}
+
+/// Deletes the file at `path`.
+pub fn unlink(path: ptr): int {
+    let w = fs.widen(path);
+    if (w == (0 as ptr)) { return -1; }
+    let r = fs.DeleteFileW(w);
+    bytes.free(w);
+    return if (r != 0) 0 else fail();
+}
+
+/// Renames/moves `from` to `to`, replacing an existing file at `to` if one exists (`MOVEFILE_REPLACE_EXISTING`).
+pub fn rename(from: ptr, to: ptr): int {
+    let a = fs.widen(from);
+    if (a == (0 as ptr)) { return -1; }
+    let b = fs.widen(to);
+    if (b == (0 as ptr)) { bytes.free(a); return -1; }
+    let r = fs.MoveFileExW(a, b, fs.MOVEFILE_REPLACE_EXISTING);
+    bytes.free(a);
+    bytes.free(b);
+    return if (r != 0) 0 else fail();
+}
+
+/// Tests whether `path` exists. `amode` is accepted for POSIX `access` signature parity but only existence is actually checked, not the specific read/write/execute bits.
+pub fn access(path: ptr, amode: int): int {
+    return if (attrsOf(path) != fs.INVALID_FILE_ATTRIBUTES) 0 else failWith(ENOENT);
+}
+
+/// Fills `buf` with a minimal `stat` record (just the file-type mode bits, at `STAT_MODE_OFF`) for `path`. Follows reparse points, so a symlink reports as its target's type.
+pub fn stat(path: ptr, buf: ptr): int {
+    let a = attrsOf(path);
+    if (a == fs.INVALID_FILE_ATTRIBUTES) { return failWith(ENOENT); }
+    let isDir = (a & fs.FILE_ATTRIBUTE_DIRECTORY) != 0;
+    let isLink = (a & fs.FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    let mode = if (isDir) S_IFDIR else S_IFREG;
+    bytes.write_u16(buf, STAT_MODE_OFF(), mode as long);
+    return 0;
+}
+
+/// Like `stat`, but does not follow reparse points: a symlink reports as `S_IFLNK` rather than its target's type.
+pub fn lstat(path: ptr, buf: ptr): int {
+    let a = attrsOf(path);
+    if (a == fs.INVALID_FILE_ATTRIBUTES) { return failWith(ENOENT); }
+    let mode = if ((a & fs.FILE_ATTRIBUTE_REPARSE_POINT) != 0) S_IFLNK
+               else if ((a & fs.FILE_ATTRIBUTE_DIRECTORY) != 0) S_IFDIR
+               else S_IFREG;
+    bytes.write_u16(buf, STAT_MODE_OFF(), mode as long);
+    return 0;
+}
+
+/// Writes the current working directory into `buf` (up to `size` bytes), narrowing from UTF-16. Returns `buf` on success, or a null pointer if the path does not fit or the underlying call fails.
+pub fn getcwd(buf: ptr, size: long): ptr {
+    let cap = (size as int) / 2;
+    let w = bytes.alloc(cap * 2);
+    let n = fs.GetCurrentDirectoryW(cap, w);
+    if (n <= 0 || n > cap) { bytes.free(w); return 0 as ptr; }
+    let written = fs.narrowInto(w, buf, size as int);
+    bytes.free(w);
+    return if (written > 0) buf else (0 as ptr);
+}
+
+/// Changes the process's current working directory to `path`.
+pub fn chdir(path: ptr): int {
+    let w = fs.widen(path);
+    if (w == (0 as ptr)) { return -1; }
+    let r = fs.SetCurrentDirectoryW(w);
+    bytes.free(w);
+    return if (r != 0) 0 else fail();
+}
+
+// Layout offsets and size of the directory-iterator record allocated by `opendir` and
+// walked by `readdir`/`closedir`: a Win32 FIND_HANDLE, a "first result already fetched"
+// flag, the raw WIN32_FIND_DATAW, and a narrowed dirent-style entry with a name buffer.
+const DIR_FIND_OFF: int = 0;
+const DIR_PENDING_OFF: int = 8;
+const DIR_DATA_OFF: int = 16;
+const DIR_ENT_OFF: int = 608;
+const DIR_NAME_CAP: int = 1024;
+const DIR_RECORD_SIZE: int = 608 + 21 + 1024;
+
+/// Opens a directory for iteration, POSIX `opendir`-style. Internally issues `FindFirstFileW` against `path` with a `*` wildcard appended, and caches that first result for the next `readdir` call. Returns a null pointer on failure.
+pub fn opendir(path: ptr): ptr {
+    let n = 0;
+    while (bytes.read_byte(path, n) != 0) { n = n + 1; }
+    let pat = bytes.alloc(n + 3);
+    let i = 0;
+    while (i < n) { bytes.write_byte(pat, i, bytes.read_byte(path, i)); i = i + 1; }
+    let p = n;
+    if (p > 0) {
+        let last = bytes.read_byte(pat, p - 1);
+        if (last != 47 && last != 92) { bytes.write_byte(pat, p, 92); p = p + 1; }
+    }
+    bytes.write_byte(pat, p, 42);
+    bytes.write_byte(pat, p + 1, 0);
+
+    let w = fs.widen(pat);
+    bytes.free(pat);
+    if (w == (0 as ptr)) { return 0 as ptr; }
+
+    let d = bytes.alloc(DIR_RECORD_SIZE);
+    let h = fs.FindFirstFileW(w, (d as long) + (DIR_DATA_OFF as long));
+    bytes.free(w);
+    if (h == fs.INVALID_HANDLE) { bytes.free(d); return 0 as ptr; }
+    bytes.write_ptr(d, DIR_FIND_OFF, h);
+    bytes.write_i32(d, DIR_PENDING_OFF, 1);
+    return d;
+}
+
+/// Advances a directory iterator opened by `opendir` and returns a pointer to the next entry record, or a null pointer at end of directory. The first call consumes the result `opendir` already fetched; later calls call `FindNextFileW`.
+pub fn readdir(dir: ptr): ptr {
+    if (dir == (0 as ptr)) { return 0 as ptr; }
+    let h = bytes.read_ptr(dir, DIR_FIND_OFF);
+    if (h == fs.INVALID_HANDLE) { return 0 as ptr; }
+
+    if (bytes.read_i32(dir, DIR_PENDING_OFF) == 0) {
+        if (fs.FindNextFileW(h, (dir as long) + (DIR_DATA_OFF as long)) == 0) { return 0 as ptr; }
+    }
+    bytes.write_i32(dir, DIR_PENDING_OFF, 0);
+
+    let ent = (dir as long) + (DIR_ENT_OFF as long);
+    let name = (ent + (DIRENT_NAME_OFF() as long)) as ptr;
+    let src = ((dir as long) + (DIR_DATA_OFF as long) + (fs.FIND_DATA_NAME_OFF as long)) as ptr;
+    if (fs.narrowInto(src, name, DIR_NAME_CAP) == 0) { bytes.write_byte(name, 0, 0); }
+    return ent as ptr;
+}
+
+/// Closes a directory iterator opened by `opendir`, releasing the Win32 find handle and freeing the record.
+pub fn closedir(dir: ptr): int {
+    if (dir == (0 as ptr)) { return -1; }
+    let h = bytes.read_ptr(dir, DIR_FIND_OFF);
+    if (h != fs.INVALID_HANDLE) { fs.FindClose(h); }
+    bytes.free(dir);
+    return 0;
+}
+
+/// Sets a process environment variable. If `overwrite` is 0 and `name` is already set, leaves it unchanged. Implemented via `_putenv_s` since Windows has no native `setenv`.
+pub fn setenv(name: ptr, value: ptr, overwrite: int): int {
+    if (overwrite == 0) {
+        let cur = getenv(name);
+        if (cur != (0 as ptr)) { return 0; }
+    }
+    return if (fs._putenv_s(name, value) == 0) 0 else -1;
+}
+
+/// Creates a connected pair of sockets, POSIX `socketpair`-style. Windows has no native equivalent, so this emulates one over TCP loopback: a listener bound to an ephemeral port, a client connect, and an accept, with the two connected ends written into `sv[0]`/`sv[1]` (as 4-byte ints each). `domain` is ignored; the emulation always uses `AF_INET`.
+pub fn socketpair(domain: int, type_: int, protocol: int, sv: ptr): int {
+    winsock.startup();
+    let listener = socket(AF_INET, type_, 0);
+    if (listener < 0) { return -1; }
+    let sa = makeSockaddrIn(0, INADDR_LOOPBACK_BE);
+    let len = bytes.alloc(4);
+    bytes.write_i32(len, 0, 16);
+    let bound = bind(listener, sa, 16) == 0
+             && getsockname(listener, sa, len) == 0
+             && listen(listener, 1) == 0;
+    bytes.free(len);
+    if (!bound) { bytes.free(sa); close_socket(listener); return -1; }
+
+    let client = socket(AF_INET, type_, 0);
+    if (client < 0) { bytes.free(sa); close_socket(listener); return -1; }
+    let connected = connect(client, sa, 16) == 0;
+    bytes.free(sa);
+    if (!connected) { close_socket(listener); close_socket(client); return -1; }
+
+    let server = accept(listener, 0 as ptr, 0 as ptr);
+    close_socket(listener);
+    if (server < 0) { close_socket(client); return -1; }
+    bytes.write_i32(sv, 0, client as long);
+    bytes.write_i32(sv, 4, server as long);
+    return 0;
+}
+
+fn close_socket(fd: int): int { return winsock.closesocket(fd as long); }
+
+/// Stub: Windows sockets have no `fcntl`, so this always fails. Non-blocking mode goes through `setNonBlocking` instead.
+pub fn fcntl(fd: int, cmd: int, arg: int): int { return -1; }
+
+/// Reports whether a file or directory exists at `path`, given as a Kyte `string`.
+pub fn pathExists(path: string): bool {
+    let cp = cstr(path);
+    let r = access(cp, F_OK);
+    bytes.free(cp);
+    return r == 0;
+}
+
+/// Returns the raw `stat` mode bits (type bits only) for `path`, given as a Kyte `string`, or -1 if `stat` fails.
+pub fn pathStatMode(path: string): int {
+    let cp = cstr(path);
+    let buf = bytes.alloc(160);
+    let r = stat(cp, buf);
+    let m = if (r == 0) (bytes.read_u16(buf, STAT_MODE_OFF()) as int) else -1;
+    bytes.free(cp);
+    bytes.free(buf);
+    return m;
+}
+
+/// Reports whether `path` (a Kyte `string`) exists and is a directory.
+pub fn pathIsDir(path: string): bool {
+    let m = pathStatMode(path);
+    if (m < 0) { return false; }
+    return (m & S_IFMT) == S_IFDIR;
+}
+
+/// Returns the current POSIX-style errno set by the last failing call in this file.
+pub fn errno(): int { return kyte_ffi_errno(); }
+/// Resets the errno cell to 0.
+pub fn clearErrno(): void { kyte_ffi_set_errno(0); }
+
+/// Reads and clears the pending `SO_ERROR` on a socket, e.g. to check whether a non-blocking `connect` succeeded. Returns -1 if the `getsockopt` call itself fails.
+pub fn soError(fd: int): int {
+    let val = bytes.alloc(4);
+    let len = bytes.alloc(4);
+    bytes.write_i32(val, 0, 0);
+    bytes.write_i32(len, 0, 4);
+    let r = getsockopt(fd, SOL_SOCKET(), SO_ERROR(), val, len);
+    let e = if (r == 0) (bytes.read_i32(val, 0) as int) else -1;
+    bytes.free(val);
+    bytes.free(len);
+    return e;
+}
+
+/// Creates a new socket of the given domain and type with protocol 0, starting Winsock first.
+pub fn newSocket(domain: int, type_: int): int {
+    winsock.startup();
+    return socket(domain, type_, 0);
+}
+
+/// Convenience wrapper over `socketpair` that returns the pair as a tuple instead of writing through a buffer. Returns `(-1, -1)` on failure.
+pub fn newSocketPair(domain: int, type_: int): (int, int) {
+    let sv = bytes.alloc(8);
+    let r = socketpair(domain, type_, 0, sv);
+    if (r != 0) {
+        bytes.free(sv);
+        return (-1, -1);
+    }
+    let a = bytes.read_i32(sv, 0) as int;
+    let b = bytes.read_i32(sv, 4) as int;
+    bytes.free(sv);
+    return (a, b);
+}
+
+/// Puts a socket into non-blocking mode.
+pub fn setNonBlocking(fd: int): int { return kyte_set_nonblock(fd); }
+
+/// Sets `SO_REUSEPORT` on a socket, so multiple sockets can bind the same local port.
+pub fn setReusePort(fd: int): int {
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    let r = setsockopt(fd, SOL_SOCKET(), SO_REUSEPORT(), one, 4);
+    bytes.free(one);
+    return r;
+}
+
+/// POSIX `mmap`-shaped entry point, but only the anonymous-memory case is actually implemented: it always allocates fresh committed+reserved pages via `VirtualAlloc`, ignoring `addr`, `prot`, `flags`, `fd` and `offset` (there is no file-backed mapping here). Returns `-1 as ptr` on failure, matching `mmap`'s `MAP_FAILED` convention.
+pub fn mmap(addr: ptr, length: long, prot: int, flags: int, fd: int, offset: long): ptr {
+    if (length <= (0 as long)) { return -1 as ptr; }
+    let p = fs.VirtualAlloc(0 as ptr, length, fs.MEM_COMMIT | fs.MEM_RESERVE, fs.PAGE_READWRITE);
+    return if (p == (0 as ptr)) (-1 as ptr) else p;
+}
+
+/// Releases a mapping created by `mmap`/`mapAnon` via `VirtualFree`. `length` is unused: `VirtualFree` with `MEM_RELEASE` always frees the whole allocation.
+pub fn munmap(addr: ptr, length: long): int {
+    return if (fs.VirtualFree(addr, 0 as long, fs.MEM_RELEASE) != 0) 0 else -1;
+}
+
+/// Allocates `length` bytes of anonymous read/write memory. Returns a null pointer on failure rather than `mmap`'s `-1 as ptr` sentinel.
+pub fn mapAnon(length: long): ptr {
+    let p = mmap(0 as ptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON(), -1, 0);
+    let pl = p as long;
+    if (pl == -1 || pl == 0) { return 0 as ptr; }
+    return p;
+}
+
+/// Alias for `munmap`, for callers that prefer the `unmap` name.
+pub fn unmap(addr: ptr, length: long): int { return munmap(addr, length); }
+
+/// Builds a heap-allocated 16-byte `sockaddr_in` for IPv4, with `port` in host byte order (converted internally) and `addrBE` already in network byte order. Caller owns the returned buffer.
+pub fn makeSockaddrIn(port: int, addrBE: long): ptr {
+    let sa = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) { bytes.write_byte(sa, i, 0); i = i + 1; }
+    bytes.write_u16(sa, 0, AF_INET as long);
+    bytes.write_u16(sa, 2, htons(port) as long);
+    bytes.write_i32(sa, 4, addrBE);
+    return sa;
+}
+
+/// Returns the local port a socket is bound to (in host byte order), or -1 if `getsockname` fails. Useful after binding to port 0 to discover the ephemeral port the OS chose.
+pub fn boundPort(fd: int): int {
+    let sa = bytes.alloc(16);
+    let len = bytes.alloc(4);
+    bytes.write_i32(len, 0, 16);
+    let r = getsockname(fd, sa, len);
+    let p = if (r == 0) (htons(bytes.read_u16(sa, 2) as int)) else -1;
+    bytes.free(sa);
+    bytes.free(len);
+    return p;
+}
+
+/// Converts a 16-bit value from host to network byte order (big-endian). Also self-inverse, so it doubles as `ntohs`.
+pub fn htons(x: int): int {
+    let lo = x & 255;
+    let hi = (x >> 8) & 255;
+    return (lo << 8) | hi;
+}

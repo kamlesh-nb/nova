@@ -1,7 +1,7 @@
-# Nova feature-parity scorecard (vs Rust and Go)
+# Kyte feature-parity scorecard (vs Rust and Go)
 
 Status: HONEST ASSESSMENT, 2026-08-20. Author: language soundness review. This document is an
-evidence-backed, deliberately unflattering audit of where Nova actually stands against Rust and Go, based on
+evidence-backed, deliberately unflattering audit of where Kyte actually stands against Rust and Go, based on
 reading the compiler, runtime, and standard library source (not the aspirational specification prose). It
 exists so we do not mislead ourselves about maturity. Where a claim is measured, the measurement is cited;
 where something is naive or fragile, it says so plainly.
@@ -20,7 +20,7 @@ defect register it inherits that register's blind spots in both directions:
 - It can UNDER-sample: a gap that is neither obvious in an excerpt nor listed in gaps.md will be missed. Do not
   read the absence of a gap here as proof one does not exist.
 - It can OVER-state: at least one severity label was wrong. gaps.md called the NovaDB primary query path
-  "SQL-injectable" (Sec4); reading `typemap.nova` first-hand shows text params ARE escaped client-side
+  "SQL-injectable" (Sec4); reading `typemap.ky` first-hand shows text params ARE escaped client-side
   (single-quote doubling, hex blobs), so the honest severity is lower (see the ship-readiness section). That
   correction was only found by reading the actual code, which the sweep did not do for every claim.
 
@@ -30,7 +30,7 @@ confirmed first-hand or is backed by a conformance case number.
 
 ## The one-line verdict
 
-Nova is **not at par with Rust or Go overall**. It has the *shape* of a peer across an impressive range of
+Kyte is **not at par with Rust or Go overall**. It has the *shape* of a peer across an impressive range of
 features, plus a few areas where it genuinely stands up or leads, but most dimensions are the intentionally
 minimal version of what the mature toolchains ship. The honest label is **capable advanced-alpha, approaching
 beta**. The gap is rarely "missing"; it is "present but shallow, naive, or not yet battle-tested". Almost all
@@ -39,16 +39,16 @@ of it is engineering, not new language theory.
 ## Scorecard
 
 Verdict legend: **Ahead** / **At par** / **Near par** / **Behind** / **Well behind**, judged on the features
-Nova actually has today, not on ambition.
+Kyte actually has today, not on ambition.
 
-| Dimension | Nova today | Verdict vs Rust/Go |
+| Dimension | Kyte today | Verdict vs Rust/Go |
 |---|---|---|
 | async / await ergonomics | LLVM stackless coroutines, spawn/await/when_all/select, enforced colouring, deadlines | At par (common path) |
 | Single-core reactor throughput | 168 to 186k rps per core on M1; one core beat 8-core peers on that box | Ahead per core (with caveats) |
 | Error handling | value-based `T \| E`, try / catch / errdefer, no unwinding | At par with Go, cleaner |
 | Enums / ADTs / switch | multi-payload variants, case guards, exhaustiveness | Near par |
 | Static memory safety | ARC plus default-on OSSA leak / double-free verifier (~99% coverage, fail-closed) | Novel middle ground, see note |
-| Crypto and TLS | pure-Nova primitives, TLS 1.3 client and server, 0-RTT, mTLS, KAT-gated | Feature-competitive, unaudited |
+| Crypto and TLS | pure-Kyte primitives, TLS 1.3 client and server, 0-RTT, mTLS, KAT-gated | Feature-competitive, unaudited |
 | Database drivers | pg / mysql / mssql / mongo real wire protocols, pooling, transactions | Near Go's database/sql breadth |
 | Web framework | routing, DI, mediator, full middleware suite, hypermedia / SSE | Broad, HTTP/1.1 only |
 | Generics | full monomorphisation, capped at nesting depth 2, bounds advisory only | Behind both |
@@ -68,10 +68,10 @@ in this exact form.
 
 It is NOT Rust's borrow checker. It does not check aliasing-xor-mutation, it gives no data-race freedom, and
 it has no lifetime or dangling-reference analysis. It is a compiler-correctness self-check, not a user-facing
-safety net against ownership mistakes (in Nova the user cannot make those, because ARC is automatic). Do not
+safety net against ownership mistakes (in Kyte the user cannot make those, because ARC is automatic). Do not
 oversell it as "Rust-safe".
 
-## Where Nova genuinely stands up
+## Where Kyte genuinely stands up
 
 1. **Async ergonomics and single-core network throughput.** LLVM coroutines put spawn / await / select in the
    same family as Rust futures, and the reactor's per-core numbers are real. Caveat below on what the headline
@@ -82,7 +82,7 @@ oversell it as "Rust-safe".
    differential tested; the TLS 1.3 stack does 0-RTT, resumption, and mTLS; the DB drivers speak real binary
    protocols with pooling and transactions.
 
-## Where Nova is clearly behind
+## Where Kyte is clearly behind
 
 ### Language
 
@@ -137,11 +137,11 @@ These are confirmed in code and tracked in `docs/gaps.md`. They are the differen
 and something safe to run in production, and they should be treated as blockers, not polish.
 
 - **MSSQL driver defaults to plaintext passwords** (`encrypt=false`) and **trusts any server certificate**
-  (`trustServerCertificate=true`) in `packages/nova-mssql/.../connection.nova`. Credentials over the wire in
+  (`trustServerCertificate=true`) in `packages/nova-mssql/.../connection.ky`. Credentials over the wire in
   clear, and a MITM is accepted by default. (Sec1, Sec2)
 - **MySQL caching_sha2 full-auth trusts the server RSA key over plaintext.** (Sec3)
 - **NovaDB's primary query and exec path uses client-side parameter substitution, not server-side binding.**
-  Verified first-hand (`packages/nova-novadb/src/typemap.nova`): `substituteParams` interpolates each value via
+  Verified first-hand (`packages/nova-novadb/src/typemap.ky`): `substituteParams` interpolates each value via
   `valueToSql`, and text values ARE escaped by `escapeText` (single-quote doubling `'` to `''`, quoted) with
   blobs hex-encoded by `byteaLiteral`. So classic quote-break injection is blocked, and a server-bound path
   (`queryPrepared` / `execPrepared` via Parse / Bind / Execute) exists. The accurate residual risk is narrower
@@ -167,7 +167,7 @@ The single-core reactor numbers are real, but read them with the caveats the doc
 - The headline raw-reactor number does no request parsing (fixed response). The full async web framework is 3
   to 5 times slower (about 26.6k rps versus 75.6k on the same box), because of per-request allocation in the
   App and mediator layers.
-- The M1 figure compared one Nova core against peers' 8-core numbers. That is a striking result, but it is not
+- The M1 figure compared one Kyte core against peers' 8-core numbers. That is a striking result, but it is not
   a same-core comparison.
 - Multi-core scaling is unmeasured. The sweep plateaus at about 185k regardless of reactor count because the
   co-resident load generator and loopback saturate first. A real multi-core figure needs a separate
@@ -201,7 +201,7 @@ Ranked by leverage, cheapest and highest-stakes first. None of these require new
 
 ## Bottom line
 
-Nova is at par with Go and Rust on async ergonomics and per-core network performance, ahead of both on the
+Kyte is at par with Go and Rust on async ergonomics and per-core network performance, ahead of both on the
 narrow axis of default-on static leak and double-free checking, broadly comparable in surface across
 stdlib, web, and DB, and materially behind on multicore concurrency, generics power, stdlib scaling and
 correctness, tooling depth, and hardening. It is a genuinely impressive one-team language that has the shape of

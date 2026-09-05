@@ -2,15 +2,15 @@
 //! declaration in the whole program, keyed by name, plus the module graph that
 //! tells you which file each symbol came from and which files import which.
 //!
-//! Nova compiles the entire program (the root file plus every imported stdlib
+//! Kyte compiles the entire program (the root file plus every imported stdlib
 //! and package module) into ONE monomorphised LLVM module, so at link time all
 //! function names live in a single flat namespace. That creates two problems
 //! this file exists to solve:
 //!
 //!   1. **Name collisions across modules.** Two different modules may each
-//!      declare a `hash` function or a `Node` struct. Nova does not erase types,
+//!      declare a `hash` function or a `Node` struct. Kyte does not erase types,
 //!      so both must survive with distinct backing names. The answer is
-//!      MODULE-PREFIXED MANGLING: a function `hash` in `src/std/string.nova`
+//!      MODULE-PREFIXED MANGLING: a function `hash` in `src/std/string.ky`
 //!      becomes `string_hash`. Types that actually collide get a `scoped_name`
 //!      derived the same way; types that are unique keep their bare name so the
 //!      common case stays readable.
@@ -167,20 +167,20 @@ pub const Module = struct {
 ///
 /// This is the human-facing module identity stored in [`Module.path`] and
 /// matched against `import` statements. It strips whichever stdlib root the file
-/// lives under (`src/std/`, `src/lib/`, or an installed `.nova/std/`), drops the
+/// lives under (`src/std/`, `src/lib/`, or an installed `.kyte/std/`), drops the
 /// extension, turns path separators into dots, and prefixes `std.` for anything
-/// that came from a stripped root. So `src/std/collections/list.nova` and
-/// `~/.nova/std/collections/list.nova` both canonicalise to
+/// that came from a stripped root. So `src/std/collections/list.ky` and
+/// `~/.kyte/std/collections/list.ky` both canonicalise to
 /// `std.collections.list`, independent of where the checkout lives.
 ///
 /// Returns `null` for files that have no module identity: an empty path, the
-/// root program file itself, or the `helpers.nova`/`test_harness.nova` support
+/// root program file itself, or the `helpers.ky`/`test_harness.ky` support
 /// files. Contrast [`canonicalModulePrefix`], which produces the underscore-
 /// joined MANGLING prefix rather than the dotted path.
 pub fn canonicalModulePath(allocator: std.mem.Allocator, file: []const u8, root_file: []const u8) !?[]const u8 {
     if (file.len == 0) return null;
     if (std.mem.eql(u8, file, root_file)) return null;
-    if (std.mem.eql(u8, file, "helpers.nova") or std.mem.eql(u8, file, "test_harness.nova")) return null;
+    if (std.mem.eql(u8, file, "helpers.ky") or std.mem.eql(u8, file, "test_harness.ky")) return null;
 
     var path = file;
 
@@ -195,8 +195,8 @@ pub fn canonicalModulePath(allocator: std.mem.Allocator, file: []const u8, root_
     }
     if (!stripped) {
 
-        if (std.mem.indexOf(u8, path, ".nova/std/")) |pos| {
-            path = path[pos + ".nova/std/".len ..];
+        if (std.mem.indexOf(u8, path, ".kyte/std/")) |pos| {
+            path = path[pos + ".kyte/std/".len ..];
             stripped = true;
         }
     }
@@ -220,21 +220,21 @@ pub fn canonicalModulePath(allocator: std.mem.Allocator, file: []const u8, root_
 ///
 /// This is the prefix glued onto a function name to keep same-named functions in
 /// different modules distinct in the flat emitted namespace: `hash` in
-/// `src/std/string.nova` mangles as `string_hash`. It strips whichever stdlib
-/// root the file lives under (including the installed `.nova/std/`, `.nova/lib/`
+/// `src/std/string.ky` mangles as `string_hash`. It strips whichever stdlib
+/// root the file lives under (including the installed `.kyte/std/`, `.kyte/lib/`
 /// forms), drops the extension, and replaces `/`, `\` and `.` with `_`.
 ///
 /// "Corrected" is meaningful here: because it strips the installed roots too, a
-/// module found at `~/.nova/std/string.nova` yields the same `string` prefix as
-/// the in-tree `src/std/string.nova`, so no absolute `$HOME` component leaks into
+/// module found at `~/.kyte/std/string.ky` yields the same `string` prefix as
+/// the in-tree `src/std/string.ky`, so no absolute `$HOME` component leaks into
 /// the mangled name. That is exactly the [`legacyModulePrefix`] bug this function
 /// avoids. Returns `null` for the same non-module files as [`canonicalModulePath`].
 pub fn canonicalModulePrefix(allocator: std.mem.Allocator, file: []const u8, root_file: []const u8) !?[]const u8 {
     if (file.len == 0) return null;
     if (std.mem.eql(u8, file, root_file)) return null;
-    if (std.mem.eql(u8, file, "helpers.nova") or std.mem.eql(u8, file, "test_harness.nova")) return null;
+    if (std.mem.eql(u8, file, "helpers.ky") or std.mem.eql(u8, file, "test_harness.ky")) return null;
     var path = file;
-    const roots = [_][]const u8{ "src/std/", "src/lib/", ".nova/std/", ".nova/lib/" };
+    const roots = [_][]const u8{ "src/std/", "src/lib/", ".kyte/std/", ".kyte/lib/" };
     for (roots) |r| {
         if (std.mem.indexOf(u8, path, r)) |pos| {
             path = path[pos + r.len ..];
@@ -253,8 +253,8 @@ pub fn canonicalModulePrefix(allocator: std.mem.Allocator, file: []const u8, roo
 /// Kept verbatim so that names emitted under the historical scheme still
 /// resolve. It strips ONLY the in-tree `src/std/` and `src/lib/` roots (via
 /// `startsWith`, so the root must be a genuine prefix), and does NOT strip the
-/// installed `.nova/std/` form. Consequently a module loaded from
-/// `~/.nova/std/string.nova` keeps the whole absolute path (minus extension,
+/// installed `.kyte/std/` form. Consequently a module loaded from
+/// `~/.kyte/std/string.ky` keeps the whole absolute path (minus extension,
 /// separators to `_`), leaking the `$HOME` components into the mangled name.
 ///
 /// This `$HOME` leak is a deliberate bug preserved for compatibility, not an
@@ -264,7 +264,7 @@ pub fn canonicalModulePrefix(allocator: std.mem.Allocator, file: []const u8, roo
 pub fn legacyModulePrefix(allocator: std.mem.Allocator, file: []const u8, root_file: []const u8) !?[]const u8 {
     if (file.len == 0) return null;
     if (std.mem.eql(u8, file, root_file)) return null;
-    if (std.mem.eql(u8, file, "helpers.nova") or std.mem.eql(u8, file, "test_harness.nova")) return null;
+    if (std.mem.eql(u8, file, "helpers.ky") or std.mem.eql(u8, file, "test_harness.ky")) return null;
     var path = file;
     if (std.mem.startsWith(u8, path, "src/std/")) {
         path = path["src/std/".len..];
@@ -462,7 +462,7 @@ pub const SymbolTable = struct {
         return path[0..slash];
     }
     /// Returns a file's base name with directory and extension stripped
-    /// (`a/b/list.nova` → `list`).
+    /// (`a/b/list.ky` → `list`).
     ///
     /// The sibling-directory counterpart to [`SymbolTable.dirOf`]; together they
     /// let an import be matched to a same-directory file by leaf name.
@@ -476,7 +476,7 @@ pub const SymbolTable = struct {
     /// Resolves an import name to a module, preferring a sibling file in the
     /// importer's own directory before falling back to a global search.
     ///
-    /// This is what makes a bare `import foo` next to `foo.nova` pick the local
+    /// This is what makes a bare `import foo` next to `foo.ky` pick the local
     /// file rather than an unrelated stdlib module of the same leaf name: it
     /// first looks for a module whose directory equals the importer's and whose
     /// base name equals the import's last segment. Only if that finds nothing
@@ -1013,7 +1013,7 @@ pub const SymbolTable = struct {
 /// `map_reduce` are namespaced, but `string`, `stringify` and `mapper` are not
 /// (the `_` boundary is required, so a prefix that is merely a substring of a
 /// longer word does not count). This is what stops a hand-written `string_hash`
-/// in `src/std/string.nova` becoming `string_string_hash`. Consulted by
+/// in `src/std/string.ky` becoming `string_string_hash`. Consulted by
 /// [`SymbolTable.canonicalNameForFn`] and [`SymbolTable.legacyNameForFn`].
 pub fn isAlreadyNamespaced(name: []const u8) bool {
     const prefixes = [_][]const u8{
@@ -1033,15 +1033,15 @@ pub fn isAlreadyNamespaced(name: []const u8) bool {
 const testing = std.testing;
 
 // Pins the point of [`canonicalModulePrefix`]: a module found in-tree
-// (`src/std/string.nova`) and the same module installed under `~/.nova/std/`
+// (`src/std/string.ky`) and the same module installed under `~/.kyte/std/`
 // must produce the identical `string` prefix, with no `$HOME` component leaking
 // in. This is the exact behaviour the legacy path gets wrong on purpose.
 test "canonicalModulePrefix: the SAME file yields the SAME prefix from any root" {
     const a = testing.allocator;
 
-    const via_src = (try canonicalModulePrefix(a, "src/std/string.nova", "app.nova")).?;
+    const via_src = (try canonicalModulePrefix(a, "src/std/string.ky", "app.ky")).?;
     defer a.free(via_src);
-    const via_home = (try canonicalModulePrefix(a, "/Users/someone/.nova/std/string.nova", "app.nova")).?;
+    const via_home = (try canonicalModulePrefix(a, "/Users/someone/.kyte/std/string.ky", "app.ky")).?;
     defer a.free(via_home);
     try testing.expectEqualStrings("string", via_src);
     try testing.expectEqualStrings("string", via_home);
@@ -1049,14 +1049,14 @@ test "canonicalModulePrefix: the SAME file yields the SAME prefix from any root"
 }
 
 // Checks that a NESTED module keeps its full sub-path in the prefix, with
-// separators flattened to `_`: `collections/list.nova` → `collections_list`,
-// again identically whether found in-tree or under `.nova/std/`.
+// separators flattened to `_`: `collections/list.ky` → `collections_list`,
+// again identically whether found in-tree or under `.kyte/std/`.
 test "canonicalModulePrefix: nested modules keep their path, slashes become underscores" {
     const a = testing.allocator;
-    const p = (try canonicalModulePrefix(a, "src/std/collections/list.nova", "app.nova")).?;
+    const p = (try canonicalModulePrefix(a, "src/std/collections/list.ky", "app.ky")).?;
     defer a.free(p);
     try testing.expectEqualStrings("collections_list", p);
-    const q = (try canonicalModulePrefix(a, "/home/x/.nova/std/collections/list.nova", "app.nova")).?;
+    const q = (try canonicalModulePrefix(a, "/home/x/.kyte/std/collections/list.ky", "app.ky")).?;
     defer a.free(q);
     try testing.expectEqualStrings("collections_list", q);
 }
@@ -1067,20 +1067,20 @@ test "canonicalModulePrefix: nested modules keep their path, slashes become unde
 test "canonicalModulePrefix: an absolute checkout path still canonicalises" {
     const a = testing.allocator;
 
-    const p = (try canonicalModulePrefix(a, "/abs/checkout/lang/src/std/string.nova", "app.nova")).?;
+    const p = (try canonicalModulePrefix(a, "/abs/checkout/lang/src/std/string.ky", "app.ky")).?;
     defer a.free(p);
     try testing.expectEqualStrings("string", p);
 }
 
-// Checks the `null` cases: the root program file itself, the `helpers.nova`
-// and `test_harness.nova` support files, and an empty path all have no module
+// Checks the `null` cases: the root program file itself, the `helpers.ky`
+// and `test_harness.ky` support files, and an empty path all have no module
 // identity and therefore no prefix.
 test "canonicalModulePrefix: the root program and harness files have no prefix" {
     const a = testing.allocator;
-    try testing.expect(try canonicalModulePrefix(a, "app.nova", "app.nova") == null);
-    try testing.expect(try canonicalModulePrefix(a, "helpers.nova", "app.nova") == null);
-    try testing.expect(try canonicalModulePrefix(a, "test_harness.nova", "app.nova") == null);
-    try testing.expect(try canonicalModulePrefix(a, "", "app.nova") == null);
+    try testing.expect(try canonicalModulePrefix(a, "app.ky", "app.ky") == null);
+    try testing.expect(try canonicalModulePrefix(a, "helpers.ky", "app.ky") == null);
+    try testing.expect(try canonicalModulePrefix(a, "test_harness.ky", "app.ky") == null);
+    try testing.expect(try canonicalModulePrefix(a, "", "app.ky") == null);
 }
 
 // Locks in the bug on purpose: [`legacyModulePrefix`] must STILL leak the
@@ -1090,11 +1090,11 @@ test "canonicalModulePrefix: the root program and harness files have no prefix" 
 test "legacyModulePrefix reproduces the OLD behaviour, including the $HOME bug" {
 
     const a = testing.allocator;
-    const via_src = (try legacyModulePrefix(a, "src/std/string.nova", "app.nova")).?;
+    const via_src = (try legacyModulePrefix(a, "src/std/string.ky", "app.ky")).?;
     defer a.free(via_src);
     try testing.expectEqualStrings("string", via_src);
 
-    const via_home = (try legacyModulePrefix(a, "/Users/kamlesh/.nova/std/string.nova", "app.nova")).?;
+    const via_home = (try legacyModulePrefix(a, "/Users/kamlesh/.kyte/std/string.ky", "app.ky")).?;
     defer a.free(via_home);
 
     try testing.expect(std.mem.indexOf(u8, via_home, "Users") != null);
@@ -1132,22 +1132,22 @@ test "findModuleBySegment: match the name a module is USED under" {
             .name = "hash",
             .params = &.{},
             .ret_type = null,
-            .body = .{ .statements = &.{}, .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "src/std/string.nova" } },
+            .body = .{ .statements = &.{}, .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "src/std/string.ky" } },
             .is_exported = true,
             .attributes = &.{},
-            .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "src/std/string.nova" },
+            .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "src/std/string.ky" },
         } },
         .{ .fn_decl = .{
             .name = "push",
             .params = &.{},
             .ret_type = null,
-            .body = .{ .statements = &.{}, .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "src/std/collections/list.nova" } },
+            .body = .{ .statements = &.{}, .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "src/std/collections/list.ky" } },
             .is_exported = true,
             .attributes = &.{},
-            .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "src/std/collections/list.nova" },
+            .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "src/std/collections/list.ky" },
         } },
     };
-    try tab.build(.{ .declarations = &decls, .span = .{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "app.nova" } });
+    try tab.build(.{ .declarations = &decls, .span = .{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "app.ky" } });
 
     const m_string = tab.findModuleBySegment("string") orelse return error.TestExpectedEqual;
 
@@ -1168,7 +1168,7 @@ test "findModuleBySegment: match the name a module is USED under" {
 test "build: a method's decl points INTO the AST, not at a dead stack copy" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
 
     var methods = [_]ast.MethodDecl{.{
         .is_public = true,

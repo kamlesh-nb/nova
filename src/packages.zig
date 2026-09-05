@@ -1,17 +1,17 @@
-//! The git-backed package manager behind `nova get`, `nova restore`,
-//! `nova update` and `nova publish`.
+//! The git-backed package manager behind `kyte get`, `kyte restore`,
+//! `kyte update` and `kyte publish`.
 //!
-//! Nova has no central package server: a dependency is just a git URL,
+//! Kyte has no central package server: a dependency is just a git URL,
 //! optionally pinned to a ref with a `#ref` suffix (a branch, tag or full SHA).
 //! This module resolves the transitive dependency graph declared in a project's
 //! `project.json`, materialises each dependency into a content-addressed cache
-//! under `~/.nova/cache`, and records the exact resolved commit of every
+//! under `~/.kyte/cache`, and records the exact resolved commit of every
 //! dependency in `project.lock.json` so a later build is reproducible.
 //!
 //! Design decisions and invariants:
 //!
 //!   * **The cache is shared and content-addressed.** A checked-out dependency
-//!     lives in `~/.nova/cache/<name>-<8-char-sha>` when it is pinned to a
+//!     lives in `~/.kyte/cache/<name>-<8-char-sha>` when it is pinned to a
 //!     resolvable commit, or `<name>-branch` when it tracks a moving ref. The
 //!     short-SHA suffix means two projects pinning the same commit share one
 //!     checkout and a pin is never confused with a different pin.
@@ -20,7 +20,7 @@
 //!     [`Mode.build`] reuses the commit already recorded in the lock (and the
 //!     directory already in the cache) instead of touching the network. Only
 //!     [`Mode.update`] re-fetches a moving ref to advance it to its tip. This
-//!     is why `nova build` is offline once the lock exists, and why `nova
+//!     is why `kyte build` is offline once the lock exists, and why `kyte
 //!     update` is the one command that changes what a floating ref points at.
 //!
 //!   * **Resolution is a breadth-first worklist over sub-manifests.** Each
@@ -52,7 +52,7 @@ const pipeline = @import("pipeline.zig");
 const registry = @import("registry.zig");
 
 
-/// The user's home directory, used as the root of the `~/.nova` cache tree.
+/// The user's home directory, used as the root of the `~/.kyte` cache tree.
 ///
 /// Reads `HOME` first (POSIX), then `USERPROFILE` (Windows), and falls back to
 /// `/` if neither is set. Environment must be read from [`init.environ_map`] in
@@ -61,12 +61,12 @@ fn homePath(init: std.process.Init) []const u8 {
     return init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
 }
 
-/// Builds the `~/.nova/cache` directory path where all fetched dependencies live.
+/// Builds the `~/.kyte/cache` directory path where all fetched dependencies live.
 ///
 /// Allocates the joined path with `allocator`; callers own the result. The
 /// directory itself is created lazily by [`fetchDep`], not here.
 fn cacheRoot(allocator: std.mem.Allocator, init: std.process.Init) ![]const u8 {
-    return std.fs.path.join(allocator, &[_][]const u8{ homePath(init), ".nova", "cache" });
+    return std.fs.path.join(allocator, &[_][]const u8{ homePath(init), ".kyte", "cache" });
 }
 
 /// A dependency string split into its git URL and optional pinned ref.
@@ -109,7 +109,7 @@ fn cacheDirName(allocator: std.mem.Allocator, name: []const u8, sha: ?[]const u8
 /// is available.
 ///
 /// Trims trailing slashes, takes the final path segment, and strips a `.git`
-/// suffix, so `https://host/org/nova-http.git/` yields `nova-http`. Returns
+/// suffix, so `https://host/org/kyte-http.git/` yields `kyte-http`. Returns
 /// `null` when there is no `/` to split on or the segment is empty. Only used
 /// when a dependency's `project.json` name cannot be read (see
 /// [`readDeclaredName`]).
@@ -297,7 +297,7 @@ const Fetched = struct { name: []const u8, sha: ?[]const u8, dir: []const u8 };
 
 /// Clones a dependency into the shared cache and returns where it landed.
 ///
-/// Clones into a scratch `~/.nova/cache/.fetch-tmp`, then either checks out the
+/// Clones into a scratch `~/.kyte/cache/.fetch-tmp`, then either checks out the
 /// requested `checkout_target` (a full-history clone is used so any ref is
 /// reachable) or, for a floating dependency, takes a `--depth 1` shallow clone
 /// of the default branch. The declared name and HEAD SHA are read from the
@@ -344,7 +344,7 @@ fn fetchDep(allocator: std.mem.Allocator, init: std.process.Init, url: []const u
 const Mode = enum {
     /// Reproducible resolution: reuse locked commits and cached checkouts,
     /// touch the network only for genuinely new dependencies. The mode used by
-    /// every `nova build` and by [`cmdRestore`] / [`cmdGet`].
+    /// every `kyte build` and by [`cmdRestore`] / [`cmdGet`].
     build,
     /// Advance floating refs to their current tip and rewrite the lock. The
     /// mode used by [`cmdUpdate`], optionally narrowed to a single URL.
@@ -368,7 +368,7 @@ fn readManifestDeps(allocator: std.mem.Allocator, io: std.Io, manifest_path: []c
 ///
 /// A `registry` value with no `://` is treated as an already-local path and
 /// returned verbatim. A URL is cloned (shallow) into
-/// `~/.nova/registry-cache/<name>` on first use and that path is reused
+/// `~/.kyte/registry-cache/<name>` on first use and that path is reused
 /// afterwards. Returns `null` at every failure point (no manifest, no
 /// `registry` key, clone failure), which makes registry resolution a strict
 /// opt-in: absent a registry, [`resolveTree`] passes dependency strings through
@@ -379,7 +379,7 @@ fn registryIndexDir(allocator: std.mem.Allocator, init: std.process.Init) ?[]con
     const reg = parsed.value.registry orelse return null;
     if (std.mem.indexOf(u8, reg, "://") == null) return reg;
     const home = homePath(init);
-    const cache = std.fs.path.join(allocator, &[_][]const u8{ home, ".nova", "registry-cache" }) catch return null;
+    const cache = std.fs.path.join(allocator, &[_][]const u8{ home, ".kyte", "registry-cache" }) catch return null;
     Io.Dir.createDirPath(.cwd(), init.io, cache) catch {};
     const name = repoNameFromUrl(reg) orelse "index";
     const dir = std.fs.path.join(allocator, &[_][]const u8{ cache, name }) catch return null;
@@ -516,14 +516,14 @@ fn lockEquals(a: []const LockEntry, b: []const LockEntry) bool {
 }
 
 
-/// Implements `nova restore`: resolve the graph and (re)write the lock.
+/// Implements `kyte restore`: resolve the graph and (re)write the lock.
 ///
 /// Errors out with a message if there is no `project.json`. Unlike
 /// [`ensureDependencies`], it always writes the lock and prints a count, since
 /// restoring is an explicit user request to reconcile the cache and lock.
 pub fn cmdRestore(allocator: std.mem.Allocator, init: std.process.Init) !void {
     Io.Dir.access(.cwd(), init.io, "project.json", .{}) catch {
-        std.debug.print("Error: project.json not found. Run 'nova init' first.\n", .{});
+        std.debug.print("Error: project.json not found. Run 'kyte init' first.\n", .{});
         return;
     };
     const entries = try resolveTree(allocator, init, .build, null);
@@ -531,7 +531,7 @@ pub fn cmdRestore(allocator: std.mem.Allocator, init: std.process.Init) !void {
     std.debug.print("Restored {d} dependenc{s} (locked).\n", .{ entries.len, if (entries.len == 1) "y" else "ies" });
 }
 
-/// Implements `nova get [<dependency>]`: add a dependency to the manifest and
+/// Implements `kyte get [<dependency>]`: add a dependency to the manifest and
 /// re-resolve, or restore when called with no argument.
 ///
 /// With fewer than three args (no dependency named) it delegates to
@@ -545,7 +545,7 @@ pub fn cmdGet(allocator: std.mem.Allocator, init: std.process.Init, args: []cons
     const new_dep = args[2];
 
     const json_data = Io.Dir.readFileAlloc(.cwd(), init.io, "project.json", allocator, .unlimited) catch {
-        std.debug.print("Error: project.json not found in current directory. Run 'nova init' first.\n", .{});
+        std.debug.print("Error: project.json not found in current directory. Run 'kyte init' first.\n", .{});
         return;
     };
     const parsed = std.json.parseFromSlice(pipeline.ProjectJson, allocator, json_data, .{ .ignore_unknown_fields = true }) catch |err| {
@@ -578,7 +578,7 @@ pub fn cmdGet(allocator: std.mem.Allocator, init: std.process.Init, args: []cons
     std.debug.print("Added {s}; resolved {d} dependenc{s} into the lock.\n", .{ new_dep, entries.len, if (entries.len == 1) "y" else "ies" });
 }
 
-/// Implements `nova update [<url>]`: advance floating refs to their tip and
+/// Implements `kyte update [<url>]`: advance floating refs to their tip and
 /// rewrite the lock.
 ///
 /// With a URL argument only that dependency is advanced; without one, all
@@ -600,10 +600,10 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, init: std.process.Init, args: []c
     }
 }
 
-/// Implements `nova publish`: tag the current commit as a release and push the
+/// Implements `kyte publish`: tag the current commit as a release and push the
 /// tag.
 ///
-/// Publishing a Nova package IS creating a git tag; there is no upload to a
+/// Publishing a Kyte package IS creating a git tag; there is no upload to a
 /// server. The guardrails, all of which must pass, are:
 ///   * `project.json` must set `"type": "library"` (only libraries publish) and
 ///     a non-empty `repository` URL (the canonical clone URL consumers use);
@@ -613,7 +613,7 @@ pub fn cmdUpdate(allocator: std.mem.Allocator, init: std.process.Init, args: []c
 ///     both are recoverable and the tag still captures a real commit.
 ///
 /// On success it creates an annotated tag, pushes it to `origin`, and prints
-/// the `nova get <repo>#<tag>` line consumers use. Returns
+/// the `kyte get <repo>#<tag>` line consumers use. Returns
 /// `error.NotALibrary`, `error.NoRepository` or `error.TagExists` for the hard
 /// failures above.
 pub fn cmdPublish(allocator: std.mem.Allocator, init: std.process.Init) !void {
@@ -651,7 +651,7 @@ pub fn cmdPublish(allocator: std.mem.Allocator, init: std.process.Init) !void {
     const msg = try std.fmt.allocPrint(allocator, "{s}", .{tag});
     try runGit(init, &[_][]const u8{ "git", "tag", "-a", tag, "-m", msg });
     try runGit(init, &[_][]const u8{ "git", "push", "origin", tag });
-    std.debug.print("Published {s}. Consume with:\n  nova get {s}#{s}\n", .{ tag, m.repository.?, tag });
+    std.debug.print("Published {s}. Consume with:\n  kyte get {s}#{s}\n", .{ tag, m.repository.?, tag });
 }
 
 /// Reports whether `v` looks like a bare `X.Y.Z` semver (digits and exactly two

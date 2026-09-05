@@ -1,6 +1,6 @@
 # Open-gaps register (2026-08-16)
 
-The honest list of what is still worth closing on Nova, after the OSSA-lite ownership verifier landed and
+The honest list of what is still worth closing on Kyte, after the OSSA-lite ownership verifier landed and
 the ARC-optimisation perf question was measured and closed this session. This is a *map*, not a promise:
 nothing here is called "done" — done is what you verify with the command each item names.
 
@@ -17,9 +17,9 @@ error is kept visible here because the register's value is its honesty.
 ---
 
 ## A. Ownership IR (Gap 1 soundness + Gap 3 perf) — the one-gap reframing. LARGELY CLOSED.
-The reframing (`swift-arch-comparison.md`) established these were one gap: Nova had no ownership IR.
+The reframing (`swift-arch-comparison.md`) established these were one gap: Kyte had no ownership IR.
 - ✅ **Soundness verifier — delivered + gated.** OSSA-lite lowering + release-balance verifier over
-  **100% of functions**, 0 false positives, non-vacuous (8 verifier unit tests). `NOVA_OSSA=hard` fails
+  **100% of functions**, 0 false positives, non-vacuous (8 verifier unit tests). `KYTE_OSSA=hard` fails
   the build on a proven leak/double-free; wired into `gate.sh` via `conformance/ossa-gate.sh`. **[verified]**
   Verify: `bash conformance/ossa-gate.sh` → `ossa gate: 0 release imbalances OK`.
 - ⚠️ **Verifier completeness hole (open).** Destructured bindings (`let {a,b} = …`) are untracked, so a
@@ -27,17 +27,17 @@ The reframing (`swift-arch-comparison.md`) established these were one gap: Nova 
   possible leak". Sound (never false-accuses); incomplete. **[verified]**
   Close it: track per-binding ownership for destructuring (needs per-binding type info in the lowering).
 - ⚠️ **Gate breadth (open, minor).** `ossa-gate.sh` runs 6 type-heavy cases (each pulls in the full
-  stdlib). Could widen the case list or make `NOVA_OSSA=hard` a dedicated CI leg over the whole corpus.
+  stdlib). Could widen the case list or make `KYTE_OSSA=hard` a dedicated CI leg over the whole corpus.
   A full-corpus sweep this session confirmed **0 imbalances across 329 cases** (`bad=[]`), so the hard gate
   cannot false-fail a legitimate build and widening the gate's case list is safe. **[verified]**
 - ✅ **Perf (Gap 3) — CLOSED as resolved (2026-08-16), not deferred.** Optimiser scrapped; two independent
   measurements (E2 borrow-skip at the LLVM level, Track A redundant-copy on the OSSA IR) both found ~0
-  headroom, re-verified fresh on `13_serde` (borrow-skip 0/0, forwarding 0/0). Nova's ARC cost is
+  headroom, re-verified fresh on `13_serde` (borrow-skip 0/0, forwarding 0/0). Kyte's ARC cost is
   fundamental per-object retain/release; forwarding cannot remove it; LLVM O3 already gives competitive
   codegen. The only remaining perf lever = per-request allocation COUNT = Gap 5 (below).
   Full closure of record: `done/gap3-closed.md`. **[verified]**
 - 🔧 **Perf (Gap 5, allocation count) — ACTIVE (reopened 2026-08-16).** "Beating Rust/Go is not a stop
-  condition." Built an allocation-count harness (`NOVA_ALLOC_COUNT` / `nova_alloc_total`). Measured profile:
+  condition." Built an allocation-count harness (`KYTE_ALLOC_COUNT` / `kyte_alloc_total`). Measured profile:
   collections ~0 allocs/op, strings ~1/op (builder remedy), JSON parse+bind = the hotspot. **Win #1 landed:
   lazy JsonValue arr/obj → 114 → 58 allocs/parse (49%), all serde cases green, ASAN + ARC audit clean.**
   Targeted + measure-first (the P7 blanket arena stays scrapped; escape-arena is low-headroom at 4% local).
@@ -60,13 +60,13 @@ re-opened by mistake. Reverify a specific one only if it resurfaces.
   a running `mongod` + a concurrent app; the fix + bench are the evidence of record.
 - **Value-optional PARAM present-0-as-absent variant** — **RESOLVED (re-run, not recall).** A present
   `0`/`false`/`0.0` passed as a value-optional ARG reads PRESENT (the R2/C10 param-ABI fix covers it). Now a
-  permanent regression guard: `127_value_optional_zero.nova` `test_param_widths`. Both are beta-checklist
+  permanent regression guard: `127_value_optional_zero.ky` `test_param_widths`. Both are beta-checklist
   item 3 (`docs/design/beta-checklist.md`), now green.
 
 ## C. Tooling (Gap 5) — **[register]**
 - **Package manager — IMPLEMENTED (2026-08-18).** The git-clone stub is replaced by the full
   `pkg-manager.md` design: `project.lock.json` (flat, declared name + resolved SHA per dep), version-keyed
-  cache `~/.nova/cache/<name>-<sha8>`, transitive cache-deduped resolution, build-honors-lock, `get`/
+  cache `~/.kyte/cache/<name>-<sha8>`, transitive cache-deduped resolution, build-honors-lock, `get`/
   `restore`/`update`/`publish`, and version-aware per-owner import resolution (multi-version coexistence +
   name-collision guard). All six §10 acceptance items pass locally (`conformance/pkg-acceptance.sh`, no
   network); wired into `gate.sh`. **[verified]**
@@ -104,18 +104,18 @@ Earlier text here claimed a missing static-LLVM mirror was the root gap. That wa
 
 | Bundle | Link | End-user gets |
 |---|---|---|
-| macOS arm64 | **static** (`-Dstatic-llvm`) | single self-contained `nova` |
-| macOS x86_64 | **static** | single self-contained `nova` |
-| Linux x86_64 | **static** | single self-contained `nova` |
-| Linux arm64 | **static** | single self-contained `nova` |
-| Windows x86_64 | dynamic + **bundled `LLVM-C.dll`** | `nova.exe` + dll, one zip |
-| Windows arm64 | dynamic + bundled dll | `nova.exe` + dll, one zip |
+| macOS arm64 | **static** (`-Dstatic-llvm`) | single self-contained `kyte` |
+| macOS x86_64 | **static** | single self-contained `kyte` |
+| Linux x86_64 | **static** | single self-contained `kyte` |
+| Linux arm64 | **static** | single self-contained `kyte` |
+| Windows x86_64 | dynamic + **bundled `LLVM-C.dll`** | `kyte.exe` + dll, one zip |
+| Windows arm64 | dynamic + bundled dll | `kyte.exe` + dll, one zip |
 
 The LTO-bitcode blocker is resolved (`convert-drop-to-native.sh`); CI static-links the OS package manager's
 `libLLVM*.a` (no mirror needed — the old fetched `llvm-dist` was removed on purpose). Web developers download
 an archive and never install LLVM. Remaining is **polish only**: (1) Windows single-file static (optional —
 the bundle is still one download), (2) un-hardcode `build.zig`'s local `static_llvm_prefix` (cosmetic; CI
-overrides via `NOVA_LLVM_PREFIX`), (3) verify `nls` is inside the release archives. See
+overrides via `KYTE_LLVM_PREFIX`), (3) verify `nls` is inside the release archives. See
 `remaining-gaps-design.md` Gap 2. Contributor DEV builds use dynamic system LLVM (fast); only release is static.
 
 ## Appendix 2 — optimiser switches vs `--release`

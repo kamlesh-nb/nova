@@ -3,7 +3,7 @@
 Status: proposed (2026-08-12). Author: performance investigation off the pizzahub driver benchmark.
 
 This document collects the follow-on refinements found while profiling the pizzahub web benchmark: revising
-the pure-Nova TLS record layer and DEFLATE compressor, the shared `mem` byte and bit builtins they both need,
+the pure-Kyte TLS record layer and DEFLATE compressor, the shared `mem` byte and bit builtins they both need,
 and a cleanup sweep that removes the parked per-request region arena that the same investigation concluded is
 not worth completing.
 
@@ -14,22 +14,22 @@ The SQL Server driver looked "almost dead" in the pizzahub web benchmark (about 
 protocol or the driver at all. SQL Server forces the connection to be encrypted, while the Postgres and MySQL
 runs were plaintext on the local socket, so mssql alone was paying a TLS tax. Turning encryption off took the
 same driver from 88 to 905 requests per second on `/products` and from 2,150 to 9,962 on `/categories`, a
-10x and 4.6x jump. So around 90 percent of the "deadness" was Nova's TLS record layer, not the database.
+10x and 4.6x jump. So around 90 percent of the "deadness" was Kyte's TLS record layer, not the database.
 
 That raised a fair question from the review: is our TLS poorly written, the same way our DEFLATE is? This
 document records the profiling that answers it for both, separates the part that is a naive-algorithm problem
-(fixable in pure Nova today) from the part that needs hardware acceleration (a codegen feature), and proposes
+(fixable in pure Kyte today) from the part that needs hardware acceleration (a codegen feature), and proposes
 a concrete revision plan for each.
 
-Both subsystems are pure Nova by design. wolfSSL and wolfCrypt were retired so the runtime carries no native
-crypto dependency. That decision is sound, but it means the crypto and compression inner loops are Nova code
+Both subsystems are pure Kyte by design. wolfSSL and wolfCrypt were retired so the runtime carries no native
+crypto dependency. That decision is sound, but it means the crypto and compression inner loops are Kyte code
 compiled through LLVM, with no access to hardware instructions unless the compiler exposes them. The findings
 below fall into two buckets that matter for planning:
 
 - Software wins: the code uses a correct but slow reference algorithm where a faster, still-portable
-  algorithm exists. Fixable now, in Nova, with no compiler change.
+  algorithm exists. Fixable now, in Kyte, with no compiler change.
 - Hardware wins: the operation is fundamentally bounded by instructions the CPU has (AES-NI, carryless
-  multiply, SIMD) that Nova cannot yet emit. These need a codegen intrinsics feature and are a later, larger
+  multiply, SIMD) that Kyte cannot yet emit. These need a codegen intrinsics feature and are a later, larger
   investment.
 
 ## How the numbers were taken
@@ -53,10 +53,10 @@ Granular per sub-item so "what is done" is unambiguous. Status: `not started`, `
 | ID | Item | Priority | Status |
 |----|------|----------|--------|
 | A-1 | Fail-closed soundness pass (checker + codegen loud on unresolved type) | P0 | done (3 defects landed with expect_fail guards; slice 7/7; corpus green) |
-| A-2 | Parse-family (parseInt/parseLong/parseDouble optionals) + small stdlib gaps | P0 | done (optionals + exponent grammar in std/string.nova; parseI64/parseFloat kept for drivers) |
-| **FR-mem-1** | `mem.load<T>` / `mem.store<T>` + `Endian` enum (Tier 1 builtins) | P2 | done (compiler builtins: sema/infer.zig types the return from T, codegen/expressions.zig compileMemCall lowers to unaligned load/store + compile-time-folded byte swap; Endian enum in std/mem/endian.nova; verified LE/BE + signedness across byte..long in corpus case 322; corpus 326/327, only the off-platform epoll case failing) |
+| A-2 | Parse-family (parseInt/parseLong/parseDouble optionals) + small stdlib gaps | P0 | done (optionals + exponent grammar in std/string.ky; parseI64/parseFloat kept for drivers) |
+| **FR-mem-1** | `mem.load<T>` / `mem.store<T>` + `Endian` enum (Tier 1 builtins) | P2 | done (compiler builtins: sema/infer.zig types the return from T, codegen/expressions.zig compileMemCall lowers to unaligned load/store + compile-time-folded byte swap; Endian enum in std/mem/endian.ky; verified LE/BE + signedness across byte..long in corpus case 322; corpus 326/327, only the off-platform epoll case failing) |
 | **FR-mem-2** | `rotl` / `rotr` / `ctz` / `clz` / `bswap` scalar bit builtins (Tier 2) | P2 | done (rotl/rotr lower to llvm.fshl/fshr, ctz/clz to llvm.cttz/ctlz, bswap reuses the folded byte-reverse; return-type from T in sema/infer.zig, ctz/clz return int; verified across u32/u64/u16 in corpus case 323; corpus 327/328, only the off-platform epoll case failing) |
-| **FR-mem-3** | `xorBytes(dst,a,b,len)` (Tier 3, AES-GCM keystream/tag XOR) | P2 | done (mem.xorBytes builtin -> nova_mem_xor runtime helper, word-at-a-time with a byte tail; non-generic so typed void via the builtins table; verified full-word / word+tail / in-place-alias in corpus case 324) |
+| **FR-mem-3** | `xorBytes(dst,a,b,len)` (Tier 3, AES-GCM keystream/tag XOR) | P2 | done (mem.xorBytes builtin -> kyte_mem_xor runtime helper, word-at-a-time with a byte tail; non-generic so typed void via the builtins table; verified full-word / word+tail / in-place-alias in corpus case 324) |
 | **FR-mem-4** | Reconcile `bytes.read_i32`/`write_i32` through `mem.load/store<int>` | P3 | done (the bytes.* raw accessors emit byte-identical IR to mem.load/store<int> with Endian.little on a little-endian host; documented the equivalence at codegen/expressions.zig read_i32 and kept both, the bytes.* terse fast path and the mem.* endianness-explicit superset, rather than adding call indirection for zero IR change) |
 | **FR-deflate-3** | Best-length-first skip in the chain walk | P2 | done (zlib's data[cand+bestLen]/[-1] pre-check kills most candidates before any full compare; output is bit-identical because the full loop already keeps the nearest match of a given length via l>bestLen, so rejecting non-beating candidates changes nothing chosen; verified by corpus 320 roundtrip + external system gunzip on the 24964-byte source, byte-identical) |
 | **FR-deflate-4** | SWAR word-at-a-time match extension (64-bit load + ctz) | P2 | done (mem.load<ulong> both sides + XOR; a full 8-byte window advances l by 8, a mismatch takes mem.ctz(x)>>3 low matching bytes then the byte tail finishes; window guarded by l+8<=maxLen so no over-read past n; byte-identical output, verified corpus 320 long-match SWAR guard + external gunzip) |
@@ -64,16 +64,16 @@ Granular per sub-item so "what is done" is unambiguous. Status: `not started`, `
 | **FR-tls-1** | Shoup-table GHASH (4-bit table, per-key) | P2 | done (per-key 16-entry product table + 16-entry reduction table built from the verified single-bit mulX, so correct by construction; hot path is 32 nibble steps of a 4-bit shift + two block XORs vs 128 single-bit steps; GCM Test Case 2 + reference vectors + AEAD/TLS cases 222/223/230/231/235 all green, byte-identical, ARC delta zero) |
 | **FR-tls-2** | Cache AES key schedule + H (+ GHASH table) per cipher context | P2 | done (aesgcm.GcmContext caches the AES key schedule + H + GHASH tables; seal/open free fns are now one-shot wrappers over it; TLS 1.2 client (client12, the mssql TDS path that motivated the whole TLS finding) holds a per-direction context built lazily and reused for every record, so setup is paid once per connection not per record; verified 223/230/231/235/251 + client12 record roundtrip, corpus 328/329. TLS 1.3's rotating-epoch keys can adopt the same primitive per epoch) |
 | **FR-simd-L1** | Integer-vector SIMD (u8x16/u32x4/u64x2 + ops + movemask) | P3 | done (real vector types: encoded with a bijective bits sentinel elemBits*1000+lanes so the three 128-bit vectors do not collide, decoded to a name in renderLegacy and to an LLVM `<lanes x iN>` in the codegen slot picker; builtins u8x16/u32x4/u64x2 with splat/load/store/add/sub/and/or/xor/eq/shl/shr + movemaskU8x16, lowered natively in codegen compileIntSimd; load/store move a lane group to/from a byte buffer at a byte offset. Verified corpus case 330 across all three widths incl. eq->movemask=0x88 and shifts; ASAN-clean) |
-| **FR-simd-L2** | Target crypto intrinsics (PCLMULQDQ / ARM pmull) + fallback | P3 | done for the carryless-multiply GHASH accelerator (simd.clmulU64x2(a,b) -> u64x2, target-selected from the triple: llvm.aarch64.neon.pmull64 on ARM, llvm.x86.pclmulqdq on x86, portable inline i128 software multiply otherwise; verified on the aarch64 host against known carryless products incl. clmul(3,3)=5 not 9 and 128-bit high-lane spillover, corpus case 331, ASAN-clean). AES-NI round intrinsics deferred: ARM aese+aesmc and x86 aesenc have different round semantics, so a uniform builtin needs per-target composition; the pure-Nova AES + Shoup GHASH remain the shipping fallback) |
-| **FR-arena** | Remove the parked per-request region arena (region.nova + runtime state) | P3 | done (deleted mem/region.nova + its std_modules entry, the Region machinery in alloc.cpp, and the per-coroutine region swap in concurrency.cpp; coroutine resume now runs the frame directly and coro frames are plain malloc/free; the synchronous request arena bytes.arenaMark/arenaReset is KEPT; corpus 328/329, reactor cases ASAN-clean) |
+| **FR-simd-L2** | Target crypto intrinsics (PCLMULQDQ / ARM pmull) + fallback | P3 | done for the carryless-multiply GHASH accelerator (simd.clmulU64x2(a,b) -> u64x2, target-selected from the triple: llvm.aarch64.neon.pmull64 on ARM, llvm.x86.pclmulqdq on x86, portable inline i128 software multiply otherwise; verified on the aarch64 host against known carryless products incl. clmul(3,3)=5 not 9 and 128-bit high-lane spillover, corpus case 331, ASAN-clean). AES-NI round intrinsics deferred: ARM aese+aesmc and x86 aesenc have different round semantics, so a uniform builtin needs per-target composition; the pure-Kyte AES + Shoup GHASH remain the shipping fallback) |
+| **FR-arena** | Remove the parked per-request region arena (region.ky + runtime state) | P3 | done (deleted mem/region.ky + its std_modules entry, the Region machinery in alloc.cpp, and the per-coroutine region swap in concurrency.cpp; coroutine resume now runs the frame directly and coro frames are plain malloc/free; the synchronous request arena bytes.arenaMark/arenaReset is KEPT; corpus 328/329, reactor cases ASAN-clean) |
 | **FR-safety-1** | `T?` sugar for `T \| undefined` | P1 | done (parser wraps a postfix `?` on a type into the same .optional node the union produces, so `string?` IS `string \| undefined`; works in return/param/field/let positions; verified corpus case 325. Surfaced a SEPARATE pre-existing crash: a value-optional call result passed directly as a nested arg, unrelated to the sugar, worked around in the case + logged) |
 | **FR-safety-2** | `defer` all-path cleanup (extends errdefer) | P1 | done (plain `defer expr;` was already implemented and runs on EVERY scope exit, in reverse declaration order; added corpus case 326 as the explicit all-path gate, proving it fires on the OK-return path where errdefer does not, on early and fall-through returns, and in reverse order; case 101 is the errdefer-only twin) |
 | **FR-safety-3** | Default trait-method bodies | P1 | done (already implemented: a trait method may carry a body, and parser expandTraitDefaults copies it onto any impl that does not override it, retyping self to the struct; verified corpus case 327 for default-used, override, and both reached through dyn dispatch on the trait object) |
-| **FR-safety-4** | Enforced exhaustive `switch` over enums | P1 | done (already enforced in type_checker.zig: an enum switch with no `default` that omits a variant is a compile error, and a GUARDED case correctly does NOT count as coverage `covers = case.guard == null`; added expect_fail/switch_non_exhaustive_enum.nova as the negative gate, classified typecheck) |
-| **FR-safety-5** | Error ergonomics: `try?` + `Result<T,E>` alias | P1 | done (`try? e` = parser sugar for `e catch undefined`, yielding `T \| undefined` that composes with `??`; plain `try` still propagates. `Result<T,E>` shipped as a value-struct in std/result with ok/err + map/flatMap/getOr/isErr, the value-style companion for callback/async seams since a bare union cannot carry methods and Nova has no type-alias facility. The explicit error marker is already the `T \| E` return. Verified corpus case 328) |
+| **FR-safety-4** | Enforced exhaustive `switch` over enums | P1 | done (already enforced in type_checker.zig: an enum switch with no `default` that omits a variant is a compile error, and a GUARDED case correctly does NOT count as coverage `covers = case.guard == null`; added expect_fail/switch_non_exhaustive_enum.ky as the negative gate, classified typecheck) |
+| **FR-safety-5** | Error ergonomics: `try?` + `Result<T,E>` alias | P1 | done (`try? e` = parser sugar for `e catch undefined`, yielding `T \| undefined` that composes with `??`; plain `try` still propagates. `Result<T,E>` shipped as a value-struct in std/result with ok/err + map/flatMap/getOr/isErr, the value-style companion for callback/async seams since a bare union cannot carry methods and Kyte has no type-alias facility. The explicit error marker is already the `T \| E` return. Verified corpus case 328) |
 | **FR-safety-6** | `@deprecated` attribute (warn + suggested replacement) | P1 | done (`@deprecated` or `@deprecated("use X instead")` on a function; the checker emits a yellow compile WARNING at each call site carrying the note, never an error, so the build proceeds; parsed in parseAttributes, warned in sema/infer warnIfDeprecated at bare-call resolution; verified corpus case 329, both note and bare forms warn and the callee still runs) |
 | aux-deflate-verify | Confirm DEFLATE byte-correctness / gzip interop before the perf rewrites | P2 | done (bidirectional system-gzip interop verified; corpus case 320 added as the regression guard the perf rewrites must not break) |
-| aux-wasm-gate | Restore the `--wasm-run` behavioural gate | P2 | done (harness env was missing nova_bytes_copy + nova_bytes_alloc_persistent_nz; added; instantiate restored. Residual: string.parseDouble asserts diverge under WASM, a narrow tracked wasm-float item) |
+| aux-wasm-gate | Restore the `--wasm-run` behavioural gate | P2 | done (harness env was missing kyte_bytes_copy + kyte_bytes_alloc_persistent_nz; added; instantiate restored. Residual: string.parseDouble asserts diverge under WASM, a narrow tracked wasm-float item) |
 
 ## Finding 1: TLS AES-GCM record layer
 
@@ -90,12 +90,12 @@ Three separate issues, in priority order.
 
 ### 1a. GHASH is the slowest possible multiply (software-fixable, biggest win)
 
-`crypto/mac/ghash.nova` `gmult` does the reference bitwise GF(2^128) multiply: for each of 16 bytes, for each
+`crypto/mac/ghash.ky` `gmult` does the reference bitwise GF(2^128) multiply: for each of 16 bytes, for each
 of 8 bits, it does two 16 byte inner passes (a masked XOR accumulate and a one-bit shift with reduction).
 That is roughly 128 iterations of 16 byte work per block, and it is 60 percent of the whole seal. A single
 128 bit multiply should not cost twice the AES rounds. The standard portable fix is Shoup's table method:
 precompute a small table from H once per connection (a 16 entry 4-bit table, or a 256 entry 8-bit table),
-then each block becomes a handful of table lookups and XORs. This is pure Nova, needs no hardware, and is
+then each block becomes a handful of table lookups and XORs. This is pure Kyte, needs no hardware, and is
 worth roughly 8x to 16x on GHASH.
 
 ### 1b. Key schedule and H are recomputed on every record (software-fixable)
@@ -109,7 +109,7 @@ once and cached alongside H.
 
 ### 1c. AES-CTR is bitsliced but single-block (partly software, mostly hardware)
 
-`crypto/cipher/aes.nova` `encryptBlock` uses a bitsliced, constant-time design (the `ortho`/`q` state). That
+`crypto/cipher/aes.ky` `encryptBlock` uses a bitsliced, constant-time design (the `ortho`/`q` state). That
 is a deliberate and reasonable choice, not sloppy code. Bitsliced AES is built to process two blocks in
 parallel (the `q` state has even and odd slots), but the current code fills only one and zeroes the other, so
 it wastes half the throughput. Doing two CTR blocks per call is a real software win of up to about 2x. The
@@ -117,7 +117,7 @@ large remaining gap to a native cipher needs AES-NI, which is a hardware intrins
 
 ## Finding 2: DEFLATE compression
 
-`compress/deflate.nova` `deflateRaw` is a standard hash-chain LZ77 with fixed Huffman output. Per-phase share:
+`compress/deflate.ky` `deflateRaw` is a standard hash-chain LZ77 with fixed Huffman output. Per-phase share:
 
 | input                                    | match search | Huffman emit plus hash update |
 |------------------------------------------|--------------|-------------------------------|
@@ -137,14 +137,14 @@ optimisations missing.
 The chain walk compares every candidate from offset zero with a byte-by-byte loop. zlib's key trick is to
 check `data[cand + bestLen]` against `data[pos + bestLen]` (and the byte before it) before doing any full
 compare, and to skip the candidate entirely if it cannot beat the current best match. On real data most
-candidates are rejected by this one comparison, which commonly cuts match search by 2x to 4x. Pure Nova, no
+candidates are rejected by this one comparison, which commonly cuts match search by 2x to 4x. Pure Kyte, no
 hardware.
 
 ### 2b. Byte-by-byte match extension instead of word at a time (software-fixable)
 
 The extension loop reads one byte at a time from both positions and compares. zlib reads a machine word (8
 bytes) from each side, XORs them, and counts the matching bytes from the trailing-zero count. On the long
-matches that HTML produces this is several times faster. In Nova this is reading `long` values and comparing,
+matches that HTML produces this is several times faster. In Kyte this is reading `long` values and comparing,
 a SWAR technique we already use elsewhere (the escape scanner). No hardware needed.
 
 ### 2c. Per-matched-byte hash update and bit-at-a-time Huffman output (software-fixable)
@@ -162,10 +162,10 @@ matter (small TLS records and real HTML), the majority of the cost is a correct-
 where a faster portable algorithm was never put in:
 
 - TLS: about 60 percent GHASH (bitwise) plus 16 percent per-record setup on small records is software-
-  fixable. That is roughly three quarters of the cost on the database and RPC shape, addressable in pure Nova
+  fixable. That is roughly three quarters of the cost on the database and RPC shape, addressable in pure Kyte
   with no compiler change.
 - DEFLATE: about 56 to 81 percent match search, most of which is addressable by the best-length skip and
-  word-at-a-time compare, again pure Nova.
+  word-at-a-time compare, again pure Kyte.
 
 The remainder (native-speed AES, native-speed carryless multiply) is a genuine hardware gap that a codegen
 intrinsics feature would close later.
@@ -173,8 +173,8 @@ intrinsics feature would close later.
 ## Foundation: the `mem` byte and bit builtins
 
 Both Phase A plans lean on the same low-level operations, and today every crypto, compression, and database
-wire-codec module hand-rolls them as byte-at-a-time loops. `aes.nova` has its own `le32` and `putLe32`,
-`deflate.nova` has `wr16`/`rd16`/`wr32`/`rd32`, GCM does big-endian lengths by hand, and each of the four
+wire-codec module hand-rolls them as byte-at-a-time loops. `aes.ky` has its own `le32` and `putLe32`,
+`deflate.ky` has `wr16`/`rd16`/`wr32`/`rd32`, GCM does big-endian lengths by hand, and each of the four
 database drivers repeats the same little-endian and big-endian reads. Every one of these compiles to a loop
 of `read_byte` calls with shifts, when the CPU can do the whole read as one wide load and an optional byte
 swap. So before the algorithm rewrites, we add a small set of shared compiler builtins that lower to one or
@@ -182,7 +182,7 @@ two LLVM instructions each. They replace the hand-rolled copies with one fast pr
 Phase A fixes stand on: the deflate word-at-a-time compare needs a 64-bit load plus a trailing-zero count,
 GHASH and the SHA family need rotations, and the whole record layer needs endian-aware reads and writes.
 
-Nova's integer types carry both width and signedness (`byte`/`ubyte`, `short`/`ushort`, `int`/`uint`,
+Kyte's integer types carry both width and signedness (`byte`/`ubyte`, `short`/`ushort`, `int`/`uint`,
 `long`/`ulong`, mapped in `sema/lower.zig` to a width in bits and a sign flag), so a single generic surface
 over `T` covers every case. This mirrors the existing generic intrinsics `serde.bindRow<T>` and
 `serde.bindWire<T>`, which already resolve their return type from the type argument in `sema/infer.zig`.
@@ -190,7 +190,7 @@ over `T` covers every case. This mirrors the existing generic intrinsics `serde.
 ### Surface
 
 ```
-enum Endian { little, big }        // a normal Nova enum in the mem stdlib module
+enum Endian { little, big }        // a normal Kyte enum in the mem stdlib module
 
 mem.load<T>(p: ptr, off: int, e: Endian): T            // zero-alloc typed read; T fixes width + signedness
 mem.store<T>(p: ptr, off: int, v: T, e: Endian): void  // zero-alloc typed write into an existing buffer
@@ -221,7 +221,7 @@ the hot path, since a malloc per record or per byte is exactly what makes the cu
 The implementation follows the serde-intrinsic pattern: a checker special case in `sema/infer.zig` that
 resolves the return type from the type argument, plus a lowering in `codegen/expressions.zig` that reads the
 width and sign flag already available from `sema/lower.zig`. No new type-system work is needed; the `simd`
-builtins and the serde intrinsics are the templates. The `Endian` enum itself is a normal Nova enum in a
+builtins and the serde intrinsics are the templates. The `Endian` enum itself is a normal Kyte enum in a
 `mem` stdlib module; `load`, `store`, `rotl` and the rest are the compiler-recognised generic builtins.
 
 ### Signedness is a free correctness win
@@ -243,9 +243,9 @@ as thin aliases, so there is a single story for typed reads and writes.
 
 ## Proposed work
 
-### Phase A: pure-Nova algorithm fixes on top of the mem builtins
+### Phase A: pure-Kyte algorithm fixes on top of the mem builtins
 
-These are the algorithm rewrites. They are pure Nova and depend only on the `mem` builtins above (the one
+These are the algorithm rewrites. They are pure Kyte and depend only on the `mem` builtins above (the one
 small compiler addition); no other compiler change is needed.
 
 TLS:
@@ -266,7 +266,7 @@ similar multiple on compress throughput, which helps HTTP response gzip across t
 
 ### Phase B: the SIMD facility (compiler feature, larger)
 
-The remaining native-speed gap (byte scanning, AES rounds, carryless multiply) is closed by giving Nova a
+The remaining native-speed gap (byte scanning, AES rounds, carryless multiply) is closed by giving Kyte a
 proper SIMD facility. This is not new ground: the compiler already has a working SIMD path. The `f64x4`
 builtins map the type name to `LLVMVectorType(LLVMDoubleType(), 4)` in `codegen/types.zig`, keep vector
 values in their own `<4 x double>` local slots so they stay in NEON or SSE registers, and lower the `simd.*`
@@ -275,7 +275,7 @@ codegen-only vector facility (the vector is a recognised builtin-slot type, not 
 which is exactly why extending it is cheap: add a type name, map it to an LLVM vector, add the ops. Adding
 SIMD is two layers on top of that proven mechanism.
 
-Everything stays pure Nova with no C dependency: the vector types and the crypto intrinsics lower straight
+Everything stays pure Kyte with no C dependency: the vector types and the crypto intrinsics lower straight
 through LLVM, and the Phase A scalar and SWAR versions remain the fallback on targets that lack the
 instructions.
 
@@ -292,7 +292,7 @@ Add integer vector types the same way `f64x4` was added: `u8x16`, `u32x4`, `u64x
 The compare-plus-movemask pair is the one thing SWAR cannot do well, and it is what makes true `memchr`,
 `eql`, and case-fold run at 16 bytes per instruction, with a `ctz` on the mask giving the exact match offset.
 This layer is portable: LLVM lowers `<16 x i8>` to SSE, NEON, or scalar depending on the target, so the
-fallback is automatic and no target detection is needed. It accelerates the `string.nova` scanning functions
+fallback is automatic and no target detection is needed. It accelerates the `string.ky` scanning functions
 beyond SWAR, the DEFLATE match compare, and it is the substrate the crypto vectors sit on.
 
 #### Layer 2: target-specific crypto intrinsics
@@ -304,7 +304,7 @@ On the vector types, expose the actual crypto instructions, which are themselves
 - the ARM equivalents (the `crypto` AES instructions and `pmull`).
 
 These are target-specific, so they need a compile-time target check plus a fallback. The fallback is exactly
-the pure-Nova software work from Phase A (Shoup-table GHASH, bitsliced AES), so that effort is not wasted: it
+the pure-Kyte software work from Phase A (Shoup-table GHASH, bitsliced AES), so that effort is not wasted: it
 becomes the portable path. This layer is what takes AES-GCM from the software ceiling to native speed and, on
 the mssql shape, from the low hundreds of requests per second toward the no-crypto ceiling of around 900.
 
@@ -314,7 +314,7 @@ the mssql shape, from the low hundreds of requests per second toward the no-cryp
   performance. A fully general portable-SIMD type (`Vec<T, N>`, in the style of Rust's `std::simd`) is a much
   larger language feature and is not needed for any of these goals.
 - WASM has its own 128-bit SIMD that LLVM can target; treat it as later surface, not a blocker.
-- Do Layer 1 first (proven by `f64x4`, fully portable, immediately useful for `string.nova` and DEFLATE),
+- Do Layer 1 first (proven by `f64x4`, fully portable, immediately useful for `string.ky` and DEFLATE),
   then Layer 2 on top (the crypto ceiling, target-gated with the Phase A software fallback).
 
 ## Cleanup sweep: remove the parked per-request region arena
@@ -324,7 +324,7 @@ whether completing it would help, and concluded it would not, at least not as th
 
 - The lever it targeted, per-request ARC and malloc churn, was real when the P7 doc was written, but most of
   it has since been captured by a different, sound technique: the wire-to-struct decode plus `str.Str`
-  borrowing. That work cut `nova_release` from about 959 to 267 and RSS from 37 to 21 MB by not materialising
+  borrowing. That work cut `kyte_release` from about 959 to 267 and RSS from 37 to 21 MB by not materialising
   the per-row object graph, and it is why `/products` now beats Rust. So the arena would be fighting for a
   much smaller residual.
 - The sound version needs an analysis we do not have. The shipped escape gauge, run on the current app,
@@ -342,22 +342,22 @@ borrow-not-materialise plus the crypto and compression primitives above for furt
 
 ### Keep
 
-- `src/std/io/arena.nova` `Arena` (the per-COROUTINE bump allocator). This is not the failed experiment. It
+- `src/std/io/arena.ky` `Arena` (the per-COROUTINE bump allocator). This is not the failed experiment. It
   is a working, tested, live feature used by conformance cases 191 and 318, a general-purpose scratch
   allocator for raw bytes, sound and orthogonal to the ARC-churn problem.
 
 ### Remove (the per-REQUEST region, never completed and inert)
 
-- `src/std/mem/region.nova` (the `runStr` synchronous region scope). Dead, zero callers.
-- In `src/runtime/concurrency.cpp`: `nova_web_region_enter`, `nova_web_region_exit`,
-  `nova_coro_region_track`, `nova_coro_region_untrack`, the `g_region_active` / `g_coro_region` state, and the
+- `src/std/mem/region.ky` (the `runStr` synchronous region scope). Dead, zero callers.
+- In `src/runtime/concurrency.cpp`: `kyte_web_region_enter`, `kyte_web_region_exit`,
+  `kyte_coro_region_track`, `kyte_coro_region_untrack`, the `g_region_active` / `g_coro_region` state, and the
   per-resume region swap inside `raw_coro_resume`. This is inert (`g_region_active` never becomes true), and
   it sits in the single hottest and most delicate runtime function. Removing it simplifies the resume path
   back to `set current coro, run, restore`.
-- In `src/runtime/alloc.cpp`: the region primitives `nova_region_new` / `set` / `current` / `free` / `gen`
+- In `src/runtime/alloc.cpp`: the region primitives `kyte_region_new` / `set` / `current` / `free` / `gen`
   and `region_alloc`, once the concurrency.cpp callers above are gone and nothing else references them.
 - `src/sema/escape.zig` (the report-only escape gauge) and its wiring in `src/main.zig` (the import plus the
-  two `NOVA_ESCAPE_REPORT` call sites). The gauge drives nothing, and its own design admits function-escape
+  two `KYTE_ESCAPE_REPORT` call sites). The gauge drives nothing, and its own design admits function-escape
   is the wrong granularity for the real opportunity, so a clean sweep is better than carrying a pass that
   points at the wrong question. If a future Stage 3 ARC-elision is ever wanted, it is a fresh analysis
   anyway, not this one.
@@ -365,8 +365,8 @@ borrow-not-materialise plus the crypto and compression primitives above for furt
 ### Procedure and verification
 
 - First confirm nothing live references the removed symbols: grep the stdlib and runtime for `region.run`,
-  `runStr`, `nova_web_region`, `nova_coro_region`, `nova_region_`, `region_alloc`, and `sema_escape` /
-  `NOVA_ESCAPE_REPORT`, and confirm the only hits are the definitions and the call sites being removed.
+  `runStr`, `kyte_web_region`, `kyte_coro_region`, `kyte_region_`, `region_alloc`, and `sema_escape` /
+  `KYTE_ESCAPE_REPORT`, and confirm the only hits are the definitions and the call sites being removed.
 - Do it as ONE isolated commit, not bundled with the TLS, DEFLATE, or builtins work, because the resume path
   is delicate.
 - Rebuild, then run the full corpus (`conformance/run.sh -j`) plus the ASAN gate (`conformance/run.sh
@@ -391,7 +391,7 @@ borrow-not-materialise plus the crypto and compression primitives above for furt
 ## Broader refinement backlog (beyond performance)
 
 The performance work above is bounded and well understood, but it is not the most important thing to refine.
-This section records the wider gaps, in priority order. The headline: for a language at Nova's stage, which
+This section records the wider gaps, in priority order. The headline: for a language at Kyte's stage, which
 is feature-rich but still ALPHA on correctness, soundness matters more than more performance or more
 features. A language that segfaults on a valid program cannot credibly call itself Beta, and it undermines
 every other investment.
@@ -409,23 +409,23 @@ The notes trace the shared root to the codegen still carrying type identity as S
 dispatch, and ARC by comparing type-name strings) instead of a `TypeId` over a typed IR. That is the
 "semantics from strings" trap, and it is why these read as unrelated crashes but share one cause. The deep
 fix is the F-series direction: the checker writes a typed IR and codegen consumes `TypeId`, never re-derives
-meaning from a name. This is less glamorous than SIMD, but it is what turns Nova from an impressive demo into
+meaning from a name. This is less glamorous than SIMD, but it is what turns Kyte from an impressive demo into
 something people trust in production, so it should get the deepest effort.
 
 ### Priority 2: ecosystem and tooling
 
-- **A `library` template for `nova init`.** The manifest already supports it (`nova-postgres`'s
+- **A `library` template for `kyte init`.** The manifest already supports it (`nova-postgres`'s
   `project.json` is `{"name","version","type":"library","dependencies":[]}`), so the resolver and cache
   already understand library packages. Only the `init` scaffold is missing, and every real package (the five
-  drivers, datastar, the orchestrator) is hand-rolled today. `nova init library <name>` should scaffold
-  `project.json` (type `library`), `src/lib.nova` (the public re-export surface), `tests/lib_test.nova` (one
-  `@test` so `nova test` works immediately), a `README.md` and a `.gitignore`. One rule to settle: make
-  `import <name>` resolve to `<pkg>/src/lib.nova`, so the canonical entry is `lib.nova` rather than a file
+  drivers, datastar, the orchestrator) is hand-rolled today. `kyte init library <name>` should scaffold
+  `project.json` (type `library`), `src/lib.ky` (the public re-export surface), `tests/lib_test.ky` (one
+  `@test` so `kyte test` works immediately), a `README.md` and a `.gitignore`. One rule to settle: make
+  `import <name>` resolve to `<pkg>/src/lib.ky`, so the canonical entry is `lib.ky` rather than a file
   that must match the package name. This is small and self-contained, and it is the on-ramp for the package
-  ecosystem Nova clearly wants.
+  ecosystem Kyte clearly wants.
 - **Package versioning and a registry.** Dependencies are raw GitHub URLs pinned to a branch, which is why
   the two-copy trap exists (a driver in `lang/packages/*` versus the one the app resolves from
-  `~/.nova/cache/nova-*`). A real semver + lockfile + index story removes that whole class of "which copy am
+  `~/.kyte/cache/kyte-*`). A real semver + lockfile + index story removes that whole class of "which copy am
   I building against" confusion.
 - **LSP maturity.** The server is basic; go-to-definition, hover types, diagnostics-on-save, and rename are
   what keep people inside the language.
@@ -487,25 +487,25 @@ Two high-value takeaways beyond the deep TypeId fix:
 
 #### Data corruption (silent wrong results the caller trusts)
 
-- (verified) `string.parseFloat` (string.nova:498) has NO exponent, Infinity, or NaN handling: `"1e3"`
+- (verified) `string.parseFloat` (string.ky:498) has NO exponent, Infinity, or NaN handling: `"1e3"`
   becomes 13, `"1.5e3"` becomes 1.53, `"Infinity"` becomes 0. It is on the float-decode path of the postgres,
   mysql, and novadb drivers (`decodeCell` Float goes through `dbDouble(parseFloat(raw))`), and both pg and
   mysql emit exponent form for large or small magnitudes, so real float columns silently corrupt. Highest
   impact; roughly a ten-line fix. Small integer prices did not trip it, which is why the pizza byte-match
   held.
-- (verified) ORM to BSON truncates every `long` to 32 bits: `orm.nova:214` `BsonSink.putInt` does
-  `entryInt(key, val as int)` while `entryInt64Val(val: long)` sits unused at `bson.nova:86`. Any Mongo model
+- (verified) ORM to BSON truncates every `long` to 32 bits: `orm.ky:214` `BsonSink.putInt` does
+  `entryInt(key, val as int)` while `entryInt64Val(val: long)` sits unused at `bson.ky:86`. Any Mongo model
   `long` over 2^31 (ids, millisecond timestamps, counters) is written corrupted. One-line fix.
-- `string.parseI64` (string.nova:440) returns 0 on empty or garbage input and truncates at the first
+- `string.parseI64` (string.ky:440) returns 0 on empty or garbage input and truncates at the first
   non-digit; used for every integer cell and the postgres CommandComplete affected-row count
-  (codec.nova:453), so a corrupt tag yields a trusted 0.
+  (codec.ky:453), so a corrupt tag yields a trusted 0.
 - `hexNibble` (nova-postgres typemap) returns 0 for invalid hex, so a corrupt bytea decodes wrong but
   plausible.
-- GridFS metadata (nova-mongodb gridfs.nova:163) defaults a missing `length` or `chunkSize` to 0, so a
+- GridFS metadata (nova-mongodb gridfs.ky:163) defaults a missing `length` or `chunkSize` to 0, so a
   corrupt entry reads back as a valid empty file.
-- The JSON parser (serde/json.nova `parseArray`/`parseObject`/`parseValue`) returns a partial node and NO
+- The JSON parser (serde/json.ky `parseArray`/`parseObject`/`parseValue`) returns a partial node and NO
   error on malformed input: `"[1,2,"` becomes `[1,2]`, with no success or failure signal.
-- MongoDB DocSource accessors (nova-mongodb document.nova:127) conflate absent or wrong-BSON-type with the
+- MongoDB DocSource accessors (nova-mongodb document.ky:127) conflate absent or wrong-BSON-type with the
   zero value (partly by design, but a real silent-default seam).
 
 #### Numeric parsing API (the fix for the parse-family corruption)
@@ -538,29 +538,29 @@ lang trait change against the out-of-repo drivers).
 
 #### Correctness footguns and stdlib stubs
 
-- (verified) `TcpClient.connect` and `connectTimeout` (net/tcp/client.nova) return `undefined` typed as a
+- (verified) `TcpClient.connect` and `connectTimeout` (net/tcp/client.ky) return `undefined` typed as a
   live `TcpStream` on connect failure; the caller cannot tell and faults on first use. Return an optional or
   an `ok()`-checkable stream.
 - `fs.Watcher` is an unconditional runtime stub (io.cpp:403): create and next-event return null on every
   platform, so the published `Watcher` API silently delivers no events.
-- `net.aio.sleep(ms)` (aio.nova:144) is `return 0`, a no-op that does not sleep; the real facility is the
+- `net.aio.sleep(ms)` (aio.ky:144) is `return 0`, a no-op that does not sleep; the real facility is the
   async `delay(ms)`.
-- ORM row binding cannot handle array, nested, or child columns (orm.nova:61): `arrayLen` 0, `itemX` empty,
+- ORM row binding cannot handle array, nested, or child columns (orm.ky:61): `arrayLen` 0, `itemX` empty,
   `getChild` returns self, so a struct with a list or nested-object field binds empty. Flat scalars are fine.
-- Streaming is not lazy: `streamRows` and `Cursor` (db.nova:467) iterate an already-materialised
+- Streaming is not lazy: `streamRows` and `Cursor` (db.ky:467) iterate an already-materialised
   `ResultSet`, so large queries get no memory relief.
-- TLS 1.3 supports only SHA-256 transcripts (handshake.nova:50); a server that only offers
+- TLS 1.3 supports only SHA-256 transcripts (handshake.ky:50); a server that only offers
   `TLS_AES_256_GCM_SHA384` fails the handshake.
-- Windows IOCP readiness arming is a no-op (ev/iocp.nova:201); conformance 192/194/195 fail on Windows, and
+- Windows IOCP readiness arming is a no-op (ev/iocp.ky:201); conformance 192/194/195 fail on Windows, and
   the `--asan` and `--arc` gates are not wired there.
 
 #### Ecosystem and tooling (expands Priority 2 above)
 
 - The two-copy driver trap is structural: `resolvePath` (main.zig:530-555) prefers a sibling `packages/` copy
-  over the `~/.nova/cache` copy apps actually use, and dependencies are raw GitHub URLs pinned to a branch
+  over the `~/.kyte/cache` copy apps actually use, and dependencies are raw GitHub URLs pinned to a branch
   with no lockfile, ref, or integrity hash. This is why the queryWire break landed unnoticed. A lockfile with
   pinned commit SHAs is the high-value minimum.
-- No `library` init template (confirmed); the desktop template is a single `main.nova` with no project.json
+- No `library` init template (confirmed); the desktop template is a single `main.ky` with no project.json
   or tests.
 - LSP (nls) has hover, goto-definition, completion, signatureHelp, documentSymbol, formatting, and
   diagnostics, but NOT rename, find-references, code-actions, or semantic tokens.
@@ -570,7 +570,7 @@ lang trait change against the out-of-repo drivers).
 
 #### Confirmed NOT bugs (checked, so they are not re-investigated)
 
-`sendBuf` loops correctly on short writes (eventedio.nova:189); discarded `sendFrame` return values only drop
+`sendBuf` loops correctly on short writes (eventedio.ky:189); discarded `sendFrame` return values only drop
 a -1 that the next read surfaces anyway; the TLS handshake result is discarded but `ok()` surfaces failure;
 the pg and mongo frame readers turn short reads and EOF into a surfaced broken-connection sentinel; and the
 collections, the string module, and the JSON parser's valid-input path are complete (the JSON parser even
@@ -584,26 +584,26 @@ password to an on-path attacker. Security-insecure-defaults join soundness at th
 
 #### Security (exploitable under default settings)
 
-- CRITICAL: MSSQL sends the password with NO encryption by default. `connection.nova:42` sets `encrypt` true
+- CRITICAL: MSSQL sends the password with NO encryption by default. `connection.ky:42` sets `encrypt` true
   only if the literal `"encrypt=true"` is present, so the default is FALSE and LOGIN7 goes over plaintext
   TCP; the password's only cover is a fixed reversible obfuscation (UTF-16LE plus nibble-swap plus XOR 0xA5,
   which the code itself labels "not encryption"). An on-path observer recovers the cleartext password. Fix:
   default `encrypt` to true; never send LOGIN7 in the clear unless the operator explicitly opts out.
-- CRITICAL: MSSQL `trustServerCertificate` defaults TRUE (`connection.nova:45`), so `verify` is false and the
+- CRITICAL: MSSQL `trustServerCertificate` defaults TRUE (`connection.ky:45`), so `verify` is false and the
   client bio skips chain and hostname checks; a MITM with any self-signed cert decrypts LOGIN7 even when
   `encrypt=true`. This is the one driver that defaults its verify flag insecurely. Fix: default to false.
-- HIGH: MySQL caching_sha2 full-auth blindly trusts the server-supplied RSA public key (`mysql.nova:711`)
+- HIGH: MySQL caching_sha2 full-auth blindly trusts the server-supplied RSA public key (`mysql.ky:711`)
   over a plaintext connection (`sslmode=disable` default). A MITM substitutes its own key, receives the
   RSA-OAEP ciphertext of password XOR salt, and recovers the password (the salt is sent in the clear). Fix:
   only do RSA key-exchange over verified TLS, or require a pinned server public key.
-- MEDIUM: NovaDB's primary `query`/`exec` uses CLIENT-SIDE string interpolation (`novadb.nova:63,85` through
+- MEDIUM: NovaDB's primary `query`/`exec` uses CLIENT-SIDE string interpolation (`novadb.ky:63,85` through
   `typemap.substituteParams`), the only SQL driver whose main path is not server-bound. `escapeText` does not
   escape backslash, and a Decimal `DbValue`'s text is inserted raw and unquoted, so an attacker-influenced
   Decimal (`1 OR 1=1`) injects. Fix: route `query`/`exec` through the server-bound Parse/Bind path the
   prepared methods already use.
 - MEDIUM: SCRAM mutual auth is not completed. The server's ServerSignature (`v=`) is never verified (pg
-  `auth.nova` ignores SASLFinal kind 12; mongo returns success without checking `v=`), and the combined nonce
-  is not verified to be prefixed by the client nonce (`scram.nova:102`). A rogue server can claim success
+  `auth.ky` ignores SASLFinal kind 12; mongo returns success without checking `v=`), and the combined nonce
+  is not verified to be prefixed by the client nonce (`scram.ky:102`). A rogue server can claim success
   without proving it knows the stored key. The password is not disclosed (one-way proof), hence medium. Fix:
   compute and compare the server signature; check the nonce prefix.
 - LOW: plaintext-by-default transport on pg/mysql/novadb; `tls=true` on mongo/novadb encrypts but does NOT
@@ -619,22 +619,22 @@ wire length fields before allocating.
 
 #### Server stability: unbounded leaks and a pool poison (a long-running server dies without these)
 
-- HIGH: `TlsStream.scratch` leaks 16 KB on EVERY TLS connection (`asynctls.nova:34`; no `delete()`, and
+- HIGH: `TlsStream.scratch` leaks 16 KB on EVERY TLS connection (`asynctls.ky:34`; no `delete()`, and
   `close()` frees bio and base but not scratch). Blast radius: every DB driver over TLS, the HTTPS client,
   and the web server's TLS accept. Fix: free scratch in `close()` and add a `delete()`.
-- HIGH: Postgres `PgReader.buf` leaks 64 KB on EVERY pg connection (`proto.nova:19`, no `delete()`). Clear
+- HIGH: Postgres `PgReader.buf` leaks 64 KB on EVERY pg connection (`proto.ky:19`, no `delete()`). Clear
   asymmetry: mysql, mssql, and novadb all free their reader buffer; postgres alone omits it. Fix: add the
   same `delete()`.
 - MEDIUM-HIGH: the Postgres prepared-statement cache is unbounded (no cap, no Close/DEALLOCATE); mysql caps
   at 256 and flushes with COM_STMT_CLOSE. Long-lived pooled connections running dynamic SQL grow both the
-  Nova list and the server plan cache forever. Fix: bound and evict with a Close frame.
+  Kyte list and the server plan cache forever. Fix: bound and evict with a Close frame.
 - HIGH: the streaming cursor poisons the pooled connection. `queryStream` sets `conn.busy` and it is cleared
   only in `finish()` or an explicit `cur.close()`; the documented `while (let row = await cur.next())` loop
   with an early break never closes, so `busy` stays true, and `Pool.release` re-pools it WITHOUT checking
-  `busy`, so the next borrower gets "connection busy" for the connection's life (`postgres.nova:385,446`,
-  `pool.nova:156`; same on mysql). Fix: clear `busy` from the cursor destructor, or evict a still-busy
+  `busy`, so the next borrower gets "connection busy" for the connection's life (`postgres.ky:385,446`,
+  `pool.ky:156`; same on mysql). Fix: clear `busy` from the cursor destructor, or evict a still-busy
   connection on release.
-- LOW: `reactorConnect` leaks the socket fd on submit failure (`eventedio.nova:293`).
+- LOW: `reactorConnect` leaks the socket fd on submit failure (`eventedio.ky:293`).
 
 #### Checker accepts-invalid (the fail-open mirror of the codegen crashes)
 
@@ -663,39 +663,39 @@ error, not a skip.
 #### Concurrency (one reachable, the rest latent)
 
 - REACHABLE: a blocking `Channel<T>` called from a reactor coroutine parks the whole OS thread on a condvar
-  (`channel.nova` over `concurrency.cpp:466`); if the producer is a coroutine on the same reactor it is a
+  (`channel.ky` over `concurrency.cpp:466`); if the producer is a coroutine on the same reactor it is a
   permanent self-deadlock. Fix: make async channels reactor-native (`coroSuspend` plus an owning-reactor
   post), and keep the blocking `Channel` sync-thread-only.
-- LATENT: `nova_chan_send` and `AsyncLock.release` resume a waiter via the thread-local run queue
-  (`nova_sched_schedule`) instead of the owning reactor (`nova_reactor_post`), which becomes a UAF plus a
+- LATENT: `kyte_chan_send` and `AsyncLock.release` resume a waiter via the thread-local run queue
+  (`kyte_sched_schedule`) instead of the owning reactor (`kyte_reactor_post`), which becomes a UAF plus a
   lost wakeup the moment channels or actors are wired across reactors; `AsyncLock` also has a
   stale-waiter-on-cancel UAF and no error-path release.
-- OPEN QUESTION that gates two findings: does a Nova `await` propagate an unwind (panic or cancel)? If it
+- OPEN QUESTION that gates two findings: does a Kyte `await` propagate an unwind (panic or cancel)? If it
   does, the pool acquire-to-release and the driver `busy` flag (neither wrapped in try/finally) leak a borrow
   (wedging the pool at its hard cap) and poison a connection respectively. This is a single, decidable
   runtime property worth settling before ranking those two.
 
-## Nova-native safety ergonomics (closing the soundness gaps in Nova's own idiom)
+## Kyte-native safety ergonomics (closing the soundness gaps in Kyte's own idiom)
 
-The review sweep showed Nova crashes on valid programs because the checker and codegen fail open on
+The review sweep showed Kyte crashes on valid programs because the checker and codegen fail open on
 optionals, exhaustiveness, and cleanup. The fix for that class is a set of safety ergonomics that the modern
 generation (Kotlin, Rust, Zig, C#, and yes Swift) all landed on independently, because they were invented to
-prevent exactly this bug class. Nova should adopt the PRINCIPLES, expressed in the idiom it already has, not
-import another language's machinery. Nova already carries the raw materials: union optionals
+prevent exactly this bug class. Kyte should adopt the PRINCIPLES, expressed in the idiom it already has, not
+import another language's machinery. Kyte already carries the raw materials: union optionals
 (`string | undefined`), error unions (`T | E`), Zig-style `errdefer`, `??`, and try/catch. Each item below is
-a thin, Nova-native layer over those, and each one closes a specific gap the sweep found. None of it touches
-Nova's identity (a pure-Nova, no-C-dependency, single-reactor, server- and hypermedia-first runtime); these
+a thin, Kyte-native layer over those, and each one closes a specific gap the sweep found. None of it touches
+Kyte's identity (a pure-Kyte, no-C-dependency, single-reactor, server- and hypermedia-first runtime); these
 are the table-stakes safety floor a language needs to be past beta.
 
 ### Optionals: `T?` sugar over the union, with enforced unwrapping
 
-Nova optionals are already just unions, which is more first-class than a special Optional type. Keep that and
+Kyte optionals are already just unions, which is more first-class than a special Optional type. Keep that and
 add:
 - `T?` as pure SUGAR for `T | undefined` (so `string?` is exactly `string | undefined`, not a new type).
 - Enforced narrowing in the checker: a `T?` is NOT usable where `T` is expected; using it requires an unwrap.
   This is the fail-closed fix for checker gap 6 (an optional flowing into a `T` slot unchecked, which
   currently segfaults): the compiler refuses the program instead of crashing at runtime.
-- Unwrap forms, over the union Nova already narrows on `!= undefined`: `if let x = opt { ... }` and
+- Unwrap forms, over the union Kyte already narrows on `!= undefined`: `if let x = opt { ... }` and
   `guard let x = opt else { return }` (bind the narrowed value for the scope), `opt?.field` (optional
   chaining, `undefined` if the receiver is), `opt ?? default` (already present), and `opt!` (force unwrap,
   traps on `undefined`). Reassignment inside a narrowed scope invalidates the narrowing (the sweep flagged the
@@ -703,8 +703,8 @@ add:
 
 ### `defer`: all-path cleanup (extends `errdefer`)
 
-Nova has `errdefer` (error path only). Add a plain `defer` that runs on EVERY scope exit, normal or error, in
-reverse order of declaration, exactly like the Zig `defer` Nova is written on top of, and like Go's. This is
+Kyte has `errdefer` (error path only). Add a plain `defer` that runs on EVERY scope exit, normal or error, in
+reverse order of declaration, exactly like the Zig `defer` Kyte is written on top of, and like Go's. This is
 the ergonomic, unwind-safe fix for the resource-leak cluster: `let c = pool.acquire(); defer pool.release(c);`
 immediately after acquire guarantees release on any exit, which closes the pool poison, the streaming-cursor
 `busy` leak, and the per-connection TlsStream and PgReader leaks by construction rather than by remembering to
@@ -712,7 +712,7 @@ free.
 
 ### Default trait-method bodies
 
-Nova traits require every impl to define every method, which is why adding `queryWire` broke four drivers and
+Kyte traits require every impl to define every method, which is why adding `queryWire` broke four drivers and
 the flagship. Allow a trait method to carry a DEFAULT body (as Rust, Java, and C# interfaces do). A trait can
 then grow a method with a sensible default (the `wireRowsFromResultSet` fallback) without breaking a single
 conformer. This removes the trait-break class, not just the one instance, and it is the single highest-leverage
@@ -726,7 +726,7 @@ cannot be typed, giving a UB fall-through).
 
 ### Error ergonomics over the union model
 
-Nova errors are `T | E` unions plus try/catch/errdefer. Add, all as thin layers over that:
+Kyte errors are `T | E` unions plus try/catch/errdefer. Add, all as thin layers over that:
 - `try?`: turn a throwing or error-union call into an optional (the value, or `undefined` on error). This
   composes directly with the optional work above and with the parse-family redesign: `parseInt(s): int?`,
   then `parseInt(s) ?? 0` or surface the `undefined`.
@@ -741,21 +741,21 @@ An `@available` or `@deprecated` attribute that makes the compiler emit a warnin
 replacement) rather than a hard break. This is how the stdlib evolves past beta cleanly: deprecate `parseI64`
 and `parseFloat` in favour of `parseLong` and `parseDouble`, give users a migration window, then remove them.
 
-### What Nova deliberately does NOT take
+### What Kyte deliberately does NOT take
 
-The point is the safety principles, not another language's whole design. Nova keeps its own model and avoids
-the parts that do not fit: a large generics-plus-associated-types-plus-existentials system (Nova's
+The point is the safety principles, not another language's whole design. Kyte keeps its own model and avoids
+the parts that do not fit: a large generics-plus-associated-types-plus-existentials system (Kyte's
 monomorphised generics are enough and far cheaper to compile), a magic Optional or `throws` runtime machinery
-(unions already express both), reference-counting as the primary memory model beyond what Nova already does,
-and any design that trades away Nova's fast, simple checking or slow compilation onto it.
+(unions already express both), reference-counting as the primary memory model beyond what Kyte already does,
+and any design that trades away Kyte's fast, simple checking or slow compilation onto it.
 
 ### Why this closes the soundness class
 
 Every item above is the same fail-closed principle as the codegen and checker remediation: an unknown or
 un-narrowed type in a checked position is a compile error, not a skip or a guess. The optional and
 exhaustiveness rules make the checker reject the programs that currently reach codegen and crash; `defer` and
-default methods remove the leak and trait-break classes structurally. Together they turn "Nova crashes on
-valid code" into "Nova refuses to compile the bug", which is the real content of a step past beta.
+default methods remove the leak and trait-break classes structurally. Together they turn "Kyte crashes on
+valid code" into "Kyte refuses to compile the bug", which is the real content of a step past beta.
 
 ## Notes
 

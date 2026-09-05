@@ -1,14 +1,14 @@
-# Nova Compiler: Low-Level Design
+# Kyte Compiler: Low-Level Design
 
 Status snapshot: 2026-08-19.
 
-This document explains **how the Nova compiler is built**, in enough depth that a developer who has never
+This document explains **how the Kyte compiler is built**, in enough depth that a developer who has never
 seen the codebase can find their way, understand why each piece exists, and change it without breaking the
 rest. It is the companion to `language-lld.md` (which describes the language the compiler accepts) and to
 `pkg-manager.md`, `demand-driven-mono.md`, `ossa-lite-tasks.md`, and the other design notes (which go deep
 on one topic each).
 
-The compiler is one Zig 0.16 binary called `nova`. It reads Nova source, lowers it through a fixed pipeline
+The compiler is one Zig 0.16 binary called `kyte`. It reads Kyte source, lowers it through a fixed pipeline
 to LLVM IR, hands that to LLVM for optimisation and object emission, and links the objects against a C++20
 runtime to make a native executable.
 
@@ -30,7 +30,7 @@ Two rules override everything in this document:
 
 1. **Run the corpus before and after every change.** From `lang/`: `conformance/run.sh -j` is the fast
    positive gate (about two minutes), `conformance/run.sh --asan` is the memory gate (needs a
-   `NOVA_ASAN=1 zig build` first), and `gate.sh` runs the whole battery. Green before and red after tells
+   `KYTE_ASAN=1 zig build` first), and `gate.sh` runs the whole battery. Green before and red after tells
    you exactly what you broke.
 2. **Type and ownership decisions are made in the semantic-analysis layer (`src/frontend/sema/`), never
    from the spelled name of a type in codegen.** Deciding ownership from a string like `"Str"` or `"List"`
@@ -53,24 +53,24 @@ Two rules override everything in this document:
 
 ### 1.1 The languages involved
 
-Nova is implemented in three languages, each chosen for one reason:
+Kyte is implemented in three languages, each chosen for one reason:
 
 - **The compiler is Zig 0.16.** Zig gives manual memory control with safety checks, a simple module system,
   and first-class LLVM bindings, without a runtime of its own.
 - **The runtime is C++20** (`src/runtime/`). It is linked into every native binary and provides the async
   scheduler, the event-loop reactors, sockets, TLS plumbing, ARC primitives, and the decimal engine. C++20
-  coroutines and mature libraries are why the runtime is C++ and not Nova.
-- **The standard library is Nova itself** (`src/lib/std/`). Collections, strings, JSON/YAML/BSON, the HTTP
-  and web framework, the DB seam, crypto, concurrency helpers, and regex are all ordinary Nova code compiled
-  from source on every build. Writing the stdlib in Nova keeps the language honest: if a feature is awkward
+  coroutines and mature libraries are why the runtime is C++ and not Kyte.
+- **The standard library is Kyte itself** (`src/lib/std/`). Collections, strings, JSON/YAML/BSON, the HTTP
+  and web framework, the DB seam, crypto, concurrency helpers, and regex are all ordinary Kyte code compiled
+  from source on every build. Writing the stdlib in Kyte keeps the language honest: if a feature is awkward
   for the stdlib, it is awkward for users.
 
 ### 1.2 The one-binary, one-program model
 
 Two design choices shape everything else:
 
-- **One binary.** `nova` is a single executable. There is no separate front end, optimiser process, or
-  assembler. LLVM is linked in (statically in release builds), so `nova` calls LLVM through its C API in
+- **One binary.** `kyte` is a single executable. There is no separate front end, optimiser process, or
+  assembler. LLVM is linked in (statically in release builds), so `kyte` calls LLVM through its C API in
   process.
 - **One merged program.** The first pipeline stage resolves every `import`, parses every reachable file,
   and **merges them all into a single `ast.Program`**. Every stage after that sees one flat list of
@@ -82,14 +82,14 @@ Two design choices shape everything else:
 
 Historically the compiler decided types by manipulating **type-name strings**. That was replaced by a
 proper **TypeId engine** (interned type identities in `src/frontend/sema/`). During the migration both
-engines run and a **shadow gate** (`NOVA_SEMA_SHADOW`) fails the build on any disagreement, so a name-based
+engines run and a **shadow gate** (`KYTE_SEMA_SHADOW`) fails the build on any disagreement, so a name-based
 decision cannot creep back in. The name layer is being deleted incrementally (tasks #171/#172/#191); until
 it is gone, "the two engines must agree" is an invariant you will meet in several places. See 4.1.
 
 ### 1.4 The pipeline in one picture
 
 ```
-                    nova build <file>
+                    kyte build <file>
                           |
   ┌───────────────────────┴───────────────────────────────────────────┐
   │ FRONTEND                                                            │
@@ -123,12 +123,12 @@ it is the ground truth and this document tracks it.
 |---|---|
 | `src/main.zig` | Process entry point. Calls `cli.run`, prints a friendly hint on a user error. |
 | `src/cli.zig` | Argument parsing, subcommand dispatch, `userErrorHint` (maps internal errors to one-liners). |
-| `src/builder.zig` | `nova build` / `nova <file>`: orchestrates the whole compile+link pipeline (`compileProgram`, `cmdBuild`). |
+| `src/builder.zig` | `kyte build` / `kyte <file>`: orchestrates the whole compile+link pipeline (`compileProgram`, `cmdBuild`). |
 | `src/pipeline.zig` | The reusable pipeline pieces: import resolution, file merge, the four synthetic generators, target derivation, link-command assembly, build-cache stamp. |
 | `src/packages.zig` | The package manager: fetch, lock, resolve, and the `get`/`restore`/`update`/`publish` commands. |
-| `src/tester.zig` | `nova test`: collects the `@test` functions defined in the USER's file(s) (not the stdlib's, filtered by source path), builds a harness, compiles, and runs. See `language-lld.md` 15.6. |
-| `src/scaffold.zig`, `src/templates.zig` | `nova init`: project scaffolding and the file templates. |
-| `src/format.zig`, `src/frontend/formatter.zig` | `nova fmt`: the source formatter. |
+| `src/tester.zig` | `kyte test`: collects the `@test` functions defined in the USER's file(s) (not the stdlib's, filtered by source path), builds a harness, compiles, and runs. See `language-lld.md` 15.6. |
+| `src/scaffold.zig`, `src/templates.zig` | `kyte init`: project scaffolding and the file templates. |
+| `src/format.zig`, `src/frontend/formatter.zig` | `kyte fmt`: the source formatter. |
 | `src/frontend/lexer.zig` | Tokeniser. |
 | `src/frontend/parser.zig` | Recursive-descent parser, produces the AST. |
 | `src/frontend/ast.zig` | The AST node definitions (the data every stage passes around). |
@@ -137,11 +137,11 @@ it is the ground truth and this document tracks it.
 | `src/frontend/sema/` | The semantic-analysis layer: the authoritative TypeId engine, monomorphisation, reachability, ownership. |
 | `src/frontend/sema/ossa/` | The OSSA-lite ownership IR, its lowering, and the release-balance verifier. |
 | `src/backend/codegen/` | LLVM code generation: `llvm_codegen.zig`, `declarations.zig`, `expressions.zig`, `statements.zig`, `arc.zig`, `types.zig`, `coverage.zig`. |
-| `src/runtime/` | The C++20 runtime (`concurrency.cpp` scheduler + reactor, `io.cpp` TLS, `core.cpp`, `alloc.cpp`, `decimal.cpp`, `nova_abi.h`, `runtime_str.h`). |
-| `src/lib/std/` | The Nova standard library. |
+| `src/runtime/` | The C++20 runtime (`concurrency.cpp` scheduler + reactor, `io.cpp` TLS, `core.cpp`, `alloc.cpp`, `decimal.cpp`, `kyte_abi.h`, `runtime_str.h`). |
+| `src/lib/std/` | The Kyte standard library. |
 | `conformance/` | The test corpus (`cases/` positive, `expect_fail/` must-reject) and `run.sh` (the harness). |
 | `docs/design/` | This document and the per-topic design notes. |
-| `packages/nova-*` | The concrete DB drivers (postgres/mysql/mssql/novadb/mongodb), in-repo for development. |
+| `packages/kyte-*` | The concrete DB drivers (postgres/mysql/mssql/novadb/mongodb), in-repo for development. |
 
 ---
 
@@ -163,7 +163,7 @@ flags) and to make a user's mistake read as a clean message rather than a Zig st
   dispatches to the right module.
 - `builder.cmdBuild` parses build arguments: `--target`, `-o`, `--release`/`--debug`, `--watch`, and the
   build-tuning flags (`--asan`, `--keep-obj`, `--dump-merged`, `--split-objects`, `--prune`, `--emit-llvm`,
-  `--mem-stats`). User-facing knobs are FLAGS; `NOVA_*` environment variables are for compiler-internal
+  `--mem-stats`). User-facing knobs are FLAGS; `KYTE_*` environment variables are for compiler-internal
   debugging only.
 - It also computes the output path and, in project mode, the `build/<profile>/{obj,bin}` layout and the
   `.build-hash` path.
@@ -190,13 +190,13 @@ rather than growing `cli.zig`, and if the option changes the OUTPUT, fold it int
 merging are concentrated here so nothing downstream has to know about files or modules.
 
 **What it does.**
-1. Preloads `string_builder.nova` from the stdlib (it is needed pervasively), then loads the app's root
+1. Preloads `string_builder.ky` from the stdlib (it is needed pervasively), then loads the app's root
    file.
 2. For each `import`, resolves the name to a source path, parses the file, and appends its declarations to
    the merged program.
 3. Tracks visited files in a set so a cycle (A imports B imports A) terminates.
-4. Accumulates a `merged.nova` text used for diagnostics and dumpable with `--dump-merged` /
-   `NOVA_DUMP_MERGED`.
+4. Accumulates a `merged.ky` text used for diagnostics and dumpable with `--dump-merged` /
+   `KYTE_DUMP_MERGED`.
 
 **Where in code.** `src/pipeline.zig` (`loadProgram`, `resolveImportPath`, and the helpers below). Called
 from `builder.compileProgram`.
@@ -205,27 +205,27 @@ from `builder.compileProgram`.
 
 An `import X` is resolved by trying, in order: stdlib short-names (`string`, `list`, `json`, ...), a path
 relative to the importing file, the local `packages/` directory, and finally the version-aware package cache
-`~/.nova/cache/<name>-<sha8>` when a `project.lock.json` exists (see 4.3 and `pkg-manager.md`). The first hit
+`~/.kyte/cache/<name>-<sha8>` when a `project.lock.json` exists (see 4.3 and `pkg-manager.md`). The first hit
 wins. If an import "cannot be found", trace this order first: the file was either not reached or resolved to
 the wrong copy.
 
 #### 3.2.2 Platform-axis variant selection
 
 Some stdlib modules have a per-OS implementation. `targetVariantPath` (`pipeline.zig` around line 431) takes
-a resolved `dir/name.nova` and prefers, in order: `dir/<os>/<arch>/name.nova`, `dir/<os>/name.nova`, then
-(for POSIX targets) `dir/posix/<arch>/name.nova` and `dir/posix/name.nova`, and finally the legacy
-`dir/name_<os>.nova` suffix. There is a special case for `net/eventloop`, which maps to
-`net/ev/<mechanism>.nova` (epoll/kqueue/iocp/uring). This is how the same import gives a Linux program the
+a resolved `dir/name.ky` and prefers, in order: `dir/<os>/<arch>/name.ky`, `dir/<os>/name.ky`, then
+(for POSIX targets) `dir/posix/<arch>/name.ky` and `dir/posix/name.ky`, and finally the legacy
+`dir/name_<os>.ky` suffix. There is a special case for `net/eventloop`, which maps to
+`net/ev/<mechanism>.ky` (epoll/kqueue/iocp/uring). This is how the same import gives a Linux program the
 epoll unit and a macOS program the kqueue unit without the caller knowing.
 
-#### 3.2.3 The `.nova` / `.nsx` interchange
+#### 3.2.3 The `.ky` / `.nsx` interchange
 
-A resolved import may be either `<path>.nova` or its `<path>.nsx` sibling. `.nsx` is the SAME language, just
-the file that holds view/markup code. The resolver tries `.nova` first (so it wins on a tie) and falls back
+A resolved import may be either `<path>.ky` or its `<path>.nsx` sibling. `.nsx` is the SAME language, just
+the file that holds view/markup code. The resolver tries `.ky` first (so it wins on a tie) and falls back
 to `.nsx`. The parser does not care which extension it came from; markup is parsed by the JSX branch either
 way (`parseJsxElement` in `parser.zig`), so `.nsx` is a filing convention, not a second grammar.
 
-#### 3.2.4 Merge, cycle termination, and `merged.nova`
+#### 3.2.4 Merge, cycle termination, and `merged.ky`
 
 Declarations from every reachable file are concatenated into one list. The visited-set makes the graph walk
 terminate. The merged text is what `--dump-merged` writes; when a bug looks like "a symbol the code
@@ -250,13 +250,13 @@ concludes their fix did nothing (this actually happened during the debugger work
 **What it does.** In project (`build`) mode it computes `sourcesHash(files, is_release, asan,
 linkLibsStamp)` and compares it to the stored `.build-hash`. If the hash matches AND the output binary
 exists, it prints "up to date" and returns without compiling. `linkLibsStamp` folds in the link libraries
-and the `~/.nova/bin/nova` compiler-binary mtime, so upgrading the compiler forces a rebuild.
+and the `~/.kyte/bin/kyte` compiler-binary mtime, so upgrading the compiler forces a rebuild.
 
 **Where in code.** `src/pipeline.zig` (`sourcesHash`, `linkLibsStamp` around line 1947); the compare is in
 `builder.compileProgram`.
 
 **Gotchas.** Any new input that can change the output (a new flag, a new codegen mode, a new env var that
-alters emission) MUST be folded into the stamp. If you add such an input and forget the stamp, `nova build`
+alters emission) MUST be folded into the stamp. If you add such an input and forget the stamp, `kyte build`
 will hand back a stale binary and the resulting "my fix does nothing" bug is maddening to trace.
 
 **How to change it safely.** After adding a stamp input, verify: build, change only that input, build again,
@@ -264,7 +264,7 @@ and confirm it rebuilds rather than short-circuits.
 
 ### 3.4 Stage 2: Synthetic code generation
 
-**What it is.** Four generators that emit real Nova AST for boilerplate the user should not hand-write.
+**What it is.** Four generators that emit real Kyte AST for boilerplate the user should not hand-write.
 
 **Why it exists.** Serialisation binders, the web mediator/router dispatch, controller routes, and the
 runtime mediator are mechanical and error-prone by hand. Generating them as ordinary AST means they are
@@ -292,7 +292,7 @@ the source `<...>`, and let the normal passes validate it.
 
 **What it is.** A rewrite that makes shadowed bindings unambiguous.
 
-**Why it exists.** Nova allows a later `let` to shadow an earlier binding in the same scope. If two live
+**Why it exists.** Kyte allows a later `let` to shadow an earlier binding in the same scope. If two live
 bindings shared a name, every later pass would have to disambiguate them. Renaming once, up front, means
 nothing downstream worries about it.
 
@@ -349,7 +349,7 @@ lowering happens, and to be the home of the compiler's soundness checks.
 
 **Data it produces.** Diagnostics. It does not lower; it accepts or rejects.
 
-**Gotchas.** Every check here is corpus-GATED: it must reject its matching `conformance/expect_fail/*.nova`
+**Gotchas.** Every check here is corpus-GATED: it must reject its matching `conformance/expect_fail/*.ky`
 case AND leave every positive case green. The design bias is fail-closed for soundness but zero false
 positive for ergonomics: rejecting valid code is worse than missing an exotic bug (which a later pass or
 `--asan` still catches).
@@ -371,8 +371,8 @@ consume it. It replaced the old string-based type reasoning.
   through `TypedIr.typeOf` / `typeOf2` / `typeOfInst`).
 - Interns and substitutes types through `subst.zig`, with builtin type knowledge in `builtins.zig` and
   `TypeRef`-to-`TypeId` lowering in `lower.zig`.
-- Runs both the name engine and the TypeId engine and, when `NOVA_SEMA_SHADOW` is set, diffs them and fails
-  on any divergence (`shadow.zig`). A `NOVA_TID_CENSUS` mode counts the coverage gaps that still block
+- Runs both the name engine and the TypeId engine and, when `KYTE_SEMA_SHADOW` is set, diffs them and fails
+  on any divergence (`shadow.zig`). A `KYTE_TID_CENSUS` mode counts the coverage gaps that still block
   deleting the string fallback.
 
 **Where in code.** Driven by `sema_shadow.run` from `builder.compileProgram` into an owned `Sema`
@@ -385,7 +385,7 @@ ownership verification, and codegen.
 **Gotchas.** Add type rules HERE, not in codegen, and keep the shadow gate green. The two-engine agreement
 is a temporary invariant; do not add a NEW name-based decision even though the name layer still exists.
 
-**How to change it safely.** Run with `NOVA_SEMA_SHADOW=1` across the corpus; any new disagreement is a
+**How to change it safely.** Run with `KYTE_SEMA_SHADOW=1` across the corpus; any new disagreement is a
 regression. See 4.1.
 
 ### 3.9 Stage 7: Monomorphisation and instantiation dispatch
@@ -393,7 +393,7 @@ regression. See 4.1.
 **What it is.** The pass that turns generic code into concrete code: `List<int>` becomes a concrete type
 `List_int_*`, and each generic method is stamped per concrete instantiation.
 
-**Why it exists.** Nova generics are NOT type-erased at runtime; monomorphisation is mandatory. An erased
+**Why it exists.** Kyte generics are NOT type-erased at runtime; monomorphisation is mandatory. An erased
 body exists only as an `internal`-linkage fallback that LLVM's globalDCE deletes.
 
 **What it does.**
@@ -428,7 +428,7 @@ AFTER codegen had already paid to build them. That was the dominant build-speed 
 reachable DECLs. Reachability is context-insensitive on type arguments (if `List.push` is reached anywhere,
 it is kept for every `List<T>`), which is over-approximate and therefore sound. The same walk drops
 unreachable subsystems, so a plaintext app never emits the crypto stack. Default ON for builds;
-`NOVA_REACH_OFF` disables it, `NOVA_REACH_SHADOW` prints the report without gating.
+`KYTE_REACH_OFF` disables it, `KYTE_REACH_SHADOW` prints the report without gating.
 
 **Where in code.** `src/frontend/sema/reach.zig` (`compute`, `publish`, `report`). Wired in
 `builder.compileProgram` right after monomorphisation; it sets `reach.gate_on` so codegen consults it.
@@ -439,7 +439,7 @@ unreachable subsystems, so a plaintext app never emits the crypto stack. Default
 slot, a reflected call), it will not be emitted and you get a link error for a method that "obviously"
 exists. When you add a new way to REACH a function, teach `reach.zig` about it.
 
-**How to change it safely.** Run with `NOVA_REACH_SHADOW=1` to audit the drop list before trusting a change;
+**How to change it safely.** Run with `KYTE_REACH_SHADOW=1` to audit the drop list before trusting a change;
 a full corpus run confirms nothing live was dropped.
 
 ### 3.11 Stage 9: Escape analysis (report-only)
@@ -453,7 +453,7 @@ REPORT-ONLY and has no codegen effect.
 
 **What it does.** Interprocedural least-fixpoint propagation: a call argument escapes only if the callee's
 matching parameter escapes. Default is ESCAPES; a name is LOCAL only when no escape route touches it, so a
-wrong LOCAL cannot arise from a missed route. Opt in with `NOVA_ESCAPE_REPORT`.
+wrong LOCAL cannot arise from a missed route. Opt in with `KYTE_ESCAPE_REPORT`.
 
 **Where in code.** `src/frontend/sema/escape.zig` (`analyze`). See `docs/design/p7-sound-arena.md`.
 
@@ -479,8 +479,8 @@ verifier that proves release-balance over the whole corpus.
 
 **Where in code.** `src/frontend/sema/ossa/` (`ir.zig`, `lower.zig`, `verify.zig`, `forward.zig`). Also a
 sema-level owned-local report in `ownership.zig` (`runVerify`) and a codegen-level ARC balance verifier
-toggled by `arc.balance_verify`. Driven by `NOVA_OSSA` (`1` = report, `hard` = fail the build) and
-`NOVA_OWN_VERIFY`.
+toggled by `arc.balance_verify`. Driven by `KYTE_OSSA` (`1` = report, `hard` = fail the build) and
+`KYTE_OWN_VERIFY`.
 
 **Gotchas.** The verifier is SOUND but INCOMPLETE: it never false-accuses (zero false positives on the
 corpus) but it does not yet track ownership THROUGH a destructuring pattern (`let {a,b} = ...`), so a leak
@@ -488,7 +488,7 @@ that only happens that way is not caught. When you extend ownership handling, ex
 or coverage silently narrows.
 
 **How to change it safely.** `conformance/run.sh --ossa -j` runs the verifier over the corpus;
-`NOVA_OSSA=hard` fails the build on a proven imbalance. Keep the hard gate in `gate.sh`.
+`KYTE_OSSA=hard` fails the build on a proven imbalance. Keep the hard gate in `gate.sh`.
 
 ### 3.13 Stage 11: Code generation
 
@@ -508,7 +508,7 @@ emits objects. It consumes the `ast.Program`, the `TypedIr`, and the reachabilit
 
 #### 3.13.2 Type mapping (`types.zig`)
 
-`types.zig` is the single source of truth for how a Nova type becomes LLVM. It holds:
+`types.zig` is the single source of truth for how a Kyte type becomes LLVM. It holds:
 - The honest-int table (`cgPrim`, `CgRepr`): `int`/`i32` to i32, `long`/`i64` to i64, and the `u*` names,
   with signedness. `reprBitWidth` gives the width.
 - Value-struct inline layout: a value struct is laid out as an inline aggregate (no box), so nested value
@@ -530,14 +530,14 @@ so `.nsx` breakpoints land on the right source line.
 #### 3.13.4 ARC insertion (`arc.zig`)
 
 `arc.zig` owns retain/release/destructor insertion. Key entry points:
-- `compileRetain` / `compileRelease(ptr, dtor)` emit calls to the runtime `nova_retain` / `nova_release`.
+- `compileRetain` / `compileRelease(ptr, dtor)` emit calls to the runtime `kyte_retain` / `kyte_release`.
 - `acquisitionDisposition` / `namesExistingOwner` decide whether an expression yields a new owner or borrows
   an existing one (this is the borrow-vs-own decision that drives whether a retain is needed).
 - `getOrCreateDestructor*` build the per-type destructor; a trait object's destructor is vtable slot 0
   (`getOrCreateTraitDestructor`).
 - Value-optional boxes and tuple/optional shapes have their own release paths.
 - `elide_enabled` (default on) turns on borrowed-field ARC elision; `balance_verify` turns on the
-  codegen-level release-balance check; `asan_codegen_enabled` instruments Nova-generated code with ASAN for
+  codegen-level release-balance check; `asan_codegen_enabled` instruments Kyte-generated code with ASAN for
   provenance.
 
 Any change in `arc.zig` risks a leak or use-after-free, so the rule is verify with `--asan`, not just the
@@ -577,7 +577,7 @@ engine (3.8). Every codegen change goes through the corpus AND `--asan`; a memor
   when not cross-compiling and not using ASAN.
 - **Native, general:** assembles a `clang++ -std=c++20` command with the dead-strip flag, PIE flags,
   profile flags (`-O3 -DNDEBUG` release, `-g -O0` debug), optional `-fsanitize=address`, the runtime archive
-  (`novacore` or `novacore_asan`), the TLS link, and any FFI libraries the program declared
+  (`kytecore` or `kytecore_asan`), the TLS link, and any FFI libraries the program declared
   (`collectFfiLibs`).
 - **Cross-compilation:** `crossLinkViaZig` uses the bundled `zig c++` toolchain, which supplies the per-OS
   link libraries (for Windows, `-lws2_32 -lmswsock -lbcrypt`, and MSVC `link.exe` flag translation described
@@ -606,8 +606,8 @@ These span several stages, so they are collected here rather than repeated.
 
 The old compiler resolved types by manipulating type-name strings (`resolveExpressionTypeName`). The new
 engine interns type identities as `TypeId`s and reasons over them (`sema/`). During the migration both run,
-and `shadow.zig` diffs them: with `NOVA_SEMA_SHADOW=1` any disagreement fails, so a name-based ownership
-decision cannot slip back in. `NOVA_TID_CENSUS` counts the expressions where the TypeId engine still returns
+and `shadow.zig` diffs them: with `KYTE_SEMA_SHADOW=1` any disagreement fails, so a name-based ownership
+decision cannot slip back in. `KYTE_TID_CENSUS` counts the expressions where the TypeId engine still returns
 null but the string engine resolved a concrete name; those are the coverage gaps that block deleting the
 string layer (tasks #171/#172/#191). The rule for a maintainer: add new decisions to the TypeId engine, keep
 the shadow gate green, and never add a new string-based decision.
@@ -615,10 +615,10 @@ the shadow gate green, and never add a new string-based decision.
 ### 4.2 ARC: how retain and release are decided
 
 ARC is decided at COMPILE time (it is not a garbage collector). Every heap object carries an 8-byte header:
-refcount at ptr-8, length at ptr-4. The primitives are `nova_retain` and `nova_release(ptr, dtor)` in the
+refcount at ptr-8, length at ptr-4. The primitives are `kyte_retain` and `kyte_release(ptr, dtor)` in the
 runtime. Codegen (`arc.zig`) inserts them, using the ownership signals from the `TypedIr` (the same
 information the OSSA verifier uses). The header offsets are a hard contract shared by the compiler and the
-runtime (`nova_abi.h`, `runtime_str.h`); change them in lockstep or not at all. Verify every ARC change with
+runtime (`kyte_abi.h`, `runtime_str.h`); change them in lockstep or not at all. Verify every ARC change with
 `--asan`; the `--arc` audit is weaker and misses use-after-frees.
 
 ### 4.3 Monomorphisation, mangling, and multi-version packages
@@ -645,7 +645,7 @@ memory note.
 Debug builds emit DWARF; VS Code drives it through `lldb-dap` (the Homebrew one on PATH, not Apple's).
 `lldb-dap` renders a pointer type as its raw address and an aggregate as a summary, which is why strings and
 containers are emitted as single-member aggregate DWARF types. Optional Python formatters at
-`~/.nova/std/debug/nova_formatters.py` (source in `src/lib/std/debug/`) give richer display (List/Map/Set
+`~/.kyte/std/debug/kyte_formatters.py` (source in `src/lib/std/debug/`) give richer display (List/Map/Set
 element expansion, struct fields, `str.Str` text) and MUST degrade gracefully when Python is absent. On
 macOS the DWARF stays in the `.o` files with OSO stubs in the executable, so `dwarfdump` on the executable
 shows "zero DWARF" even when it is present; `dsymutil` collects it.
@@ -654,7 +654,7 @@ shows "zero DWARF" even when it is present; `dsymutil` collects it.
 
 The runtime (`src/runtime/`) provides the scheduler and the event-loop reactors that back `async`/`await`
 and `spawn`. There are four reactor backends selected per target (kqueue on macOS, epoll and io_uring on
-Linux, IOCP on Windows), and on Linux the choice is made by a RUNTIME probe (`nova_reactor_backend()` in
+Linux, IOCP on Windows), and on Linux the choice is made by a RUNTIME probe (`kyte_reactor_backend()` in
 `concurrency.cpp`), because a header being present does not mean the running kernel enables io_uring. The
 proactor backends (IOCP, io_uring) have a rule that has cost real debugging and is spelled out in
 `lang/CLAUDE.md`: on a proactor the KERNEL owns the op record until the operation completes or is cancelled,
@@ -673,8 +673,8 @@ reactor, read the reactor sections of `lang/CLAUDE.md` first.
   stdlib module (via `targetVariantPath`, 3.2.2).
 - **Delivery:** contributor DEV builds use dynamic system LLVM (fast); RELEASE builds static-link LLVM
   (`zig build -Dstatic-llvm`) so end users install nothing. `release.yml` publishes six bundles
-  (macOS/Linux arm64+x86_64 static, Windows dynamic with a bundled `LLVM-C.dll`), each containing `nova` +
-  `nls` + the stdlib + a checksum. A release that ships `nova` alone is broken for anyone without the stdlib
+  (macOS/Linux arm64+x86_64 static, Windows dynamic with a bundled `LLVM-C.dll`), each containing `kyte` +
+  `nls` + the stdlib + a checksum. A release that ships `kyte` alone is broken for anyone without the stdlib
   on disk.
 - **Windows** has its own trap list (WSAStartup, IOCP timers and association, ConnectEx, MSVC link.exe flag
   translation); it is documented in `lang/CLAUDE.md` and must be read before touching the Windows path.
@@ -687,16 +687,16 @@ Match the switch to the stage where a bug lives:
 
 | Switch | What it does | Use when |
 |---|---|---|
-| `--dump-merged` / `NOVA_DUMP_MERGED=1` | Writes the merged program to `merged.nova`. | A symbol the code defines seems missing (stage 1). |
-| `NOVA_SEMA_SHADOW=1` | Diffs the name engine and the TypeId engine, fails on divergence. | A type decision is suspect (stage 6). |
-| `NOVA_TID_CENSUS=1` | Counts TypeId-engine coverage gaps. | Auditing the string-engine deletion. |
-| `NOVA_REACH_SHADOW=1` / `NOVA_REACH_OFF` | Reports / disables the reachability gate. | A method fails to link, or auditing what got dropped (stage 8). |
-| `NOVA_OSSA=1` / `NOVA_OSSA=hard` | Runs the ownership verifier, optionally failing the build. | Verifying ARC balance (stage 10). |
-| `NOVA_OWN_VERIFY=1` / `hard` | The sema owned-local report plus the codegen balance verifier. | Cross-checking ownership (stage 10). |
-| `NOVA_ESCAPE_REPORT=1` | The report-only escape gauge. | Escape-analysis work (stage 9). |
+| `--dump-merged` / `KYTE_DUMP_MERGED=1` | Writes the merged program to `merged.ky`. | A symbol the code defines seems missing (stage 1). |
+| `KYTE_SEMA_SHADOW=1` | Diffs the name engine and the TypeId engine, fails on divergence. | A type decision is suspect (stage 6). |
+| `KYTE_TID_CENSUS=1` | Counts TypeId-engine coverage gaps. | Auditing the string-engine deletion. |
+| `KYTE_REACH_SHADOW=1` / `KYTE_REACH_OFF` | Reports / disables the reachability gate. | A method fails to link, or auditing what got dropped (stage 8). |
+| `KYTE_OSSA=1` / `KYTE_OSSA=hard` | Runs the ownership verifier, optionally failing the build. | Verifying ARC balance (stage 10). |
+| `KYTE_OWN_VERIFY=1` / `hard` | The sema owned-local report plus the codegen balance verifier. | Cross-checking ownership (stage 10). |
+| `KYTE_ESCAPE_REPORT=1` | The report-only escape gauge. | Escape-analysis work (stage 9). |
 | `--emit-llvm` | Writes the `.ll`. | Codegen looks wrong; read the IR before theorising (stage 11). |
 | `--mem-stats` | Prints declaration and instantiation counts. | Build-speed or memory work (stages 7 to 8). |
-| `NOVA_IO_WATCHDOG=1` / `NOVA_CRASH_TRACE=1` | Runtime reactor diagnostics. | A connection hangs with the server idle, or a silent async SIGSEGV (runtime). |
+| `KYTE_IO_WATCHDOG=1` / `KYTE_CRASH_TRACE=1` | Runtime reactor diagnostics. | A connection hangs with the server idle, or a silent async SIGSEGV (runtime). |
 
 The discipline everywhere in this codebase: measure before theorising. Each switch above has ruled out an
 entire class of bug in one run.
@@ -705,10 +705,10 @@ entire class of bug in one run.
 
 ## 7. Test and gate infrastructure
 
-- **The corpus** (`conformance/cases/*.nova`) is the positive gate: `conformance/run.sh` runs each case via
-  `nova test`; `-j` parallelises it (about two minutes). Run it BEFORE and AFTER every change.
+- **The corpus** (`conformance/cases/*.ky`) is the positive gate: `conformance/run.sh` runs each case via
+  `kyte test`; `-j` parallelises it (about two minutes). Run it BEFORE and AFTER every change.
 - **`expect_fail/`** holds programs that MUST be rejected; each soundness check (3.7) owns one.
-- **`--asan`** is the memory gate (needs a `NOVA_ASAN=1 zig build` first); it catches the use-after-frees the
+- **`--asan`** is the memory gate (needs a `KYTE_ASAN=1 zig build` first); it catches the use-after-frees the
   `--arc` audit misses.
 - **`--ossa`** runs the ownership verifier over the corpus.
 - **`conformance/pkg-acceptance.sh`** proves the package manager (six items, local `file://` repos, no
@@ -742,12 +742,12 @@ Register it in the TypeId builtins (`sema/builtins.zig`) and map it to LLVM in c
 if it is a scalar). If it is a heap object, decide its ARC story in `arc.zig`. Gate: corpus plus `--asan`.
 
 ### 8.4 Add a soundness check
-Add the check to `type_checker.zig`, add a `conformance/expect_fail/<name>.nova` that it must reject, and run
+Add the check to `type_checker.zig`, add a `conformance/expect_fail/<name>.ky` that it must reject, and run
 the whole positive corpus to confirm zero false positives. Bias conservative: missing an exotic bug is better
 than rejecting valid code. Wire it into `gate.sh` if it needs its own mode.
 
 ### 8.5 Add a stdlib module
-Add the `.nova` file under `src/lib/std/` and register its short name where the resolver maps names to paths
+Add the `.ky` file under `src/lib/std/` and register its short name where the resolver maps names to paths
 (`pipeline.zig`). If it is platform-specific, use the `targetVariantPath` layout (3.2.2). Gate: a `@test` in
 the module plus the corpus.
 
@@ -759,7 +759,7 @@ new target; then the corpus.
 ### 8.7 Add a codegen lowering
 Lower it in `expressions.zig` or `statements.zig`, using types from `types.zig` and ARC from `arc.zig`. Do
 NOT make a type decision from a name here; if you need one, add it to the sema engine (3.8) and read it back
-from the `TypedIr`. Gate: corpus, `--asan`, and `NOVA_OSSA=hard`.
+from the `TypedIr`. Gate: corpus, `--asan`, and `KYTE_OSSA=hard`.
 
 ---
 

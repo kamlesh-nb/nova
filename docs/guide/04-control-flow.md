@@ -2,11 +2,11 @@
 
 ## `if` / `while`, and `if` as an expression
 
-Conditions **must** be `bool`; Nova does not treat integers or pointers as truthy. `if` doubles as an
+Conditions **must** be `bool`; Kyte does not treat integers or pointers as truthy. `if` doubles as an
 expression, so you can bind its result.
 
-```nova
-// examples/05_control_flow.nova
+```kyte
+// examples/05_control_flow.ky
 fn main(): void {
     let n = 7;
     if (n % 2 == 0) {
@@ -40,11 +40,11 @@ sum 0..4 = 10
 
 ## The four `for` forms
 
-Nova has one keyword, `for`, with four shapes. The increment lives in its own block, so `continue`
+Kyte has one keyword, `for`, with four shapes. The increment lives in its own block, so `continue`
 runs it in every form.
 
-```nova
-// examples/06_for_loops.nova
+```kyte
+// examples/06_for_loops.ky
 import collections.list;
 
 fn main(): void {
@@ -100,8 +100,8 @@ Range syntax: `a..b` is **exclusive** of `b`; `a..=b` is **inclusive**. Ranges a
 
 `switch` matches enum values and can **bind a variant's payload**:
 
-```nova
-// examples/07_switch.nova
+```kyte
+// examples/07_switch.ky
 enum Shape { Circle(int), Square(int), Point }
 
 fn area(s: Shape): int {

@@ -1,4 +1,4 @@
-# Design Specification: Nova Data Studio
+# Design Specification: Kyte Data Studio
 
 > ## ⚠️ BLOCKED / REWRITE PENDING (2026-07-17)
 >
@@ -11,16 +11,16 @@
 > resizes, clean). Do not carry the workaround — or the fear — forward.
 >
 > Also note `studio/` in the repo root is currently a **Node.js** app (`server.js`, `node_modules`),
-> not Nova. **Rewrite this document after the foundation and drivers land** (plan P4-28).
+> not Kyte. **Rewrite this document after the foundation and drivers land** (plan P4-28).
 
 
-This document specifies the design, user interface layout, and backend integration for **Nova Data Studio** (an Azure Data Studio-like desktop and web application) powered by a high-performance **Nova language** backend and the low-level database drivers designed in `db-drivers.md`.
+This document specifies the design, user interface layout, and backend integration for **Kyte Data Studio** (an Azure Data Studio-like desktop and web application) powered by a high-performance **Kyte language** backend and the low-level database drivers designed in `db-drivers.md`.
 
 ---
 
 ## 1. Look & Feel (Visual Design System)
 
-Nova Data Studio adopts the precise dark theme design system of **Azure Data Studio / VS Code**, built using HTML5, vanilla CSS/Variables, and Monaco Editor.
+Kyte Data Studio adopts the precise dark theme design system of **Azure Data Studio / VS Code**, built using HTML5, vanilla CSS/Variables, and Monaco Editor.
 
 ### 1.1 Color Palette (CSS Custom Properties)
 ```css
@@ -107,15 +107,15 @@ The interface utilizes a grid-based multi-pane layout:
 
 ---
 
-## 3. Backend Integration (Nova Language API Server)
+## 3. Backend Integration (Kyte Language API Server)
 
-The desktop shell (Tauri/Electron) communicates with a lightweight, multi-threaded Nova backend server compiled with `--native`. The server maintains database pools using asynchronous coroutines (`net/asyncio` and `go`).
+The desktop shell (Tauri/Electron) communicates with a lightweight, multi-threaded Kyte backend server compiled with `--native`. The server maintains database pools using asynchronous coroutines (`net/asyncio` and `go`).
 
 ### 3.1 Session Manager Design
 The server uses a pre-allocated registry map (`g_sessions`) to map connection IDs to open socket streams.
 
-```nova
-// session_manager.nova
+```kyte
+// session_manager.ky
 import pg_client;
 import mysql_client;
 import mssql_client;
@@ -136,11 +136,11 @@ const g_sessions = Map<string, DbSession>(1024, string.hash);
 ```
 
 ### 3.2 Asynchronous Endpoint Routing
-The Nova web server uses coroutine routes to handle requests concurrently without holding threads.
+The Kyte web server uses coroutine routes to handle requests concurrently without holding threads.
 
 #### 3.2.1 Route: `/api/connect` (POST)
 Initializes connection streams and logs the state in the session manager.
-```nova
+```kyte
 async fn handleConnect(req: Request): Response {
     let body = req.json();
     let db_type = body.get("type");
@@ -167,7 +167,7 @@ async fn handleConnect(req: Request): Response {
 
 #### 3.2.2 Route: `/api/query` (POST)
 Executes a SQL command asynchronously, returning results, error messages, and execution latency.
-```nova
+```kyte
 async fn handleQuery(req: Request): Response {
     let body = req.json();
     let session_id = body.get("sessionId");
@@ -194,7 +194,7 @@ async fn handleQuery(req: Request): Response {
 
 #### 3.2.3 Route: `/api/schema` (GET)
 Returns database object hierarchies to populate the connection explorer tree view.
-```nova
+```kyte
 async fn handleSchema(req: Request): Response {
     let session_id = req.query("sessionId");
     let sess = g_sessions.get(session_id);
@@ -264,13 +264,13 @@ Connection configurations are managed using Datastar client-side signals. Form e
 </div>
 ```
 
-On a successful connection, the Nova backend streams back an SSE event containing the compiled Object Explorer sidebar HTML fragment, which Datastar automatically merges into the sidebar DOM without a page refresh.
+On a successful connection, the Kyte backend streams back an SSE event containing the compiled Object Explorer sidebar HTML fragment, which Datastar automatically merges into the sidebar DOM without a page refresh.
 
 ### 5.2 Real-time Query Row Streaming
-When executing query batches that return hundreds of thousands of rows, compiling a single massive JSON response causes memory spikes and UI lag. Datastar's Server-Sent Events structure enables the Nova coroutines to stream query rows **chunk-by-chunk orelse row-by-row** to the frontend as they are parsed from the socket.
+When executing query batches that return hundreds of thousands of rows, compiling a single massive JSON response causes memory spikes and UI lag. Datastar's Server-Sent Events structure enables the Kyte coroutines to stream query rows **chunk-by-chunk orelse row-by-row** to the frontend as they are parsed from the socket.
 
-#### 5.2.1 Nova SSE Streaming Endpoint (Conceptual)
-```nova
+#### 5.2.1 Kyte SSE Streaming Endpoint (Conceptual)
+```kyte
 async fn handleQueryStream(req: Request, client_fd: int): void {
     let sql = req.body().get("sql");
     

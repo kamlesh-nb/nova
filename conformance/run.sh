@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Nova conformance corpus runner (roadmap workstream E2).
+# Kyte conformance corpus runner (roadmap workstream E2).
 #
-# Runs `nova test` on every cases/*.nova file and reports pass/fail. This is the
+# Runs `kyte test` on every cases/*.ky file and reports pass/fail. This is the
 # safety net: run it before and after any compiler/runtime/stdlib change to catch
 # regressions. Exit code is non-zero if any case fails to compile or any test fails.
 #
@@ -9,12 +9,12 @@
 #         ./run.sh 02         # run cases whose name contains "02"
 set -u
 
-NOVA="${NOVA:-$HOME/.nova/bin/nova}"
-# Dogfood mode inherits NOVA_ASAN as a convenience signal; nova now takes it as --asan (see cmdTest).
-ASAN_FLAG=""; [[ -n "${NOVA_ASAN:-}" ]] && ASAN_FLAG="--asan"
+KYTE="${KYTE:-$HOME/.kyte/bin/kyte}"
+# Dogfood mode inherits KYTE_ASAN as a convenience signal; kyte now takes it as --asan (see cmdTest).
+ASAN_FLAG=""; [[ -n "${KYTE_ASAN:-}" ]] && ASAN_FLAG="--asan"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-# --arc : run every positive case under NOVA_ARC_AUDIT=1 and gate LEAK REGRESSIONS
+# --arc : run every positive case under KYTE_ARC_AUDIT=1 and gate LEAK REGRESSIONS
 # against conformance/arc-baseline.txt. Not on by default because the corpus is not
 # at zero yet (the tuple leak alone is ~108 objects); a gate that is always red gates
 # nothing. But leaks were previously not measured AT ALL by this harness, so any
@@ -24,13 +24,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # delivers, say) used to stall the whole corpus with no output and no diagnosis — indistinguishable
 # from a slow machine, and fatal to an unattended run. Bounded here instead, so a hang is reported as
 # an ordinary failure and the run continues. macOS has no coreutils `timeout`, so this is the same
-# background-killer shape the wasm path already uses. Override with NOVA_CASE_TIMEOUT.
-CASE_TIMEOUT="${NOVA_CASE_TIMEOUT:-120}"
+# background-killer shape the wasm path already uses. Override with KYTE_CASE_TIMEOUT.
+CASE_TIMEOUT="${KYTE_CASE_TIMEOUT:-120}"
 HAVE_TIMEOUT="$(command -v timeout || true)"   # coreutils on Linux/Git-Bash; absent on stock macOS
 
 run_case() {
   local rc out wd
-  # Each case gets its own working directory. `nova test` writes a HARDCODED build/test/__nova_test{,.o}
+  # Each case gets its own working directory. `kyte test` writes a HARDCODED build/test/__kyte_test{,.o}
   # relative to the cwd, so a sequential loop that stays put has every case reusing one output path.
   # That self-collides on Windows: the previous case's object or binary is still locked when the next
   # link opens it, and the link fails with LNK1104 "cannot open file" (or a missing .o) about HALF the
@@ -43,15 +43,15 @@ run_case() {
   ln -s "$(cd "$HERE/.." && pwd)/packages" "$wd/packages" 2>/dev/null
   cd "$wd" || { rm -rf "$wd"; return 1; }
   if [[ -n "$HAVE_TIMEOUT" ]]; then
-    out="$("$HAVE_TIMEOUT" -k 5 "$CASE_TIMEOUT" "$NOVA" test $ASAN_FLAG "$1" 2>&1)"; rc=$?
+    out="$("$HAVE_TIMEOUT" -k 5 "$CASE_TIMEOUT" "$KYTE" test $ASAN_FLAG "$1" 2>&1)"; rc=$?
   else
     # No coreutils timeout (stock macOS): kill from a background sleeper. The sleeper is NOT
     # waited on — killing the subshell does not necessarily reap its `sleep` child, and waiting
     # for it would then cost the full timeout on EVERY case, turning the guard into the stall it
     # exists to prevent.
     local tmp cpid kpid
-    tmp="$(mktemp -t novacase.XXXXXX)"
-    ( "$NOVA" test $ASAN_FLAG "$1" >"$tmp" 2>&1 ) & cpid=$!
+    tmp="$(mktemp -t kytecase.XXXXXX)"
+    ( "$KYTE" test $ASAN_FLAG "$1" >"$tmp" 2>&1 ) & cpid=$!
     ( sleep "$CASE_TIMEOUT"; kill -9 "$cpid" 2>/dev/null ) & kpid=$!
     wait "$cpid" 2>/dev/null; rc=$?
     kill "$kpid" 2>/dev/null
@@ -75,7 +75,7 @@ TSAN_MODE=0
 OSSA_MODE=0
 SHADOW_MODE=0
 WASM_MODE=0
-# --wasm : compile every positive case to a wasm module (`nova <file> --wasm`) and
+# --wasm : compile every positive case to a wasm module (`kyte <file> --wasm`) and
 # gate that it emits a VALID wasm binary (magic \0asm), i.e. codegen + wasm-ld link
 # succeed across the corpus. Not all cases compile to wasm yet (the ~44 is_wasm
 # branches are still filling in: heap/string round-trips, some methods), so this is
@@ -92,7 +92,7 @@ WASMRUN_MODE=0
 # conformance/wasm-run-baseline.txt like --arc: a listed case that stops passing is
 # a regression; a new pass asks to be added. Requires `node`.
 if [[ "${1:-}" == "--wasm-run" ]]; then WASMRUN_MODE=1; shift; fi
-# --shadow : run every case under NOVA_SEMA_SHADOW=1 and gate the F5-2 migration invariant. The
+# --shadow : run every case under KYTE_SEMA_SHADOW=1 and gate the F5-2 migration invariant. The
 # compiler's reportTypeIdDiff exits 1 if the string ownership engine and the TypeId engine DISAGREE
 # on any concrete type or keystone substitution. Corpus-wide this is 0 today (that agreement is the
 # license to delete isRefCountedType); this gate keeps it 0 so "ownership decided by name-matching"
@@ -104,19 +104,19 @@ if [[ "${1:-}" == "--arc" ]]; then ARC_MODE=1; shift; fi
 # `isRefCountedType`'s catch-all returns true for a name it does not recognise, so "the
 # compiler is confused" means "free this memory". Without ASAN such a bug reports as a
 # garbage VALUE at a random later point — `Expected "Host", got "\xef..."` — because
-# nova_release on a freed block reads the header quietly and the damage only lands once
+# kyte_release on a freed block reads the header quietly and the damage only lands once
 # malloc reuses it. With ASAN you get the use, the free, and the allocation, each with a
 # function name. That is how "string heap corruption" stayed misfiled for months.
 #
-# Requires the sanitized runtime: `NOVA_ASAN=1 zig build` first.
+# Requires the sanitized runtime: `KYTE_ASAN=1 zig build` first.
 # NOT a leak gate — LeakSanitizer is unsupported on Darwin; use --arc for leaks.
 if [[ "${1:-}" == "--asan" ]]; then ASAN_MODE=1; shift; fi
-# --tsan : run the concurrency subset under ThreadSanitizer with NOVA_THREADS=4. TSan finds
+# --tsan : run the concurrency subset under ThreadSanitizer with KYTE_THREADS=4. TSan finds
 # DATA RACES in the multi-reactor runtime that the (single-threaded) corpus and ASAN gate
 # cannot. This is the gate for the self-hosted runtime work — any race becomes a located
-# report naming both accesses. Requires: NOVA_TSAN=1 zig build first.
+# report naming both accesses. Requires: KYTE_TSAN=1 zig build first.
 if [[ "${1:-}" == "--tsan" ]]; then TSAN_MODE=1; shift; fi
-# --ossa : compile every positive case under NOVA_OSSA=hard so the OSSA-lite release-balance verifier
+# --ossa : compile every positive case under KYTE_OSSA=hard so the OSSA-lite release-balance verifier
 # runs corpus-wide (it fires during sema, before the test binary), and FAIL on any function it proves has
 # a leak or double-free ("OSSA OWNERSHIP GATE FAILED"). This is the corpus-wide enforcement of the gate
 # that conformance/ossa-gate.sh only spot-checks on 6 cases. Sound (never falsely accuses) but incomplete
@@ -130,9 +130,9 @@ if [[ "${1:-}" == "--ossa" ]]; then OSSA_MODE=1; shift; fi
 DOGFOOD_MODE=0
 if [[ "${1:-}" == "--dogfood" ]]; then DOGFOOD_MODE=1; shift; fi
 # -j [N] / --parallel [N] : run the positive corpus N-way parallel (default: cores-1). Each case runs
-# in its own temp dir so the hardcoded __nova_test output cannot collide, with packages/ symlinked in so
+# in its own temp dir so the hardcoded __kyte_test output cannot collide, with packages/ symlinked in so
 # driver-importing cases still resolve; server cases use ephemeral ports so they parallelise cleanly.
-# Applies to the default `nova test` run AND to `--asan` (which gains per-case temp-dir isolation + a
+# Applies to the default `kyte test` run AND to `--asan` (which gains per-case temp-dir isolation + a
 # per-case timeout, so it no longer wedges on a server case that waits on a socket). The wasm/arc/tsan
 # modes stay sequential (baseline-gated, order-sensitive). The default (no -j) path is unchanged.
 PARALLEL=0
@@ -146,23 +146,23 @@ if [[ "${1:-}" == "-j" || "${1:-}" == "--parallel" ]]; then
 fi
 FILTER="${1:-}"
 
-if [[ ! -x "$NOVA" ]]; then
-  echo "ERROR: nova compiler not found at $NOVA (build with 'zig build' in lang/)" >&2
+if [[ ! -x "$KYTE" ]]; then
+  echo "ERROR: kyte compiler not found at $KYTE (build with 'zig build' in lang/)" >&2
   exit 2
 fi
 
 if [[ $DOGFOOD_MODE -eq 1 ]]; then
-  # Inherits NOVA_ASAN from the environment: plain run catches crashes (a hard SEGV exits non-zero
-  # regardless of ASAN); `NOVA_ASAN=1 run.sh --dogfood` (after a `NOVA_ASAN=1 zig build`) adds silent
+  # Inherits KYTE_ASAN from the environment: plain run catches crashes (a hard SEGV exits non-zero
+  # regardless of ASAN); `KYTE_ASAN=1 run.sh --dogfood` (after a `KYTE_ASAN=1 zig build`) adds silent
   # use-after-free detection. Either way each program must compile and exit 0.
-  asan_note=""; [[ -n "${NOVA_ASAN:-}" ]] && asan_note=" +ASAN"
+  asan_note=""; [[ -n "${KYTE_ASAN:-}" ]] && asan_note=" +ASAN"
   echo "--- dogfood suite: realistic feature-combination programs (expect exit 0${asan_note}) ---"
   dg_pass=0; dg_fail=0; dg_failed=()
   dg_tmp="$(mktemp -d)"
-  for f in "$HERE"/dogfood/*.nova; do
+  for f in "$HERE"/dogfood/*.ky; do
     [ -e "$f" ] || continue
-    name="$(basename "$f" .nova)"
-    if ! "$NOVA" "$f" -o "$dg_tmp/$name" >/dev/null 2>&1; then
+    name="$(basename "$f" .ky)"
+    if ! "$KYTE" "$f" -o "$dg_tmp/$name" >/dev/null 2>&1; then
       printf "  \033[31mFAIL\033[0m  %-34s (compile)\n" "$name"; dg_fail=$((dg_fail+1)); dg_failed+=("$name:compile"); continue
     fi
     if "$dg_tmp/$name" >/dev/null 2>&1; then
@@ -183,12 +183,12 @@ if [[ $PARALLEL -gt 0 && $WASM_MODE -eq 0 && $WASMRUN_MODE -eq 0 && $ASAN_MODE -
   # Self-contained worker (plain exported env vars propagate into the xargs child; an exported
   # function does not, reliably). Timeout via coreutils timeout/gtimeout, else a perl alarm.
   ROOT="$(cd "$HERE/.." && pwd)"
-  export NOVA ROOT CASE_TIMEOUT
+  export KYTE ROOT CASE_TIMEOUT
   echo "--- parallel: ${PARALLEL} workers (per-case temp dir; packages symlinked) ---"
   _verd="$(mktemp)"; _worker="$(mktemp)"
   # Worker is a tiny script (macOS xargs -I{} chokes on a long inline command; an exported function does
-  # not reliably reach the xargs child). Reads $NOVA/$ROOT/$CASE_TIMEOUT from the exported env. Each case
-  # runs in its own temp dir so the hardcoded __nova_test output cannot collide, with packages/ symlinked
+  # not reliably reach the xargs child). Reads $KYTE/$ROOT/$CASE_TIMEOUT from the exported env. Each case
+  # runs in its own temp dir so the hardcoded __kyte_test output cannot collide, with packages/ symlinked
   # so most driver-importing cases resolve; the per-case $CASE_TIMEOUT (perl alarm on stock macOS) caps a
   # case that waits on a live service. NOTE: a case that links a package's NATIVE lib (the mysql/mssql/pg
   # DB drivers) links it relative to the repo root, so it FAILS FAST here (link error) rather than in a
@@ -197,9 +197,9 @@ if [[ $PARALLEL -gt 0 && $WASM_MODE -eq 0 && $WASMRUN_MODE -eq 0 && $ASAN_MODE -
 f="$1"; name="$(basename "$f")"; wd="$(mktemp -d)"
 ln -s "$ROOT/packages" "$wd/packages" 2>/dev/null
 cd "$wd" || exit 0
-if command -v timeout >/dev/null 2>&1; then out="$(timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?
-elif command -v gtimeout >/dev/null 2>&1; then out="$(gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?
-else out="$(perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?; fi
+if command -v timeout >/dev/null 2>&1; then out="$(timeout -k 5 "$CASE_TIMEOUT" "$KYTE" test $ASAN_FLAG "$f" 2>&1)"; code=$?
+elif command -v gtimeout >/dev/null 2>&1; then out="$(gtimeout -k 5 "$CASE_TIMEOUT" "$KYTE" test $ASAN_FLAG "$f" 2>&1)"; code=$?
+else out="$(perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$KYTE" test $ASAN_FLAG "$f" 2>&1)"; code=$?; fi
 cd / ; rm -rf "$wd"
 res="$(printf '%s\n' "$out" | grep -E '^Results:' | tail -1)"
 if [ "$code" -eq 0 ] && printf '%s' "$res" | grep -q '0 failed'; then printf 'PASS\t%s\t%s\n' "$name" "$res"
@@ -210,7 +210,7 @@ WORKER
   # workers FIRST. xargs -P assigns items in order as workers free up, so starting the long poles
   # early lets the many short cases backfill the tail instead of a 9s case landing last on an idle
   # box. Weight 0 = heavy (first), 1 = light; sorted by (weight, path) for deterministic order.
-  for f in "$HERE"/cases/*.nova; do
+  for f in "$HERE"/cases/*.ky; do
     n="$(basename "$f")"; [[ -n "$FILTER" && "$n" != *"$FILTER"* ]] && continue
     if grep -qE '^[[:space:]]*import[[:space:]]+(web|net|reactor|flagship|asynctls|tls|crypto|data)\b' "$f" 2>/dev/null; then
       printf '0\t%s\n' "$f"
@@ -226,18 +226,18 @@ WORKER
   done < <(sort "$_verd")
   rm -f "$_verd"
 else
-for f in "$HERE"/cases/*.nova; do
+for f in "$HERE"/cases/*.ky; do
   name="$(basename "$f")"
   [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
-  # ASAN mode has its own dedicated gate below (each case is run under NOVA_ASAN=1 there); skip the
+  # ASAN mode has its own dedicated gate below (each case is run under KYTE_ASAN=1 there); skip the
   # redundant plain run so `--asan` is a focused gate like `--wasm`/`--tsan`, not a double run.
   [[ $ASAN_MODE -eq 1 ]] && continue
-  # OSSA mode likewise has its own dedicated gate below (each case compiled under NOVA_OSSA=hard).
+  # OSSA mode likewise has its own dedicated gate below (each case compiled under KYTE_OSSA=hard).
   [[ $OSSA_MODE -eq 1 ]] && continue
   if [[ $WASM_MODE -eq 1 ]]; then
     base="$HERE/cases/$name"
-    wout="$(mktemp -t novawasm.XXXXXX)"; wout="$wout.wasm"
-    out="$("$NOVA" "$base" --wasm -o "$wout" 2>&1)"; code=$?
+    wout="$(mktemp -t kytewasm.XXXXXX)"; wout="$wout.wasm"
+    out="$("$KYTE" "$base" --wasm -o "$wout" 2>&1)"; code=$?
     magic="$(head -c4 "$wout" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
     rm -f "$wout" "$wout.o" 2>/dev/null
     in_base=0; grep -qxF "$name" "$HERE/wasm-baseline.txt" 2>/dev/null && in_base=1
@@ -260,16 +260,16 @@ for f in "$HERE"/cases/*.nova; do
   fi
   if [[ $WASMRUN_MODE -eq 1 ]]; then
     base="$HERE/cases/$name"
-    wout="$(mktemp -t novawasm.XXXXXX)"; wout="$wout.wasm"
-    "$NOVA" "$base" --wasm -o "$wout" >/dev/null 2>&1
+    wout="$(mktemp -t kytewasm.XXXXXX)"; wout="$wout.wasm"
+    "$KYTE" "$base" --wasm -o "$wout" >/dev/null 2>&1
     # A wasm @test can infinite-loop (synchronous — an in-JS timeout can't fire),
     # so wall-clock-limit node with a background killer (macOS has no `timeout`).
-    ( node "$HERE/wasm-run.mjs" "$wout" >/tmp/nova_wr.$$ 2>&1 ) & npid=$!
+    ( node "$HERE/wasm-run.mjs" "$wout" >/tmp/kyte_wr.$$ 2>&1 ) & npid=$!
     ( sleep 20; kill -9 "$npid" 2>/dev/null ) & kpid=$!
     wait "$npid" 2>/dev/null; code=$?
     kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
-    out="$(cat /tmp/nova_wr.$$ 2>/dev/null); [[ $code -ge 128 ]] && echo '(timed out)'"
-    rm -f "$wout" "$wout.o" /tmp/nova_wr.$$ 2>/dev/null
+    out="$(cat /tmp/kyte_wr.$$ 2>/dev/null); [[ $code -ge 128 ]] && echo '(timed out)'"
+    rm -f "$wout" "$wout.o" /tmp/kyte_wr.$$ 2>/dev/null
     in_base=0; grep -qxF "$name" "$HERE/wasm-run-baseline.txt" 2>/dev/null && in_base=1
     if [[ $code -eq 0 ]]; then
       if [[ $in_base -eq 1 ]]; then printf "  \033[32mPASS\033[0m  %-32s %s\n" "$name" "(wasm runs)"; pass=$((pass+1));
@@ -284,7 +284,7 @@ for f in "$HERE"/cases/*.nova; do
     fi
     continue
   fi
-  # nova test emits DEBUG lines on stderr; capture everything, judge by exit code
+  # kyte test emits DEBUG lines on stderr; capture everything, judge by exit code
   # and the "Results:" summary line.
   out="$(run_case "$f")"
   code=$?
@@ -300,7 +300,7 @@ for f in "$HERE"/cases/*.nova; do
 done
 fi
 
-# Negative cases: each expect_fail/*.nova MUST be REJECTED, and must be rejected
+# Negative cases: each expect_fail/*.ky MUST be REJECTED, and must be rejected
 # for the RIGHT REASON.
 #
 # ⚠️ Why this is not "exit code != 0": a SEGFAULT also exits non-zero. Judging by
@@ -333,7 +333,7 @@ classify_failure() {
     # Same verdict, reached without signals — required on Windows, harmless elsewhere.
     # Windows has no SIGSEGV: a crashing test process still reports `.exited`, carrying the
     # NTSTATUS exception code (0xC0000005 = access violation), and that code is truncated to
-    # 8 bits before `nova test` sees it — so a segfault prints "Test suite FAILED (exit code
+    # 8 bits before `kyte test` sees it — so a segfault prints "Test suite FAILED (exit code
     # 5)", which no exit code alone can tell apart from an ordinary failure. The branch above
     # therefore never fires there, and a compile-and-crash would masquerade as a valid
     # rejection — exactly the failure this self-test exists to catch.
@@ -344,7 +344,7 @@ classify_failure() {
     echo "COMPILED-THEN-CRASHED"
   elif [[ $code -eq 0 ]]; then
     echo "COMPILED-AND-RAN"          # the check is NOT firing
-  elif printf '%s' "$out" | grep -q "in main (nova)"; then
+  elif printf '%s' "$out" | grep -q "in main (kyte)"; then
     echo "compiler-crash"            # a Zig backtrace reached the user
   elif printf '%s' "$out" | grep -q "Type checking failed\|undefined identifier\|is not public\|in module '"; then
     echo "typecheck"           # includes F1-4 cross-module visibility + F1-7 module-fn rejections
@@ -373,12 +373,12 @@ if [[ -d "$HERE/harness-selftest" && $WASM_MODE -ne 1 && $WASMRUN_MODE -ne 1 ]];
   check_selftest() {
     local file="$1" want="$2"
     local o c a d
-    # Own temp dir, for the same reason the case loops use one: the hardcoded build/test/__nova_test
+    # Own temp dir, for the same reason the case loops use one: the hardcoded build/test/__kyte_test
     # output path is shared with whatever ran last, and on Windows the stale handle makes the link fail
     # intermittently. A self-test that trips on that reports HARNESS INTEGRITY BROKEN and aborts the
     # whole run — the most confusing possible symptom for a file-locking race.
     d="$(mktemp -d)"
-    o="$(cd "$d" && "$NOVA" test "$HERE/harness-selftest/$file" 2>&1)"; c=$?
+    o="$(cd "$d" && "$KYTE" test "$HERE/harness-selftest/$file" 2>&1)"; c=$?
     rm -rf "$d"
     a="$(classify_failure "$o" "$c")"
     if [[ "$a" == "$want" ]]; then
@@ -388,8 +388,8 @@ if [[ -d "$HERE/harness-selftest" && $WASM_MODE -ne 1 && $WASMRUN_MODE -ne 1 ]];
       selftest_ok=0
     fi
   }
-  check_selftest "compiles-then-crashes.nova" "COMPILED-THEN-CRASHED"
-  check_selftest "compiles-and-runs.nova"     "COMPILED-AND-RAN"
+  check_selftest "compiles-then-crashes.ky" "COMPILED-THEN-CRASHED"
+  check_selftest "compiles-and-runs.ky"     "COMPILED-AND-RAN"
   if [[ $selftest_ok -ne 1 ]]; then
     echo "  ✗ HARNESS INTEGRITY BROKEN: the negative-case classifier no longer detects a" >&2
     echo "    crash/compile-and-run. Every negative result is now UNTRUSTWORTHY. Fix" >&2
@@ -400,13 +400,13 @@ fi
 
 if [[ -d "$HERE/expect_fail" && $WASM_MODE -ne 1 && $WASMRUN_MODE -ne 1 ]]; then
   echo "--- negative cases (must be rejected, FOR THE DECLARED REASON) ---"
-  for f in "$HERE"/expect_fail/*.nova; do
+  for f in "$HERE"/expect_fail/*.ky; do
     [[ -e "$f" ]] || continue
     name="$(basename "$f")"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
     expected="$(grep -m1 -oE '^// EXPECT-FAIL:[[:space:]]*[a-z-]+' "$f" | sed -E 's|^// EXPECT-FAIL:[[:space:]]*||')"
     expected="${expected:-typecheck}"
-    out="$("$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?
+    out="$("$KYTE" test $ASAN_FLAG "$f" 2>&1)"; code=$?
     actual="$(classify_failure "$out" "$code")"
     if [[ "$actual" == "$expected" ]]; then
       printf "  \033[32mPASS\033[0m  %-32s %s\n" "$name" "(rejected: $actual)"
@@ -419,31 +419,31 @@ if [[ -d "$HERE/expect_fail" && $WASM_MODE -ne 1 && $WASMRUN_MODE -ne 1 ]]; then
   done
 fi
 
-# AddressSanitizer gate (opt-in: NOVA_ASAN=1 zig build && ./run.sh --asan)
+# AddressSanitizer gate (opt-in: KYTE_ASAN=1 zig build && ./run.sh --asan)
 if [[ $ASAN_MODE -eq 1 ]]; then
   echo "--- AddressSanitizer gate (use-after-free / double-free) ---"
-  if [[ ! -f "$HOME/.nova/lib/libnovacore_asan.a" ]]; then
-    echo "  ERROR: libnovacore_asan.a missing — run: NOVA_ASAN=1 zig build" >&2
+  if [[ ! -f "$HOME/.kyte/lib/libkytecore_asan.a" ]]; then
+    echo "  ERROR: libkytecore_asan.a missing — run: KYTE_ASAN=1 zig build" >&2
     exit 2
   fi
   if [[ $PARALLEL -gt 0 ]]; then
     # ---- parallel ASAN (opt-in: --asan -j) ----------------------------------------------------
-    # The same per-case temp-dir isolation + timeout the plain -j path uses, with NOVA_ASAN=1. The
+    # The same per-case temp-dir isolation + timeout the plain -j path uses, with KYTE_ASAN=1. The
     # sequential loop below has NO per-case timeout, so ONE server/reactor case that waits on a socket
     # wedges the entire gate (it hangs with no output). Running each case in its own temp dir (so the
-    # hardcoded __nova_test output cannot collide) under a per-case timeout makes ASAN safe to
+    # hardcoded __kyte_test output cannot collide) under a per-case timeout makes ASAN safe to
     # parallelise across cores-1 workers — the full gate then completes in minutes instead of hanging.
     ROOT="$(cd "$HERE/.." && pwd)"
-    export NOVA ROOT CASE_TIMEOUT
-    echo "--- parallel: ${PARALLEL} workers (per-case temp dir; packages symlinked; NOVA_ASAN=1) ---"
+    export KYTE ROOT CASE_TIMEOUT
+    echo "--- parallel: ${PARALLEL} workers (per-case temp dir; packages symlinked; KYTE_ASAN=1) ---"
     _averd="$(mktemp)"; _aworker="$(mktemp)"
     cat > "$_aworker" <<'AWORKER'
-f="$1"; name="$(basename "$f" .nova)"; wd="$(mktemp -d)"
+f="$1"; name="$(basename "$f" .ky)"; wd="$(mktemp -d)"
 ln -s "$ROOT/packages" "$wd/packages" 2>/dev/null
 cd "$wd" || exit 0
-if command -v timeout >/dev/null 2>&1; then out="$(timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test --asan "$f" 2>&1)"
-elif command -v gtimeout >/dev/null 2>&1; then out="$(gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test --asan "$f" 2>&1)"
-else out="$(perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test --asan "$f" 2>&1)"; fi
+if command -v timeout >/dev/null 2>&1; then out="$(timeout -k 5 "$CASE_TIMEOUT" "$KYTE" test --asan "$f" 2>&1)"
+elif command -v gtimeout >/dev/null 2>&1; then out="$(gtimeout -k 5 "$CASE_TIMEOUT" "$KYTE" test --asan "$f" 2>&1)"
+else out="$(perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$KYTE" test --asan "$f" 2>&1)"; fi
 cd / ; rm -rf "$wd"
 if printf '%s' "$out" | grep -q "ERROR: AddressSanitizer"; then
   kind="$(printf '%s' "$out" | grep -m1 -oE 'AddressSanitizer: [a-z-]+' | sed 's/AddressSanitizer: //')"
@@ -452,7 +452,7 @@ elif printf '%s' "$out" | grep -qE '^Results:.*0 failed'; then printf 'PASS\t%s\
 else printf 'FAIL\t%s\tasan-run\n' "$name"; fi
 AWORKER
     # Longest-first (heavy stdlib graph first), same scheduling as the plain -j path.
-    for f in "$HERE"/cases/*.nova; do
+    for f in "$HERE"/cases/*.ky; do
       n="$(basename "$f")"; [[ -n "$FILTER" && "$n" != *"$FILTER"* ]] && continue
       if grep -qE '^[[:space:]]*import[[:space:]]+(web|net|reactor|flagship|asynctls|tls|crypto|data)\b' "$f" 2>/dev/null; then
         printf '0\t%s\n' "$f"; else printf '1\t%s\n' "$f"; fi
@@ -465,15 +465,15 @@ AWORKER
     rm -f "$_averd"
   else
   ASAN_ROOT="$(cd "$HERE/.." && pwd)"
-  for f in "$HERE"/cases/*.nova; do
-    name="$(basename "$f" .nova)"
+  for f in "$HERE"/cases/*.ky; do
+    name="$(basename "$f" .ky)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
-    # Per-case temp dir, as in the -j branch above: the shared build/test/__nova_test output path
+    # Per-case temp dir, as in the -j branch above: the shared build/test/__kyte_test output path
     # self-collides on Windows and fails the link intermittently. (This sequential branch still has no
     # per-case timeout, so prefer `--asan -j` for a full gate; this only removes the collision.)
     _swd="$(mktemp -d)"
     ln -s "$ASAN_ROOT/packages" "$_swd/packages" 2>/dev/null
-    out="$(cd "$_swd" && "$NOVA" test --asan "$f" 2>&1)"
+    out="$(cd "$_swd" && "$KYTE" test --asan "$f" 2>&1)"
     rm -rf "$_swd"
     if printf '%s' "$out" | grep -q "ERROR: AddressSanitizer"; then
       kind="$(printf '%s' "$out" | grep -m1 -oE 'AddressSanitizer: [a-z-]+' | sed 's/AddressSanitizer: //')"
@@ -493,7 +493,7 @@ AWORKER
 fi
 
 # OSSA ownership gate, CORPUS-WIDE (opt-in: ./run.sh --ossa [-j]). Compiles every positive case under
-# NOVA_OSSA=hard; the OSSA-lite release-balance verifier runs during sema and prints
+# KYTE_OSSA=hard; the OSSA-lite release-balance verifier runs during sema and prints
 # "OSSA OWNERSHIP GATE FAILED" for any function it PROVES leaks or double-frees. The verdict is emitted at
 # COMPILE time, so a per-case timeout that kills a hanging reactor/server test still captures it. No
 # sanitized runtime needed (unlike --asan/--tsan) -- this is a pure front-end check.
@@ -501,23 +501,23 @@ if [[ $OSSA_MODE -eq 1 ]]; then
   echo "--- OSSA ownership gate, corpus-wide (release-balance verifier: 0 proven leaks/double-frees) ---"
   if [[ $PARALLEL -gt 0 ]]; then
     ROOT="$(cd "$HERE/.." && pwd)"
-    export NOVA ROOT CASE_TIMEOUT
-    echo "--- parallel: ${PARALLEL} workers (per-case temp dir; packages symlinked; NOVA_OSSA=hard) ---"
+    export KYTE ROOT CASE_TIMEOUT
+    echo "--- parallel: ${PARALLEL} workers (per-case temp dir; packages symlinked; KYTE_OSSA=hard) ---"
     _overd="$(mktemp)"; _oworker="$(mktemp)"
     cat > "$_oworker" <<'OWORKER'
-f="$1"; name="$(basename "$f" .nova)"; wd="$(mktemp -d)"
+f="$1"; name="$(basename "$f" .ky)"; wd="$(mktemp -d)"
 ln -s "$ROOT/packages" "$wd/packages" 2>/dev/null
 cd "$wd" || exit 0
-if command -v timeout >/dev/null 2>&1; then out="$(NOVA_OSSA=hard timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
-elif command -v gtimeout >/dev/null 2>&1; then out="$(NOVA_OSSA=hard gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
-else out="$(NOVA_OSSA=hard perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test "$f" 2>&1)"; fi
+if command -v timeout >/dev/null 2>&1; then out="$(KYTE_OSSA=hard timeout -k 5 "$CASE_TIMEOUT" "$KYTE" test "$f" 2>&1)"
+elif command -v gtimeout >/dev/null 2>&1; then out="$(KYTE_OSSA=hard gtimeout -k 5 "$CASE_TIMEOUT" "$KYTE" test "$f" 2>&1)"
+else out="$(KYTE_OSSA=hard perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$KYTE" test "$f" 2>&1)"; fi
 cd / ; rm -rf "$wd"
 if printf '%s' "$out" | grep -q "OSSA OWNERSHIP GATE FAILED"; then
   n="$(printf '%s' "$out" | grep -oE '[0-9]+ function' | head -1)"
   printf 'FAIL\t%s\tossa-imbalance %s\n' "$name" "${n:-?}"
 else printf 'PASS\t%s\t(0 proven imbalances)\n' "$name"; fi
 OWORKER
-    for f in "$HERE"/cases/*.nova; do
+    for f in "$HERE"/cases/*.ky; do
       n="$(basename "$f")"; [[ -n "$FILTER" && "$n" != *"$FILTER"* ]] && continue
       if grep -qE '^[[:space:]]*import[[:space:]]+(web|net|reactor|flagship|asynctls|tls|crypto|data)\b' "$f" 2>/dev/null; then
         printf '0\t%s\n' "$f"; else printf '1\t%s\n' "$f"; fi
@@ -529,12 +529,12 @@ OWORKER
     done < <(sort "$_overd")
     rm -f "$_overd"
   else
-  for f in "$HERE"/cases/*.nova; do
-    name="$(basename "$f" .nova)"
+  for f in "$HERE"/cases/*.ky; do
+    name="$(basename "$f" .ky)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
-    if command -v timeout >/dev/null 2>&1; then out="$(NOVA_OSSA=hard timeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
-    elif command -v gtimeout >/dev/null 2>&1; then out="$(NOVA_OSSA=hard gtimeout -k 5 "$CASE_TIMEOUT" "$NOVA" test "$f" 2>&1)"
-    else out="$(NOVA_OSSA=hard perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$NOVA" test "$f" 2>&1)"; fi
+    if command -v timeout >/dev/null 2>&1; then out="$(KYTE_OSSA=hard timeout -k 5 "$CASE_TIMEOUT" "$KYTE" test "$f" 2>&1)"
+    elif command -v gtimeout >/dev/null 2>&1; then out="$(KYTE_OSSA=hard gtimeout -k 5 "$CASE_TIMEOUT" "$KYTE" test "$f" 2>&1)"
+    else out="$(KYTE_OSSA=hard perl -e "alarm $CASE_TIMEOUT; exec @ARGV" "$KYTE" test "$f" 2>&1)"; fi
     if printf '%s' "$out" | grep -q "OSSA OWNERSHIP GATE FAILED"; then
       n="$(printf '%s' "$out" | grep -oE '[0-9]+ function' | head -1)"
       printf "  \033[31mFAIL\033[0m  %-32s \033[31mossa-imbalance %s\033[0m\n" "$name" "${n:-?}"
@@ -548,21 +548,21 @@ OWORKER
   fi
 fi
 
-# ThreadSanitizer gate (opt-in: NOVA_TSAN=1 zig build && ./run.sh --tsan)
-# Runs the multi-threaded subset under NOVA_THREADS=4; single-threaded cases would exercise
+# ThreadSanitizer gate (opt-in: KYTE_TSAN=1 zig build && ./run.sh --tsan)
+# Runs the multi-threaded subset under KYTE_THREADS=4; single-threaded cases would exercise
 # no concurrency and are skipped. Extend TSAN_CASES as new concurrent code lands.
 if [[ $TSAN_MODE -eq 1 ]]; then
-  echo "--- ThreadSanitizer gate (data races, NOVA_THREADS=4) ---"
-  if [[ ! -f "$HOME/.nova/lib/libnovacore_tsan.a" ]]; then
-    echo "  ERROR: libnovacore_tsan.a missing — run: NOVA_TSAN=1 zig build" >&2
+  echo "--- ThreadSanitizer gate (data races, KYTE_THREADS=4) ---"
+  if [[ ! -f "$HOME/.kyte/lib/libkytecore_tsan.a" ]]; then
+    echo "  ERROR: libkytecore_tsan.a missing — run: KYTE_TSAN=1 zig build" >&2
     exit 2
   fi
   TSAN_CASES=(10_async_go 11_channels 102_future_first_class 103_async_when_all 195_multicore_reactors 199_reactor_nested_await 200_reactor_async_io 201_reactor_tcp_connect_accept 202_asyncstream_on_reactor 203_reactor_resolve_connect 204_app_request_on_reactor 205_flagship_db_on_reactor 206_app_multicore_workers 207_reactor_native_timer 208_reactor_read_deadline 209_inbound_tls_on_reactor 210_cross_reactor_wakeup)
   for name in "${TSAN_CASES[@]}"; do
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
-    f="$HERE/cases/$name.nova"
+    f="$HERE/cases/$name.ky"
     [[ -f "$f" ]] || { printf "  \033[31mFAIL\033[0m  %-32s %s\n" "$name" "(case missing)"; fail=$((fail+1)); continue; }
-    out="$(NOVA_TSAN=1 NOVA_THREADS=4 "$NOVA" test "$f" 2>&1)"
+    out="$(KYTE_TSAN=1 KYTE_THREADS=4 "$KYTE" test "$f" 2>&1)"
     if printf '%s' "$out" | grep -q "data race"; then
       where="$(printf '%s' "$out" | grep -m1 -oE '#0 .* in [A-Za-z_][A-Za-z0-9_]*' | sed 's/.* in //')"
       printf "  \033[31mFAIL\033[0m  %-32s \033[31mdata race\033[0m in %s\n" "$name" "${where:-?}"
@@ -587,16 +587,16 @@ if [[ $ARC_MODE -eq 1 ]]; then
   fi
   improved=()
   ARC_ROOT="$(cd "$HERE/.." && pwd)"
-  for f in "$HERE"/cases/*.nova; do
-    name="$(basename "$f" .nova)"
+  for f in "$HERE"/cases/*.ky; do
+    name="$(basename "$f" .ky)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
     base="$(grep -E "^$name " "$baseline_file" | awk '{print $2}')"
     if [[ -z "$base" ]]; then
       printf "  \033[31mFAIL\033[0m  %-32s %s\n" "$name" "(no baseline entry — add one)"
       fail=$((fail+1)); failed_cases+=("$name:arc-nobaseline"); continue
     fi
-    # Run in a per-case temp dir, exactly as the -j and --asan -j workers do. `nova test` writes a
-    # HARDCODED build/test/__nova_test{,.o} relative to the cwd, so a loop that stays in one directory
+    # Run in a per-case temp dir, exactly as the -j and --asan -j workers do. `kyte test` writes a
+    # HARDCODED build/test/__kyte_test{,.o} relative to the cwd, so a loop that stays in one directory
     # has every case reusing one output path. On Windows that self-collides: the previous case's object
     # or binary is still locked when the next link opens it, and the run fails with LNK1104 "cannot open
     # file" (or a missing .o) about HALF the time — measured 3/6 here against 6/6 with isolation. It
@@ -606,7 +606,7 @@ if [[ $ARC_MODE -eq 1 ]]; then
     # import a driver still resolve.
     _awd="$(mktemp -d)"
     ln -s "$ARC_ROOT/packages" "$_awd/packages" 2>/dev/null
-    out="$(cd "$_awd" && NOVA_ARC_AUDIT=1 "$NOVA" test "$f" 2>&1 | grep -vE '^DEBUG')"
+    out="$(cd "$_awd" && KYTE_ARC_AUDIT=1 "$KYTE" test "$f" 2>&1 | grep -vE '^DEBUG')"
     rm -rf "$_awd"
     if printf '%s' "$out" | grep -q "ARC audit: clean"; then live=0
     else live="$(printf '%s' "$out" | grep -oE 'ARC AUDIT FAILED: [0-9]+' | grep -oE '[0-9]+' | head -1)"; fi
@@ -636,10 +636,10 @@ fi
 # F5-2 migration-invariant gate (opt-in: ./run.sh --shadow)
 if [[ $SHADOW_MODE -eq 1 ]]; then
   echo "--- F5-2 shadow gate (string vs TypeId ownership engines MUST agree) ---"
-  for f in "$HERE"/cases/*.nova; do
-    name="$(basename "$f" .nova)"
+  for f in "$HERE"/cases/*.ky; do
+    name="$(basename "$f" .ky)"
     [[ -n "$FILTER" && "$name" != *"$FILTER"* ]] && continue
-    out="$(NOVA_SEMA_SHADOW=1 "$NOVA" test $ASAN_FLAG "$f" 2>&1)"; code=$?
+    out="$(KYTE_SEMA_SHADOW=1 "$KYTE" test $ASAN_FLAG "$f" 2>&1)"; code=$?
     if printf '%s' "$out" | grep -q "FOUNDATION GATE FAILED"; then
       printf "  \033[31mFAIL\033[0m  %-32s \033[31m(ownership engines DISAGREE)\033[0m\n" "$name"
       printf '%s' "$out" | grep -A3 "FOUNDATION GATE FAILED" | sed 's/^/          /'

@@ -5,7 +5,7 @@
 # and io_uring is only ever exercised by hand. CLAUDE.md's claim that "epoll and io_uring have
 # IDENTICAL failure lists" therefore has no gate behind it -- this script is that gate.
 set -u
-export PATH="$HOME/.nova/bin:$PATH"
+export PATH="$HOME/.kyte/bin:$PATH"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 CASES="192_reactor_echo 194_coroutine_reactor 195_multicore_reactors 199_reactor_nested_await
@@ -16,7 +16,7 @@ CASES="192_reactor_echo 194_coroutine_reactor 195_multicore_reactors 199_reactor
 run_one() {   # $1 = case, $2 = backend
   local case="$1" backend="$2" d out rc
   d="$(mktemp -d)"
-  out="$(cd "$d" && NOVA_REACTOR="$backend" timeout -k 5 120 nova test "$HERE/cases/$case.nova" 2>&1)"
+  out="$(cd "$d" && KYTE_REACTOR="$backend" timeout -k 5 120 kyte test "$HERE/cases/$case.ky" 2>&1)"
   rc=$?
   rm -rf "$d"
   if [[ $rc -eq 0 ]] && grep -q "0 failed" <<<"$out"; then echo "PASS"
@@ -28,7 +28,7 @@ printf '%-34s %-10s %-10s\n' CASE epoll io_uring
 printf '%-34s %-10s %-10s\n' "----" "-----" "--------"
 differs=0
 for c in $CASES; do
-  [[ -f "$HERE/cases/$c.nova" ]] || { printf '%-34s %s\n' "$c" "(absent)"; continue; }
+  [[ -f "$HERE/cases/$c.ky" ]] || { printf '%-34s %s\n' "$c" "(absent)"; continue; }
   e="$(run_one "$c" epoll)"
   u="$(run_one "$c" uring)"
   mark=""

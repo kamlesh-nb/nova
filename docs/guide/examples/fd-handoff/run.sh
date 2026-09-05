@@ -8,17 +8,17 @@
 #
 # This is a synchronous, blocking prototype that proves the mechanic (not the reactor throughput path).
 set -u
-export PATH="$HOME/.nova/bin:$PATH"
+export PATH="$HOME/.kyte/bin:$PATH"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
-cleanup() { pkill -9 -x router 2>/dev/null; pkill -9 -x worker 2>/dev/null; rm -f /tmp/nova_handoff.sock; }
+cleanup() { pkill -9 -x router 2>/dev/null; pkill -9 -x worker 2>/dev/null; rm -f /tmp/kyte_handoff.sock; }
 trap cleanup EXIT
 cleanup; sleep 0.3
 
 echo "building router + worker ..."
-nova router.nova -o router  >/dev/null || { echo "router build failed"; exit 1; }
-nova worker.nova -o worker  >/dev/null || { echo "worker build failed"; exit 1; }
+kyte router.ky -o router  >/dev/null || { echo "router build failed"; exit 1; }
+kyte worker.ky -o worker  >/dev/null || { echo "worker build failed"; exit 1; }
 
 echo "starting router (TCP :8099) with WORKERS=2 ..."
 WORKERS=2 ./router & sleep 1

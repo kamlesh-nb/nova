@@ -1,11 +1,11 @@
 //! ARC (automatic reference counting) code generation.
 //!
-//! Nova has no garbage collector. Every heap object carries an 8-byte header
+//! Kyte has no garbage collector. Every heap object carries an 8-byte header
 //! (refcount at offset -8, byte length at offset -4), and the compiler emits
-//! `nova_retain`/`nova_release` calls so that objects are freed exactly when
+//! `kyte_retain`/`kyte_release` calls so that objects are freed exactly when
 //! their last reference goes away. This file is the part of codegen that
 //! decides WHERE those calls go and, crucially, MANUFACTURES the destructor
-//! functions that `nova_release` invokes once a refcount hits zero. It is a
+//! functions that `kyte_release` invokes once a refcount hits zero. It is a
 //! companion to `expressions.zig`/`statements.zig` (which call in here at
 //! binding, return, and scope-exit points) and sits directly on top of the
 //! LLVM C API via [`core`].
@@ -15,7 +15,7 @@
 //! 1. **Disposition** ([`acquisitionDisposition`], [`Disposition`]): when an
 //!    expression's value flows into a new home (a `let`, a container slot, a
 //!    struct field), does the destination TAKE ownership of an existing object
-//!    (so we must `nova_retain` it, because the source still names it too) or
+//!    (so we must `kyte_retain` it, because the source still names it too) or
 //!    CONSUME a fresh temporary (so we just move it, no retain)? Naming an
 //!    existing owner (`x`, `obj.field`, `arr[i]`) borrows; a constructor call
 //!    or literal produces a fresh owned value. The authoritative answer comes
@@ -50,7 +50,7 @@
 //! holds and a drop must release them. That is why copies (see
 //! [`buildTupleDeepCopy`]) call `retainValueStructOwnedFields` and drops (see
 //! [`dropValueStruct`], [`releaseLocalByName`]) call the value-struct
-//! destructor directly rather than `nova_release`.
+//! destructor directly rather than `kyte_release`.
 //!
 //! ## Optimisation and self-verification passes (module-level, opt-in globals)
 //!
@@ -74,7 +74,7 @@
 /// The Zig standard library, used here for slices, formatting, hash maps, and
 /// `std.process.exit` on the fail-closed compiler-bug paths.
 const std = @import("std");
-/// Nova's AST. Disposition analysis reads [`ast.Expression`]/[`ast.ExprKind`]
+/// Kyte's AST. Disposition analysis reads [`ast.Expression`]/[`ast.ExprKind`]
 /// and the destructor builders read struct/enum declarations and [`ast.TypeRef`].
 const ast = @import("../../frontend/ast.zig");
 /// The LLVM Zig bindings namespace; [`types`] and [`core`] are pulled out of it.
@@ -376,18 +376,18 @@ pub fn takeOwnedElement(self: *LlvmCompiler, elem_kind: ast.ExprKind, val: types
     }
 }
 
-/// Emits a call to the runtime `nova_retain(ptr)`, incrementing an object's
+/// Emits a call to the runtime `kyte_retain(ptr)`, incrementing an object's
 /// refcount.
 ///
-/// The `nova_retain` declaration is created lazily on first use and cached in
+/// The `kyte_retain` declaration is created lazily on first use and cached in
 /// `self.func_map` so the whole module shares one declaration. `ptr` is passed
-/// as the integer `val_type` (Nova models heap pointers as integers).
+/// as the integer `val_type` (Kyte models heap pointers as integers).
 pub fn compileRetain(self: *LlvmCompiler, ptr: types.LLVMValueRef) anyerror!void {
-    const retain_fn = if (self.func_map.get("nova_retain")) |f| f else blk: {
+    const retain_fn = if (self.func_map.get("kyte_retain")) |f| f else blk: {
         var arg_types = [_]types.LLVMTypeRef{self.val_type};
         const fn_type = core.LLVMFunctionType(self.void_type, &arg_types, 1, 0);
-        const f = core.LLVMAddFunction(self.module, "nova_retain", fn_type);
-        try self.func_map.put("nova_retain", f);
+        const f = core.LLVMAddFunction(self.module, "kyte_retain", fn_type);
+        try self.func_map.put("kyte_retain", f);
         break :blk f;
     };
     const fn_t = core.LLVMGlobalGetValueType(retain_fn);
@@ -395,22 +395,22 @@ pub fn compileRetain(self: *LlvmCompiler, ptr: types.LLVMValueRef) anyerror!void
     _ = core.LLVMBuildCall2(self.builder, fn_t, retain_fn, &args, 1, "");
 }
 
-/// Emits a call to the runtime `nova_release(ptr, dtor)`, decrementing an
+/// Emits a call to the runtime `kyte_release(ptr, dtor)`, decrementing an
 /// object's refcount and running its destructor when it reaches zero.
 ///
 /// The second argument is the destructor to invoke on the final release. When
 /// `destructor_fn_opt` is null (the type owns nothing transitively, or is a
 /// leaf), a null pointer is passed and the runtime just frees the box; when
 /// present it is bitcast to an opaque `void*` function pointer. Like
-/// [`compileRetain`], the `nova_release` declaration is created once and cached
+/// [`compileRetain`], the `kyte_release` declaration is created once and cached
 /// in `self.func_map`.
 pub fn compileRelease(self: *LlvmCompiler, ptr: types.LLVMValueRef, destructor_fn_opt: ?types.LLVMValueRef) anyerror!void {
-    const release_fn = if (self.func_map.get("nova_release")) |f| f else blk: {
+    const release_fn = if (self.func_map.get("kyte_release")) |f| f else blk: {
         const ptr_type = core.LLVMPointerType(self.void_type, 0);
         var arg_types = [_]types.LLVMTypeRef{self.val_type, ptr_type};
         const fn_type = core.LLVMFunctionType(self.void_type, &arg_types, 2, 0);
-        const f = core.LLVMAddFunction(self.module, "nova_release", fn_type);
-        try self.func_map.put("nova_release", f);
+        const f = core.LLVMAddFunction(self.module, "kyte_release", fn_type);
+        try self.func_map.put("kyte_release", f);
         break :blk f;
     };
     const fn_t = core.LLVMGlobalGetValueType(release_fn);
@@ -560,7 +560,7 @@ pub fn isFunctionType(type_name: []const u8) bool {
 /// Returns the element type of a `Storage<T>` name (the `T` slice), or null if
 /// the name is not a `Storage<...>`.
 ///
-/// `Storage<T>` is Nova's raw contiguous backing buffer (the primitive under
+/// `Storage<T>` is Kyte's raw contiguous backing buffer (the primitive under
 /// `List`/`RawBuffer`); knowing its element type lets the storage destructor
 /// loop release each owned slot. See [`buildStorageDestructor`].
 fn storageElem(type_name: []const u8) ?[]const u8 {
@@ -574,7 +574,7 @@ fn storageElem(type_name: []const u8) ?[]const u8 {
 ///
 /// Value-struct elements are stored by value (their bytes packed into the
 /// buffer at `elementSize` stride), not as pointers, so they cannot be released
-/// with `nova_release`; instead each slot's ADDRESS is passed straight to the
+/// with `kyte_release`; instead each slot's ADDRESS is passed straight to the
 /// element's own destructor. The element count is derived from the buffer's
 /// byte length (loaded from the header at `self - 4`) divided by the element
 /// width (min 1 to avoid division by zero). Builds the standard
@@ -785,7 +785,7 @@ pub fn getOrCreateTraitDestructor(self: *LlvmCompiler) anyerror!types.LLVMValueR
 /// destructor loads the captured environment pointer and the optional cleanup
 /// function pointer; if a cleanup is present (non-null), it is called with the
 /// environment (this is where captured owned variables get released), then the
-/// environment box is freed with `nova_bytes_free`. The has-cleanup branch is
+/// environment box is freed with `kyte_bytes_free`. The has-cleanup branch is
 /// conditional so closures that captured nothing owned skip the call. Every
 /// closure type shares this because the box layout is uniform.
 fn getOrCreateClosureDestructor(self: *LlvmCompiler) anyerror!types.LLVMValueRef {
@@ -822,11 +822,11 @@ fn getOrCreateClosureDestructor(self: *LlvmCompiler) anyerror!types.LLVMValueRef
     _ = core.LLVMBuildBr(self.builder, after_bb);
     core.LLVMPositionBuilderAtEnd(self.builder, after_bb);
 
-    const free_fn = if (self.func_map.get("nova_bytes_free")) |f| f else blk: {
+    const free_fn = if (self.func_map.get("kyte_bytes_free")) |f| f else blk: {
         var at = [_]types.LLVMTypeRef{self.val_type};
         const ft = core.LLVMFunctionType(self.void_type, &at, 1, 0);
-        const f = core.LLVMAddFunction(self.module, "nova_bytes_free", ft);
-        try self.func_map.put("nova_bytes_free", f);
+        const f = core.LLVMAddFunction(self.module, "kyte_bytes_free", ft);
+        try self.func_map.put("kyte_bytes_free", f);
         break :blk f;
     };
     const free_t = core.LLVMGlobalGetValueType(free_fn);
@@ -937,11 +937,11 @@ pub fn getOrCreateDestructorPreferId(self: *LlvmCompiler, name_str: []const u8, 
 pub fn getOrCreateDestructor(self: *LlvmCompiler, type_name: []const u8) anyerror!?types.LLVMValueRef {
 
     if (std.mem.eql(u8, type_name, "any")) {
-        if (self.func_map.get("nova_any_box_dtor")) |f| return f;
+        if (self.func_map.get("kyte_any_box_dtor")) |f| return f;
         var one = [_]types.LLVMTypeRef{self.val_type};
         const ft = core.LLVMFunctionType(self.void_type, &one, 1, 0);
-        const f = core.LLVMAddFunction(self.module, "nova_any_box_dtor", ft);
-        try self.func_map.put("nova_any_box_dtor", f);
+        const f = core.LLVMAddFunction(self.module, "kyte_any_box_dtor", ft);
+        try self.func_map.put("kyte_any_box_dtor", f);
         return f;
     }
 
@@ -1745,7 +1745,7 @@ pub fn buildErrUnion(self: *LlvmCompiler, val: types.LLVMValueRef, is_err: bool,
 /// going through refcounting.
 ///
 /// A value struct lives inline in its owner, so it is not a refcounted box:
-/// there is nothing to `nova_release`, but its owned FIELDS still need freeing.
+/// there is nothing to `kyte_release`, but its owned FIELDS still need freeing.
 /// This fetches the struct's destructor (preferring the TypeId,
 /// [`getOrCreateDestructorPreferId`]) and calls it with the struct's address. A
 /// no-op if the type owns nothing (destructor is null). Used by
@@ -1857,15 +1857,15 @@ pub var elide_enabled: bool = false;
 /// the census ([`arcCensusAfter`]).
 pub var elide_count: usize = 0;
 
-/// Enables the ARC-traffic census (`NOVA_ARC_CENSUS`): counts total retain/release
+/// Enables the ARC-traffic census (`KYTE_ARC_CENSUS`): counts total retain/release
 /// calls before and after elision and estimates further headroom.
 pub var arc_census: bool = false;
-/// `nova_retain` call count captured before elision, by [`arcCensusBefore`].
+/// `kyte_retain` call count captured before elision, by [`arcCensusBefore`].
 pub var census_retain_before: usize = 0;
-/// `nova_release` call count captured before elision, by [`arcCensusBefore`].
+/// `kyte_release` call count captured before elision, by [`arcCensusBefore`].
 pub var census_release_before: usize = 0;
 
-/// Counts `nova_retain` and `nova_release` calls across all DEFINED functions in
+/// Counts `kyte_retain` and `kyte_release` calls across all DEFINED functions in
 /// a module (declarations are skipped).
 ///
 /// The primitive both census snapshots use; writes totals through the `retains`
@@ -1878,8 +1878,8 @@ fn countArcCalls(module: types.LLVMModuleRef, retains: *usize, releases: *usize)
         while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
             var inst = core.LLVMGetFirstInstruction(bb);
             while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) {
-                if (isNamedCall(inst, "nova_retain")) retains.* += 1;
-                if (isNamedCall(inst, "nova_release")) releases.* += 1;
+                if (isNamedCall(inst, "kyte_retain")) retains.* += 1;
+                if (isNamedCall(inst, "kyte_release")) releases.* += 1;
             }
         }
     }
@@ -1901,7 +1901,7 @@ pub fn arcCensusBefore(_: *LlvmCompiler, module: types.LLVMModuleRef) void {
 /// optimisation could remove (a static lower bound for the census).
 ///
 /// Within each basic block it materialises the instruction list, then for every
-/// `nova_retain` walks forward to the matching `nova_release` of the same value.
+/// `kyte_retain` walks forward to the matching `kyte_release` of the same value.
 /// If in between the value only appears in loads/compares and never "escapes"
 /// (is not itself retained again, nor passed as the LAST argument of a call,
 /// the destructor-argument position), the retained value stays borrow-only in
@@ -1921,13 +1921,13 @@ fn countBorrowSkipCandidates(a: std.mem.Allocator, module: types.LLVMModuleRef) 
             while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) insts.append(a, inst) catch {};
 
             for (insts.items, 0..) |ri, i| {
-                if (!isNamedCall(ri, "nova_retain")) continue;
+                if (!isNamedCall(ri, "kyte_retain")) continue;
                 const v = core.LLVMGetOperand(ri, 0);
                 var j = i + 1;
                 var escaped = false;
                 while (j < insts.items.len) : (j += 1) {
                     const uj = insts.items[j];
-                    if (isNamedCall(uj, "nova_release") and core.LLVMGetOperand(uj, 0) == v) {
+                    if (isNamedCall(uj, "kyte_release") and core.LLVMGetOperand(uj, 0) == v) {
                         if (!escaped) candidates += 1;
                         break;
                     }
@@ -1935,7 +1935,7 @@ fn countBorrowSkipCandidates(a: std.mem.Allocator, module: types.LLVMModuleRef) 
                     const opc = core.LLVMGetInstructionOpcode(uj);
                     if (opc == .LLVMLoad or opc == .LLVMICmp) continue;
                     if (opc == .LLVMCall) {
-                        if (isNamedCall(uj, "nova_retain")) { escaped = true; break; }
+                        if (isNamedCall(uj, "kyte_retain")) { escaped = true; break; }
                         const n = core.LLVMGetNumOperands(uj);
                         if (n >= 1 and core.LLVMGetOperand(uj, @intCast(n - 1)) == v) { escaped = true; break; }
                         continue;
@@ -1954,7 +1954,7 @@ fn countBorrowSkipCandidates(a: std.mem.Allocator, module: types.LLVMModuleRef) 
 ///
 /// Instead of scanning forward within a block, it walks all USES of the retained
 /// value directly (use/def graph, so it spans basic blocks). A candidate is a
-/// retain whose value has exactly one `nova_release`, is never retained again,
+/// retain whose value has exactly one `kyte_release`, is never retained again,
 /// and never escapes through a call's destructor-argument slot; loads and
 /// compares are ignored. Reports a broader (inter-block) headroom figure for the
 /// census; does not alter IR.
@@ -1967,7 +1967,7 @@ fn countBorrowSkipFnScope(module: types.LLVMModuleRef) usize {
         while (bb != null) : (bb = core.LLVMGetNextBasicBlock(bb)) {
             var inst = core.LLVMGetFirstInstruction(bb);
             while (inst != null) : (inst = core.LLVMGetNextInstruction(inst)) {
-                if (!isNamedCall(inst, "nova_retain")) continue;
+                if (!isNamedCall(inst, "kyte_retain")) continue;
                 const v = core.LLVMGetOperand(inst, 0);
                 var releases: usize = 0;
                 var escapes = false;
@@ -1975,8 +1975,8 @@ fn countBorrowSkipFnScope(module: types.LLVMModuleRef) usize {
                 while (use != null) : (use = core.LLVMGetNextUse(use)) {
                     const user = core.LLVMGetUser(use);
                     if (user == inst) continue;
-                    if (isNamedCall(user, "nova_release")) { releases += 1; continue; }
-                    if (isNamedCall(user, "nova_retain")) { escapes = true; break; }
+                    if (isNamedCall(user, "kyte_release")) { releases += 1; continue; }
+                    if (isNamedCall(user, "kyte_retain")) { escapes = true; break; }
                     const opc = core.LLVMGetInstructionOpcode(user);
                     if (opc == .LLVMLoad or opc == .LLVMICmp) continue;
                     if (opc == .LLVMCall) {
@@ -2016,9 +2016,9 @@ pub fn arcCensusAfter(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     const pct: usize = if (before == 0) 0 else (removed * 100) / before;
     const bs_pct: usize = if (after == 0) 0 else (borrow_skip * 2 * 100) / after;
     std.debug.print(
-        "=== ARC-traffic census (NOVA_ARC_CENSUS, Gap3-A/E2 headroom) ===\n" ++
-        "  nova_retain  : before={d}  after={d}\n" ++
-        "  nova_release : before={d}  after={d}\n" ++
+        "=== ARC-traffic census (KYTE_ARC_CENSUS, Gap3-A/E2 headroom) ===\n" ++
+        "  kyte_retain  : before={d}  after={d}\n" ++
+        "  kyte_release : before={d}  after={d}\n" ++
         "  total ARC calls : before={d}  after(surviving)={d}\n" ++
         "  removed by current elision : {d} ({d}% of raw traffic)\n" ++
         "  elide_count (pairs the pass reported removing) : {d}\n" ++
@@ -2049,7 +2049,7 @@ pub var asan_codegen_enabled: bool = false;
 /// not a call or the callee is anonymous.
 ///
 /// The callee is the LAST operand of an LLVM call. Underpins [`isNamedCall`],
-/// which every elision/verifier pass uses to recognise `nova_retain`/`nova_release`.
+/// which every elision/verifier pass uses to recognise `kyte_retain`/`kyte_release`.
 fn callTargetName(inst: types.LLVMValueRef) ?[]const u8 {
     if (core.LLVMGetInstructionOpcode(inst) != .LLVMCall) return null;
     const n = core.LLVMGetNumOperands(inst);
@@ -2063,7 +2063,7 @@ fn callTargetName(inst: types.LLVMValueRef) ?[]const u8 {
 
 /// True if `inst` is a direct call to the function named `want`.
 ///
-/// The recogniser for `nova_retain`/`nova_release` (and `nova_bytes_free`)
+/// The recogniser for `kyte_retain`/`kyte_release` (and `kyte_bytes_free`)
 /// throughout the passes; built on [`callTargetName`].
 fn isNamedCall(inst: types.LLVMValueRef, want: []const u8) bool {
     const nm = callTargetName(inst) orelse return false;
@@ -2095,7 +2095,7 @@ fn tracesBorrowedParamField(sv: types.LLVMValueRef, param_slots: []const types.L
     return false;
 }
 
-/// Returns the `nova_retain` instruction that retains `sv`, if any, else null.
+/// Returns the `kyte_retain` instruction that retains `sv`, if any, else null.
 ///
 /// Scans the uses of `sv` for a retain call. Used by the balance verifier and
 /// the borrow-elider to pair a stored value with the retain that acquired it.
@@ -2103,7 +2103,7 @@ fn valueIsRetained(sv: types.LLVMValueRef) ?types.LLVMValueRef {
     var use = core.LLVMGetFirstUse(sv);
     while (use != null) : (use = core.LLVMGetNextUse(use)) {
         const user = core.LLVMGetUser(use);
-        if (isNamedCall(user, "nova_retain")) return user;
+        if (isNamedCall(user, "kyte_retain")) return user;
     }
     return null;
 }
@@ -2124,7 +2124,7 @@ pub fn elideBorrowedArc(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
     }
 }
 
-/// Enables the ARC release-balance self-verifier (`NOVA_OWN_VERIFY`); off by
+/// Enables the ARC release-balance self-verifier (`KYTE_OWN_VERIFY`); off by
 /// default. See [`verifyArcBalance`].
 pub var balance_verify: bool = false;
 /// When set, a detected imbalance is FATAL (`std.process.exit(1)`) rather than
@@ -2167,7 +2167,7 @@ pub fn verifyArcBalance(self: *LlvmCompiler, module: types.LLVMModuleRef) void {
         verifyArcBalanceInFn(self, fnv, &rep);
     }
     std.debug.print(
-        "=== ARC release-balance verifier (NOVA_OWN_VERIFY, V4' slice 1) ===\n" ++
+        "=== ARC release-balance verifier (KYTE_OWN_VERIFY, V4' slice 1) ===\n" ++
         "  functions (defined)     : {d}\n" ++
         "  checkable owned slots   : {d}   (proved non-escaping + owned-via-retain)\n" ++
         "  skipped (conservative)  : {d}\n" ++
@@ -2196,7 +2196,7 @@ fn storedValueStaysLocal(sv: types.LLVMValueRef, slot: types.LLVMValueRef) bool 
     var use = core.LLVMGetFirstUse(sv);
     while (use != null) : (use = core.LLVMGetNextUse(use)) {
         const user = core.LLVMGetUser(use);
-        if (isNamedCall(user, "nova_retain")) continue;
+        if (isNamedCall(user, "kyte_retain")) continue;
         if (core.LLVMGetInstructionOpcode(user) == .LLVMICmp) continue;
         if (core.LLVMGetInstructionOpcode(user) == .LLVMStore and core.LLVMGetOperand(user, 0) == sv and core.LLVMGetOperand(user, 1) == slot) continue;
         return false;
@@ -2249,9 +2249,9 @@ fn verifyArcBalanceInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef, rep: *Bala
                     var luse = core.LLVMGetFirstUse(user);
                     while (luse != null) : (luse = core.LLVMGetNextUse(luse)) {
                         const luser = core.LLVMGetUser(luse);
-                        if (isNamedCall(luser, "nova_release")) {
+                        if (isNamedCall(luser, "kyte_release")) {
                             releases += 1;
-                        } else if (isNamedCall(luser, "nova_retain")) {
+                        } else if (isNamedCall(luser, "kyte_retain")) {
                             acquires += 1;
                         } else if (core.LLVMGetInstructionOpcode(luser) == .LLVMICmp) {
                         } else {
@@ -2294,9 +2294,9 @@ fn instUsesValue(inst: types.LLVMValueRef, v: types.LLVMValueRef) bool {
 
 /// Removes redundant intra-block retain/release pairs on the same value.
 ///
-/// Within each basic block: for a `nova_retain` of value `v`, it scans forward
+/// Within each basic block: for a `kyte_retain` of value `v`, it scans forward
 /// to the first instruction that USES `v`; if that instruction is a
-/// `nova_release` of `v`, both the retain and the release are marked for
+/// `kyte_release` of `v`, both the retain and the release are marked for
 /// erasure (the +1/-1 cancel and nothing in between depended on the extra
 /// count). An `erased` set stops a call being paired twice. Erasures are
 /// deferred to a batch at the end so iteration is not disturbed. Increments
@@ -2317,14 +2317,14 @@ fn elideRedundantPairsInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
 
         for (insts.items, 0..) |ri, i| {
             if (erased.contains(ri)) continue;
-            if (!isNamedCall(ri, "nova_retain")) continue;
+            if (!isNamedCall(ri, "kyte_retain")) continue;
             const v = core.LLVMGetOperand(ri, 0);
             var j = i + 1;
             while (j < insts.items.len) : (j += 1) {
                 const uj = insts.items[j];
                 if (erased.contains(uj)) continue;
                 if (!instUsesValue(uj, v)) continue;
-                if (isNamedCall(uj, "nova_release") and core.LLVMGetOperand(uj, 0) == v) {
+                if (isNamedCall(uj, "kyte_release") and core.LLVMGetOperand(uj, 0) == v) {
                     to_erase.append(a, ri) catch {};
                     to_erase.append(a, uj) catch {};
                     erased.put(ri, {}) catch {};
@@ -2419,7 +2419,7 @@ fn elideBorrowedArcInFn(self: *LlvmCompiler, fnv: types.LLVMValueRef) void {
                         const luser = core.LLVMGetUser(luse);
                         const lopc = core.LLVMGetInstructionOpcode(luser);
                         if (lopc == .LLVMICmp) continue;
-                        if (isNamedCall(luser, "nova_release")) {
+                        if (isNamedCall(luser, "kyte_release")) {
                             releases.append(a, luser) catch {};
                             continue;
                         }

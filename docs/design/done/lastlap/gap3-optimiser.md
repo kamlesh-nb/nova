@@ -3,9 +3,9 @@
 > forward plan is **docs/design/sil-arc-optimiser-direction.md** (Swift-SIL ARC optimisation, go/scrap-gated
 > on a measured perf delta). Everything below is retained as the HISTORICAL record + the reusable analysis.
 
-# Gap analysis: completing the Nova optimiser EMIT PATH
+# Gap analysis: completing the Kyte optimiser EMIT PATH
 
-> **2026-08-16 empirical measurement (build path, `NOVA_OPT=1`):** on `03_strings` the shadow lowers
+> **2026-08-16 empirical measurement (build path, `KYTE_OPT=1`):** on `03_strings` the shadow lowers
 > **100% of HIR** (5150 nodes), the pipeline removes **895 insts** (mem2reg/constfold/copyprop/dce) and
 > inlines **7 calls**, but **`arc_elision` removes 0 of 44 threaded ARC ops** — confirmed firing 0x, and
 > NOT stale: the ARC threading is already tight (no balanced-adjacent retain/release pairs to cancel), so
@@ -25,9 +25,9 @@
 > loosening the way string-engine slice B was. The realistic next unit is B6 (value-optional, MEDIUM
 > confidence, documented ABI) as a multi-session effort with a full `--asan` gate.
 
-Scope: the `NOVA_OPT_EMIT` LIR to LLVM emit path (`src/optimiser/*`, `src/optimiser/passes/*`,
+Scope: the `KYTE_OPT_EMIT` LIR to LLVM emit path (`src/optimiser/*`, `src/optimiser/passes/*`,
 `src/backend/codegen/lir_emit.zig`). Verified against code and live repros on 2026-08-15, working dir
-`/Users/kamlesh/nova-lang/lang`. The status table read is `docs/design/optimiser-pending.md`; the design
+`/Users/kamlesh/kyte-lang/lang`. The status table read is `docs/design/optimiser-pending.md`; the design
 narrative is `docs/design/lld/40-optimiser.md`. Where this file disagrees with the table, the code and the
 repros below win.
 
@@ -41,11 +41,11 @@ sub-items (whole-program MIR, async coroutines) are genuine multi-week rearchite
 The whole LLVM module gets `default<O3>` + loop/SLP vectorization in RELEASE (declarations.zig:1337),
 whether a function came from the AST path OR the emit path. Consequences, stated plainly:
 
-1. The Nova optimiser's generic passes — mem2reg, constfold, copyprop, dce, inline, simplifycfg — are
+1. The Kyte optimiser's generic passes — mem2reg, constfold, copyprop, dce, inline, simplifycfg — are
    REDUNDANT with LLVM O3, which does all of them (plus GVN/LICM/vectorization) on the final module. They
    change NOTHING about the shipped binary.
-2. The ONLY thing the Nova optimiser can do that LLVM cannot is ARC ELISION (LLVM sees nova_retain/
-   nova_release as opaque calls). That is the sole non-redundant pass, and it fires 0x (measured, 0/44).
+2. The ONLY thing the Kyte optimiser can do that LLVM cannot is ARC ELISION (LLVM sees kyte_retain/
+   kyte_release as opaque calls). That is the sole non-redundant pass, and it fires 0x (measured, 0/44).
 3. So for the ~10-12% that "emit", the optimiser produces code LLVM O3 optimises IDENTICALLY to the AST
    path — the differential test proves the outputs are byte-identical. There is no observable difference
    between "emitted via optimiser" and "fell back to AST".
@@ -65,7 +65,7 @@ one landable, differential+ASAN-gated slice. Ordered roughly by dependency, not 
 
 ### B6 — value-optional emit (ACTIVE, multi-session #193)
 - [x] valopt_box / valopt_unbox MIR ops + operand/effect/rewrite/lower-LIR/inline switches (bcfe63e)
-- [x] valopt_box / valopt_unbox LLVM emit arms (call nova_valopt_box/unbox) (bcfe63e)
+- [x] valopt_box / valopt_unbox LLVM emit arms (call kyte_valopt_box/unbox) (bcfe63e)
 - [x] value-optional RETURN of a scalar int/bool: box at `.ret`, undefined stays null, no double-box (f14f793)
 - [ ] value-optional RETURN of a **float/double** (f32/f64 bits in the word) — op gate currently int/bool only
 - [ ] value-optional **PARAM**: unbox on read inside the body (valopt_unbox at each param use)
@@ -154,7 +154,7 @@ scaffolding is retired (E3). Until then it is a correctness-preserving partial a
 `lir_emit.tryEmit` is called per-function from `declarations.zig:970`
 (`if (lir_emit.emit_enabled and lir_emit.tryEmit(&compiler, fn_val, func)) continue;`). It is a strict
 **per-function fallback**: any function outside the emittable subset returns `false` and codegen emits that
-function from the AST exactly as before. It is **off by default** (`emit_enabled` set from `NOVA_OPT_EMIT` in
+function from the AST exactly as before. It is **off by default** (`emit_enabled` set from `KYTE_OPT_EMIT` in
 `builder.zig:192` and `tester.zig:284`; `opt_driver.enabled = false` in `driver.zig:235`).
 
 The emittable subset today (each an explicit allowlist entry in `hirEmittable` at `lir_emit.zig:207-253` plus
@@ -166,20 +166,20 @@ tuples, all-string templates, reference optionals (read/compare + nullish `??`),
 
 ### What FALLS BACK (each confirmed with a verbose repro or a cited gate)
 
-Repros run with `NOVA_OPT_EMIT=1 NOVA_OPT_EMIT_VERBOSE=1 nova test <case>` over real corpus cases. The
+Repros run with `KYTE_OPT_EMIT=1 KYTE_OPT_EMIT_VERBOSE=1 kyte test <case>` over real corpus cases. The
 `reject:` line is printed by `lir_emit.reject()` (`lir_emit.zig:45-48`). Counts below aggregate the whole
 compile (stdlib + case), so they prove the reject FIRES, not a per-function tally.
 
 | Item | Falls back? | Evidence | Gate in code |
 |---|---|---|---|
-| **B6 value-optional** param/return/body | YES | `127_value_optional_zero.nova`: `reject: optional return` x10, `reject: non-emittable HIR node` x10 (the `undefined` literal). Emitted 18 / rejected 150. | `lir_emit.zig:114` (`optional return`), `:74` (`optional param`), `:239-249` (`.undefined`/`.null` deliberately NOT in the HIR allowlist) |
-| **B7 error-union** `T\|E` return | YES | `266_exception.nova`: `reject: error-union return` x2. `101_errdefer.nova`: x3. | `lir_emit.zig:125` (`error-union return`), `:80` (`error-union param`) |
-| **C6 closures** | YES | `04_closures.nova` rejects wholesale (90x `MIR outside emittable subset` + `non-emittable HIR node`). | HIR: `.closure` never in allowlist (`lir_emit.zig:246 else => false`). Lowering is OPAQUE: `lower_ast_hir.zig:520` emits `.closure = { .body = HirId.none }`; `lower_hir_mir.zig:239` lowers it to `const_int 0`. |
-| **C7 try/errdefer** | YES | `101_errdefer.nova` + `266_exception.nova` reject. | `try_` is a NO-OP passthrough: `lower_hir_mir.zig:249` `.try_ => lowerNode(operand)` (drops propagation). `errdefer`/`defer_stmt` has no HIR lowering (`lower_ast_hir.zig:323 else => unsupported`). Guarded also by the B7 signature reject. |
+| **B6 value-optional** param/return/body | YES | `127_value_optional_zero.ky`: `reject: optional return` x10, `reject: non-emittable HIR node` x10 (the `undefined` literal). Emitted 18 / rejected 150. | `lir_emit.zig:114` (`optional return`), `:74` (`optional param`), `:239-249` (`.undefined`/`.null` deliberately NOT in the HIR allowlist) |
+| **B7 error-union** `T\|E` return | YES | `266_exception.ky`: `reject: error-union return` x2. `101_errdefer.ky`: x3. | `lir_emit.zig:125` (`error-union return`), `:80` (`error-union param`) |
+| **C6 closures** | YES | `04_closures.ky` rejects wholesale (90x `MIR outside emittable subset` + `non-emittable HIR node`). | HIR: `.closure` never in allowlist (`lir_emit.zig:246 else => false`). Lowering is OPAQUE: `lower_ast_hir.zig:520` emits `.closure = { .body = HirId.none }`; `lower_hir_mir.zig:239` lowers it to `const_int 0`. |
+| **C7 try/errdefer** | YES | `101_errdefer.ky` + `266_exception.ky` reject. | `try_` is a NO-OP passthrough: `lower_hir_mir.zig:249` `.try_ => lowerNode(operand)` (drops propagation). `errdefer`/`defer_stmt` has no HIR lowering (`lower_ast_hir.zig:323 else => unsupported`). Guarded also by the B7 signature reject. |
 | **D5-async** `await`/`spawn` | YES | Any `async fn` rejected up front. | `lir_emit.zig:56` `if (func.is_async) return reject("async fn (coroutine)")`. Even the `await_`/`spawn_` MIR ops (`mir.zig:95-96`) have NO arm in the emit switch, and `spawn_` lowering is a stub (`lower_hir_mir.zig:245-247` builds `.spawn_{callee=0, args=&.{}}`). |
 | **D7 inline** | DORMANT (no-op) | Pipeline pass is a no-op. | `passes/inline.zig:22-25` `run` is `_ = allocator; _ = func;` -- "DORMANT on real code... no MIR call graph yet". Activation path `inlineSmallCallees` only runs in the SHADOW (`driver.zig:122`), never on the emit path. |
 | **D6 arc_elision** | WIRED, fires 0x | In pipeline (`driver.zig:39`) but proven no-op on the current subset (comment `driver.zig:9-12`). |
-| **C4 optional-chain** `a?.b` | YES (nullish `??` emits for ref-optional only) | `166_optional_chaining.nova` rejects. | `lower_hir_mir.zig:152` note: a value-field `a?.b` is a boxed value optional (not modelled). |
+| **C4 optional-chain** `a?.b` | YES (nullish `??` emits for ref-optional only) | `166_optional_chaining.ky` rejects. | `lower_hir_mir.zig:152` note: a value-field `a?.b` is a boxed value optional (not modelled). |
 | **B3 decimal**, float arrays/fields, float mod/shift/bitwise | YES | -- | documented in `optimiser-pending.md` B3; scalar-only gates |
 | **E1 default-on flip** | NOT DONE | `opt_driver.enabled = false`; env-gated only. | `driver.zig:235` |
 
@@ -193,7 +193,7 @@ The emit path meets ONE of its two goals (correctness-preserving partial coverag
   But this over-counts: the checklist is dominated by easy scalar-signature rows and under-weights the four
   structural blockers that gate the entire value/error/async/closure half of the language.
 - **By function coverage on real code**: on `127_value_optional_zero` the emit path took 18 functions and
-  rejected 150 (~11%); on `266_exception`, 15 emitted / 138 rejected (~10%). So on ordinary Nova ~**10-12%**
+  rejected 150 (~11%); on `266_exception`, 15 emitted / 138 rejected (~10%). So on ordinary Kyte ~**10-12%**
   of functions currently emit; the rest fall back to the AST.
 - **By GOAL** (the stated aim: "the designed perf win"): the win is `arc_elision` + inlining removing
   redundant retain/release on hot functions. `arc_elision` fires **0 times** on the current subset and
@@ -201,7 +201,7 @@ The emit path meets ONE of its two goals (correctness-preserving partial coverag
   even the correctness work reaches no shipping build.
 
 **Honest headline: call it ~40% of goal.** The scalar/string/struct plumbing is real and airtight, but the
-constructs that make Nova *Nova* (value optionals, error unions, closures, async) are all fallback, the two
+constructs that make Kyte *Kyte* (value optionals, error unions, closures, async) are all fallback, the two
 perf passes are inert, and it ships to nobody. The "63% of checklist" number is real but measures the wrong
 thing; ~40% is the honest weight once you account for the blocked half and the unrealised perf goal.
 
@@ -259,7 +259,7 @@ prerequisite for D5-async (which additionally needs coroutine lowering).
 ## B6 MULTI-SESSION LOG (value-optional emit)
 
 **Session 1 DONE (bcfe63e):** MIR ops `valopt_box`/`valopt_unbox` + emit arms (call the runtime
-`nova_valopt_box`/`nova_valopt_unbox`, byte-compatible with AST). Wired through all MIR switches. Additive;
+`kyte_valopt_box`/`kyte_valopt_unbox`, byte-compatible with AST). Wired through all MIR switches. Additive;
 no producer yet; 5/5 emit-subset cases unregressed. This is the ABI foundation.
 
 **Session 2 DONE (f14f793): value-optional RETURN emits.** hir.Func.ret_valopt (from fn_decl.ret_type),
@@ -290,7 +290,7 @@ clean, ARC audit clean, no emit-subset regression, default path untouched. Case 
    expression or `.undefined`/`.null`; otherwise keep the fallback. This needs a per-`.ret` operand-type check
    in the emittability pass, not just the signature reject.
 5. **Verify:** hand-write value-optional return cases (`return 5`, `return undefined`, `return x+1`), confirm
-   NOVA_OPT_EMIT output == AST output AND `NOVA_ASAN=1` + `--arc` clean. Then a full `--asan` corpus before
+   KYTE_OPT_EMIT output == AST output AND `KYTE_ASAN=1` + `--arc` clean. Then a full `--asan` corpus before
    flipping the reject in the committed build.
 
 **Sessions 3+:** value-optional PARAMS (unbox on read, the call-site box), value-optional LOCALS (box on store,
@@ -330,7 +330,7 @@ snapshotted vs must be recomputed; whether method/generic monomorphised instance
 ### 3.2 Box-op MIR: value optional (B6)  -- WEEKS
 
 **Mechanism.** Add MIR ops `valopt_box {word} -> ptr` and `valopt_unbox {box} -> word` mirroring the AST
-helpers (`nova_valopt_box` = `nova_bytes_alloc(8)` storing the raw word; unbox = `box==0 ? 0 : *box`; absent =
+helpers (`kyte_valopt_box` = `kyte_bytes_alloc(8)` storing the raw word; unbox = `box==0 ? 0 : *box`; absent =
 null word). The AST boxes on every store into a value-optional slot and unboxes on every payload read -- the
 lowering must insert box/unbox at exactly those points, driven by the threaded TypeId telling value-optional
 from reference-optional. Then admit `.undefined`/`.null` in the HIR gate ONLY when the target is a value
@@ -430,18 +430,18 @@ mis-sizing 3.1b and 3.4.
 **Per-item done gate.** Every emit-path increment lands under the SAME discipline the existing 25 opt-emit
 cases (`conformance/cases/338`-`362`) landed under:
 1. **Differential byte-identical:** `conformance/emit-differential.sh` compiles a program BOTH ways (trusted
-   AST vs `NOVA_OPT_EMIT=1`) and asserts identical output -- the oracle the path was built against
+   AST vs `KYTE_OPT_EMIT=1`) and asserts identical output -- the oracle the path was built against
    (`emit-differential.sh:2-9`). A new construct adds a differential case here.
-2. **ASAN-clean:** `NOVA_ASAN=1 zig build` then `conformance/run.sh --asan` -- the authority for the box work
+2. **ASAN-clean:** `KYTE_ASAN=1 zig build` then `conformance/run.sh --asan` -- the authority for the box work
    (value-optional/error-union boxes are ARC heap objects; ASAN catches the UAF/double-free that `--arc`
    misses). Prior latent emit miscompiles in this area were caught exactly here.
 3. **`--arc` balanced:** `conformance/run.sh --arc` (baseline-gated) for ARC-neutral box/retain/release.
-4. **A pinning corpus case** (like 354-362) proving the new coverage emits (via `NOVA_OPT_EMIT_VERBOSE`
+4. **A pinning corpus case** (like 354-362) proving the new coverage emits (via `KYTE_OPT_EMIT_VERBOSE`
    showing `emitted fn ... via LIR path`, not a `reject:`).
 5. **Default corpus stays green:** `conformance/run.sh -j` (321 cases) unchanged with the path OFF -- proves no
    regression to the shipping backend.
 
-**End-state bar (the emit path "complete").** The emit path is **on by default** (`NOVA_OPT_EMIT` retired /
+**End-state bar (the emit path "complete").** The emit path is **on by default** (`KYTE_OPT_EMIT` retired /
 `driver.zig` `enabled = true`), and with it on: the full default corpus is green (`run.sh -j`), `--asan` is
 green, `--arc` is baseline-clean, the emit-differential gate is byte-identical across the whole set, AND
 `arc_elision` + inline demonstrably fire on hot functions with a measured throughput win (E2) -- because the

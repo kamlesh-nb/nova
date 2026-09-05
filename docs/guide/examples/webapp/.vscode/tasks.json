@@ -2,9 +2,9 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "nova: build (debug)",
+      "label": "kyte: build (debug)",
       "type": "shell",
-      "command": "nova build",
+      "command": "kyte build",
       "problemMatcher": [],
       "group": { "kind": "build", "isDefault": true }
     }

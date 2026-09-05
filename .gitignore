@@ -2,7 +2,7 @@
 zig-out/
 .zig-cache/
 zig-pkg/
-# nova build output
+# kyte build output
 build/
 # vendored deps: keep source, ignore their build artifacts
 deps/*/build/
@@ -10,8 +10,8 @@ deps/*/.zig-cache/
 deps/*/zig-out/
 deps/*/build_*/
 # test/debug artifacts
-__nova_test
-__nova_test.ll
+__kyte_test
+__kyte_test.ll
 *.dSYM/
 *.o
 # local scratch
@@ -22,12 +22,12 @@ recovered/
 
 # Local crypto reference copy (not part of the build)
 deps/BearSSL/
-__nova_test.exe
-__nova_test.pdb
+__kyte_test.exe
+__kyte_test.pdb
 *.pdb
 
-# Debug dump of the merged front-end source (NOVA_DUMP_MERGED=1); never part of the build
-merged.nova
+# Debug dump of the merged front-end source (KYTE_DUMP_MERGED=1); never part of the build
+merged.ky
 
 # Claude Code session worktrees/artifacts
 .claude/

@@ -8,7 +8,7 @@ problem (arc.md §4: the erased `map` body's `mapped: U` never dropped). **That 
 The dominant leak had nothing to do with generics or `map`. It reproduces with a plain, non-generic
 function and no closure:
 
-```nova
+```kyte
 fn wrap(s: string): string { return `<${s}>`; }   // interpolates its PARAMETER
 let arg = mk("x");
 let r = wrap(arg);                                  // `arg` ("x!") leaked — 1 object
@@ -28,7 +28,7 @@ ARC-clean now.
 ## RESOLVED (2026-07-19c) — both remaining bugs fixed
 
 Both bugs below were traced to CLOSURE TYPING, not the method-call machinery, and are now FIXED
-(`06c6ee0` + `27e56e5`, pinned by `conformance/cases/49_closure_interpolation.nova`):
+(`06c6ee0` + `27e56e5`, pinned by `conformance/cases/49_closure_interpolation.ky`):
 
 - **Chained intermediate box leak** — a closure with an un-pinnable param (`(x) => `v${x}``) was
   typed `.unresolved`, so the intermediate `List` box (and the closure box) were not owned locals and
@@ -45,7 +45,7 @@ real fix is closure-param typing in sema (F2-6). The historical analysis below i
 ## (historical) What remained before the closure-typing fix
 
 ### 1. Chained method-call intermediate box — `xs.map(f).map(g)` leaks 1 object / 24 bytes
-`repro/chained_map_intermediate_box.nova`. After the template fix, the ONLY survivor is the 24-byte
+`repro/chained_map_intermediate_box.ky`. After the template fix, the ONLY survivor is the 24-byte
 intermediate `List` BOX from the first `map` (its elements ARE freed — only the outer struct leaks).
 Narrowing:
 - `xs.map(f).size()` and `xs.filter(f).size()` are CLEAN — a chained receiver whose second call
@@ -58,8 +58,8 @@ Narrowing:
   ordering when an owned call's receiver is itself an owned call.
 
 ### 2. Closure returning a string, bound to a `let` — leak AND crash
-`repro/closure_string_result_leak.nova`, `repro/closure_string_return_crash.nova`.
-```nova
+`repro/closure_string_result_leak.ky`, `repro/closure_string_return_crash.ky`.
+```kyte
 let f = (s) => `<${s}>`;  let arg = mk("x");  let r = f(arg);   // leaks the closure BOX (24B) + r
 let g = (x) => `n${x}`;   let r2 = g(5);                        // CRASHES ("terminated abnormally")
 ```

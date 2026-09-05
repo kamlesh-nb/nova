@@ -1,0 +1,51 @@
+
+import os.socket;
+import os.sys;
+import bytes;
+import string;
+import env;
+
+const SOCK_PATH: string = "/tmp/kyte_handoff.sock";
+
+fn requestLine(req: string): string {
+    let i = 0;
+    while (i < req.length) {
+        let c = req[i];
+        if (c == 13 || c == 10) { return string.slice(req, 0, i); }
+        i = i + 1;
+    }
+    return req;
+}
+
+fn main(): int {
+    let id = env.get("WORKER_ID");
+    if (id == "") { id = "worker-1"; }
+
+    let ua = socket.makeSockaddrUn(SOCK_PATH);
+    let ctrl = socket.newUnix();
+    let ok = -1;
+    let tries = 0;
+    while (tries < 2000) {
+        ok = socket.connectSock(ctrl, ua, socket.sockaddrUnLen());
+        if (ok == 0) { break; }
+        socket.close(ctrl);
+        ctrl = socket.newUnix();
+        tries = tries + 1;
+    }
+    bytes.free(ua);
+    if (ok != 0) { console.log(id + ": could not reach router"); return 1; }
+    console.log(id + ": connected to router; serving handed-off client sockets");
+
+    let count = 0;
+    while (true) {
+        let h = socket.recvFd(ctrl, 8192);
+        if (h.fd < 0) { console.log(id + ": control channel closed, exiting"); break; }
+        count = count + 1;
+        let line = requestLine(h.payload);
+        let body = `{"served_by":"${id}","request":"${line}","served":${count}}`;
+        let resp = `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`;
+        socket.sendAll(h.fd, resp as long, resp.length);
+        socket.close(h.fd);
+    }
+    return 0;
+}

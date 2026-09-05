@@ -1,4 +1,4 @@
-# arc.md — Nova ownership & reference-counting, as an explicit sema pass
+# arc.md — Kyte ownership & reference-counting, as an explicit sema pass
 
 **Status:** DESIGN (2026-07-19). Supersedes the string-heuristic ARC in codegen. This is the rewrite
 that ends the fix-then-revert cycle (see `resume.md` "THE REAL PROBLEM") and takes the correctness
@@ -8,7 +8,7 @@ foundation (F4/F5) to a true 100%.
 temp-drain heuristics. Instead, a **sema pass computes ownership globally and inserts explicit
 `dup`/`drop`/`move` operations into a typed IR**; codegen mechanically lowers them. Ownership becomes
 *analyzable and provable*, not guessed. The model is **Perceus** (precise reference counting, from
-Koka/Lean4) adapted to Nova's existing `nova_retain`/`nova_release` runtime.
+Koka/Lean4) adapted to Kyte's existing `kyte_retain`/`kyte_release` runtime.
 
 ---
 
@@ -24,7 +24,7 @@ unit:
 - **Step 2 (`0e94ede`)** — made it the PRINCIPLED model (`principledDisposition`): `.owned` is the
   DEFAULT for a managed producer; only borrows (ident/field/index), assignment, bare literals, and
   own-arm-acquired kinds (try/cast/await/go/optional-chaining) are excluded. Corpus-measured the
-  whitelist-vs-principled divergence (report-only under `NOVA_SEMA_SHADOW=1` → `dumpAcqShadow`): only
+  whitelist-vs-principled divergence (report-only under `KYTE_SEMA_SHADOW=1` → `dumpAcqShadow`): only
   `.tuple` (cut over — fixed a real orphaned-tuple box leak, `conformance/cases/46`) and `.if_expr`.
   `would_drop=0` everywhere (principled ⊇ whitelist).
 - **Step 3 (`769532c`)** — unified the store-into-aggregate move/dup rule (retain-borrowed /
@@ -71,9 +71,9 @@ defect, not a bug count.
 
 ---
 
-## 0b. What Nova ALREADY has — the pass COMPLETES RAII, it does not add it
+## 0b. What Kyte ALREADY has — the pass COMPLETES RAII, it does not add it
 
-RAII has two halves. Nova got the **destruction** half right and only the **ownership-assignment** half
+RAII has two halves. Kyte got the **destruction** half right and only the **ownership-assignment** half
 wrong. Do not throw the working half away.
 
 - ✅ **Destruction at scope exit — CORRECT and KEPT.** `releaseLocalVariables` (function exit),
@@ -82,7 +82,7 @@ wrong. Do not throw the working half away.
   deterministically at scope exit," and it is why the corpus is leak-free where it is covered.
 - ❌ **Ownership assignment — GUESSED (the bug).** "Is this use a copy (dup) or a move? Is this arg
   borrowed or consumed?" is inferred by `isRefCountedType` + `pending_temps`. In C++ the TYPE SYSTEM
-  answers this (overload picks copy-ctor / move-ctor / `T&`); Nova has no enforcement, so it guesses,
+  answers this (overload picks copy-ctor / move-ctor / `T&`); Kyte has no enforcement, so it guesses,
   and guesses wrong at boundaries.
 
 Proof it is the assignment half, not the destruction half: the chained-map leak's `a` scope-exit drop
@@ -122,9 +122,9 @@ This is a checkable, global property. The pass both *establishes* it (by inserti
 *asserts* it (Section 6). That assertion is what replaces "run a probe and hope."
 
 ### 1.4 The three IR operations the pass inserts
-- **`dup(v)`** — `+1`. Lowers to `nova_retain(v)`. Inserted when a value is used more than once: every
+- **`dup(v)`** — `+1`. Lowers to `kyte_retain(v)`. Inserted when a value is used more than once: every
   non-last use gets a `dup` so each use owns its own reference.
-- **`drop(v: T)`** — `-1` with the destructor for `T`. Lowers to `nova_release(v, __drop_T)`. Inserted
+- **`drop(v: T)`** — `-1` with the destructor for `T`. Lowers to `kyte_release(v, __drop_T)`. Inserted
   at the LAST live point of every `owned` value that nothing else consumed.
 - **`move`** — no runtime op; a bookkeeping mark that ownership transferred (bind/store/return/owned-arg),
   so the pass does NOT also `drop` it. (Codegen emits nothing; it is purely the pass's accounting.)
@@ -186,10 +186,10 @@ body (`List_string_map`) — big, and it did not fully close it.
 **Better: keep the parametric body; make its `drop` calls parametric too.**
 - The ownership pass inserts `drop(mapped: U)` at `mapped`'s last use — U is a type PARAMETER.
 - `drop(v: U)` lowers to a call to **`__drop_U`**, a per-INSTANTIATION drop-glue function:
-  `__drop_string(v) = nova_release(v, __drop_string_impl)`, `__drop_int(v) = { }` (no-op).
+  `__drop_string(v) = kyte_release(v, __drop_string_impl)`, `__drop_int(v) = { }` (no-op).
 - The erased `List_map` body is emitted ONCE; where U is bound (List<int>.map<string>), the call site
   passes the drop glue for U=string (via the instantiation's dictionary / a mangled call
-  `__drop_string`), OR — simpler for Nova's monomorphizing model — the body is emitted per
+  `__drop_string`), OR — simpler for Kyte's monomorphizing model — the body is emitted per
   instantiation but ONLY the `drop`/`dup` glue differs, not the logic.
 
 This is exactly how Rust/Swift handle `T`'s drop: the LOGIC is parametric, the DROP GLUE is
@@ -199,7 +199,7 @@ per-type. It means:
 - No need to specialize the entire method body for correctness. Method-mono becomes a pure SIZE/speed
   optimization (fewer indirections), not a correctness requirement — which is the right layering.
 
-Concretely, Nova already monomorphizes bodies; so the minimal form is: the ownership pass, run on the
+Concretely, Kyte already monomorphizes bodies; so the minimal form is: the ownership pass, run on the
 already-monomorphized `List_int_map` etc., sees `mapped` typed by the instantiation and inserts the
 concrete `drop`. Where a truly erased body must exist (an uninstantiated generic reached only via a
 fn-pointer table), emit `__drop_T` glue and call it. Either way the DECISION is the pass's, uniform.
@@ -210,12 +210,12 @@ fn-pointer table), emit `__drop_T` glue and call it. Either way the DECISION is 
 
 - **New pass:** `src/sema/ownership.zig`, run AFTER type inference and (if kept) monomorphization,
   BEFORE codegen. Input: the typed AST + `TypeStore` + `TypedIr` (expr→TypeId). Output: an
-  **ownership-annotated IR** — for Nova's current shape, the cheapest form is to annotate `TypedIr`
+  **ownership-annotated IR** — for Kyte's current shape, the cheapest form is to annotate `TypedIr`
   with, per expr node: its disposition (`owned`/`borrowed`) and a list of inserted `dup`/`drop` ops
   keyed to program points (before/after the node, at scope exit).
 - **Codegen becomes a lowering:** delete `isRefCountedType`, the `isOwned*` fallback family, and the
-  `pending_temps`/`drainTemporaries` heuristic machinery. Replace with: "emit `nova_retain` for each
-  `dup`, `nova_release(_, __drop_T)` for each `drop`, nothing else." The destructor `__drop_T` comes
+  `pending_temps`/`drainTemporaries` heuristic machinery. Replace with: "emit `kyte_retain` for each
+  `dup`, `kyte_release(_, __drop_T)` for each `drop`, nothing else." The destructor `__drop_T` comes
   from the TypeId (existing `getOrCreateDestructor`, but keyed on TypeId not a rendered string).
 - `TypeStore.isOwned` + variant-aware enum ownership is the ONLY ownership oracle; it already exists
   and is `--shadow`-proven on concretes. Extend it with enum-variant awareness (the one documented gap)
@@ -288,7 +288,7 @@ a true, provable 100%.** The residue is unrelated small cleanup that never cause
   The heuristic model had no such check; this is the core upgrade.
 - **Control-flow (branches, loops, early return, `try` propagation)** → last-use analysis is per-CFG;
   a value live on one branch and not another gets a `drop` on the branch that ends its life (Perceus
-  handles this with per-edge drops; Nova's `spillTemp`-to-slot trick already exists for exactly the
+  handles this with per-edge drops; Kyte's `spillTemp`-to-slot trick already exists for exactly the
   "born in a branch the drain block doesn't dominate" case and can back the drop-on-edge).
 - **The `StringBuilder.alloc_persistent` string** → under the pass it is a normal managed value with a
   known TypeId (`string`); its `drop` is inserted at its last use like any other. The "persistent"
@@ -309,10 +309,10 @@ leaks/UAFs (the pass being right where the heuristics were wrong), begin the per
 ## 11. Reference implementations to follow (real, shipping — mapped to this design)
 
 No single project is a drop-in template (each targets a different language), but each solves one piece
-of §1–§7, and TWO are close enough to Nova to follow closely. Ranked by relevance:
+of §1–§7, and TWO are close enough to Kyte to follow closely. Ranked by relevance:
 
 ### A. Swift — SIL Ownership SSA (OSSA) + calling conventions. **Closest overall.**
-Swift is an imperative language with `retain`/`release` ARC, generics, protocols (≈ traits) — Nova's
+Swift is an imperative language with `retain`/`release` ARC, generics, protocols (≈ traits) — Kyte's
 shape. Learn:
 - **OSSA (Ownership SSA):** Swift's SIL carries ownership on every value and a VERIFIER statically
   proves every owned value is consumed exactly once on all paths. This IS §6.1 (the static balance
@@ -332,7 +332,7 @@ codebase is far smaller/more readable than Swift's. Learn:
   an imperative language with generics. → Nim manual "Destructors and move semantics"; compiler
   `compiler/injectdestructors.nim` is the drop-insertion pass — **read this file; it is the single
   closest analogue to `ownership.zig`.**
-- **`--mm:arc`** = deterministic RC (no cycle collector); `--mm:orc` adds cycle collection. Nova can
+- **`--mm:arc`** = deterministic RC (no cycle collector); `--mm:orc` adds cycle collection. Kyte can
   start at `arc` (no cycles) like Nim did.
 
 ### C. Koka — Perceus. **The reference for the dup/drop INSERTION algorithm.**
@@ -340,7 +340,7 @@ The precise last-use `dup`/`drop` placement in §1.4/§2 is Perceus. Learn the a
 - **Paper:** "Perceus: Garbage Free Reference Counting with Reuse", Reinking, Xie, de Moura, Leijen,
   PLDI 2021 — the canonical description of dup/drop insertion + drop-reuse.
 - **Code:** `koka-lang/koka` (the `Backend`/`Core` reference-counting pass). Functional language, so
-  its control flow is simpler than Nova's — take the algorithm, not the language assumptions.
+  its control flow is simpler than Kyte's — take the algorithm, not the language assumptions.
 
 ### D. Lean 4 — RC for a functional+systems language.
 "Counting Immutable Beans: Reference Counting Optimized for Purely Functional Programming", Ullrich &
@@ -355,27 +355,27 @@ per-monomorphization destructor (same idea as §4). Read this when implementing 
 
 ### F. LLVM ObjC ARC optimizer — RC-pair elimination at the IR level.
 `llvm/lib/Transforms/ObjCARC` — a real pass that removes redundant `retain`/`release`. Relevant LATER,
-as an optimization once correctness lands (our `dup`/`drop` lower to `nova_retain`/`nova_release`, and
+as an optimization once correctness lands (our `dup`/`drop` lower to `kyte_retain`/`kyte_release`, and
 an ARC-opt pass can then elide pairs). Not needed for 100%-correct; needed for fast.
 
 ### G. C++ `std::shared_ptr` — the intuition pump and correctness baseline (you already know it)
-`shared_ptr` IS reference counting, and Nova's runtime already matches it: `nova_retain`/`nova_release`
+`shared_ptr` IS reference counting, and Kyte's runtime already matches it: `kyte_retain`/`kyte_release`
 = `shared_ptr` inc/dec; the 8-byte header at `ptr-8` = the control block (INLINE — better than
 `shared_ptr`'s separate, atomically-counted block). So the RC MECHANISM is not the problem.
 
-The lesson is WHY `shared_ptr` is correct and Nova's codegen was not: **RAII.** `shared_ptr` never
+The lesson is WHY `shared_ptr` is correct and Kyte's codegen was not: **RAII.** `shared_ptr` never
 guesses — a copy is a retain (copy-ctor), a scope exit is a release (dtor), `std::move` transfers; the
 C++ compiler mechanically emits the dtor at every scope exit. That is the "one owner of the decision"
-property (§0). **This whole document is "give Nova RAII"**: the pass inserts `dup` (= copy), `drop`
+property (§0). **This whole document is "give Kyte RAII"**: the pass inserts `dup` (= copy), `drop`
 (= dtor at last-use), `move` (= `std::move`) so ownership is mechanical, not heuristic. Sanity-check
 every §2 rule with: "would this be right if every managed value were a `shared_ptr`?"
 
 CAVEATS (why we follow Perceus/Nim/Swift, not `shared_ptr` literally): `shared_ptr` is the NAÏVE RC —
 atomic counts, separate control block, no last-use elision, and it LEAKS CYCLES (needs `weak_ptr` by
-hand; Nova will need ORC-style cycle collection or weak refs eventually, same as Nim). And you CANNOT
-shortcut by wrapping Nova values in `shared_ptr` in the runtime: it changes the ABI, adds atomic cost,
+hand; Kyte will need ORC-style cycle collection or weak refs eventually, same as Nim). And you CANNOT
+shortcut by wrapping Kyte values in `shared_ptr` in the runtime: it changes the ABI, adds atomic cost,
 and — the point — still does not tell the compiler WHERE to emit the copies/dtors. That placement IS
-the pass. Nova's inline-header RC + this pass = `shared_ptr` semantics with better layout and
+the pass. Kyte's inline-header RC + this pass = `shared_ptr` semantics with better layout and
 compiler-optimized (non-atomic, elided, last-use) counts.
 
 ### Recommendation

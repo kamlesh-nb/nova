@@ -2,5 +2,5 @@ build/
 *.o
 packages
 project.lock.json
-__nova_test
-__nova_test.ll
+__kyte_test
+__kyte_test.ll

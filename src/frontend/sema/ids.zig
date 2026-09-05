@@ -4,7 +4,7 @@
 //! Later semantic passes (type inference, monomorphisation, ownership/ARC,
 //! lowering) need to attach information to individual expressions and look it up
 //! again from a different place in the pipeline. The obvious key, the
-//! expression's address, is unusable here: Nova's AST nodes are plain value
+//! expression's address, is unusable here: Kyte's AST nodes are plain value
 //! structs that get copied by value all over the compiler (stored into unions,
 //! passed to helpers, returned), and a copy has a brand-new address while being
 //! semantically the same node. Keying a side table on `&expr` would silently

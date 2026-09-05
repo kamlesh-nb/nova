@@ -1,8 +1,8 @@
 # Foundation Gap Register (F1–F5 → 100%)
 
 Living record for the autonomous foundation-hardening pass. Grading ruler: **can spec-legal code
-crash / leak / UAF / silently produce a wrong value?** — verified with ASAN + `NOVA_SEMA_SHADOW` +
-`NOVA_ARC_AUDIT`, not just FUNC gates. Every fix lands with a genuine test in that discipline, or is
+crash / leak / UAF / silently produce a wrong value?** — verified with ASAN + `KYTE_SEMA_SHADOW` +
+`KYTE_ARC_AUDIT`, not just FUNC gates. Every fix lands with a genuine test in that discipline, or is
 reverted. No faked green.
 
 Status legend: ☐ open · ◑ in progress · ☑ fixed+gated · ✗ attempted, reverted (why)
@@ -106,7 +106,7 @@ Status legend: ☐ open · ◑ in progress · ☑ fixed+gated · ✗ attempted, 
 - ☑ **B2** — COMPLETE (verified 2026-07-21). `decimal` is IEEE-754 decimal128 (BID), `m`-suffixed literals
       (`10.5m`), toString/interpolation, arithmetic+compare, BSON codec — gates 50/51/52 all pass. No
       implicit int↔decimal / float↔decimal conversion is the HONEST design choice (explicit only), so a
-      `let a: decimal = 3.14` (binary float) is correctly a type error. See [[nova-decimal128]].
+      `let a: decimal = 3.14` (binary float) is correctly a type error. See [[kyte-decimal128]].
 
 ## Class C — optionals / narrowing (F2, spec §3.4)
 - ◑ **C1** the spec (§3.4) DESIGNS optional member access as GUARDED (safe), not statically-enforced —
@@ -154,9 +154,9 @@ Status legend: ☐ open · ◑ in progress · ☑ fixed+gated · ✗ attempted, 
 - ☑ **E3** DUPLICATE struct-name across modules → wrong-struct resolution — RESOLVED for the stdlib
       (2026-07-21) by RENAMING the 7 dups + re-adding the now-safe collision diagnostic. The 7 (each →
       module-unique): driver internals `Dsn`/`Frame`/`PCursor`/`Reader` → `Pg*`/`My*`/`Bt*` (per driver;
-      private, file-local); web `Mediator`→`AppMediator` + `Route`→`AppRoute` in app.nova (app is the
-      self-contained flagship; keeps mediator.nova's `Mediator` and router.nova's `Route`); `Router`→
-      `CtrlRouter` in the vestigial router.nova/controller.nova (keeps routing.nova's flagship `Router`).
+      private, file-local); web `Mediator`→`AppMediator` + `Route`→`AppRoute` in app.ky (app is the
+      self-contained flagship; keeps mediator.ky's `Mediator` and router.ky's `Route`); `Router`→
+      `CtrlRouter` in the vestigial router.kyte/controller.ky (keeps routing.ky's flagship `Router`).
       Stdlib is now duplicate-free: all 3 drivers + app + mediator + routing compile TOGETHER (was 7
       collisions → 11/11). The collision diagnostic (type_checker struct registration) is RE-ADDED —
       previously reverted for over-firing on the driver internals, now safe since the stdlib is clean, so
@@ -173,9 +173,9 @@ Status legend: ☐ open · ◑ in progress · ☑ fixed+gated · ✗ attempted, 
       `docs/design/F1-module-scoped-types.md`. (The stdlib renames stay — clearer names, and now optional.)
       --- ORIGINAL FINDING (kept for context) ---
       DUPLICATE struct-name across modules → wrong-struct resolution (found 2026-07-21). The codegen
-      struct table (and sema type lookup) is BARE-NAME keyed (last-wins), not module-scoped. `web/app.nova`
-      and `web/mediator.nova` BOTH define `pub struct Mediator` (different shapes); importing both makes
-      `self: Mediator` in mediator.nova's methods resolve to app's Mediator (no `behaviors` field) →
+      struct table (and sema type lookup) is BARE-NAME keyed (last-wins), not module-scoped. `web/app.ky`
+      and `web/mediator.ky` BOTH define `pub struct Mediator` (different shapes); importing both makes
+      `self: Mediator` in mediator.ky's methods resolve to app's Mediator (no `behaviors` field) →
       `self.behaviors.push(...)` → objType null → "no such method or function" (span-less codegen fail).
       SEVEN stdlib names are duplicated across modules and latently collide: `Duration`, `Mediator`,
       `Process`, `Route`, `Router`, `StopWatch`, `Watcher`. Proper fix = MODULE-SCOPED struct/type
@@ -202,7 +202,7 @@ Status legend: ☐ open · ◑ in progress · ☑ fixed+gated · ✗ attempted, 
       visibility (`recordFnVisibility`, shared with the edge path) as defense-in-depth. This EXPOSED a
       latent bug the hole had hidden: `serde/bson` had ZERO `pub fn` (all 28 private) yet is used as a
       public API — marked its 25 public-API fns `pub` (kept 3 internal byte-plumbing helpers private),
-      matching json's convention (21 pub / 2 private). Gate: expect_fail/private_fn_cross_module.nova
+      matching json's convention (21 pub / 2 private). Gate: expect_fail/private_fn_cross_module.ky
       (bson.getDocSize, a private helper, rejected cross-module). FUNC/SHADOW/ARC 93/93; DB drivers +
       multi-segment stdlib imports all still typecheck.
 - ☑ **E2** — RESOLVED (verified 2026-07-21). Both facets now hold: (1) an unimported/unresolved call is a
@@ -237,7 +237,7 @@ Ruler: repro under FUNC/ASAN/SHADOW/ARC. Verifying BEFORE fixing prevented "fixi
       lifecycle I have NOT fully traced. DO NOT re-attempt blindly. Fix needs a full trace of the temp
       lifecycle for `??`-on-borrowed-owned vs the balanced general field-`??`. Routing is unaffected
       (mediator uses null-narrowing). REVERTED both attempts; 13_serde ARC clean.
-- ☑ **F1t** REDIAGNOSED + FIXED: not "int+string should be rejected" — Nova `+` with a string operand
+- ☑ **F1t** REDIAGNOSED + FIXED: not "int+string should be rejected" — Kyte `+` with a string operand
       IS concat (with coercion), and `"n="+5` → "n=5" works. The real bug: a DESTRUCTURED tuple
       element's TypeId is correct (`e.length` worked) but its RENDERED string was "i32" (tuple type
       doesn't round-trip), so `is_string_concat`/`is_string_comparison` (which read the STRING) missed
@@ -259,14 +259,14 @@ alias, trait widening at fn-arg and struct-field, `Map<K,string>` coalesce. That
 
 CONFIRMED memory-unsafe (direct ASAN):
 - **A1** `x ?? default` where `x` is an OWNED struct/trait value (`let h = m.get(); h ?? d`, or inline
-  `(m.get(k) ?? d)`, key present OR absent) → heap-use-after-free / double-free (nova_release
+  `(m.get(k) ?? d)`, key present OR absent) → heap-use-after-free / double-free (kyte_release
   alloc.cpp:369). `?? StructDefault` in a trait-typed coalesce (key absent) → SEGV (raw struct in a
   trait slot). Narrowing (`if (x==undefined)`) is SOUND and clean — this is ONLY the `??` unwrap.
   STATUS: 3 fix attempts reverted. Unresolved CONTRADICTION: the per-edge retain fires only on
   ident/field/index lefts, yet 13_serde (all `.get()`-call lefts) leaked +286 — impossible under my
   model → my model of drainTemporaries/consumeTemporary/phi-registration is WRONG somewhere.
-  NEXT STEP (do this, not more guessing): apply the per-edge fix, dump 13_serde `__nova_test.ll`, grep
-  the `nc_` blocks for the ADDED `nova_retain`, and find which `??` site it fired on — that reveals the
+  NEXT STEP (do this, not more guessing): apply the per-edge fix, dump 13_serde `__kyte_test.ll`, grep
+  the `nc_` blocks for the ADDED `kyte_retain`, and find which `??` site it fired on — that reveals the
   wrong assumption. Only then design the fix. Routing is UNAFFECTED (mediator uses narrowing).
 
 Not-memory-unsafe (lower priority): C1 (unnarrowed optional → safe located TRAP, not SEGV; static

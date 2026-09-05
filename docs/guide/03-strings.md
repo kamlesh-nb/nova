@@ -4,13 +4,13 @@ A `string` is a UTF-8 byte buffer with a length prefix. The idiomatic way to bui
 **template literal** (`` `...${expr}...` ``), which stringifies `int`/`long`/`float`/`bool`/`decimal`/
 `string` for you. Prefer it over manual `+` concatenation.
 
-```nova
-// examples/04_strings.nova
+```kyte
+// examples/04_strings.ky
 import string;
 
 fn main(): void {
     let a = "Hello";
-    let b = "Nova";
+    let b = "Kyte";
     console.log(a + ", " + b + "!");        // concatenation
     console.log(`length of "${a}" = ${a.length}`);
 
@@ -20,7 +20,7 @@ fn main(): void {
     console.log(`n=${n} ok=${ok} half=${n / 2}`);
 
     // string stdlib (ASCII/byte level)
-    console.log(`upper: ${string.toUpperCase("nova")}`);
+    console.log(`upper: ${string.toUpperCase("kyte")}`);
     console.log(`slice(0,3): ${string.slice("hypermedia", 0, 3)}`);
     console.log(`indexOf 'per': ${string.indexOf("hypermedia", "per")}`);
     console.log(`contains 'media': ${string.contains("hypermedia", "media")}`);
@@ -30,10 +30,10 @@ fn main(): void {
 Output:
 
 ```
-Hello, Nova!
+Hello, Kyte!
 length of "Hello" = 5
 n=7 ok=true half=3
-upper: NOVA
+upper: KYTE
 slice(0,3): hyp
 indexOf 'per': 2
 contains 'media': true
@@ -60,15 +60,15 @@ For real Unicode codepoint iteration (rather than bytes), use `text.utf8`.
 
 A `string` OWNS its bytes: it is heap-allocated, reference-counted, and copied when you slice it. Most of
 the time that is exactly what you want. But on a hot path, minting a fresh owned `string` for every
-substring adds allocations you do not need. For that, Nova has a borrowed view type, `Str`, from the
-`str` module. It is Nova's equivalent of Rust's `&str`.
+substring adds allocations you do not need. For that, Kyte has a borrowed view type, `Str`, from the
+`str` module. It is Kyte's equivalent of Rust's `&str`.
 
 A `Str` is just a `{ ptr, len }` pair: an address and a byte count that BORROW a run of UTF-8 bytes it
 does not own. There is no allocation, no reference count, and no retain or release traffic. It is a value
 struct, so passing or copying a `Str` copies only the two fields, never the bytes, and every copy shares
 the same backing store.
 
-```nova
+```kyte
 import str;
 
 let owner = "hypermedia";           // an owned string; it holds the bytes
@@ -85,7 +85,7 @@ to enforce this, so the guarantee is yours: keep the backing `string` (or buffer
 any view into it is used, and never store a `Str` in a field, a list, or a return value that escapes that
 scope. When a value genuinely has to escape, copy it into an owned `string` with `toOwned()`:
 
-```nova
+```kyte
 fn keep(v: str.Str): string {
     return v.toOwned();   // copies the borrowed bytes into a fresh, self-owned string
 }

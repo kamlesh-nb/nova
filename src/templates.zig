@@ -1,6 +1,6 @@
-//! Project scaffold file templates for `nova init`.
+//! Project scaffold file templates for `kyte init`.
 //!
-//! Each `pub const` here is the verbatim text of ONE file that `nova init`
+//! Each `pub const` here is the verbatim text of ONE file that `kyte init`
 //! writes when creating a new project, stored as a Zig multiline string
 //! literal. They are pure data: [`scaffold`] selects the right set for the
 //! requested project kind (`console` / `web` / `desktop`) and writes each to
@@ -9,16 +9,16 @@
 //! and the front-end shell). Editing a template here changes what a freshly
 //! initialised project looks like; it does not affect already-created apps.
 
-/// The `main.nova` written by `nova init console`: a hello-world entry point.
+/// The `main.ky` written by `kyte init console`: a hello-world entry point.
 pub const console_main_sample =
     \\import string;
     \\
     \\fn main(): void {
-    \\    console.log("Hello, World from Nova console application!");
+    \\    console.log("Hello, World from Kyte console application!");
     \\}
 ;
 
-/// `.vscode/launch.json`: the lldb-dap debug configuration, which imports the Nova value formatters so `List`/`Map`/`struct`/`str.Str` display cleanly.
+/// `.vscode/launch.json`: the lldb-dap debug configuration, which imports the Kyte value formatters so `List`/`Map`/`struct`/`str.Str` display cleanly.
 pub const vscode_launch_json =
     \\{
     \\  "version": "0.2.0",
@@ -26,12 +26,12 @@ pub const vscode_launch_json =
     \\    {
     \\      "type": "lldb-dap",
     \\      "request": "launch",
-    \\      "name": "Debug Nova (debug build)",
+    \\      "name": "Debug Kyte (debug build)",
     \\      "program": "${workspaceFolder}/build/debug/bin/${workspaceFolderBasename}",
     \\      "cwd": "${workspaceFolder}",
-    \\      "preLaunchTask": "nova: build (debug)",
+    \\      "preLaunchTask": "kyte: build (debug)",
     \\      "initCommands": [
-    \\        "command script import ~/.nova/std/debug/nova_formatters.py"
+    \\        "command script import ~/.kyte/std/debug/kyte_formatters.py"
     \\      ]
     \\    }
     \\  ]
@@ -39,15 +39,15 @@ pub const vscode_launch_json =
     \\
 ;
 
-/// `.vscode/tasks.json`: wires `nova build` (debug) as the editor's default build task, used by the launch config's preLaunchTask.
+/// `.vscode/tasks.json`: wires `kyte build` (debug) as the editor's default build task, used by the launch config's preLaunchTask.
 pub const vscode_tasks_json =
     \\{
     \\  "version": "2.0.0",
     \\  "tasks": [
     \\    {
-    \\      "label": "nova: build (debug)",
+    \\      "label": "kyte: build (debug)",
     \\      "type": "shell",
-    \\      "command": "nova build",
+    \\      "command": "kyte build",
     \\      "problemMatcher": [],
     \\      "group": { "kind": "build", "isDefault": true }
     \\    }
@@ -56,7 +56,7 @@ pub const vscode_tasks_json =
     \\
 ;
 
-/// A starter `@test` for a console project, asserting through the `assert` module (so `nova test` has something to run).
+/// A starter `@test` for a console project, asserting through the `assert` module (so `kyte test` has something to run).
 pub const console_test_sample =
     \\import assert;
     \\
@@ -67,10 +67,10 @@ pub const console_test_sample =
 ;
 
 
-/// The web app composition root (`main.nova`, the Go "server struct" / Program.cs analogue): constructs
+/// The web app composition root (`main.ky`, the Go "server struct" / Program.cs analogue): constructs
 /// the shared dependencies once, lets each feature register its own routes, wires static files, runs.
 pub const web_main_sample =
-    \\// main.nova, the composition root. It constructs the app-wide dependencies ONCE (here just a
+    \\// main.ky, the composition root. It constructs the app-wide dependencies ONCE (here just a
     \\// repository), then hands them to each feature's `register(...)` so the feature can wire its own
     \\// routes. A route maps a path to a handler INSTANCE that implements `RouteHandler` (one uniform
     \\// `async serve(ctx): Response` method) and holds its dependencies as fields. There is no mediator
@@ -128,7 +128,7 @@ pub const web_app_yaml_sample =
     \\  #   poolSize: 16
     \\
     \\# The sections below are read by the ORCHESTRATOR when you deploy this app (it ignores `config:`
-    \\# above, just as the app ignores these). They are commented out so a local `nova build && run`
+    \\# above, just as the app ignores these). They are commented out so a local `kyte build && run`
     \\# needs nothing. Uncomment and fill in when you deploy -- see the "Deploying with the orchestrator"
     \\# guide chapter.
     \\# metadata: { name: my-app }
@@ -141,7 +141,7 @@ pub const web_routes_sample =
     \\// A feature's route table. Each `app.<verb>(path, Handler(deps))` binds a path to a handler
     \\// instance and injects that handler's dependencies (here the shared ProductRepository) as plain
     \\// constructor arguments. Keeping routes in one small file per feature is what keeps the composition
-    \\// root (main.nova) tidy as the app grows: main builds the shared deps and calls one `register` per
+    \\// root (main.ky) tidy as the app grows: main builds the shared deps and calls one `register` per
     \\// feature. `{id:int}` is a typed path parameter, bound to the handler's request struct by name.
     \\import web.app;
     \\import Features.Products.Shared.repository;
@@ -204,7 +204,7 @@ pub const web_create_handler_sample =
     \\import Features.Products.views.product_card;
     \\
     \\// Handles POST /api/products. A `RouteHandler` is a plain struct that holds its dependencies as
-    \\// fields (here the ProductRepository, injected in routes.nova) and exposes ONE uniform method,
+    \\// fields (here the ProductRepository, injected in routes.ky) and exposes ONE uniform method,
     \\// `serve(ctx)`. It reads its typed input with `ctx.bind<CreateProduct>()`, does its work, and
     \\// returns a `Response`. This is a hypermedia app, so the response body is an HTML fragment (the new
     \\// product's card) that the browser swaps into the page; return JSON instead if you are building an API.
@@ -230,7 +230,7 @@ pub const web_create_handler_sample =
 pub const web_repository_sample =
     \\import Domain.Dtos.ProductDto;
     \\
-    \\// A repository. Handlers receive it as a constructor argument (wired in Features/Products/routes.nova),
+    \\// A repository. Handlers receive it as a constructor argument (wired in Features/Products/routes.ky),
     \\// so it is a plain struct: no DI container, no marker trait to implement. This starter returns stub
     \\// data so the app runs with no database.
     \\//
@@ -243,7 +243,7 @@ pub const web_repository_sample =
     \\//     let _r  = await repo.add(entity);   // INSERT from a Domain.Entities.Product
     \\//
     \\// Repository<T> binds T from the ORM seam and keeps the connection, so slices stay free of bind code.
-    \\// Connect ONCE at sync top level in main.nova (an async connect driven inside a request would abort),
+    \\// Connect ONCE at sync top level in main.ky (an async connect driven inside a request would abort),
     \\// then pass the connection down to the repositories here.
     \\pub struct ProductRepository {
     \\    init() {}
@@ -310,7 +310,7 @@ pub const web_get_handler_sample =
 
 /// The `.nsx` hypermedia view template that renders the feature's response as markup.
 pub const web_view_sample =
-    \\// A per-feature NSX view. View code lives in `.nsx` files (same language as `.nova`, just filed apart
+    \\// A per-feature NSX view. View code lives in `.nsx` files (same language as `.ky`, just filed apart
     \\// so markup stays separate from logic) and returns an HTML string the handler or a page route renders.
     \\// An NSX element is a `string`, so expressions embed inline with `{...}` and views compose directly.
     \\//
@@ -345,7 +345,7 @@ pub const web_domain_entity_sample =
     \\}
 ;
 
-/// The root `index.html` shell, wired for **htmx** (`nova init web --framework htmx`, the default).
+/// The root `index.html` shell, wired for **htmx** (`kyte init web --framework htmx`, the default).
 ///
 /// htmx reads plain HTML attributes (`hx-get`/`hx-target`/`hx-swap`) and swaps the HTML fragment the
 /// server returns into the page. That is exactly what this template's handlers already return (a product
@@ -356,17 +356,17 @@ pub const web_index_html_htmx =
     \\<head>
     \\  <meta charset="utf-8">
     \\  <meta name="viewport" content="width=device-width, initial-scale=1">
-    \\  <title>Nova Web App</title>
+    \\  <title>Kyte Web App</title>
     \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
     \\       Run `npm install` once, then `npm run css:watch` while developing. -->
     \\  <link rel="stylesheet" href="/app.css">
     \\  <!-- htmx, the hypermedia framework. It turns the hx-* attributes below into AJAX calls and swaps
-    \\       the returned HTML fragment into the page, so your Nova handlers just return the markup they
+    \\       the returned HTML fragment into the page, so your Kyte handlers just return the markup they
     \\       already render. Pin the version you build against. -->
     \\  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
     \\</head>
     \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
-    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <h1 class="text-2xl font-bold tracking-tight">Kyte Web App</h1>
     \\  <p class="mt-2 text-slate-600">A hypermedia app powered by htmx. The button GETs a product and swaps
     \\     the returned card (its <code>id="product"</code>) into the page, with no reload.</p>
     \\  <button class="mt-4 rounded-lg bg-slate-800 px-4 py-2 text-white hover:bg-slate-700"
@@ -378,7 +378,7 @@ pub const web_index_html_htmx =
     \\</html>
 ;
 
-/// The root `index.html` shell, wired for **Unpoly** (`nova init web --framework unpoly`).
+/// The root `index.html` shell, wired for **Unpoly** (`kyte init web --framework unpoly`).
 ///
 /// Unpoly follows a link/form, fetches the URL, and swaps the element matching `up-target` using the
 /// element of the SAME selector in the response. So the returned product card must carry `id="product"`
@@ -390,7 +390,7 @@ pub const web_index_html_unpoly =
     \\<head>
     \\  <meta charset="utf-8">
     \\  <meta name="viewport" content="width=device-width, initial-scale=1">
-    \\  <title>Nova Web App</title>
+    \\  <title>Kyte Web App</title>
     \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
     \\       Run `npm install` once, then `npm run css:watch` while developing. -->
     \\  <link rel="stylesheet" href="/app.css">
@@ -400,7 +400,7 @@ pub const web_index_html_unpoly =
     \\  <script src="https://cdn.jsdelivr.net/npm/unpoly@3.10.2/unpoly.min.js"></script>
     \\</head>
     \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
-    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <h1 class="text-2xl font-bold tracking-tight">Kyte Web App</h1>
     \\  <p class="mt-2 text-slate-600">A hypermedia app powered by Unpoly. The link GETs a product and swaps
     \\     the matching <code>#product</code> fragment from the response, with no reload.</p>
     \\  <a href="/api/products/1" up-target="#product" up-follow
@@ -412,7 +412,7 @@ pub const web_index_html_unpoly =
     \\</html>
 ;
 
-/// The root `index.html` shell, wired for **htmz** (`nova init web --framework htmz`).
+/// The root `index.html` shell, wired for **htmz** (`kyte init web --framework htmz`).
 ///
 /// htmz has no CDN package -- it IS the ~166-byte inline snippet below. A link with `target=htmz` loads
 /// the URL into the hidden iframe; the iframe's onload then replaces the element named by the URL hash
@@ -423,13 +423,13 @@ pub const web_index_html_htmz =
     \\<head>
     \\  <meta charset="utf-8">
     \\  <meta name="viewport" content="width=device-width, initial-scale=1">
-    \\  <title>Nova Web App</title>
+    \\  <title>Kyte Web App</title>
     \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
     \\       Run `npm install` once, then `npm run css:watch` while developing. -->
     \\  <link rel="stylesheet" href="/app.css">
     \\</head>
     \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
-    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <h1 class="text-2xl font-bold tracking-tight">Kyte Web App</h1>
     \\  <p class="mt-2 text-slate-600">A hypermedia app powered by htmz. The link GETs a product into the
     \\     hidden iframe, which swaps the <code>#product</code> fragment in place, with no reload.</p>
     \\  <a href="/api/products/1#product" target=htmz
@@ -444,7 +444,7 @@ pub const web_index_html_htmz =
     \\</html>
 ;
 
-/// The root `index.html` shell, wired for **Alpine AJAX** (`nova init web --framework alpine`).
+/// The root `index.html` shell, wired for **Alpine AJAX** (`kyte init web --framework alpine`).
 ///
 /// Alpine AJAX (the alpine-ajax plugin on Alpine.js) intercepts an `x-target` link/form, fetches the URL,
 /// and merges the response elements whose ids are listed (`product`) into the page. So the returned card
@@ -455,7 +455,7 @@ pub const web_index_html_alpine =
     \\<head>
     \\  <meta charset="utf-8">
     \\  <meta name="viewport" content="width=device-width, initial-scale=1">
-    \\  <title>Nova Web App</title>
+    \\  <title>Kyte Web App</title>
     \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
     \\       Run `npm install` once, then `npm run css:watch` while developing. -->
     \\  <link rel="stylesheet" href="/app.css">
@@ -465,7 +465,7 @@ pub const web_index_html_alpine =
     \\  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
     \\</head>
     \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
-    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <h1 class="text-2xl font-bold tracking-tight">Kyte Web App</h1>
     \\  <p class="mt-2 text-slate-600">A hypermedia app powered by Alpine AJAX. The link GETs a product and
     \\     merges the returned <code>#product</code> fragment into the page, with no reload.</p>
     \\  <a href="/api/products/1" x-target="product"
@@ -477,12 +477,12 @@ pub const web_index_html_alpine =
     \\</html>
 ;
 
-/// The root `index.html` shell, wired for **datastar** (`nova init web --framework datastar`).
+/// The root `index.html` shell, wired for **datastar** (`kyte init web --framework datastar`).
 ///
 /// datastar reads `data-*` attributes and drives reactive signals in the browser. The counter below works
 /// with only the CDN script (no server round-trip), so it is a live demo out of the box. datastar's
 /// server-driven actions (`@get`/`@post`) expect a `text/event-stream` SSE response that PATCHES elements,
-/// not a plain HTML fragment -- for that path, stream `datastar-patch-elements` events from a Nova SSE
+/// not a plain HTML fragment -- for that path, stream `datastar-patch-elements` events from a Kyte SSE
 /// handler (`web.sse`, see the guide's SSE section), rather than returning a fragment as these handlers do.
 pub const web_index_html_datastar =
     \\<!doctype html>
@@ -490,7 +490,7 @@ pub const web_index_html_datastar =
     \\<head>
     \\  <meta charset="utf-8">
     \\  <meta name="viewport" content="width=device-width, initial-scale=1">
-    \\  <title>Nova Web App</title>
+    \\  <title>Kyte Web App</title>
     \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
     \\       Run `npm install` once, then `npm run css:watch` while developing. -->
     \\  <link rel="stylesheet" href="/app.css">
@@ -499,7 +499,7 @@ pub const web_index_html_datastar =
     \\  <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js"></script>
     \\</head>
     \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
-    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <h1 class="text-2xl font-bold tracking-tight">Kyte Web App</h1>
     \\  <p class="mt-2 text-slate-600">A hypermedia app powered by datastar. The counter below is a reactive
     \\     signal, driven entirely by data-* attributes.</p>
     \\  <div data-signals="{count: 0}" class="mt-4">
@@ -514,7 +514,7 @@ pub const web_index_html_datastar =
 /// The `package.json` for the app's front-end tooling (Tailwind build, etc.).
 pub const web_package_json_sample =
     \\{
-    \\  "name": "nova-web-app",
+    \\  "name": "kyte-web-app",
     \\  "private": true,
     \\  "scripts": {
     \\    "css": "tailwindcss -i ./styles/app.css -o ./wwwroot/app.css --minify",
@@ -541,7 +541,7 @@ pub const web_tailwind_config_sample =
     \\/** @type {import('tailwindcss').Config} */
     \\module.exports = {
     \\  content: [
-    \\    "./src/**/*.{nsx,nova}",
+    \\    "./src/**/*.{nsx,kyte}",
     \\    "./wwwroot/*.html",
     \\  ],
     \\};
@@ -605,27 +605,27 @@ pub const web_test_sample =
     \\}
 ;
 
-/// The `main.nova` written by `nova init desktop`.
+/// The `main.ky` written by `kyte init desktop`.
 pub const desktop_main_sample =
-    \\// main.nova, a native desktop app: a webview window rendering NSX, with a Nova
+    \\// main.ky, a native desktop app: a webview window rendering NSX, with a Kyte
     \\// handler bound to a JS call. Build native and run to open the window.
     \\import webview;
     \\
-    \\// JS -> Nova: window.greet(name) calls this; `req` is a JSON array of the JS args.
+    \\// JS -> Kyte: window.greet(name) calls this; `req` is a JSON array of the JS args.
     \\fn greet(req: string): string {
-    \\    return "\"Hello from Nova! args=" + req + "\"";
+    \\    return "\"Hello from Kyte! args=" + req + "\"";
     \\}
     \\
     \\fn main(): void {
     \\    let w = webview.Webview(true);
-    \\    w.setTitle("Nova Desktop");
+    \\    w.setTitle("Kyte Desktop");
     \\    w.setSize(900, 640, webview.HINT_NONE);
     \\
     \\    let page = <html>
     \\        <body style="font-family:system-ui;display:grid;place-items:center;height:100vh;margin:0;background:#0f172a;color:#e2e8f0">
     \\            <div style="text-align:center">
-    \\                <h1>Nova Desktop</h1>
-    \\                <button onclick="window.greet('world').then(r => document.querySelector('#out').textContent = r)">Call Nova</button>
+    \\                <h1>Kyte Desktop</h1>
+    \\                <button onclick="window.greet('world').then(r => document.querySelector('#out').textContent = r)">Call Kyte</button>
     \\                <p id="out"></p>
     \\            </div>
     \\        </body>

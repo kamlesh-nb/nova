@@ -6,10 +6,10 @@ Status: `not started`, `in progress`, `done`, `deferred`, `superseded`.
 
 | ID | Item | Status |
 |----|------|--------|
-| P7-S1 | Stage 1: escape gauge, report-only (NOVA_ESCAPE_REPORT, escape.zig) | done (shipped report-only; ~10% of sites classified function-local) |
+| P7-S1 | Stage 1: escape gauge, report-only (KYTE_ESCAPE_REPORT, escape.zig) | done (shipped report-only; ~10% of sites classified function-local) |
 | P7-S2 | Stage 2: interprocedural summaries (param-escapes / return-fresh), still report-only | done (shipped report-only) |
 | P7-S3+ | Stage 3+: request-escape (persistent-sink) analysis + arena enablement | superseded (function-escape is the wrong granularity; blanket arena was 28% slower + GB RSS; the churn it targeted was largely captured by the wire-to-struct + str.Str borrow work, so /products already beats Rust) |
-| P7-remove | Remove the parked scaffolding (region.nova, runtime region state, escape.zig gauge) | done for the region arena (FR-arena, commit 088d9b6: deleted mem/region.nova, the Region machinery in alloc.cpp, and the per-coro region swap in concurrency.cpp; corpus 328/329, reactor cases ASAN-clean). The escape.zig report-only gauge is KEPT (harmless, still useful for future request-escape analysis) |
+| P7-remove | Remove the parked scaffolding (region.ky, runtime region state, escape.zig gauge) | done for the region arena (FR-arena, commit 088d9b6: deleted mem/region.ky, the Region machinery in alloc.cpp, and the per-coro region swap in concurrency.cpp; corpus 328/329, reactor cases ASAN-clean). The escape.zig report-only gauge is KEPT (harmless, still useful for future request-escape analysis) |
 
 The sound arena is NOT the next move (see the Stage-3 reasoning below and the FR-arena decision in
 `further-refinement.md`). This document is retained for the analysis; the actionable outcome is the FR-arena
@@ -22,7 +22,7 @@ A `sample` of the pizza web app under load (byte-matched 194 KB `/products`, fus
 
 | bucket | ~samples |
 |---|---|
-| `nova_release` + `nova_retain` (ARC) | ~1044 |
+| `kyte_release` + `kyte_retain` (ARC) | ~1044 |
 | malloc / free / memmove / memset | ~1500 |
 | socket write (190 KB body) + read + kevent | ~850 |
 | HTML escape of the 190 KB body | ~226 |
@@ -35,12 +35,12 @@ The bind is free; the DbValue array is small. The lever is the ARC + malloc buck
 
 ## What was already tried and why it failed (do NOT repeat)
 
-The BLANKET async arena (`NOVA_REQUEST_ARENA`, region live across the whole request, hand-guarded escapes)
-was fully attempted and ROLLED BACK (see [[nova-p7-request-arena-infra]]): it became correct but ~28%
+The BLANKET async arena (`KYTE_REQUEST_ARENA`, region live across the whole request, hand-guarded escapes)
+was fully attempted and ROLLED BACK (see [[kyte-p7-request-arena-infra]]): it became correct but ~28%
 SLOWER (range-check keeps every chunk mapped → 6-10x working set, cache thrash) and leaked RSS to
 3.5-8.3 GB. Root cause is structural: **ARC follows pointers across the region boundary**, so freeing the
 arena decrements persistent strings the arena borrowed (UAF), and hand-guarding every crossing does not
-converge. (Historical: the runtime region primitives `nova_region_new/set/free/gen`, `region_alloc`, and
+converge. (Historical: the runtime region primitives `kyte_region_new/set/free/gen`, `region_alloc`, and
 the gen-validated per-coro region swap once survived here as parked scaffolding; FR-arena has since deleted
 all of them, see the P7-remove row above. Only the analysis in this document and the `escape.zig` gauge
 remain.)
@@ -73,7 +73,7 @@ the call site.
   New `src/sema/escape.zig`: for every owned allocation site (an expr with `ir.expr_owned == true` bound to
   a local, plus struct/list/map/set/string-concat), classify `LOCAL` vs `ESCAPES` intraprocedurally with a
   simple fixpoint over local dataflow (return / field-store / call-arg / closure-capture / alias). Print
-  per-program counts behind `NOVA_ESCAPE_REPORT`. Corpus stays green (nothing generated differs). Validates
+  per-program counts behind `KYTE_ESCAPE_REPORT`. Corpus stays green (nothing generated differs). Validates
   the classifier and quantifies the opportunity (how many alloc sites on the pizza request path are LOCAL).
 
 - **Stage 2 — interprocedural summaries.** Compute per-function `{param escapes?, return fresh?}` summaries
@@ -82,12 +82,12 @@ the call site.
 
 - **Stage 3 — ARC-elision of proven-LOCAL.** For a `LOCAL` allocation with a strictly-nested lifetime, drop
   its `retain`/`release` pair (they net to a scope-end free). Strictly safe subset first (single-owner, no
-  container insertion). Gate `NOVA_ESCAPE_ELIDE`; validate under `--asan` on the pizza app at c=50 AND full
-  corpus; measure. This alone captures part of the `nova_release` bucket with NO region (no free-time UAF
+  container insertion). Gate `KYTE_ESCAPE_ELIDE`; validate under `--asan` on the pizza app at c=50 AND full
+  corpus; measure. This alone captures part of the `kyte_release` bucket with NO region (no free-time UAF
   class).
 
 - **Stage 4 — region-alloc proven-LOCAL + barrier.** Route proven-LOCAL allocations to the per-request
-  region (`nova_web_region_enter/exit` in the serve loop) and add a barrier: a store of a region pointer into
+  region (`kyte_web_region_enter/exit` in the serve loop) and add a barrier: a store of a region pointer into
   a persistent object is a compile error (the analysis proves it cannot happen, so the barrier only guards
   bugs). `inRoot(body)` for the few persistent per-query allocs (pg read-buffer growth, stmt cache). Free the
   region strictly AFTER the response is written. Validate `--asan` c=50 + corpus; measure RSS + rps.
@@ -97,7 +97,7 @@ the call site.
 
 ## Gauges
 
-- `NOVA_ESCAPE_REPORT` — Stage 1/2 per-program classification counts (report-only).
-- `NOVA_ESCAPE_ELIDE` — Stage 3 opt-in ARC-elision.
-- `NOVA_REQUEST_ARENA` — Stage 4 opt-in region routing (replaces the old blanket flag; now analysis-driven).
+- `KYTE_ESCAPE_REPORT` — Stage 1/2 per-program classification counts (report-only).
+- `KYTE_ESCAPE_ELIDE` — Stage 3 opt-in ARC-elision.
+- `KYTE_REQUEST_ARENA` — Stage 4 opt-in region routing (replaces the old blanket flag; now analysis-driven).
 - `--asan` on the real app under load is the soundness authority throughout.

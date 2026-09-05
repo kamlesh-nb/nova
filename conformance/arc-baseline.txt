@@ -1,5 +1,5 @@
 # ARC live-object baseline — one line per case: <case> <live_objects_at_exit>
-# Generated 2026-09-02 via: NOVA_ARC_AUDIT=1 nova test <case> (ReleaseFast nova)
+# Generated 2026-09-02 via: KYTE_ARC_AUDIT=1 kyte test <case> (ReleaseFast kyte)
 # Cases that hang/crash or emit no audit report are omitted (left unmeasured).
 00_smoke 0
 01_collections_list 0
@@ -90,28 +90,28 @@
 212_eventloop_completion_echo 0
 212_mmap_anon 0
 214_radix_literals 0
-215_sha256_nova 11
-216_sha512_nova 12
-217_sha1_hmac_nova 20
-218_hkdf_nova 15
-219_chacha_poly_nova 14
+215_sha256_kyte 11
+216_sha512_kyte 12
+217_sha1_hmac_kyte 20
+218_hkdf_kyte 15
+219_chacha_poly_kyte 14
 22_static_methods 0
-220_chachapoly_aead_nova 14
-221_aes_nova 14
-222_ghash_nova 15
-223_aesgcm_nova 14
-224_aesctr_nova 16
-225_x25519_nova 15
-226_p256_nova 13
-227_p256_ecdsa_nova 16
-228_rsa_nova 28
-229_x509_nova 10
+220_chachapoly_aead_kyte 14
+221_aes_kyte 14
+222_ghash_kyte 15
+223_aesgcm_kyte 14
+224_aesctr_kyte 16
+225_x25519_kyte 15
+226_p256_kyte 13
+227_p256_ecdsa_kyte 16
+228_rsa_kyte 28
+229_x509_kyte 10
 23_module_qualified_calls 0
-230_tls13_nova 22
-231_tls13hs_nova 24
-232_tls13client_nova 192
-233_x509policy_nova 32
-234_ecdsa_sign_nova 16
+230_tls13_kyte 22
+231_tls13hs_kyte 24
+232_tls13client_kyte 192
+233_x509policy_kyte 32
+234_ecdsa_sign_kyte 16
 234_structured_log 0
 235_list_ext 0
 235_tls_membio 66

@@ -1,0 +1,161 @@
+//! Structured, levelled logging with a compact JSON writer.
+//!
+//! This module gives Kyte programs a small logger that emits one JSON object
+//! per line: a `level`, a `msg`, and any extra key/value `Field`s the caller
+//! attaches. It sits alongside `metrics` in the observability corner of the
+//! standard library: `Span` ties the two together, recording an operation's
+//! elapsed time into a `metrics.Registry` and logging it in the same call.
+//!
+//! There is no global logger instance; callers construct a `Logger` with
+//! `newLogger` and thread it through explicitly.
+
+import string;
+import list;
+import datetime;
+import metrics;
+
+/// The severity of a log record, in ascending order: `Debug` is the most
+/// verbose, `Error` the least. A `Logger` filters records below its
+/// configured `minLevel`.
+pub enum LogLevel { Debug, Info, Warn, Error }
+
+// Maps a LogLevel to its ordinal position for threshold comparisons.
+fn levelNum(l: LogLevel): int {
+    if (l == LogLevel.Debug) { return 0; }
+    if (l == LogLevel.Info) { return 1; }
+    if (l == LogLevel.Warn) { return 2; }
+    return 3;
+}
+// Maps a LogLevel to its lowercase name as written in the JSON output.
+fn levelName(l: LogLevel): string {
+    if (l == LogLevel.Debug) { return "debug"; }
+    if (l == LogLevel.Info) { return "info"; }
+    if (l == LogLevel.Warn) { return "warn"; }
+    return "error";
+}
+
+/// A single structured key/value pair attached to a log record. Both `key`
+/// and `val` are written as JSON strings; `val` is always a string, so
+/// numeric fields must be pre-formatted (see `metrics.numStr`).
+pub struct Field {
+    /// The field's name, as it appears as a JSON object key.
+    pub key: string,
+    /// The field's value, always rendered as a JSON string.
+    pub val: string,
+    init(key: string, val: string) { self.key = key; self.val = val; }
+}
+/// Constructs a `Field` from a key and value; a short alias for `Field(key, val)`.
+pub fn f(key: string, val: string): Field { return Field(key, val); }
+
+/// An empty field list, for log calls that carry no extra structured data.
+pub fn noFields(): List<Field> { return List<Field>(); }
+/// Builds a one-element field list.
+pub fn fields1(a: Field): List<Field> { let l = List<Field>(); l.push(a); return l; }
+/// Builds a two-element field list.
+pub fn fields2(a: Field, b: Field): List<Field> { let l = List<Field>(); l.push(a); l.push(b); return l; }
+/// Builds a three-element field list.
+pub fn fields3(a: Field, b: Field, c: Field): List<Field> { let l = List<Field>(); l.push(a); l.push(b); l.push(c); return l; }
+
+// Escapes a string for embedding inside a JSON string literal: quotes,
+// backslashes, newline, carriage return, and tab. Other control bytes are
+// passed through unescaped.
+fn jesc(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < s.length) {
+        let c = s[i];
+        if (c == 34) { out = out + "\\\""; }
+        else if (c == 92) { out = out + "\\\\"; }
+        else if (c == 10) { out = out + "\\n"; }
+        else if (c == 13) { out = out + "\\r"; }
+        else if (c == 9) { out = out + "\\t"; }
+        else { out = out + string.slice(s, i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A JSON line logger that filters records below its `minLevel`.
+pub struct Logger {
+    /// Records below this level are dropped by `log` (and by `debug`/`info`/
+    /// `warn`/`error`) before formatting, so filtered-out calls pay no
+    /// JSON-building cost.
+    pub minLevel: LogLevel,
+    init(minLevel: LogLevel) { self.minLevel = minLevel; }
+
+    /// Renders a single log record as a JSON object string:
+    /// `{"level":...,"msg":...,"<field key>":"<field val>",...}`, one entry
+    /// per field in `fields`, in order. Does not filter by level.
+    pub fn format(self: Logger, level: LogLevel, msg: string, fields: List<Field>): string {
+        let out = `{"level":"${levelName(level)}","msg":"${jesc(msg)}"`;
+        let i = 0;
+        while (i < fields.size()) {
+            let fld = fields.get(i) ?? Field("", "");
+            out = out + `,"${jesc(fld.key)}":"${jesc(fld.val)}"`;
+            i = i + 1;
+        }
+        return out + "}";
+    }
+
+    /// Formats and writes a record to `console.log` if `level` is at or
+    /// above `minLevel`; otherwise does nothing.
+    pub fn log(self: Logger, level: LogLevel, msg: string, fields: List<Field>): void {
+        if (levelNum(level) < levelNum(self.minLevel)) { return; }
+        console.log(self.format(level, msg, fields));
+    }
+
+    /// Reports whether a record at `level` would actually be written,
+    /// useful for skipping expensive field construction when it would not.
+    pub fn enabled(self: Logger, level: LogLevel): bool { return levelNum(level) >= levelNum(self.minLevel); }
+
+    /// Logs at `LogLevel.Debug`.
+    pub fn debug(self: Logger, msg: string, fields: List<Field>): void { self.log(LogLevel.Debug, msg, fields); }
+    /// Logs at `LogLevel.Info`.
+    pub fn info(self: Logger, msg: string, fields: List<Field>): void { self.log(LogLevel.Info, msg, fields); }
+    /// Logs at `LogLevel.Warn`.
+    pub fn warn(self: Logger, msg: string, fields: List<Field>): void { self.log(LogLevel.Warn, msg, fields); }
+    /// Logs at `LogLevel.Error`.
+    pub fn error(self: Logger, msg: string, fields: List<Field>): void { self.log(LogLevel.Error, msg, fields); }
+}
+
+/// Constructs a `Logger` that writes records at or above `minLevel`.
+pub fn newLogger(minLevel: LogLevel): Logger { return Logger(minLevel); }
+
+/// A timed operation that logs its own elapsed duration when finished.
+/// Created with `startSpan` at the point work begins; call `finish` when
+/// the work completes.
+pub struct Span {
+    /// The logger the span reports its completion to.
+    pub logger: Logger,
+    /// The span's name, used both as the metric name prefix and as the log
+    /// message.
+    pub name: string,
+    /// The start time in nanoseconds, as captured by `datetime.nowNs()`.
+    pub startNs: long,
+
+    init(logger: Logger, name: string, startNs: long) {
+        self.logger = logger;
+        self.name = name;
+        self.startNs = startNs;
+    }
+
+    /// Computes the elapsed time since the span started, records it into
+    /// `reg` as both a running total (`<name>_ns_total`) and a last-value
+    /// gauge (`<name>_last_ns`), logs it at `Info` level with an
+    /// `elapsed_ns` field, and returns the elapsed nanoseconds.
+    pub fn finish(self: Span, reg: metrics.Registry): long {
+        let elapsed = datetime.nowNs() - self.startNs;
+        reg.add(self.name + "_ns_total", elapsed);
+        reg.setGauge(self.name + "_last_ns", elapsed);
+        self.logger.info(self.name, fields2(
+            f("span", self.name),
+            f("elapsed_ns", metrics.numStr(elapsed))));
+        return elapsed;
+    }
+}
+
+/// Starts a `Span` named `name`, capturing the current time via
+/// `datetime.nowNs()` as its start point.
+pub fn startSpan(logger: Logger, name: string): Span {
+    return Span(logger, name, datetime.nowNs());
+}

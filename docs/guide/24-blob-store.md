@@ -8,7 +8,7 @@ artifact origin for this: `artifactd`, a content-addressed blob server, plus the
 each orchd node uses to pull a binary by hash before it spawns a replica.
 
 Everything here lives in `packages/nova-orchestrator`, in `src/artifacts/` (the store) and
-`src/orch/artifact.nova` (the client). It is a stopgap that lives inside the orchestrator repository; see
+`src/orch/artifact.ky` (the client). It is a stopgap that lives inside the orchestrator repository; see
 "Current status and future direction" at the end for exactly what that means.
 
 `artifactd` wears a second hat, covered in Chapter 23: alongside the content-addressed blobs it also
@@ -31,7 +31,7 @@ the hash of the binary. That single idea buys three things:
 
 ## The store: a content-addressed store (CAS)
 
-`BlobStore` (in `src/artifacts/blobstore.nova`) is the store. It has a single field, `root`, the
+`BlobStore` (in `src/artifacts/blobstore.ky`) is the store. It has a single field, `root`, the
 directory the blobs live in. A blob's key is its SHA-256 hex digest (64 lowercase hex characters), and
 that is also its file name. On disk it uses a two-level fan-out shard so a single directory never fills up
 with thousands of entries:
@@ -49,11 +49,11 @@ So a blob with digest `ab12cd...` lands at `<root>/ab/12/ab12cd...`. The core me
   `undefined` if the blob is absent or the on-disk bytes do not hash to their own name.
 - `put(sha, data)` is the security-critical write; it is described under "Safety properties" below.
 
-Blob bodies are ordinary Nova `string`s, which are length-prefixed and binary-safe, so a native binary
+Blob bodies are ordinary Kyte `string`s, which are length-prefixed and binary-safe, so a native binary
 round-trips through the file API without any text encoding getting in the way. The digest is computed with
 `sha.sha256` from the standard library.
 
-On top of the raw store there is a naming layer, `Registry` (in `src/artifacts/registry.nova`), which maps
+On top of the raw store there is a naming layer, `Registry` (in `src/artifacts/registry.ky`), which maps
 a human name and version to a digest. It keeps pointer files under `<root>/apps/<app>/<version>` (each
 containing a `"sha256:<hex>"` line) and an `<root>/apps/<app>/current` pointer, with methods like `bind`,
 `resolve`, `binary`, `promote`, `current`, and `versions`. The registry is how you say "app `shop`
@@ -61,15 +61,15 @@ version `1.4.0` is this digest" and later "promote `1.4.0` to current".
 
 ## The HTTP interface: artifactd
 
-`artifactd` (in `bin/artifactd.nova`) is the daemon that serves the store over HTTP. On startup it reads
+`artifactd` (in `bin/artifactd.ky`) is the daemon that serves the store over HTTP. On startup it reads
 its environment, builds a `BlobStore` rooted at `<root>/blobs` and a `Registry` rooted at `<root>/apps`,
 and serves:
 
 ```sh
 artifactd
-# NOVA_ARTIFACT_ROOT   blobs + apps root       (default ./artifacts-store)
-# NOVA_ARTIFACT_TOKEN  the deploy token        (empty = auth OFF, dev only)
-# NOVA_PORT            listen port             (default 8135)
+# KYTE_ARTIFACT_ROOT   blobs + apps root       (default ./artifacts-store)
+# KYTE_ARTIFACT_TOKEN  the deploy token        (empty = auth OFF, dev only)
+# KYTE_PORT            listen port             (default 8135)
 ```
 
 Note the on-disk directory is `blobs/` but the HTTP route prefix is `artifacts/`. The content-addressed
@@ -96,7 +96,7 @@ spawning a replica.
 ## Bearer auth
 
 Every route is wrapped by `DeployAuth`, a route middleware installed with `app.use(DeployAuth(token))`.
-The token comes from `NOVA_ARTIFACT_TOKEN`. If it is empty, auth is disabled and the daemon logs
+The token comes from `KYTE_ARTIFACT_TOKEN`. If it is empty, auth is disabled and the daemon logs
 `auth=OFF (dev)` on startup, which is a development convenience only. When a token is set, each request
 must carry `Authorization: Bearer <token>` or it is rejected with 401.
 
@@ -129,7 +129,7 @@ body hashes to the `{sha}` in the URL before publishing, returning 409 on a mism
 
 ## The client side: pulling a binary into a deploy
 
-On the consuming side, `src/orch/artifact.nova` is the glue orchd uses to turn an artifact reference into
+On the consuming side, `src/orch/artifact.ky` is the glue orchd uses to turn an artifact reference into
 a local file it can execute. It carries a small error type, `ArtifactError`, with `NotCached(sha)` and
 `Corrupt(sha)` cases, and three functions:
 
@@ -146,10 +146,10 @@ a local file it can execute. It carries a small error type, `ArtifactError`, wit
   cached local path.
 
 The actual HTTP fetch (a `web.client` GET to `/artifacts/<sha>`) and setting the executable bit on the
-cached file are left to the caller's integration step. Keeping the network out of `artifact.nova` is what
+cached file are left to the caller's integration step. Keeping the network out of `artifact.ky` is what
 lets the verify-and-cache logic be unit-tested without a running server.
 
-The manifest ties into this through `spec.artifact` (in `src/orch/spec.nova`), a `"sha256:<hex>"` string
+The manifest ties into this through `spec.artifact` (in `src/orch/spec.ky`), a `"sha256:<hex>"` string
 on a workload. When it is set, orchd pulls the binary by hash into its blob cache and points the
 workload's `binaryPath` at the cached file before spawning replicas. When it is empty, the workload runs
 in the legacy local-path mode. So a fully hash-addressed deployment names its binary once, by digest, and

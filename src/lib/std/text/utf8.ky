@@ -1,0 +1,190 @@
+
+//! UTF-8 codec helpers for Kyte strings.
+//!
+//! Kyte `string` values are stored as raw UTF-8 bytes, so `s.length` is a
+//! BYTE count, not a character count. This module provides the operations
+//! that read and write actual Unicode codepoints on top of that byte buffer:
+//! decoding the codepoint at a given byte offset, measuring how many bytes a
+//! lead byte's sequence occupies, encoding a codepoint back into UTF-8,
+//! splitting a string into its constituent characters, and validating that a
+//! buffer is well-formed UTF-8. It sits alongside `str.ky` (the borrowed
+//! `Str` view) and `string.ky` (the owned string type) as the layer that
+//! understands multi-byte encoding rather than raw bytes.
+
+import bytes;
+import list;
+import string;
+import assert;
+
+// Returns the byte width of the UTF-8 sequence that starts with lead byte `b0`.
+// Does not validate the input: an invalid continuation-only byte (128-191)
+// is reported as width 1, and any byte from 248 upward also falls back to 1.
+fn widthOfLead(b0: int): int {
+    if (b0 < 128) { return 1; }
+    if (b0 < 192) { return 1; }
+    if (b0 < 224) { return 2; }
+    if (b0 < 240) { return 3; }
+    if (b0 < 248) { return 4; }
+    return 1;
+}
+
+/// Decodes the Unicode codepoint that starts at byte offset `i` in `s`.
+///
+/// `i` must point at the first byte of a UTF-8 sequence (typically obtained
+/// from a previous `widthAt` step or offset 0). The function does not bounds
+/// check trailing continuation bytes, so calling it on invalid UTF-8 or a
+/// mid-sequence offset produces a garbage codepoint rather than an error.
+pub fn codepointAt(s: string, i: int): int {
+    let b0 = bytes.read_byte(s, i);
+    if (b0 < 128) { return b0; }
+    if (b0 < 224) {
+        let b1 = bytes.read_byte(s, i + 1);
+        return ((b0 & 31) << 6) | (b1 & 63);
+    }
+    if (b0 < 240) {
+        let b1 = bytes.read_byte(s, i + 1);
+        let b2 = bytes.read_byte(s, i + 2);
+        return ((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63);
+    }
+    let b1 = bytes.read_byte(s, i + 1);
+    let b2 = bytes.read_byte(s, i + 2);
+    let b3 = bytes.read_byte(s, i + 3);
+    return ((b0 & 7) << 18) | ((b1 & 63) << 12) | ((b2 & 63) << 6) | (b3 & 63);
+}
+
+/// Returns the byte width (1 to 4) of the UTF-8 character starting at offset `i` in `s`.
+pub fn widthAt(s: string, i: int): int {
+    return widthOfLead(bytes.read_byte(s, i));
+}
+
+/// Counts the number of Unicode codepoints (characters) in `s`.
+///
+/// This is an O(n) scan over the bytes, distinct from `s.length`, which
+/// reports the byte count. A string with multi-byte characters always has
+/// `codepointCount(s) <= s.length`.
+pub fn codepointCount(s: string): int {
+    let n = s.length;
+    let i = 0;
+    let count = 0;
+    while (i < n) {
+        i = i + widthOfLead(bytes.read_byte(s, i));
+        count = count + 1;
+    }
+    return count;
+}
+
+/// Encodes a single Unicode codepoint as a new UTF-8 string.
+///
+/// Chooses the shortest valid encoding (1 to 4 bytes) based on the codepoint's
+/// value. Does not validate that `cp` is a legal Unicode scalar value (for
+/// example, surrogate-range values are encoded as though they were valid).
+pub fn fromCodepoint(cp: int): string {
+    if (cp < 128) {
+        let p = bytes.alloc(1);
+        bytes.write_byte(p, 0, cp);
+        return p as string;
+    }
+    if (cp < 2048) {
+        let p = bytes.alloc(2);
+        bytes.write_byte(p, 0, 192 | (cp >> 6));
+        bytes.write_byte(p, 1, 128 | (cp & 63));
+        return p as string;
+    }
+    if (cp < 65536) {
+        let p = bytes.alloc(3);
+        bytes.write_byte(p, 0, 224 | (cp >> 12));
+        bytes.write_byte(p, 1, 128 | ((cp >> 6) & 63));
+        bytes.write_byte(p, 2, 128 | (cp & 63));
+        return p as string;
+    }
+    let p = bytes.alloc(4);
+    bytes.write_byte(p, 0, 240 | (cp >> 18));
+    bytes.write_byte(p, 1, 128 | ((cp >> 12) & 63));
+    bytes.write_byte(p, 2, 128 | ((cp >> 6) & 63));
+    bytes.write_byte(p, 3, 128 | (cp & 63));
+    return p as string;
+}
+
+/// Splits `s` into a list of single-character substrings, one per Unicode codepoint.
+///
+/// Each element is a newly sliced UTF-8 substring (1 to 4 bytes), so a string
+/// with `n` codepoints produces a list of length `n`, not `s.length`.
+pub fn chars(s: string): list.List<string> {
+    let result = list.List<string>();
+    let n = s.length;
+    let i = 0;
+    while (i < n) {
+        let w = widthOfLead(bytes.read_byte(s, i));
+        result.push(string.slice(s, i, i + w));
+        i = i + w;
+    }
+    return result;
+}
+
+/// Checks whether `s` is well-formed UTF-8.
+///
+/// Rejects stray continuation bytes, lead bytes outside the valid 1-4 byte
+/// range, and sequences that would run past the end of the buffer. Returns
+/// `true` for the empty string.
+pub fn isValid(s: string): bool {
+    let n = s.length;
+    let i = 0;
+    while (i < n) {
+        let b0 = bytes.read_byte(s, i);
+        let w = 0;
+        if (b0 < 128) { w = 1; }
+        else if (b0 < 192) { return false; }
+        else if (b0 < 224) { w = 2; }
+        else if (b0 < 240) { w = 3; }
+        else if (b0 < 248) { w = 4; }
+        else { return false; }
+        if (i + w > n) { return false; }
+        let j = 1;
+        while (j < w) {
+            let bj = bytes.read_byte(s, i + j);
+            if (bj < 128 || bj >= 192) { return false; }
+            j = j + 1;
+        }
+        i = i + w;
+    }
+    return true;
+}
+
+@test
+fn test_codepoint_count_vs_bytes(): void {
+
+    let s = "héllo wörld";
+    assert.equalInt(codepointCount(s), 11);
+    assert.equalInt(s.length, 13);
+}
+
+@test
+fn test_codepoint_at_and_roundtrip(): void {
+    let s = "aé€";
+    assert.equalInt(codepointAt(s, 0), 97);
+    assert.equalInt(codepointAt(s, 1), 233);
+    assert.equalInt(codepointAt(s, 3), 8364);
+    assert.equalStr(fromCodepoint(97), "a");
+    assert.equalStr(fromCodepoint(233), "é");
+    assert.equalStr(fromCodepoint(8364), "€");
+}
+
+@test
+fn test_chars_iteration(): void {
+    let cs = chars("aé€");
+    assert.equalInt(cs.len, 3);
+    assert.equalStr(cs.get(0), "a");
+    assert.equalStr(cs.get(1), "é");
+    assert.equalStr(cs.get(2), "€");
+}
+
+@test
+fn test_validation(): void {
+    assert.isTrue(isValid("héllo"));
+    assert.isTrue(isValid(""));
+
+    let bad = bytes.alloc(1);
+    bytes.write_byte(bad, 0, 128);
+    assert.isFalse(isValid(bad as string));
+    bytes.free(bad);
+}

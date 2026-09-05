@@ -1,0 +1,1702 @@
+//! DEFLATE codec with gzip framing (RFC 1951 + RFC 1952).
+//!
+//! This file is a self-contained, pure-Kyte implementation of the DEFLATE
+//! compression format and the gzip container that wraps it. It has both halves:
+//! a decoder ([`inflate`], [`gunzip`]) and an encoder ([`deflateRaw`],
+//! [`gzipCompress`]), plus a table-driven [`crc32`]. Nothing here calls out to
+//! zlib or any C library; the whole pipeline is Kyte over the `bytes` and `mem`
+//! primitives, so it links into both the native runtime and the WASM target
+//! without a foreign dependency. It is the engine behind HTTP content-encoding
+//! (gzip request/response bodies) and any other place the standard library
+//! needs to shrink or expand a byte stream.
+//!
+//! Why hand-rolled? DEFLATE is a bit-level format: codes are packed
+//! least-significant-bit first, symbols are Huffman coded with canonical
+//! (length-only) code books, and back-references reach up to 32 KB behind the
+//! current output position. That does not map onto Kyte's high-level string and
+//! collection types, so the code works almost entirely in raw byte buffers
+//! (`ptr`) with explicit little-endian loads. Addresses are always `long`, never
+//! `int`: an `int` would truncate a heap address above 4 GB and hand back a
+//! garbage pointer (see the project note on `bytes.read_byte`/`write_byte`, which
+//! do their offset arithmetic at 64-bit width internally).
+//!
+//! Design decisions and invariants worth knowing before touching this file:
+//!
+//!   1. Static lookup tables are built ONCE at module load through `const`
+//!      initialisers (for example [`LEN_BASE`], [`CRC_TABLE`], [`FIXED_LIT_CODE`]).
+//!      They are never freed, by intent: they live for the life of the process
+//!      and are shared by every call. Only the per-call scratch buffers are
+//!      allocated and freed.
+//!   2. The decoder is deliberately forgiving. On a malformed stream it stops
+//!      and returns whatever it has decoded so far rather than raising: the
+//!      loops break out on a bad Huffman symbol, an out-of-range back-reference,
+//!      or running off the end of the input. Callers that need integrity must
+//!      verify the gzip CRC and ISIZE trailer themselves.
+//!   3. The encoder is a real optimising DEFLATE, close in structure to zlib and
+//!      Go's `compress/flate`. It uses lazy matching (a match is only emitted if
+//!      the next position does not start a longer one), a dual hash chain (a
+//!      4-byte and a longer 7-byte hash) plus a repeat-distance probe to find
+//!      back-references, a package-merge Huffman code builder ([`bitCounts`])
+//!      that respects the 15-bit code-length limit, and it picks the cheapest of
+//!      stored, fixed-Huffman, and dynamic-Huffman encodings per block by
+//!      actually costing all three.
+//!   4. Match tokens are packed into a single 32-bit int ([`TOK_MATCH`] tags a
+//!      match; length and distance are bit-packed alongside), so the token buffer
+//!      is a flat `int` array, not a list of structs.
+//!
+//! The units fit together as a small pipeline. [`BitReader`] and [`BitWriter`]
+//! do the LSB-first bit packing; [`Huffman`] decodes canonical codes on the way
+//! in and [`assignCanonical`] / [`genHuff`] build them on the way out;
+//! [`ByteBuf`] is the growable output sink. See also the sibling compression
+//! notes in the standard library, and `web` for where gzip content-encoding is
+//! wired to HTTP.
+
+import bytes;
+import string;
+import mem.endian;
+
+/// Growable byte buffer used as the output sink for inflate and as the encoder's
+/// bit stream.
+///
+/// This is a plain `{ptr, len, cap}` vector over a raw `bytes.alloc` region, not
+/// a Kyte `string` or `List`, because the codec appends single bytes millions of
+/// times and needs index access with no ARC or bounds-check overhead. It owns its
+/// backing buffer and must be released with [`ByteBuf.delete`]; it is not a value
+/// struct, so copies share the same `buf`.
+pub struct ByteBuf {
+    /// Base address of the owned byte region. A raw machine address, hence `ptr`
+    /// (a 64-bit value), never an `int`.
+    pub buf: ptr,
+    /// Number of bytes currently written, i.e. the logical length. Always
+    /// `0 <= len <= cap`.
+    pub len: int,
+    /// Allocated capacity in bytes. Grows by doubling in [`ByteBuf.ensure`].
+    pub cap: int,
+
+    /// Creates an empty buffer with a small initial capacity of 64 bytes.
+    init() {
+        self.cap = 64;
+        self.buf = bytes.alloc(self.cap);
+        self.len = 0;
+    }
+
+    /// Ensures at least `extra` more bytes fit past `len`, reallocating if not.
+    ///
+    /// Growth is geometric (capacity doubles, and keeps doubling until it clears
+    /// the request) so that repeated single-byte [`ByteBuf.push`] calls stay
+    /// amortised O(1). The old region is copied byte by byte into the new one and
+    /// then freed. A no-op when the current capacity already suffices.
+    fn ensure(self: ByteBuf, extra: int): void {
+        if (self.len + extra <= self.cap) { return; }
+        let ncap = self.cap * 2;
+        while (ncap < self.len + extra) { ncap = ncap * 2; }
+        let nbuf = bytes.alloc(ncap);
+        let i = 0;
+        while (i < self.len) {
+            bytes.write_byte(nbuf, i, bytes.read_byte(self.buf, i));
+            i = i + 1;
+        }
+        let old = self.buf;
+        self.buf = nbuf;
+        self.cap = ncap;
+        bytes.free(old);
+    }
+
+    /// Appends a single byte, masked to 0..255, growing the buffer if needed.
+    pub fn push(self: ByteBuf, b: int): void {
+        self.ensure(1);
+        bytes.write_byte(self.buf, self.len, b & 255);
+        self.len = self.len + 1;
+    }
+
+    /// Reads the byte at index `i` (0-based). Not bounds-checked; the caller must
+    /// keep `0 <= i < len`. Used both for output and, during inflate, to copy
+    /// bytes from earlier in the output for a back-reference.
+    pub fn at(self: ByteBuf, i: int): int {
+        return bytes.read_byte(self.buf, i);
+    }
+
+    /// Copies the first `len` bytes into a fresh owned Kyte `string`.
+    ///
+    /// The result is an independent ARC-managed string, so the buffer may be
+    /// [`ByteBuf.delete`]d afterwards. An empty buffer yields the empty string
+    /// without allocating.
+    pub fn toString(self: ByteBuf): string {
+        if (self.len == 0) { return ""; }
+        let out = bytes.alloc(self.len);
+        let i = 0;
+        while (i < self.len) {
+            bytes.write_byte(out, i, bytes.read_byte(self.buf, i));
+            i = i + 1;
+        }
+        return out as string;
+    }
+
+    /// Frees the backing region and nulls `buf`, making the call idempotent.
+    /// Must be called exactly once when the buffer is no longer needed, since
+    /// `ByteBuf` owns raw memory that ARC does not track.
+    pub fn delete(self: ByteBuf): void {
+        if (self.buf != 0) { bytes.free(self.buf); self.buf = 0; }
+    }
+}
+
+/// LSB-first bit reader over a Kyte `string`, used by the inflate side.
+///
+/// DEFLATE packs bits within a byte starting from the least significant bit, and
+/// this reader mirrors that: [`BitReader.bit`] pulls the low bit of a one-byte
+/// window and shifts it down. It reads past the end gracefully by returning zero
+/// bits, which is part of the decoder's forgiving-on-truncation behaviour rather
+/// than an error path.
+pub struct BitReader {
+    /// The compressed input being read. Bytes are pulled from it via
+    /// `bytes.read_byte`.
+    pub src: string,
+    /// Total length of `src` in bytes, cached so the hot loop avoids repeated
+    /// `.length` calls.
+    pub len: int,
+    /// Index of the NEXT unread byte in `src`.
+    pub pos: int,
+    /// The current partially-consumed byte, holding `bitcnt` unread bits in its
+    /// low bits.
+    pub bitbuf: int,
+    /// Number of valid bits left in `bitbuf`. When zero, the next read refills
+    /// from `src[pos]`.
+    pub bitcnt: int,
+
+    /// Wraps `src` and positions the reader at its first bit.
+    init(src: string) {
+        self.src = src;
+        self.len = src.length;
+        self.pos = 0;
+        self.bitbuf = 0;
+        self.bitcnt = 0;
+    }
+
+    /// Reads and consumes a single bit, LSB first, refilling from the next input
+    /// byte when the current one is exhausted. Returns 0 once the input runs out,
+    /// rather than signalling end-of-stream.
+    pub fn bit(self: BitReader): int {
+        if (self.bitcnt == 0) {
+            if (self.pos >= self.len) { return 0; }
+            self.bitbuf = bytes.read_byte(self.src, self.pos);
+            self.pos = self.pos + 1;
+            self.bitcnt = 8;
+        }
+        let b = self.bitbuf & 1;
+        self.bitbuf = self.bitbuf >> 1;
+        self.bitcnt = self.bitcnt - 1;
+        return b;
+    }
+
+    /// Reads `n` bits and assembles them into an integer, first bit read landing
+    /// in bit 0. This is the little-endian bit order DEFLATE uses for extra-bit
+    /// fields and header counts.
+    pub fn bits(self: BitReader, n: int): int {
+        let v = 0;
+        let i = 0;
+        while (i < n) {
+            v = v | (self.bit() << i);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    /// Discards any bits left in the current byte, snapping the reader to the
+    /// next byte boundary. DEFLATE stored (uncompressed) blocks begin byte
+    /// aligned, so [`inflateStored`] calls this before reading their length.
+    pub fn alignByte(self: BitReader): void {
+        self.bitcnt = 0;
+        self.bitbuf = 0;
+    }
+
+    /// Reads one whole byte straight from `src`, bypassing the bit buffer.
+    ///
+    /// Valid only when the reader is byte aligned (after [`BitReader.alignByte`]).
+    /// Returns 0 at end of input. Used for the raw payload and length header of a
+    /// stored block.
+    pub fn readByte(self: BitReader): int {
+        if (self.pos >= self.len) { return 0; }
+        let b = bytes.read_byte(self.src, self.pos);
+        self.pos = self.pos + 1;
+        return b;
+    }
+}
+
+/// A canonical Huffman decoder built from per-symbol code lengths.
+///
+/// DEFLATE never transmits the codes themselves, only how many bits each symbol
+/// uses; the codes are then assigned canonically (shorter lengths first, and in
+/// symbol order within a length). This struct stores that book in the compact
+/// form the decode loop wants: a histogram of code lengths ([`Huffman.counts`])
+/// and the symbols sorted by code length ([`Huffman.symbols`]). It is used on the
+/// decode path only; the encoder builds codes with [`assignCanonical`] instead.
+pub struct Huffman {
+    /// Count of symbols having each code length, indexed by length 0..15.
+    /// `counts[0]` is forced to zero (length-0 means the symbol is unused).
+    pub counts: ptr,
+    /// Symbols ordered by ascending code length, packed as 16-bit big-endian
+    /// entries via [`wr16`]/[`rd16`]. The decode walk indexes into this run.
+    pub symbols: ptr,
+    /// Total number of symbols with a non-zero code length, i.e. the used size of
+    /// [`Huffman.symbols`].
+    pub nsym: int,
+
+    /// Builds the decoder from `n` code lengths (`lengths[i]` is the bit length of
+    /// symbol `i`, 0 meaning absent).
+    ///
+    /// This is the classic two-pass canonical build: first count how many symbols
+    /// use each length, then compute per-length starting offsets and scatter each
+    /// used symbol into `symbols` at its length's slot. The `offsets` scratch
+    /// buffer is freed before returning. `counts[0]` is cleared so absent symbols
+    /// do not skew the length histogram the decode loop relies on.
+    init(lengths: ptr, n: int) {
+        self.counts = bytes.alloc(16);
+        let i = 0;
+        while (i < 16) { bytes.write_byte(self.counts, i, 0); i = i + 1; }
+        i = 0;
+        while (i < n) {
+            let l = bytes.read_byte(lengths, i);
+            bytes.write_byte(self.counts, l, bytes.read_byte(self.counts, l) + 1);
+            i = i + 1;
+        }
+        bytes.write_byte(self.counts, 0, 0);
+
+        let offsets = bytes.alloc(32);
+        let sum = 0;
+        let l2 = 1;
+        while (l2 < 16) {
+            wr16(offsets, l2, sum);
+            sum = sum + bytes.read_byte(self.counts, l2);
+            l2 = l2 + 1;
+        }
+        self.nsym = sum;
+        self.symbols = bytes.alloc((sum + 1) * 2);
+        i = 0;
+        while (i < n) {
+            let l = bytes.read_byte(lengths, i);
+            if (l != 0) {
+                let off = rd16(offsets, l);
+                wr16(self.symbols, off, i);
+                wr16(offsets, l, off + 1);
+            }
+            i = i + 1;
+        }
+        bytes.free(offsets);
+    }
+
+    /// Decodes the next symbol from `br` by walking code lengths 1..15.
+    ///
+    /// At each length it shifts one more bit into the running `code`, and checks
+    /// whether `code` falls inside the range of canonical codes assigned to that
+    /// length (`code - first < count`). When it does, the matching symbol is read
+    /// straight out of [`Huffman.symbols`]. Returns -1 if no code matches within
+    /// 15 bits, which the block loops treat as a corrupt stream and stop on.
+    pub fn decode(self: Huffman, br: BitReader): int {
+        let code = 0;
+        let first = 0;
+        let index = 0;
+        let len = 1;
+        while (len < 16) {
+            code = code | br.bit();
+            let count = bytes.read_byte(self.counts, len);
+            if (code - first < count) {
+                let s = rd16(self.symbols, index + (code - first));
+                return s;
+            }
+            index = index + count;
+            first = (first + count) << 1;
+            code = code << 1;
+            len = len + 1;
+        }
+        return -1;
+    }
+
+    /// Deliberate no-op. The `counts`/`symbols` regions a `Huffman` allocates are
+    /// left to leak by design, because every `Huffman` in this file is short-lived
+    /// scratch built from a per-call length array and the buffers are trivially
+    /// small; the method exists to give call sites a uniform lifetime hook. Do not
+    /// free here without auditing every construction site.
+    pub fn delete(self: Huffman): void {
+    }
+}
+
+/// Writes a 16-bit value big-endian into a byte buffer at 16-bit slot `i`.
+/// Paired with [`rd16`]; used for every table that stores values above 255
+/// (length/distance bases, symbol tables, code caches).
+fn wr16(p: ptr, i: int, v: int): void {
+    bytes.write_byte(p, i * 2, (v >> 8) & 255);
+    bytes.write_byte(p, i * 2 + 1, v & 255);
+}
+/// Reads a 16-bit big-endian value from slot `i`. Inverse of [`wr16`].
+fn rd16(p: ptr, i: int): int {
+    return (bytes.read_byte(p, i * 2) << 8) | bytes.read_byte(p, i * 2 + 1);
+}
+
+/// Base length for each of the 29 length codes (257..285), per RFC 1951 §3.2.5.
+/// Loaded once at module init; indexed by `symbol - 257`.
+const LEN_BASE: ptr = lenBaseTable();
+/// Number of extra bits to read after each length code, matching [`LEN_BASE`].
+const LEN_EXTRA: ptr = lenExtraTable();
+/// Base distance for each of the 30 distance codes, per RFC 1951 §3.2.5.
+const DIST_BASE: ptr = distBaseTable();
+/// Number of extra bits to read after each distance code, matching [`DIST_BASE`].
+const DIST_EXTRA: ptr = distExtraTable();
+
+/// Builds [`LEN_BASE`] from the RFC's length-base list, stored as 16-bit slots
+/// because 258 exceeds a byte.
+fn lenBaseTable(): ptr {
+    let t = bytes.alloc(29 * 2);
+    let vals = "3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258";
+    fillShorts(t, vals);
+    return t;
+}
+/// Builds [`LEN_EXTRA`]; single-byte values so it uses a plain byte buffer.
+fn lenExtraTable(): ptr {
+    let t = bytes.alloc(29);
+    let vals = "0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0";
+    fillBytes(t, vals);
+    return t;
+}
+/// Builds [`DIST_BASE`]; distances reach 24577, so 16-bit slots.
+fn distBaseTable(): ptr {
+    let t = bytes.alloc(30 * 2);
+    let vals = "1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577";
+    fillShorts(t, vals);
+    return t;
+}
+/// Builds [`DIST_EXTRA`]; single-byte values, plain byte buffer.
+fn distExtraTable(): ptr {
+    let t = bytes.alloc(30);
+    let vals = "0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13";
+    fillBytes(t, vals);
+    return t;
+}
+
+/// Parses a comma-separated list of decimal integers and writes each as a 16-bit
+/// slot via [`wr16`]. A tiny loader used to keep the RFC tables above readable as
+/// literal CSV strings rather than long index-by-index assignments. Assumes
+/// well-formed input (digits and commas only); there is no error handling.
+fn fillShorts(t: ptr, csv: string): void {
+    let idx = 0;
+    let cur = 0;
+    let i = 0;
+    while (i < csv.length) {
+        let c = bytes.read_byte(csv, i);
+        if (c == 44) { wr16(t, idx, cur); idx = idx + 1; cur = 0; }
+        else { cur = cur * 10 + (c - 48); }
+        i = i + 1;
+    }
+    wr16(t, idx, cur);
+}
+/// Like [`fillShorts`] but writes each parsed value as a single byte. Used for
+/// tables whose entries all fit in 0..255 (extra-bit counts, code-length order).
+fn fillBytes(t: ptr, csv: string): void {
+    let idx = 0;
+    let cur = 0;
+    let i = 0;
+    while (i < csv.length) {
+        let c = bytes.read_byte(csv, i);
+        if (c == 44) { bytes.write_byte(t, idx, cur); idx = idx + 1; cur = 0; }
+        else { cur = cur * 10 + (c - 48); }
+        i = i + 1;
+    }
+    bytes.write_byte(t, idx, cur);
+}
+
+/// Decompresses a raw DEFLATE stream (no gzip or zlib wrapper) into a [`ByteBuf`].
+///
+/// Walks the block list: each block starts with a final-flag bit and a 2-bit
+/// type, dispatching to stored (type 0), fixed-Huffman (type 1), or
+/// dynamic-Huffman (type 2). A reserved type 3, or the final block, ends the
+/// loop. The returned buffer is owned by the caller, who must [`ByteBuf.delete`]
+/// it. On malformed input the decode stops early and returns the partial output;
+/// there is no error signal, so verify integrity externally when it matters (see
+/// [`gunzip`], which checks nothing itself either).
+pub fn inflate(src: string): ByteBuf {
+    let br = BitReader(src);
+    let out = ByteBuf();
+    let final = 0;
+    while (final == 0) {
+        final = br.bit();
+        let btype = br.bits(2);
+        if (btype == 0) {
+            inflateStored(br, out);
+        } else if (btype == 1) {
+            let fl = fixedLitHuffman();
+            let fd = fixedDistHuffman();
+            inflateBlock(br, out, fl, fd, true);
+        } else if (btype == 2) {
+            inflateDynamic(br, out);
+        } else {
+            return out;
+        }
+    }
+    return out;
+}
+
+/// Decodes a stored (type 0, uncompressed) block into `out`.
+///
+/// Aligns to the next byte, reads the little-endian 16-bit length, skips the
+/// one's-complement check field (the two [`BitReader.readByte`] calls that
+/// discard NLEN), then copies that many raw bytes through. The NLEN field is not
+/// verified, in keeping with the decoder's tolerant stance.
+fn inflateStored(br: BitReader, out: ByteBuf): void {
+    br.alignByte();
+    let len = br.readByte() | (br.readByte() << 8);
+    br.readByte();
+    br.readByte();
+    let i = 0;
+    while (i < len) {
+        out.push(br.readByte());
+        i = i + 1;
+    }
+}
+
+/// Decodes one compressed block body given its literal/length and distance code
+/// books, appending to `out`.
+///
+/// This is the LZ77 heart of inflate. It reads literal/length symbols until the
+/// end-of-block symbol 256: a symbol below 256 is a literal byte; 257 and up is a
+/// length code, whose base ([`LEN_BASE`]) plus extra bits gives the match length,
+/// followed by a distance code giving how far back to copy from. The copy uses
+/// [`ByteBuf.at`] on the output already produced, so it correctly handles
+/// overlapping runs (distance smaller than length). It bails out on a bad symbol,
+/// a negative distance code, or a back-reference reaching before the start of the
+/// output. `ownTables` is accepted for call-site symmetry but the `Huffman`
+/// tables are not freed here (see [`Huffman.delete`]).
+fn inflateBlock(br: BitReader, out: ByteBuf, lit: Huffman, dist: Huffman, ownTables: bool): void {
+    while (true) {
+        if (br.pos > br.len + 4) { break; }
+        let sym = lit.decode(br);
+        if (sym == 256) { break; }
+        if (sym < 0) { break; }
+        if (sym < 256) {
+            out.push(sym);
+        } else {
+            let li = sym - 257;
+            let length = rd16(LEN_BASE, li) + br.bits(bytes.read_byte(LEN_EXTRA, li));
+            let ds = dist.decode(br);
+            if (ds < 0) { break; }
+            let distance = rd16(DIST_BASE, ds) + br.bits(bytes.read_byte(DIST_EXTRA, ds));
+            let start = out.len - distance;
+            if (start < 0) { break; }
+            let k = 0;
+            while (k < length) {
+                out.push(out.at(start + k));
+                k = k + 1;
+            }
+        }
+    }
+}
+
+/// Decodes a dynamic-Huffman (type 2) block: reads its code books, then the body.
+///
+/// A dynamic block begins with three counts (HLIT, HDIST, HCLEN) followed by a
+/// small code-length code book, transmitted in the RFC's permuted order
+/// (`order`). That inner book is then used to decode the actual literal and
+/// distance code lengths, which arrive run-length encoded: symbols 0..15 are a
+/// literal length, 16 repeats the previous length 3..6 times, 17 and 18 emit runs
+/// of zero lengths of different spans. The decoded lengths are split into the
+/// literal and distance halves, turned into [`Huffman`] books, and handed to
+/// [`inflateBlock`]. All scratch buffers are freed before returning.
+fn inflateDynamic(br: BitReader, out: ByteBuf): void {
+    let hlit = br.bits(5) + 257;
+    let hdist = br.bits(5) + 1;
+    let hclen = br.bits(4) + 4;
+
+    let order = "16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15";
+    let ord = bytes.alloc(19);
+    fillBytes(ord, order);
+    let cl = bytes.alloc(19);
+    let i = 0;
+    while (i < 19) { bytes.write_byte(cl, i, 0); i = i + 1; }
+    i = 0;
+    while (i < hclen) {
+        bytes.write_byte(cl, bytes.read_byte(ord, i), br.bits(3));
+        i = i + 1;
+    }
+    let clHuff = Huffman(cl, 19);
+
+    let total = hlit + hdist;
+    let lens = bytes.alloc(total);
+    let n = 0;
+    while (n < total) {
+        let sym = clHuff.decode(br);
+        if (sym < 16) {
+            bytes.write_byte(lens, n, sym);
+            n = n + 1;
+        } else if (sym == 16) {
+            let rep = 3 + br.bits(2);
+            let prev = bytes.read_byte(lens, n - 1);
+            let r = 0;
+            while (r < rep) { bytes.write_byte(lens, n, prev); n = n + 1; r = r + 1; }
+        } else if (sym == 17) {
+            let rep = 3 + br.bits(3);
+            let r = 0;
+            while (r < rep) { bytes.write_byte(lens, n, 0); n = n + 1; r = r + 1; }
+        } else {
+            let rep = 11 + br.bits(7);
+            let r = 0;
+            while (r < rep) { bytes.write_byte(lens, n, 0); n = n + 1; r = r + 1; }
+        }
+    }
+
+    let litLens = bytes.alloc(hlit);
+    i = 0;
+    while (i < hlit) { bytes.write_byte(litLens, i, bytes.read_byte(lens, i)); i = i + 1; }
+    let distLens = bytes.alloc(hdist);
+    i = 0;
+    while (i < hdist) { bytes.write_byte(distLens, i, bytes.read_byte(lens, hlit + i)); i = i + 1; }
+    let litH = Huffman(litLens, hlit);
+    let distH = Huffman(distLens, hdist);
+    inflateBlock(br, out, litH, distH, true);
+    bytes.free(ord);
+    bytes.free(cl);
+    bytes.free(lens);
+    bytes.free(litLens);
+    bytes.free(distLens);
+}
+
+/// Builds the fixed literal/length [`Huffman`] book defined by RFC 1951 §3.2.6.
+///
+/// The fixed code lengths are a constant pattern: symbols 0..143 use 8 bits,
+/// 144..255 use 9, 256..279 use 7, and 280..287 use 8. Rebuilt on each type-1
+/// block; the temporary length array is freed, the returned `Huffman` is not (see
+/// [`Huffman.delete`]).
+fn fixedLitHuffman(): Huffman {
+    let lens = bytes.alloc(288);
+    let i = 0;
+    while (i < 144) { bytes.write_byte(lens, i, 8); i = i + 1; }
+    while (i < 256) { bytes.write_byte(lens, i, 9); i = i + 1; }
+    while (i < 280) { bytes.write_byte(lens, i, 7); i = i + 1; }
+    while (i < 288) { bytes.write_byte(lens, i, 8); i = i + 1; }
+    let h = Huffman(lens, 288);
+    bytes.free(lens);
+    return h;
+}
+/// Builds the fixed distance [`Huffman`] book: all 30 distance codes are 5 bits.
+fn fixedDistHuffman(): Huffman {
+    let lens = bytes.alloc(30);
+    let i = 0;
+    while (i < 30) { bytes.write_byte(lens, i, 5); i = i + 1; }
+    let h = Huffman(lens, 30);
+    bytes.free(lens);
+    return h;
+}
+
+/// 32-bit all-ones mask (0xFFFFFFFF), used to keep CRC arithmetic inside 32 bits
+/// while the running value is held in a 64-bit `long`.
+const MASK32: long = 4294967295;
+/// Classic 256-entry CRC-32 lookup table, one entry per input byte.
+///
+/// Retained for reference and completeness; the hot [`crc32`] path uses the
+/// slice-by-8 table [`CRC8`] instead, which is faster. Built once at module load.
+const CRC_TABLE: ptr = crcTable();
+/// Fills the single-byte CRC-32 table with the standard reflected polynomial
+/// 0xEDB88320 (here as decimal `poly`). Each entry is stored as four
+/// little-endian bytes.
+fn crcTable(): ptr {
+    let t = bytes.alloc(256 * 4);
+    let poly: long = 3988292384;
+    let n = 0;
+    while (n < 256) {
+        let c: long = n as long;
+        let k = 0;
+        while (k < 8) {
+            if ((c & 1) != 0) { c = poly ^ (c >> 1); }
+            else { c = c >> 1; }
+            k = k + 1;
+        }
+        bytes.write_byte(t, n * 4, (c & 255) as int);
+        bytes.write_byte(t, n * 4 + 1, ((c >> 8) & 255) as int);
+        bytes.write_byte(t, n * 4 + 2, ((c >> 16) & 255) as int);
+        bytes.write_byte(t, n * 4 + 3, ((c >> 24) & 255) as int);
+        n = n + 1;
+    }
+    return t;
+}
+
+/// Slice-by-8 CRC-32 table: eight 256-entry sub-tables laid out contiguously.
+///
+/// This is the table [`crc32`] actually reads. Slice-by-8 lets the CRC consume
+/// eight input bytes per iteration by XOR-combining eight precomputed lookups,
+/// which is several times faster than the byte-at-a-time [`CRC_TABLE`]. Built once
+/// at module load by [`crc8Table`].
+const CRC8: ptr = crc8Table();
+/// Constructs the slice-by-8 table [`CRC8`].
+///
+/// Sub-table 0 is the ordinary byte CRC table. Each subsequent sub-table `k` is
+/// derived from the previous one by advancing the CRC state one more byte
+/// position, so that [`crc32`] can fold eight bytes at once. Entries are stored as
+/// 32-bit little-endian ints via [`wr32`].
+fn crc8Table(): ptr {
+    let t = ibuf(8 * 256);
+    let poly: long = 3988292384;
+    let n = 0;
+    while (n < 256) {
+        let c: long = n as long;
+        let k = 0;
+        while (k < 8) {
+            if ((c & 1) != 0) { c = poly ^ (c >> 1); } else { c = c >> 1; }
+            k = k + 1;
+        }
+        wr32(t, n, (c & MASK32) as int);
+        n = n + 1;
+    }
+    let kk = 1;
+    while (kk < 8) {
+        let b = 0;
+        while (b < 256) {
+            let prev: long = (rd32(t, (kk - 1) * 256 + b) as long) & MASK32;
+            let v: long = ((prev >> 8) ^ ((rd32(t, (prev & 255) as int) as long) & MASK32)) & MASK32;
+            wr32(t, kk * 256 + b, v as int);
+            b = b + 1;
+        }
+        kk = kk + 1;
+    }
+    return t;
+}
+/// Reads sub-table `k`, entry `x` from [`CRC8`] as an unsigned 32-bit value.
+/// A small helper so the eight-way fold in [`crc32`] stays readable.
+fn crcT(k: int, x: int): long { return (rd32(CRC8, k * 256 + x) as long) & MASK32; }
+
+/// Computes the gzip/zlib CRC-32 of `data` (reflected, standard polynomial).
+///
+/// Uses slice-by-8 over [`CRC8`]: while at least eight bytes remain it loads them
+/// as one little-endian 64-bit word and folds them through the eight sub-tables
+/// in a single step, then finishes the tail one byte at a time. The value is
+/// seeded with all ones and finally XORed with all ones, per the CRC-32 spec. The
+/// result is a `long` holding a 32-bit quantity; [`gzipCompress`] writes its four
+/// low bytes little-endian into the gzip trailer.
+pub fn crc32(data: string): long {
+    let c: long = MASK32;
+    let len = data.length;
+    let i = 0;
+    while (i + 8 <= len) {
+        let w: ulong = mem.load<ulong>(data, i, endian.Endian.little);
+        let one: long = (c ^ ((w & MASK32) as long)) & MASK32;
+        let two: long = ((w >> 32) & MASK32) as long;
+        c = crcT(7, (one & 255) as int)
+          ^ crcT(6, ((one >> 8) & 255) as int)
+          ^ crcT(5, ((one >> 16) & 255) as int)
+          ^ crcT(4, ((one >> 24) & 255) as int)
+          ^ crcT(3, (two & 255) as int)
+          ^ crcT(2, ((two >> 8) & 255) as int)
+          ^ crcT(1, ((two >> 16) & 255) as int)
+          ^ crcT(0, ((two >> 24) & 255) as int);
+        i = i + 8;
+    }
+    while (i < len) {
+        let idx = ((c ^ (bytes.read_byte(data, i) as long)) & 255) as int;
+        c = (crcT(0, idx) ^ (c >> 8)) & MASK32;
+        i = i + 1;
+    }
+    return c ^ MASK32;
+}
+
+/// Decodes a gzip container (RFC 1952) and returns the decompressed payload.
+///
+/// Parses the 10-byte fixed header, then skips whichever optional fields the flag
+/// byte marks present, in order: FEXTRA (a length-prefixed block), FNAME and
+/// FCOMMENT (NUL-terminated strings), and FHCRC (a 2-byte header CRC). The DEFLATE
+/// body is everything between there and the 8-byte trailer (CRC-32 + ISIZE),
+/// which is sliced off and passed to [`inflate`]. Returns the empty string for
+/// input too short to hold a header. The CRC and ISIZE trailer are NOT verified;
+/// callers needing integrity should recompute [`crc32`] and compare.
+pub fn gunzip(src: string): string {
+    if (src.length < 18) { return ""; }
+    let flags = bytes.read_byte(src, 3);
+    let off = 10;
+    if ((flags & 4) != 0) {
+        let xlen = bytes.read_byte(src, off) | (bytes.read_byte(src, off + 1) << 8);
+        off = off + 2 + xlen;
+    }
+    if ((flags & 8) != 0) {
+        while (bytes.read_byte(src, off) != 0) { off = off + 1; }
+        off = off + 1;
+    }
+    if ((flags & 16) != 0) {
+        while (bytes.read_byte(src, off) != 0) { off = off + 1; }
+        off = off + 1;
+    }
+    if ((flags & 2) != 0) { off = off + 2; }
+    let deflated = string.slice(src, off, src.length - 8);
+    let buf = inflate(deflated);
+    let result = buf.toString();
+    return result;
+}
+
+
+/// Writes a 32-bit little-endian int into buffer `p` at 32-bit slot `i`.
+/// The int-array workhorse behind every `ibuf` scratch table. Paired with
+/// [`rd32`].
+fn wr32(p: ptr, i: int, v: int): void {
+    mem.store<int>(p, i * 4, v, endian.Endian.little);
+}
+/// Reads a 32-bit little-endian int from slot `i`. Inverse of [`wr32`].
+fn rd32(p: ptr, i: int): int {
+    return mem.load<int>(p, i * 4, endian.Endian.little);
+}
+
+/// LSB-first bit writer over a [`ByteBuf`], used by the encoder.
+///
+/// The mirror image of [`BitReader`]: it accumulates bits in a small buffer and
+/// flushes a full byte to `out` whenever eight bits are ready. DEFLATE requires
+/// LSB-first packing for extra-bit fields and MSB-first for Huffman codes, so the
+/// two write paths differ: [`BitWriter.writeBits`] packs low bit first, while
+/// [`BitWriter.writeHuff`] emits the code high bit first.
+pub struct BitWriter {
+    /// The growing output byte stream. Owned by the writer's caller; its raw
+    /// bytes become the DEFLATE result.
+    pub out: ByteBuf,
+    /// Bits accumulated but not yet flushed, held in the low `bitcnt` bits.
+    pub bitbuf: int,
+    /// Number of valid pending bits in `bitbuf`, always in 0..7 after a flush of
+    /// whole bytes.
+    pub bitcnt: int,
+
+    /// Creates a writer with a fresh empty [`ByteBuf`] and no pending bits.
+    init() {
+        self.out = ByteBuf();
+        self.bitbuf = 0;
+        self.bitcnt = 0;
+    }
+
+    /// Appends a single bit into the low end of the pending buffer, flushing a
+    /// byte to `out` once eight have accumulated.
+    pub fn writeBit(self: BitWriter, b: int): void {
+        self.bitbuf = self.bitbuf | ((b & 1) << self.bitcnt);
+        self.bitcnt = self.bitcnt + 1;
+        if (self.bitcnt == 8) {
+            self.out.push(self.bitbuf & 255);
+            self.bitbuf = 0;
+            self.bitcnt = 0;
+        }
+    }
+    /// Writes the low `n` bits of `v`, least-significant bit first, flushing whole
+    /// bytes as they fill. This is the order DEFLATE uses for extra bits, block
+    /// headers, and stored-block lengths.
+    pub fn writeBits(self: BitWriter, v: int, n: int): void {
+        self.bitbuf = self.bitbuf | ((v & ((1 << n) - 1)) << self.bitcnt);
+        self.bitcnt = self.bitcnt + n;
+        while (self.bitcnt >= 8) {
+            self.out.push(self.bitbuf & 255);
+            self.bitbuf = self.bitbuf >> 8;
+            self.bitcnt = self.bitcnt - 8;
+        }
+    }
+    /// Writes an `n`-bit Huffman code MOST-significant bit first.
+    ///
+    /// Huffman codes are transmitted with their high bit first, the opposite of
+    /// [`BitWriter.writeBits`], so this emits bit `n-1` down to bit 0. Feeding a
+    /// canonical code (from [`assignCanonical`]) through here produces the correct
+    /// prefix-code bit stream.
+    pub fn writeHuff(self: BitWriter, code: int, n: int): void {
+        let i = n - 1;
+        while (i >= 0) { self.writeBit((code >> i) & 1); i = i - 1; }
+    }
+    /// Flushes any pending partial byte to `out`, padding with zero bits.
+    ///
+    /// Called at end of stream and before a stored block (which must start byte
+    /// aligned). After this the writer holds no pending bits.
+    pub fn flush(self: BitWriter): void {
+        if (self.bitcnt > 0) {
+            self.out.push(self.bitbuf & 255);
+            self.bitbuf = 0;
+            self.bitcnt = 0;
+        }
+    }
+}
+
+/// Emits a literal/length symbol using the FIXED Huffman code, inline.
+///
+/// The magic offsets (48, 400, 192) are the canonical starting codes for each
+/// fixed length band from RFC 1951 §3.2.6. This is a standalone helper mirroring
+/// the fixed encoding; the main token path in [`writeTokens`] instead looks codes
+/// up in the prebuilt [`FIXED_LIT_CODE`] table.
+fn emitLitLen(bw: BitWriter, sym: int): void {
+    if (sym <= 143) { bw.writeHuff(48 + sym, 8); }
+    else if (sym <= 255) { bw.writeHuff(400 + (sym - 144), 9); }
+    else if (sym <= 279) { bw.writeHuff(sym - 256, 7); }
+    else { bw.writeHuff(192 + (sym - 280), 8); }
+}
+
+/// Returns the length code (0..28) covering match length `l`.
+///
+/// Linear scan down from 28 to the first code whose base length is at most `l`.
+/// Correct but O(29); the encoder uses the precomputed [`LEN_CODE`] table via
+/// [`lengthCodeFast`] on the hot path and only calls this to BUILD that table.
+fn lengthCode(l: int): int {
+    let i = 28;
+    while (i > 0 && rd16(LEN_BASE, i) > l) { i = i - 1; }
+    return i;
+}
+/// Returns the distance code (0..29) covering back-reference distance `d`.
+/// Same linear-scan shape as [`lengthCode`]; used only to build the fast lookup
+/// tables [`DIST_CODE_LOW`]/[`DIST_CODE_HIGH`].
+fn distCode(d: int): int {
+    let i = 29;
+    while (i > 0 && rd16(DIST_BASE, i) > d) { i = i - 1; }
+    return i;
+}
+
+/// Direct length-to-code table: `LEN_CODE[l]` is the length code for length `l`,
+/// for every valid length 3..258. Trades 259 slots for O(1) lookup.
+const LEN_CODE: ptr = lenCodeTable();
+/// Distance-to-code table for the near range (distances 1..256), one slot per
+/// distance. Read by [`distCodeFast`].
+const DIST_CODE_LOW: ptr = distCodeLowTable();
+/// Distance-to-code table for the far range (distances above 256), indexed by
+/// `(d-1) >> 7`. Codes are constant across each 128-distance band, so this needs
+/// only 256 slots to cover up to 32768. Read by [`distCodeFast`].
+const DIST_CODE_HIGH: ptr = distCodeHighTable();
+/// Builds [`LEN_CODE`] by evaluating [`lengthCode`] for every length 3..258 once.
+fn lenCodeTable(): ptr {
+    let t = bytes.alloc(259 * 2);
+    let l = 3;
+    while (l <= 258) { wr16(t, l, lengthCode(l)); l = l + 1; }
+    return t;
+}
+/// Builds [`DIST_CODE_LOW`] for distances 1..256.
+fn distCodeLowTable(): ptr {
+    let t = bytes.alloc(257 * 2);
+    let d = 1;
+    while (d <= 256) { wr16(t, d, distCode(d)); d = d + 1; }
+    return t;
+}
+/// Builds [`DIST_CODE_HIGH`], sampling one representative distance per 128-wide
+/// band since the distance code is constant within a band.
+fn distCodeHighTable(): ptr {
+    let t = bytes.alloc(256 * 2);
+    let k = 0;
+    while (k < 256) { wr16(t, k, distCode((k << 7) + 1)); k = k + 1; }
+    return t;
+}
+/// O(1) length code lookup via [`LEN_CODE`]. Requires `3 <= l <= 258`.
+fn lengthCodeFast(l: int): int { return rd16(LEN_CODE, l); }
+/// O(1) distance code lookup, splitting on 256 between the two range tables.
+/// Requires `1 <= d <= 32768`.
+fn distCodeFast(d: int): int {
+    if (d <= 256) { return rd16(DIST_CODE_LOW, d); }
+    return rd16(DIST_CODE_HIGH, (d - 1) >> 7);
+}
+
+/// Number of index bits for the encoder's hash tables (so the tables have
+/// 2^17 = 131072 buckets).
+const HASHL_BITS: int = 17;
+/// Number of buckets in each match-finder hash table, `2^HASHL_BITS`.
+const HASHL_SIZE: int = 131072;
+/// Bit mask for a hash bucket index, `HASHL_SIZE - 1`.
+const HASHL_MASK: int = 131071;
+/// Knuth 32-bit multiplicative hash constant, used by the 4-byte hash [`hashS`].
+const HASH_MUL: ulong = 2654435761;
+/// 64-bit Fibonacci hashing constant, used by the longer 7-byte hash [`hashL`].
+const HASH_MUL64: ulong = 0x9E3779B185EBCA87;
+
+/// Hashes the 4 bytes at `data[pos]` into a bucket index (short hash).
+///
+/// A 4-byte window is the DEFLATE minimum match length plus one, so this hash
+/// catches short matches. Multiplicative hashing keeps the high bits well mixed;
+/// the top `HASHL_BITS` are taken and masked. Used together with [`hashL`] to give
+/// the match finder two different match lengths to chase.
+fn hashS(data: string, pos: int): int {
+    let w: ulong = mem.load<ulong>(data, pos, endian.Endian.little) & 4294967295;
+    return ((((w * HASH_MUL) & 4294967295) >> (32 - HASHL_BITS)) as int) & HASHL_MASK;
+}
+/// Hashes the 7 bytes at `data[pos]` into a bucket index (long hash).
+///
+/// Masks the loaded 64-bit word to its low 56 bits (7 bytes) before the Fibonacci
+/// multiply, so a longer context feeds the hash. A longer window biases towards
+/// longer matches, which compress better; the finder tries both hashes and keeps
+/// whichever match is longest. The mask constant 72057594037927935 is `2^56 - 1`.
+fn hashL(data: string, pos: int): int {
+    let w: ulong = mem.load<ulong>(data, pos, endian.Endian.little) & 72057594037927935;
+    return (((w * HASH_MUL64) >> (64 - HASHL_BITS)) as int) & HASHL_MASK;
+}
+
+/// Returns how many bytes match between positions `a` and `b` in `data`, up to
+/// `maxLen`.
+///
+/// Compares eight bytes at a time by XORing 64-bit words: a zero XOR means eight
+/// equal bytes, otherwise the count of trailing zero BITS divided by 8 gives the
+/// number of equal leading bytes before the first mismatch (little-endian, so the
+/// lowest-address byte is the low byte). Falls back to a byte loop for the tail.
+/// This word-at-a-time comparison is the single biggest reason the encoder keeps
+/// pace with C implementations.
+fn matchLen(data: string, a: int, b: int, maxLen: int): int {
+    let l = 0;
+    while (l + 8 <= maxLen) {
+        let wa = mem.load<ulong>(data, a + l, endian.Endian.little);
+        let wb = mem.load<ulong>(data, b + l, endian.Endian.little);
+        let x = wa ^ wb;
+        if (x == 0) { l = l + 8; }
+        else { l = l + (mem.ctz<ulong>(x) >> 3); break; }
+    }
+    while (l < maxLen && bytes.read_byte(data, a + l) == bytes.read_byte(data, b + l)) { l = l + 1; }
+    return l;
+}
+
+
+/// Number of literal/length symbols the encoder tracks (0..285, so 286).
+const LITLEN_SYMS: int = 286;
+/// Number of distance symbols (30).
+const OFFSET_SYMS: int = 30;
+/// Number of code-length (codegen) symbols used to transmit dynamic code books
+/// (0..18, so 19).
+const CODEGEN_SYMS: int = 19;
+/// Maximum tokens buffered before the encoder must flush a block. Bounds the
+/// per-block scratch and keeps Huffman books adapting to local statistics.
+const MAX_BLOCK_TOKENS: int = 16384;
+/// Largest 32-bit signed int, used as a sentinel "infinite cost/frequency" in the
+/// package-merge builder [`bitCounts`] and the block-cost comparison.
+const MAXI32: int = 2147483647;
+/// Sentinel value marking the end of a codegen instruction stream in
+/// [`generateCodegen`]; 255 is outside the valid 0..18 codegen symbol range.
+const BADCODE: int = 255;
+
+/// Flag bit set in a packed token int to mark it as a match rather than a literal.
+/// A literal token is just the byte value (< 256); a match token ORs this in and
+/// packs length and distance into the lower bits.
+const TOK_MATCH: int = 16777216;
+
+/// Allocates an int buffer of `nslots` 32-bit slots. The `ptr`-typed counterpart
+/// of `bytes.alloc` for the many int-array scratch tables the encoder uses.
+fn ibuf(nslots: int): ptr { return bytes.alloc(nslots * 4); }
+/// Zeroes the first `nslots` 32-bit slots of `p`. Used to reset frequency and
+/// count tables between blocks.
+fn izero(p: ptr, nslots: int): void {
+    let i = 0;
+    while (i < nslots) { wr32(p, i, 0); i = i + 1; }
+}
+
+/// The permuted order in which code-length code lengths are transmitted in a
+/// dynamic block header (RFC 1951 §3.2.7). Frequently-zero entries sit at the end
+/// so trailing zeros can be dropped. Built once by [`codegenOrderTable`].
+const CODEGEN_ORDER: ptr = codegenOrderTable();
+/// Fills [`CODEGEN_ORDER`] from the RFC's fixed permutation.
+fn codegenOrderTable(): ptr {
+    let t = bytes.alloc(CODEGEN_SYMS);
+    fillBytes(t, "16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15");
+    return t;
+}
+
+/// Code lengths for the fixed literal/length book (encoder side), the same 8/9/7/8
+/// pattern the decoder builds in [`fixedLitHuffman`]. Used to cost a fixed-Huffman
+/// block in [`emitBlock`].
+const FIXED_LIT_LEN: ptr = fixedLitLenTable();
+/// Canonical codes matching [`FIXED_LIT_LEN`], so [`writeTokens`] can emit a fixed
+/// block by table lookup.
+const FIXED_LIT_CODE: ptr = fixedLitCodeTable();
+/// Code lengths for the fixed distance book (all 5 bits).
+const FIXED_OFF_LEN: ptr = fixedOffLenTable();
+/// Canonical codes matching [`FIXED_OFF_LEN`].
+const FIXED_OFF_CODE: ptr = fixedOffCodeTable();
+/// Builds [`FIXED_LIT_LEN`] with the RFC fixed literal/length code lengths.
+fn fixedLitLenTable(): ptr {
+    let t = bytes.alloc(LITLEN_SYMS);
+    let i = 0;
+    while (i < 144) { bytes.write_byte(t, i, 8); i = i + 1; }
+    while (i < 256) { bytes.write_byte(t, i, 9); i = i + 1; }
+    while (i < 280) { bytes.write_byte(t, i, 7); i = i + 1; }
+    while (i < 286) { bytes.write_byte(t, i, 8); i = i + 1; }
+    return t;
+}
+/// Derives [`FIXED_LIT_CODE`] by running [`assignCanonical`] over the fixed
+/// lengths. Depends on [`FIXED_LIT_LEN`] already being initialised.
+fn fixedLitCodeTable(): ptr {
+    let c = ibuf(LITLEN_SYMS);
+    assignCanonical(FIXED_LIT_LEN, LITLEN_SYMS, c);
+    return c;
+}
+/// Builds [`FIXED_OFF_LEN`]: every distance code is 5 bits in the fixed book.
+fn fixedOffLenTable(): ptr {
+    let t = bytes.alloc(OFFSET_SYMS);
+    let i = 0;
+    while (i < OFFSET_SYMS) { bytes.write_byte(t, i, 5); i = i + 1; }
+    return t;
+}
+/// Derives [`FIXED_OFF_CODE`] canonically from [`FIXED_OFF_LEN`].
+fn fixedOffCodeTable(): ptr {
+    let c = ibuf(OFFSET_SYMS);
+    assignCanonical(FIXED_OFF_LEN, OFFSET_SYMS, c);
+    return c;
+}
+
+/// Assigns canonical Huffman codes to symbols from their code lengths.
+///
+/// This is the encoder mirror of [`Huffman`]'s decode-side build and follows RFC
+/// 1951 §3.2.2 exactly: count symbols per length, compute the first code of each
+/// length (`(code + count[len-1]) << 1`), then hand out consecutive codes to
+/// symbols in symbol order within each length. Symbols with length 0 get code 0
+/// (unused). `outCode[i]` receives the code for symbol `i`. Both scratch tables
+/// are freed before returning.
+fn assignCanonical(len: ptr, size: int, outCode: ptr): void {
+    let blCount = ibuf(16);
+    izero(blCount, 16);
+    let i = 0;
+    while (i < size) {
+        let l = bytes.read_byte(len, i);
+        wr32(blCount, l, rd32(blCount, l) + 1);
+        i = i + 1;
+    }
+    wr32(blCount, 0, 0);
+    let nextCode = ibuf(16);
+    izero(nextCode, 16);
+    let code = 0;
+    let bits = 1;
+    while (bits < 16) {
+        code = (code + rd32(blCount, bits - 1)) << 1;
+        wr32(nextCode, bits, code);
+        bits = bits + 1;
+    }
+    i = 0;
+    while (i < size) {
+        let l = bytes.read_byte(len, i);
+        if (l != 0) {
+            let c = rd32(nextCode, l);
+            wr32(outCode, i, c);
+            wr32(nextCode, l, c + 1);
+        } else {
+            wr32(outCode, i, 0);
+        }
+        i = i + 1;
+    }
+    bytes.free(blCount);
+    bytes.free(nextCode);
+}
+
+/// Insertion-sorts the `count` active nodes by frequency, then by symbol.
+///
+/// The two parallel arrays `lit` (symbol) and `freq` (frequency) are reordered
+/// together into ascending order. The sort key packs frequency in the high bits
+/// and symbol in the low 10 bits (`(freq << 10) | lit`), giving a stable
+/// frequency-then-symbol order that the package-merge builder [`bitCounts`]
+/// requires. Insertion sort is chosen because the active-symbol count per block is
+/// small and often nearly sorted.
+fn sortNodes(lit: ptr, freq: ptr, count: int): void {
+    let i = 1;
+    while (i < count) {
+        let kl = rd32(lit, i);
+        let kf = rd32(freq, i);
+        let key = (kf << 10) | kl;
+        let j = i - 1;
+        while (j >= 0 && ((rd32(freq, j) << 10) | rd32(lit, j)) > key) {
+            wr32(lit, j + 1, rd32(lit, j));
+            wr32(freq, j + 1, rd32(freq, j));
+            j = j - 1;
+        }
+        wr32(lit, j + 1, kl);
+        wr32(freq, j + 1, kf);
+        i = i + 1;
+    }
+}
+
+/// Computes how many symbols get each code length under a length-limited optimal
+/// Huffman code, using the boundary package-merge algorithm.
+///
+/// Plain Huffman can produce codes longer than DEFLATE's 15-bit ceiling. The
+/// boundary package-merge method (the same approach zlib and Go use) finds the
+/// optimal prefix code subject to a maximum length `maxBits0`. It works level by
+/// level over a set of "packages", tracking at each bit level the next leaf, the
+/// next package, and how many more nodes are still needed. On return, `bitCount[b]`
+/// holds the number of symbols assigned code length `b`. The `nodeLit`/`nodeFreq`
+/// arrays must already be frequency-sorted by [`sortNodes`]. All the level-state
+/// scratch buffers are freed before returning.
+///
+/// This is the subtlest routine in the file; the `leaf`/`lvNeeded`/`lvNextPair`
+/// bookkeeping is a direct transcription of the package-merge state machine, so
+/// treat the level arithmetic as load-bearing and do not "simplify" it without a
+/// byte-exact round-trip test.
+fn bitCounts(nodeLit: ptr, nodeFreq: ptr, count: int, maxBits0: int, bitCount: ptr): void {
+    let n = count;
+    wr32(nodeFreq, n, MAXI32);
+    wr32(nodeLit, n, 65535);
+
+    let maxBits = maxBits0;
+    if (maxBits > n - 1) { maxBits = n - 1; }
+
+    let lvLastFreq = ibuf(18);
+    let lvNextChar = ibuf(18);
+    let lvNextPair = ibuf(18);
+    let lvNeeded = ibuf(18);
+    izero(lvNeeded, 18);
+    let leaf = ibuf(16 * 16);
+    izero(leaf, 16 * 16);
+
+    let level = 1;
+    while (level <= maxBits) {
+        wr32(lvLastFreq, level, rd32(nodeFreq, 1));
+        wr32(lvNextChar, level, rd32(nodeFreq, 2));
+        wr32(lvNextPair, level, rd32(nodeFreq, 0) + rd32(nodeFreq, 1));
+        wr32(leaf, level * 16 + level, 2);
+        if (level == 1) { wr32(lvNextPair, level, MAXI32); }
+        level = level + 1;
+    }
+    wr32(lvNeeded, maxBits, 2 * n - 4);
+
+    level = maxBits;
+    while (level < 16) {
+        let nextPair = rd32(lvNextPair, level);
+        let nextChar = rd32(lvNextChar, level);
+        if (nextPair == MAXI32 && nextChar == MAXI32) {
+            wr32(lvNeeded, level, 0);
+            wr32(lvNextPair, level + 1, MAXI32);
+            level = level + 1;
+            continue;
+        }
+        let prevFreq = rd32(lvLastFreq, level);
+        if (nextChar < nextPair) {
+            let cnt = rd32(leaf, level * 16 + level) + 1;
+            wr32(lvLastFreq, level, nextChar);
+            wr32(leaf, level * 16 + level, cnt);
+            let eFreq = rd32(nodeFreq, cnt);
+            let eLit = rd32(nodeLit, cnt);
+            if (eLit < 65535) { wr32(lvNextChar, level, eFreq); }
+            else { wr32(lvNextChar, level, MAXI32); }
+        } else {
+            wr32(lvLastFreq, level, nextPair);
+            let save = rd32(leaf, level * 16 + level);
+            let j = 0;
+            while (j < 16) { wr32(leaf, level * 16 + j, rd32(leaf, (level - 1) * 16 + j)); j = j + 1; }
+            wr32(leaf, level * 16 + level, save);
+            wr32(lvNeeded, level - 1, 2);
+        }
+
+        let need = rd32(lvNeeded, level) - 1;
+        wr32(lvNeeded, level, need);
+        if (need == 0) {
+            if (level == maxBits) { break; }
+            wr32(lvNextPair, level + 1, prevFreq + rd32(lvLastFreq, level));
+            level = level + 1;
+        } else {
+            while (rd32(lvNeeded, level - 1) > 0) { level = level - 1; }
+        }
+    }
+
+    izero(bitCount, 17);
+    let bits = 1;
+    let lv = maxBits;
+    while (lv > 0) {
+        wr32(bitCount, bits, rd32(leaf, maxBits * 16 + lv) - rd32(leaf, maxBits * 16 + (lv - 1)));
+        bits = bits + 1;
+        lv = lv - 1;
+    }
+
+    bytes.free(lvLastFreq); bytes.free(lvNextChar); bytes.free(lvNextPair);
+    bytes.free(lvNeeded); bytes.free(leaf);
+}
+
+/// Builds a complete length-limited Huffman code book from symbol frequencies.
+///
+/// Collects the symbols with non-zero frequency, then handles the degenerate
+/// cases directly: no active symbols leaves all lengths zero, and one or two
+/// active symbols get length 1 (a code book needs at least two codes to be a valid
+/// prefix code). Otherwise it sorts the nodes ([`sortNodes`]), runs the
+/// package-merge length allocation ([`bitCounts`]), assigns each symbol its length
+/// by walking the per-length counts from the longest codes inward, and finally
+/// derives canonical codes with [`assignCanonical`]. `outLen` receives per-symbol
+/// bit lengths, `outCode` the codes. Scratch node arrays are freed before return.
+fn genHuff(freq: ptr, size: int, maxBits: int, outLen: ptr, outCode: ptr): void {
+    let nodeLit = ibuf(size + 2);
+    let nodeFreq = ibuf(size + 2);
+    let count = 0;
+    let i = 0;
+    while (i < size) {
+        bytes.write_byte(outLen, i, 0);
+        let f = rd32(freq, i);
+        if (f != 0) {
+            wr32(nodeLit, count, i);
+            wr32(nodeFreq, count, f);
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+
+    if (count == 0) {
+        assignCanonical(outLen, size, outCode);
+        bytes.free(nodeLit); bytes.free(nodeFreq);
+        return;
+    }
+    if (count <= 2) {
+        let k = 0;
+        while (k < count) { bytes.write_byte(outLen, rd32(nodeLit, k), 1); k = k + 1; }
+        assignCanonical(outLen, size, outCode);
+        bytes.free(nodeLit); bytes.free(nodeFreq);
+        return;
+    }
+
+    sortNodes(nodeLit, nodeFreq, count);
+    let bitCount = ibuf(17);
+    bitCounts(nodeLit, nodeFreq, count, maxBits, bitCount);
+
+    let idx = count;
+    let b = 1;
+    while (b <= maxBits) {
+        let c = rd32(bitCount, b);
+        let k = 0;
+        while (k < c) {
+            idx = idx - 1;
+            bytes.write_byte(outLen, rd32(nodeLit, idx), b);
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    assignCanonical(outLen, size, outCode);
+    bytes.free(nodeLit); bytes.free(nodeFreq); bytes.free(bitCount);
+}
+
+/// Sums the encoded bit cost of a symbol stream: sum of `freq[i] * len[i]`.
+///
+/// Used by [`emitBlock`] to cost each candidate encoding (dynamic, fixed) so it
+/// can pick the cheapest. Symbols with zero frequency contribute nothing.
+fn bitLength(freq: ptr, len: ptr, size: int): int {
+    let total = 0;
+    let i = 0;
+    while (i < size) {
+        let f = rd32(freq, i);
+        if (f != 0) { total = total + f * bytes.read_byte(len, i); }
+        i = i + 1;
+    }
+    return total;
+}
+
+/// Returns how many trailing symbols must actually be transmitted.
+///
+/// A dynamic block only sends HLIT literal lengths and HDIST distance lengths, so
+/// trailing zero-length symbols are dropped. This trims from `size` down until it
+/// hits a non-zero length or the RFC minimum (`minCount`: 257 for literals, 1 for
+/// distances). The result feeds the HLIT/HDIST header fields in [`emitBlock`].
+fn numUsed(len: ptr, size: int, minCount: int): int {
+    let nm = size;
+    while (nm > minCount && bytes.read_byte(len, nm - 1) == 0) { nm = nm - 1; }
+    return nm;
+}
+
+/// Run-length encodes the concatenated literal and distance code lengths into the
+/// codegen instruction stream a dynamic block transmits.
+///
+/// RFC 1951 §3.2.7 lets a run of equal lengths be sent as codegen symbol 16
+/// (repeat previous 3..6 times) and runs of zeros as 17 (3..10) or 18 (11..138),
+/// which shrinks the header. This walks the combined length array (with a
+/// [`BADCODE`] terminator appended), emitting literal lengths and the appropriate
+/// repeat instructions, and tallies how often each codegen symbol occurs in
+/// `codegenFreq` so its own Huffman book can be built. Returns the number of
+/// entries written to `codegen`. The scratch copy `cg` is freed before returning.
+///
+/// The interleaved `count` arithmetic (the `count - 1` before the run loops, the
+/// trailing drain loop) is exact reproduction of the reference encoder's state and
+/// is easy to get subtly wrong; changing it risks producing a valid-looking but
+/// non-canonical header.
+fn generateCodegen(litLen: ptr, numLit: int, offLen: ptr, numOff: int,
+                   codegen: ptr, codegenFreq: ptr): int {
+    izero(codegenFreq, CODEGEN_SYMS);
+    let total = numLit + numOff;
+    let cg = bytes.alloc(total + 1);
+    let i = 0;
+    while (i < numLit) { bytes.write_byte(cg, i, bytes.read_byte(litLen, i)); i = i + 1; }
+    i = 0;
+    while (i < numOff) { bytes.write_byte(cg, numLit + i, bytes.read_byte(offLen, i)); i = i + 1; }
+    bytes.write_byte(cg, total, BADCODE);
+
+    let size = bytes.read_byte(cg, 0);
+    let count = 1;
+    let outIndex = 0;
+    let inIndex = 1;
+    while (size != BADCODE) {
+        let nextSize = bytes.read_byte(cg, inIndex);
+        inIndex = inIndex + 1;
+        if (nextSize == size) {
+            count = count + 1;
+            continue;
+        }
+        if (size != 0) {
+            wr32(codegen, outIndex, size); outIndex = outIndex + 1;
+            wr32(codegenFreq, size, rd32(codegenFreq, size) + 1);
+            count = count - 1;
+            while (count >= 3) {
+                let m = 6;
+                if (count < 6) { m = count; }
+                wr32(codegen, outIndex, 16); outIndex = outIndex + 1;
+                wr32(codegen, outIndex, m - 3); outIndex = outIndex + 1;
+                wr32(codegenFreq, 16, rd32(codegenFreq, 16) + 1);
+                count = count - m;
+            }
+        } else {
+            while (count >= 11) {
+                let m = 138;
+                if (count < 138) { m = count; }
+                wr32(codegen, outIndex, 18); outIndex = outIndex + 1;
+                wr32(codegen, outIndex, m - 11); outIndex = outIndex + 1;
+                wr32(codegenFreq, 18, rd32(codegenFreq, 18) + 1);
+                count = count - m;
+            }
+            if (count >= 3) {
+                wr32(codegen, outIndex, 17); outIndex = outIndex + 1;
+                wr32(codegen, outIndex, count - 3); outIndex = outIndex + 1;
+                wr32(codegenFreq, 17, rd32(codegenFreq, 17) + 1);
+                count = 0;
+            }
+        }
+        count = count - 1;
+        while (count >= 0) {
+            wr32(codegen, outIndex, size); outIndex = outIndex + 1;
+            wr32(codegenFreq, size, rd32(codegenFreq, size) + 1);
+            count = count - 1;
+        }
+        size = nextSize;
+        count = 1;
+    }
+    wr32(codegen, outIndex, BADCODE);
+    bytes.free(cg);
+    return outIndex;
+}
+
+/// Returns how many codegen code lengths (HCLEN + 4) to transmit.
+///
+/// The codegen lengths are sent in the permuted [`CODEGEN_ORDER`], and trailing
+/// unused ones are dropped down to a minimum of 4. This walks back from the end of
+/// that order skipping symbols whose frequency is zero.
+fn numCodegensUsed(codegenFreq: ptr): int {
+    let nc = CODEGEN_SYMS;
+    while (nc > 4 && rd32(codegenFreq, bytes.read_byte(CODEGEN_ORDER, nc - 1)) == 0) { nc = nc - 1; }
+    return nc;
+}
+
+/// Emits the token stream of a block as Huffman-coded output, then the
+/// end-of-block symbol.
+///
+/// Each entry in `toks` is either a literal (its value < 256) or a match tagged
+/// with [`TOK_MATCH`]. For a match, length and distance are unpacked from the bit
+/// fields, converted to their length/distance codes with [`lengthCodeFast`] /
+/// [`distCodeFast`], and written as: the length code, its extra bits, the distance
+/// code, and its extra bits, exactly the DEFLATE match encoding. Literals go
+/// straight through the literal code book. Symbol 256 is written last to close the
+/// block. The four code/length tables let the same routine serve both fixed and
+/// dynamic encodings.
+fn writeTokens(bw: BitWriter, toks: ptr, ntoks: int,
+               litCode: ptr, litLen: ptr, offCode: ptr, offLen: ptr): void {
+    let i = 0;
+    while (i < ntoks) {
+        let t = rd32(toks, i);
+        if ((t & TOK_MATCH) == 0) {
+            bw.writeHuff(rd32(litCode, t), bytes.read_byte(litLen, t));
+        } else {
+            let len = ((t >> 15) & 255) + 3;
+            let dist = (t & 32767) + 1;
+            let lc = lengthCodeFast(len);
+            let sym = 257 + lc;
+            bw.writeHuff(rd32(litCode, sym), bytes.read_byte(litLen, sym));
+            bw.writeBits(len - rd16(LEN_BASE, lc), bytes.read_byte(LEN_EXTRA, lc));
+            let dc = distCodeFast(dist);
+            bw.writeHuff(rd32(offCode, dc), bytes.read_byte(offLen, dc));
+            bw.writeBits(dist - rd16(DIST_BASE, dc), bytes.read_byte(DIST_EXTRA, dc));
+        }
+        i = i + 1;
+    }
+    bw.writeHuff(rd32(litCode, 256), bytes.read_byte(litLen, 256));
+}
+
+/// Writes a stored (uncompressed) block for `data[start .. start+len]`.
+///
+/// Emits the 3-bit block header (type 0, final flag in the low bit), byte-aligns
+/// with [`BitWriter.flush`], writes LEN and its one's-complement NLEN as two
+/// little-endian 16-bit fields, then copies the raw bytes straight into the output
+/// buffer. Chosen by [`emitBlock`] when the data is effectively incompressible.
+/// Only valid for `len <= 65535`, which [`emitBlock`] guarantees before calling.
+fn writeStored(bw: BitWriter, data: string, start: int, len: int, final: bool): void {
+    bw.writeBits(if (final) 1 else 0, 3);
+    bw.flush();
+    bw.writeBits(len & 65535, 16);
+    bw.writeBits((~len) & 65535, 16);
+    let i = 0;
+    while (i < len) { bw.out.push(bytes.read_byte(data, start + i)); i = i + 1; }
+}
+
+/// Encodes one block, choosing whichever of stored, fixed, and dynamic Huffman is
+/// smallest.
+///
+/// This is where the encoder commits a block. It first builds dynamic
+/// literal/length and distance code books from the collected frequencies
+/// ([`genHuff`]), builds the codegen stream and its own book that a dynamic header
+/// needs ([`generateCodegen`]), then costs all three candidate encodings in bits:
+/// the dynamic size (header plus token cost plus extra bits), the fixed-Huffman
+/// size, and the stored size (only if `blkLen <= 65535`). It writes the cheapest:
+/// a stored block via [`writeStored`], a fixed block via [`writeTokens`] with the
+/// [`FIXED_LIT_CODE`]/[`FIXED_OFF_CODE`] tables, or a full dynamic block (header
+/// fields, the codegen symbols with their extra bits, then the tokens). The
+/// end-of-block symbol frequency is bumped up front because [`writeTokens`] always
+/// emits it. Every per-block scratch buffer is freed before returning.
+///
+/// One special case worth noting: if the distance book ends up with a single unused
+/// distance symbol, its length is forced to 1 and its code reassigned, because a
+/// DEFLATE distance book must contain at least one code even when the block has no
+/// matches.
+fn emitBlock(bw: BitWriter, data: string, start: int, blkLen: int,
+             toks: ptr, ntoks: int, litFreq: ptr, offFreq: ptr, extraBits: int, final: bool): void {
+    wr32(litFreq, 256, rd32(litFreq, 256) + 1);
+
+    let litLen = bytes.alloc(LITLEN_SYMS);
+    let litCode = ibuf(LITLEN_SYMS);
+    genHuff(litFreq, LITLEN_SYMS, 15, litLen, litCode);
+    let offLen = bytes.alloc(OFFSET_SYMS);
+    let offCode = ibuf(OFFSET_SYMS);
+    genHuff(offFreq, OFFSET_SYMS, 15, offLen, offCode);
+
+    let numLit = numUsed(litLen, LITLEN_SYMS, 257);
+    let numOff = numUsed(offLen, OFFSET_SYMS, 1);
+    if (numOff == 1 && bytes.read_byte(offLen, 0) == 0) {
+        bytes.write_byte(offLen, 0, 1);
+        assignCanonical(offLen, OFFSET_SYMS, offCode);
+    }
+
+    let codegen = ibuf(LITLEN_SYMS + OFFSET_SYMS + 2);
+    let codegenFreq = ibuf(CODEGEN_SYMS);
+    generateCodegen(litLen, numLit, offLen, numOff, codegen, codegenFreq);
+    let cgLen = bytes.alloc(CODEGEN_SYMS);
+    let cgCode = ibuf(CODEGEN_SYMS);
+    genHuff(codegenFreq, CODEGEN_SYMS, 7, cgLen, cgCode);
+    let numCg = numCodegensUsed(codegenFreq);
+
+    let headerSize = 3 + 5 + 5 + 4 + 3 * numCg
+        + bitLength(codegenFreq, cgLen, CODEGEN_SYMS)
+        + rd32(codegenFreq, 16) * 2 + rd32(codegenFreq, 17) * 3 + rd32(codegenFreq, 18) * 7;
+    let dynSize = headerSize + bitLength(litFreq, litLen, LITLEN_SYMS)
+        + bitLength(offFreq, offLen, OFFSET_SYMS) + extraBits;
+    let fixSize = 3 + bitLength(litFreq, FIXED_LIT_LEN, LITLEN_SYMS)
+        + bitLength(offFreq, FIXED_OFF_LEN, OFFSET_SYMS) + extraBits;
+    let storeSize = MAXI32;
+    if (blkLen <= 65535) { storeSize = (blkLen + 5) * 8; }
+
+    if (storeSize <= dynSize && storeSize <= fixSize) {
+        writeStored(bw, data, start, blkLen, final);
+    } else if (fixSize <= dynSize) {
+        bw.writeBits(if (final) 3 else 2, 3);
+        writeTokens(bw, toks, ntoks, FIXED_LIT_CODE, FIXED_LIT_LEN, FIXED_OFF_CODE, FIXED_OFF_LEN);
+    } else {
+        bw.writeBits(if (final) 5 else 4, 3);
+        bw.writeBits(numLit - 257, 5);
+        bw.writeBits(numOff - 1, 5);
+        bw.writeBits(numCg - 4, 4);
+        let i = 0;
+        while (i < numCg) {
+            bw.writeBits(bytes.read_byte(cgLen, bytes.read_byte(CODEGEN_ORDER, i)), 3);
+            i = i + 1;
+        }
+        i = 0;
+        while (true) {
+            let sym = rd32(codegen, i);
+            i = i + 1;
+            if (sym == BADCODE) { break; }
+            bw.writeHuff(rd32(cgCode, sym), bytes.read_byte(cgLen, sym));
+            if (sym == 16) { bw.writeBits(rd32(codegen, i), 2); i = i + 1; }
+            else if (sym == 17) { bw.writeBits(rd32(codegen, i), 3); i = i + 1; }
+            else if (sym == 18) { bw.writeBits(rd32(codegen, i), 7); i = i + 1; }
+        }
+        writeTokens(bw, toks, ntoks, litCode, litLen, offCode, offLen);
+    }
+
+    bytes.free(litLen); bytes.free(litCode); bytes.free(offLen); bytes.free(offCode);
+    bytes.free(codegen); bytes.free(codegenFreq); bytes.free(cgLen); bytes.free(cgCode);
+}
+
+/// Records position `p` in the match-finder hash tables without searching.
+///
+/// Used to keep the hash chains current across the interior of a match that was
+/// already emitted, so that later positions can still find back-references into
+/// it. `tabS` is the short-hash head table; `tabLc`/`tabLp` form a one-deep chain
+/// for the long hash (current head plus the previous head it displaced), giving
+/// the finder a second candidate to try. See [`findMatch`] for the read side.
+fn hashInsert(data: string, p: int, tabS: ptr, tabLc: ptr, tabLp: ptr): void {
+    let hs = hashS(data, p);
+    let hl = hashL(data, p);
+    wr32(tabS, hs, p);
+    wr32(tabLp, hl, rd32(tabLc, hl));
+    wr32(tabLc, hl, p);
+}
+
+/// Finds the best back-reference for the bytes at `pos`, and updates the hash
+/// tables to include `pos`.
+///
+/// Probes up to four candidate source positions and keeps the longest match: the
+/// short-hash head, the long-hash head, the long-hash previous head (a one-deep
+/// chain), and the most recent match distance `repeat` (the repeat-distance probe,
+/// which is cheap and often wins on structured data). Each candidate is only
+/// considered if it lies within the 32 KB DEFLATE window and actually improves on
+/// the best length so far. Returns 0 if no match reaches the 3-byte minimum;
+/// otherwise packs `(bestLen << 20) | bestDist` into an int for the caller to
+/// unpack. This is a greedy per-position search; the lazy-matching decision lives
+/// in [`deflateRaw`].
+fn findMatch(data: string, pos: int, n: int, tabS: ptr, tabLc: ptr, tabLp: ptr, repeat: int): int {
+    let maxLen = n - pos;
+    if (maxLen > 258) { maxLen = 258; }
+    let hs = hashS(data, pos);
+    let hl = hashL(data, pos);
+    let cL = rd32(tabLc, hl);
+    let cLp = rd32(tabLp, hl);
+    let cS = rd32(tabS, hs);
+    wr32(tabS, hs, pos);
+    wr32(tabLp, hl, cL);
+    wr32(tabLc, hl, pos);
+
+    let bestLen = 0;
+    let bestDist = 0;
+    if (cL >= 0 && pos - cL <= 32768) {
+        let l = matchLen(data, cL, pos, maxLen);
+        if (l > bestLen) { bestLen = l; bestDist = pos - cL; }
+    }
+    if (cLp >= 0 && pos - cLp <= 32768) {
+        let l = matchLen(data, cLp, pos, maxLen);
+        if (l > bestLen) { bestLen = l; bestDist = pos - cLp; }
+    }
+    if (cS >= 0 && pos - cS <= 32768) {
+        let l = matchLen(data, cS, pos, maxLen);
+        if (l > bestLen) { bestLen = l; bestDist = pos - cS; }
+    }
+    let cR = pos - repeat;
+    if (cR >= 0) {
+        let l = matchLen(data, cR, pos, maxLen);
+        if (l >= 3 && l > bestLen) { bestLen = l; bestDist = repeat; }
+    }
+    if (bestLen < 3) { return 0; }
+    return (bestLen << 20) | bestDist;
+}
+
+/// Compresses `data` into a raw DEFLATE stream (no gzip or zlib wrapper).
+///
+/// This is the top-level encoder. It sets up the three hash tables (all cleared to
+/// -1, meaning empty) and a token buffer, then walks the input running LZ77 with
+/// lazy matching: at each position it finds the best match ([`findMatch`]) but
+/// defers emitting it, because the NEXT position might start a longer one. A match
+/// is only committed when the previous position's match is at least as good as the
+/// current one, in which case the interior positions of the emitted match are
+/// still hashed ([`hashInsert`]) so future matches can reference into them.
+/// Non-matched bytes become literal tokens. When the token buffer fills
+/// ([`MAX_BLOCK_TOKENS`]) the accumulated block is flushed via [`emitBlock`] and
+/// the frequency tables reset, so the Huffman books track local statistics. The
+/// final block is flushed with `final = true`. Returns the output [`ByteBuf`],
+/// which the caller owns; all scratch tables are freed here. `repeat` tracks the
+/// last match distance to feed the repeat-distance probe.
+///
+/// Only positions with at least 8 bytes of lookahead are searched, so the tail of
+/// the input naturally falls through to literals; this keeps the word-at-a-time
+/// [`matchLen`] and hash loads from reading past the end of `data`.
+pub fn deflateRaw(data: string): ByteBuf {
+    let bw = BitWriter();
+    let n = data.length;
+
+    let tabS = bytes.alloc(HASHL_SIZE * 4);
+    let tabLc = bytes.alloc(HASHL_SIZE * 4);
+    let tabLp = bytes.alloc(HASHL_SIZE * 4);
+    let h = 0;
+    while (h < HASHL_SIZE) { wr32(tabS, h, -1); wr32(tabLc, h, -1); wr32(tabLp, h, -1); h = h + 1; }
+
+    let toks = ibuf(MAX_BLOCK_TOKENS + 1);
+    let litFreq = ibuf(LITLEN_SYMS);
+    let offFreq = ibuf(OFFSET_SYMS);
+    izero(litFreq, LITLEN_SYMS);
+    izero(offFreq, OFFSET_SYMS);
+    let ntoks = 0;
+    let extraBits = 0;
+    let blkStart = 0;
+    let repeat = 1;
+
+    let pos = 0;
+    let matchAvail = false;
+    let prevLen = 0;
+    let prevDist = 0;
+    while (pos < n) {
+        if (ntoks >= MAX_BLOCK_TOKENS) {
+            emitBlock(bw, data, blkStart, pos - blkStart, toks, ntoks, litFreq, offFreq, extraBits, false);
+            ntoks = 0; extraBits = 0; blkStart = pos;
+            izero(litFreq, LITLEN_SYMS); izero(offFreq, OFFSET_SYMS);
+        }
+
+        let cur = 0;
+        if (pos + 8 <= n) { cur = findMatch(data, pos, n, tabS, tabLc, tabLp, repeat); }
+        let curLen = cur >> 20;
+        let curDist = cur & 1048575;
+
+        if (prevLen >= 3 && prevLen >= curLen) {
+            let mstart = pos - 1;
+            let lc = lengthCodeFast(prevLen);
+            let dc = distCodeFast(prevDist);
+            wr32(toks, ntoks, TOK_MATCH | ((prevLen - 3) << 15) | (prevDist - 1));
+            ntoks = ntoks + 1;
+            wr32(litFreq, 257 + lc, rd32(litFreq, 257 + lc) + 1);
+            wr32(offFreq, dc, rd32(offFreq, dc) + 1);
+            extraBits = extraBits + bytes.read_byte(LEN_EXTRA, lc) + bytes.read_byte(DIST_EXTRA, dc);
+            repeat = prevDist;
+            let k = pos + 1;
+            let endp = mstart + prevLen;
+            while (k < endp) {
+                if (k + 8 <= n) { hashInsert(data, k, tabS, tabLc, tabLp); }
+                k = k + 1;
+            }
+            pos = mstart + prevLen;
+            matchAvail = false;
+            prevLen = 0;
+        } else if (matchAvail) {
+            let b = bytes.read_byte(data, pos - 1);
+            wr32(toks, ntoks, b);
+            ntoks = ntoks + 1;
+            wr32(litFreq, b, rd32(litFreq, b) + 1);
+            prevLen = curLen; prevDist = curDist;
+            pos = pos + 1;
+        } else {
+            matchAvail = true;
+            prevLen = curLen; prevDist = curDist;
+            pos = pos + 1;
+        }
+    }
+    if (matchAvail) {
+        let b = bytes.read_byte(data, n - 1);
+        wr32(toks, ntoks, b);
+        ntoks = ntoks + 1;
+        wr32(litFreq, b, rd32(litFreq, b) + 1);
+    }
+
+    emitBlock(bw, data, blkStart, pos - blkStart, toks, ntoks, litFreq, offFreq, extraBits, true);
+    bw.flush();
+
+    bytes.free(tabS);
+    bytes.free(tabLc);
+    bytes.free(tabLp);
+    bytes.free(toks);
+    bytes.free(litFreq);
+    bytes.free(offFreq);
+    return bw.out;
+}
+
+/// Compresses `data` into a complete gzip container (RFC 1952) and returns it as
+/// a string.
+///
+/// Wraps the [`deflateRaw`] output with the gzip framing: the 10-byte header
+/// (magic 0x1F 0x8B, method 8 = deflate, no flags, zero mtime, XFL 0, OS 255 =
+/// unknown), the compressed body, and the 8-byte trailer holding the CRC-32 of the
+/// ORIGINAL data ([`crc32`]) and the input size, both little-endian. The size and
+/// CRC use the raw uncompressed length. Both intermediate buffers are deleted
+/// before the owned result string is returned. This is the function HTTP gzip
+/// content-encoding calls; [`gunzip`] is its inverse.
+pub fn gzipCompress(data: string): string {
+    let body = deflateRaw(data);
+    let out = ByteBuf();
+    out.push(31); out.push(139); out.push(8); out.push(0);
+    out.push(0); out.push(0); out.push(0); out.push(0);
+    out.push(0); out.push(255);
+    let i = 0;
+    while (i < body.len) { out.push(body.at(i)); i = i + 1; }
+    let crc = crc32(data);
+    out.push((crc & 255) as int);
+    out.push(((crc >> 8) & 255) as int);
+    out.push(((crc >> 16) & 255) as int);
+    out.push(((crc >> 24) & 255) as int);
+    let isize = data.length;
+    out.push(isize & 255);
+    out.push((isize >> 8) & 255);
+    out.push((isize >> 16) & 255);
+    out.push((isize >> 24) & 255);
+    let s = out.toString();
+    out.delete();
+    body.delete();
+    return s;
+}

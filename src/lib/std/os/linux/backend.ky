@@ -1,0 +1,51 @@
+//! Linux backend constants: the platform-specific numbers the `os` layer needs
+//! to talk to the Linux kernel directly (syscall flag values, socket option
+//! numbers, struct field offsets, and errno values), collected in one place so
+//! the portable `os` code above it never hardcodes a platform magic number.
+//! This is the Linux counterpart of the equivalent `backend.ky` files under
+//! `os/darwin` and `os/windows`: same names, different values, selected by the
+//! target-conditional file rule so callers stay platform-agnostic.
+
+/// Identifies this backend as "epoll" for the reactor selection logic.
+pub fn name(): string { return "epoll"; }
+/// Size, in bytes, of a single `struct epoll_event` on Linux, used to size and
+/// index the raw event buffer passed to `epoll_wait`.
+pub const EVENT_SIZE: int = 12;
+/// epoll is readiness-based (tells you a fd is ready, not that an operation
+/// finished), unlike a proactor backend such as IOCP or io_uring.
+pub const COMPLETION_BASED: bool = false;
+
+
+/// `open(2)` flag: create the file if it does not exist.
+pub const OPEN_CREAT: int = 64;
+/// `open(2)` flag: truncate an existing file to zero length on open.
+pub const OPEN_TRUNC: int = 512;
+/// `open(2)` flag: writes go to the end of the file.
+pub const OPEN_APPEND: int = 1024;
+/// `open(2)` flag: fail with EAGAIN instead of blocking.
+pub const OPEN_NONBLOCK: int = 2048;
+
+/// `mmap(2)` flag: the mapping is not backed by a file.
+pub const MMAP_ANON: int = 32;
+
+/// `setsockopt(2)`/`getsockopt(2)` level for socket-layer options (`SOL_SOCKET`).
+pub const SOCKOPT_LEVEL: int = 1;
+/// Socket option number for `SO_ERROR`, used to read a pending async connect's outcome.
+pub const SOCKOPT_ERROR: int = 4;
+/// Socket option number for `SO_REUSEADDR`.
+pub const SOCKOPT_REUSEADDR: int = 2;
+/// Socket option number for `SO_REUSEPORT`.
+pub const SOCKOPT_REUSEPORT: int = 15;
+
+/// Byte offset of the `st_mode` field within Linux's `struct stat`.
+pub const STAT_MODE_OFFSET: int = 24;
+/// Byte offset of the `d_name` field within Linux's `struct dirent`.
+pub const DIRENT_NAME_OFFSET: int = 19;
+
+/// errno value for `EAGAIN`: a non-blocking operation would block, retry later.
+pub const ERR_AGAIN: int = 11;
+/// errno value for `EINPROGRESS`: a non-blocking connect is still in progress.
+pub const ERR_INPROGRESS: int = 115;
+
+/// Byte offset of the address field within a resolved `addrinfo` entry.
+pub const ADDRINFO_ADDR_OFFSET: int = 24;

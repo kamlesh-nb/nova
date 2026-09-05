@@ -1,9 +1,9 @@
-//! Project scaffolding for the `nova init` and `nova add-feature` CLI commands.
+//! Project scaffolding for the `kyte init` and `kyte add-feature` CLI commands.
 //!
-//! This module turns an empty directory into a working Nova project by writing
+//! This module turns an empty directory into a working Kyte project by writing
 //! a fixed set of starter files and directories to disk. It is the code behind
-//! `nova init <console|web|desktop> --name X [--framework <htmx|datastar|unpoly|htmz|alpine>]` and
-//! `nova add-feature <name>`. It
+//! `kyte init <console|web|desktop> --name X [--framework <htmx|datastar|unpoly|htmz|alpine>]` and
+//! `kyte add-feature <name>`. It
 //! deals purely in filesystem effects: it creates directories, writes template
 //! text into files, and prints progress to stderr. It does not compile, parse,
 //! or type-check anything.
@@ -13,7 +13,7 @@
 //! which relative paths exist and what template fills each one, while
 //! `templates.zig` owns the *content*. The `console` and `desktop` layouts are a
 //! couple of files; the `web` layout mirrors an ASP.NET-style vertical-slice
-//! structure (`src/Features/<Area>/<UseCase>/{command,query,handler,...}.nova`),
+//! structure (`src/Features/<Area>/<UseCase>/{command,query,handler,...}.ky`),
 //! so it is factored out into [`scaffoldWeb`] with a data-driven table of
 //! path/content pairs.
 //!
@@ -27,7 +27,7 @@
 //!     level.
 //!
 //!   - Directory creation is idempotent: `error.PathAlreadyExists` is swallowed
-//!     everywhere so re-running `nova init` over an existing tree overwrites the
+//!     everywhere so re-running `kyte init` over an existing tree overwrites the
 //!     files rather than failing. This is a deliberate "regenerate in place"
 //!     policy, not accidental error suppression.
 //!
@@ -90,7 +90,7 @@ const pipeline = @import("pipeline.zig");
 /// it creates the leading directory chain via `createDirPath` (idempotently:
 /// `error.PathAlreadyExists` is not an error). This is what lets a template
 /// table name a deeply nested path such as
-/// `src/Features/Products/CreateProduct/handler.nova` without any caller
+/// `src/Features/Products/CreateProduct/handler.ky` without any caller
 /// pre-creating the intervening directories.
 ///
 /// The joined path is heap-allocated from `allocator` and freed before return.
@@ -106,10 +106,10 @@ fn scaffoldFile(allocator: std.mem.Allocator, io: std.Io, project: []const u8, r
     try Io.Dir.writeFile(.cwd(), io, .{ .data = content, .sub_path = full, .flags = .{} });
 }
 
-/// The hypermedia frameworks `nova init web --framework` accepts. All are a natural fit for this
+/// The hypermedia frameworks `kyte init web --framework` accepts. All are a natural fit for this
 /// template's "handler returns an HTML fragment" model: htmx/htmz/unpoly/alpine swap that fragment into
 /// the page (differing only in how they target it), and datastar drives reactive signals (its server
-/// actions want an SSE stream, which Nova serves via `web.sse`). SPA/JSON frameworks are deliberately
+/// actions want an SSE stream, which Kyte serves via `web.sse`). SPA/JSON frameworks are deliberately
 /// excluded -- they are a different, non-hypermedia model.
 const web_frameworks = [_][]const u8{ "htmx", "datastar", "unpoly", "htmz", "alpine" };
 
@@ -147,32 +147,32 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8, fr
     // The complete set of files that make up a scaffolded web app, each
     // pairing a relative path with its template constant from [`templates`].
     const files = [_]f{
-        .{ .rel = "src/main.nova", .content = templates.web_main_sample },
+        .{ .rel = "src/main.ky", .content = templates.web_main_sample },
 
         // app.yaml: the project-root manifest -- app config (read into `app.config`) and, when deployed,
         // the orchestrator workload manifest, in one file. Fixed name, always at the project root.
         .{ .rel = "app.yaml", .content = templates.web_app_yaml_sample },
 
-        .{ .rel = "src/Features/Products/routes.nova", .content = templates.web_routes_sample },
+        .{ .rel = "src/Features/Products/routes.ky", .content = templates.web_routes_sample },
 
-        .{ .rel = "src/Features/Products/CreateProduct/command.nova", .content = templates.web_create_command_sample },
-        .{ .rel = "src/Features/Products/CreateProduct/validator.nova", .content = templates.web_create_validator_sample },
-        .{ .rel = "src/Features/Products/CreateProduct/handler.nova", .content = templates.web_create_handler_sample },
+        .{ .rel = "src/Features/Products/CreateProduct/command.ky", .content = templates.web_create_command_sample },
+        .{ .rel = "src/Features/Products/CreateProduct/validator.ky", .content = templates.web_create_validator_sample },
+        .{ .rel = "src/Features/Products/CreateProduct/handler.ky", .content = templates.web_create_handler_sample },
 
-        .{ .rel = "src/Features/Products/GetProductById/query.nova", .content = templates.web_get_query_sample },
-        .{ .rel = "src/Features/Products/GetProductById/handler.nova", .content = templates.web_get_handler_sample },
+        .{ .rel = "src/Features/Products/GetProductById/query.ky", .content = templates.web_get_query_sample },
+        .{ .rel = "src/Features/Products/GetProductById/handler.ky", .content = templates.web_get_handler_sample },
 
-        .{ .rel = "src/Features/Products/Shared/repository.nova", .content = templates.web_repository_sample },
+        .{ .rel = "src/Features/Products/Shared/repository.ky", .content = templates.web_repository_sample },
 
         .{ .rel = "src/Features/Products/views/product_card.nsx", .content = templates.web_view_sample },
 
         // Clean-arch Domain layer: entities model the persisted rows, DTOs are the
         // request/response shapes bound and returned by the feature slices.
-        .{ .rel = "src/Domain/Entities/Product.nova", .content = templates.web_domain_entity_sample },
-        .{ .rel = "src/Domain/Dtos/ProductDto.nova", .content = templates.web_get_response_sample },
-        .{ .rel = "src/Domain/Dtos/CreateProductDto.nova", .content = templates.web_create_response_sample },
+        .{ .rel = "src/Domain/Entities/Product.ky", .content = templates.web_domain_entity_sample },
+        .{ .rel = "src/Domain/Dtos/ProductDto.ky", .content = templates.web_get_response_sample },
+        .{ .rel = "src/Domain/Dtos/CreateProductDto.ky", .content = templates.web_create_response_sample },
         .{ .rel = "wwwroot/index.html", .content = indexHtmlFor(framework) },
-        .{ .rel = "tests/features/products_test.nova", .content = templates.web_test_sample },
+        .{ .rel = "tests/features/products_test.ky", .content = templates.web_test_sample },
 
         .{ .rel = "package.json", .content = templates.web_package_json_sample },
         .{ .rel = "tailwind.config.js", .content = templates.web_tailwind_config_sample },
@@ -197,18 +197,18 @@ fn writeVscodeConfig(allocator: std.mem.Allocator, io: std.Io, project: []const 
 }
 
 fn scaffoldDesktop(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
-    try scaffoldFile(allocator, io, project, "src/main.nova", templates.desktop_main_sample);
+    try scaffoldFile(allocator, io, project, "src/main.ky", templates.desktop_main_sample);
 }
 
 pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
     if (args.len < 3) {
-        std.debug.print("Usage: nova init <console|web|desktop> --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
+        std.debug.print("Usage: kyte init <console|web|desktop> --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
         return;
     }
     var template_type = args[2];
 
     if (std.mem.eql(u8, template_type, "app")) {
-        std.debug.print("note: `nova init app` is deprecated, use `nova init web` (or `desktop`). Scaffolding a web app.\n", .{});
+        std.debug.print("note: `kyte init app` is deprecated, use `kyte init web` (or `desktop`). Scaffolding a web app.\n", .{});
         template_type = "web";
     }
     if (!std.mem.eql(u8, template_type, "console") and
@@ -216,7 +216,7 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         !std.mem.eql(u8, template_type, "desktop"))
     {
         std.debug.print("Invalid template type '{s}'. Expected 'console', 'web', or 'desktop'.\n", .{template_type});
-        std.debug.print("Usage: nova init <console|web|desktop> --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
+        std.debug.print("Usage: kyte init <console|web|desktop> --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
         return;
     }
 
@@ -248,13 +248,13 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     if (!isValidFramework(framework)) {
         std.debug.print("Invalid framework '{s}'. Expected one of: htmx, datastar, unpoly, htmz, alpine.\n", .{framework});
-        std.debug.print("Usage: nova init web --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
+        std.debug.print("Usage: kyte init web --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
         return;
     }
 
     if (project_name == null) {
         std.debug.print("Error: Project name must be specified with --name <name> or -n <name>.\n", .{});
-        std.debug.print("Usage: nova init <console|app> --name <project_name>\n", .{});
+        std.debug.print("Usage: kyte init <console|app> --name <project_name>\n", .{});
         return;
     }
 
@@ -278,11 +278,11 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
             if (err != error.PathAlreadyExists) return err;
         };
 
-        const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.nova", .{project_name.?});
+        const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.ky", .{project_name.?});
         defer allocator.free(main_path);
         try Io.Dir.writeFile(.cwd(), init.io, .{ .data = templates.console_main_sample, .sub_path = main_path, .flags = .{} });
 
-        const test_path = try std.fmt.allocPrint(allocator, "{s}/tests/main_test.nova", .{project_name.?});
+        const test_path = try std.fmt.allocPrint(allocator, "{s}/tests/main_test.ky", .{project_name.?});
         defer allocator.free(test_path);
         try Io.Dir.writeFile(.cwd(), init.io, .{ .data = templates.console_test_sample, .sub_path = test_path, .flags = .{} });
     } else if (std.mem.eql(u8, template_type, "web")) {
@@ -324,16 +324,16 @@ pub fn cmdAddFeature(allocator: std.mem.Allocator, init: std.process.Init, name:
     Io.Dir.createDirPath(.cwd(), init.io, feature_dir_path) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
-    const model_path = try std.fmt.allocPrint(allocator, "features/{s}/model.nova", .{name});
+    const model_path = try std.fmt.allocPrint(allocator, "features/{s}/model.ky", .{name});
     defer allocator.free(model_path);
     try Io.Dir.writeFile(.cwd(), init.io, .{ .data = "// Model layer\n", .sub_path = model_path, .flags = .{} });
-    const service_path = try std.fmt.allocPrint(allocator, "features/{s}/service.nova", .{name});
+    const service_path = try std.fmt.allocPrint(allocator, "features/{s}/service.ky", .{name});
     defer allocator.free(service_path);
     try Io.Dir.writeFile(.cwd(), init.io, .{ .data = "// Service layer\n", .sub_path = service_path, .flags = .{} });
-    const view_path = try std.fmt.allocPrint(allocator, "features/{s}/view.nova", .{name});
+    const view_path = try std.fmt.allocPrint(allocator, "features/{s}/view.ky", .{name});
     defer allocator.free(view_path);
     try Io.Dir.writeFile(.cwd(), init.io, .{ .data = "// View layer\n", .sub_path = view_path, .flags = .{} });
-    const handler_path = try std.fmt.allocPrint(allocator, "features/{s}/{s}.nova", .{ name, name });
+    const handler_path = try std.fmt.allocPrint(allocator, "features/{s}/{s}.ky", .{ name, name });
     defer allocator.free(handler_path);
     const handler_content = try std.fmt.allocPrint(allocator, "// Handler layer for {s}\n", .{name});
     defer allocator.free(handler_content);

@@ -4,7 +4,7 @@ Scope: native macOS / Linux / Windows, cross-compilation, and WASM. Verified aga
 `lang/src/pipeline.zig`, `lang/src/backend/codegen/*`, `lang/src/frontend/*`,
 `lang/src/runtime/concurrency.cpp`, `lang/src/lib/std/net/ev/*`, and the conformance harness.
 
-**Host used for verification: macOS (arm64, Darwin 24.6.0), Zig 0.16.0, prebuilt `~/.nova/bin/nova`.**
+**Host used for verification: macOS (arm64, Darwin 24.6.0), Zig 0.16.0, prebuilt `~/.kyte/bin/kyte`.**
 Everything marked "verified here" was actually run on this box. Everything marked "documented,
 host-dependent" could NOT be re-verified (no Linux/Windows host, no CI on other OSes here) and is
 taken from CLAUDE.md / code inspection with that caveat stated.
@@ -19,7 +19,7 @@ weighted heavily.
 ## 1. Gap (assessed) -- per target
 
 ### 1a. macOS native (arm64) -- WORKS, verified here
-- `nova m.nova -o mn` produced a `Mach-O 64-bit executable arm64`, ran, exit 0. **Verified here.**
+- `kyte m.ky -o mn` produced a `Mach-O 64-bit executable arm64`, ran, exit 0. **Verified here.**
 - Default build links the ASAN runtime (`Native output written to mn (ASAN)`), i.e. the dev default
   on this host is an ASAN build. Reactor backend = kqueue (`platform.os == "darwin"`,
   `pipeline.zig:459`).
@@ -28,27 +28,27 @@ weighted heavily.
 - **Open on macOS: essentially none at the target level.** This is the primary, best-supported host.
 
 ### 1b. Linux native (x86_64/arm64) -- cross-EMIT verified here; run + gate host-dependent
-- `nova m.nova --target linux-x86_64 -o ml` produced a **statically-linked ELF x86-64** and
+- `kyte m.ky --target linux-x86_64 -o ml` produced a **statically-linked ELF x86-64** and
   triggered a one-time cross-compile of the C++ runtime to `x86_64-linux-musl`
-  (`~/.nova/lib/novacore_x86_64-linux-musl.o`, confirmed present, 2.1 MB). **Verified here (emit).**
+  (`~/.kyte/lib/kytecore_x86_64-linux-musl.o`, confirmed present, 2.1 MB). **Verified here (emit).**
 - `mapCrossTarget` (`pipeline.zig:139-140`) maps linux triples to `x86_64/aarch64-linux-musl`,
   `static = true`. `-no-pie` applied on Linux hosts (`pie_flags`, `pipeline.zig:25`).
-- Reactor: epoll is the default on Linux, with io_uring behind `NOVA_REACTOR=uring` + a runtime
+- Reactor: epoll is the default on Linux, with io_uring behind `KYTE_REACTOR=uring` + a runtime
   probe (CLAUDE.md reactor table). Throughput figures (75.6k rps epoll, ~65k io_uring on a WSL2
   4-core box) are **documented, host-dependent, not re-verified here.**
 - **KEY FINDING -- the CLAUDE.md "Still open" item 3 is STALE.** CLAUDE.md (dated 2026-07-31) says
-  "Linux still aborts in `nova_run_root` -- it needs the epoll driver." The code disproves this:
-  `src/runtime/concurrency.cpp:1016` `nova_run_root` now branches
-  `#if NOVA_HAVE_KQUEUE / #elif NOVA_HAVE_IOCP / #elif NOVA_HAVE_EPOLL / #else abort`. The epoll
-  driver EXISTS (`#include <sys/epoll.h>`, `NOVA_HAVE_EPOLL` support block from line ~120, timerfd +
+  "Linux still aborts in `kyte_run_root` -- it needs the epoll driver." The code disproves this:
+  `src/runtime/concurrency.cpp:1016` `kyte_run_root` now branches
+  `#if KYTE_HAVE_KQUEUE / #elif KYTE_HAVE_IOCP / #elif KYTE_HAVE_EPOLL / #else abort`. The epoll
+  driver EXISTS (`#include <sys/epoll.h>`, `KYTE_HAVE_EPOLL` support block from line ~120, timerfd +
   eventfd wake). So async programs no longer abort on Linux at the driver level. Whether the full
   async corpus passes on a Linux host is documented (Linux/epoll 225-passing table) and
   **not re-verified here.**
 
 ### 1c. Windows native -- cross-EMIT verified here; native build + run host-dependent
-- `nova m.nova --target windows-x86_64 -o mw.exe` produced a real **PE32+ executable (console)
+- `kyte m.ky --target windows-x86_64 -o mw.exe` produced a real **PE32+ executable (console)
   x86-64**, cross-compiling the runtime to `x86_64-windows-gnu`
-  (`~/.nova/lib/novacore_x86_64-windows-gnu.o`, present, 1.27 MB). **Verified here (emit).**
+  (`~/.kyte/lib/kytecore_x86_64-windows-gnu.o`, present, 1.27 MB). **Verified here (emit).**
 - Cross link adds the Windows system libs and drives the gnu path; `mapCrossTarget` returns
   `x86_64-windows-gnu`, `static = false` (`pipeline.zig:142`). On a genuine Windows HOST the build
   drives MSVC `link.exe` (`/OPT:REF`, COFF runtime object, `-rtlib=compiler-rt`) -- that path is in
@@ -61,7 +61,7 @@ weighted heavily.
 **Open items on Windows:**
 1. **Readiness cases 192/194/195** (`192_reactor_echo`, `194_coroutine_reactor`,
    `195_multicore_reactors`). CLAUDE.md "Still open" item 1 says `armRead`/`armWrite` have no IOCP
-   analogue. **Partially stale in code:** `src/lib/std/net/ev/iocp.nova:263-264` now implement
+   analogue. **Partially stale in code:** `src/lib/std/net/ev/iocp.ky:263-264` now implement
    `armRead`/`armWrite` via `armZeroByte(...)` (the zero-byte-receive readiness trick the reactor
    section describes as done). So the readiness *primitive* exists. Whether cases 192/194/195
    actually PASS on a Windows host is **not re-verifiable here** and there is a documentation gap
@@ -70,19 +70,19 @@ weighted heavily.
    points to it for the Windows corpus; `ls` confirms it is absent. So the Windows pass/fail set is
    not tracked in-tree -- the "224/234 on Windows" figure lives only in prose, un-gated. Real gap.
 3. **`--asan` / `--arc` gates not wired on Windows** (install step skips those runtimes). Documented;
-   plausible given `~/.nova/lib` only caches `novacore_asan.o` for the host, not per-cross-target.
+   plausible given `~/.kyte/lib` only caches `kytecore_asan.o` for the host, not per-cross-target.
    Not re-verifiable here.
 
 ### 1d. Cross-compilation (from macOS) -- WORKS, verified here
 - All three cross targets (linux-x86_64, windows-x86_64, native) emitted correct binaries in one
   session (see 1b/1c). The runtime is cross-compiled once per target via bundled `zig c++`
-  (`crossLinkViaZig`, `pipeline.zig:164-201`) and cached in `~/.nova/lib`. **Verified here.**
+  (`crossLinkViaZig`, `pipeline.zig:164-201`) and cached in `~/.kyte/lib`. **Verified here.**
 - arm64 variants (`aarch64-linux-musl`, `aarch64-windows-gnu`) are in `mapCrossTarget` but were not
   emitted in this session -- **documented, not re-verified here.**
 - This is the strongest cross-platform story: from one macOS host you get ELF, PE32+, and Mach-O.
 
 ### 1e. WASM -- BEST-EFFORT, verified here (and better than the baseline implies)
-- `nova m.nova --wasm -o m.wasm` produced a valid `WebAssembly (wasm) binary module version 0x1
+- `kyte m.ky --wasm -o m.wasm` produced a valid `WebAssembly (wasm) binary module version 0x1
   (MVP)`, magic `\0asm`. **Verified here.** Target triple `wasm32-unknown-unknown`
   (`llvm_codegen.zig:252-253`), ptr size 4, `is_posix = false` (`pipeline.zig:359-360`). Link via
   in-process `wasm-ld` with `--no-entry --export-all --allow-undefined --initial-memory=128MiB`
@@ -90,7 +90,7 @@ weighted heavily.
 - **The baseline UNDERSTATES real wasm coverage.** `wasm-baseline.txt` lists 104 of 321 corpus cases
   (32%); 217 are "skipped". But the baseline is explicitly a ratchet ("a case that now compiles is a
   bonus, asks you to add it") and is under-maintained: I compiled several *un-listed* cases to valid
-  wasm here -- `215_sha256_nova`, `266_exception`, `337_module_private`, `261_simd_f64x4`,
+  wasm here -- `215_sha256_kyte`, `266_exception`, `337_module_private`, `261_simd_f64x4`,
   `336_tuple_dot_index` all emitted WebAssembly. So the pure-computation surface that actually
   compiles to wasm is materially larger than 104. **Verified here.**
 - **What wasm genuinely does NOT support** (verified here via the diagnostics):
@@ -101,7 +101,7 @@ weighted heavily.
     (`declarations.zig:845`).
   - **native-only runtime symbols** -- `82_ffi_extern` failed with `'abs' is native-only and not
     available on the wasm target (it resolves to a native runtime symbol with no wasm host import)`;
-    `163_process` failed on `nova_process_spawn`. Verified here.
+    `163_process` failed on `kyte_process_spawn`. Verified here.
   - **networking / sockets / sys** -- `os/socket`, `os/sys` resolve to native-only modules; wasm
     builds cannot pull them (`62_socket_send_n`, `192_reactor_echo` failed). Verified here.
   - **SIMD degrades to scalar** -- `simd_target = .none` for wasm (`llvm_codegen.zig:350`); the
@@ -115,17 +115,17 @@ weighted heavily.
   stdlib gives it no wasm fallback to lean on.
 - **There is no production wasm host.** `--allow-undefined` turns unresolved runtime calls into host
   imports (`env.*`). The only implementation of those imports is the **test harness**
-  `conformance/wasm-run.mjs` (~35 `env.*` functions: `nova_bytes_alloc`, `nova_test_fail`, decimal
-  helpers, etc.), used by `run.sh --wasm-run` under Node. That is enough to *execute pure-Nova @tests*
+  `conformance/wasm-run.mjs` (~35 `env.*` functions: `kyte_bytes_alloc`, `kyte_test_fail`, decimal
+  helpers, etc.), used by `run.sh --wasm-run` under Node. That is enough to *execute pure-Kyte @tests*
   under Node, not to run a real wasm application against a browser/WASI host.
 
 ---
 
 ## 2. Root cause / why incomplete (from code)
 
-- **WASM has no coroutine runtime.** async in Nova is LLVM coroutines lowered by CoroSplit into a
+- **WASM has no coroutine runtime.** async in Kyte is LLVM coroutines lowered by CoroSplit into a
   native scheduler (`concurrency.cpp`). wasm32-unknown-unknown has no thread/coroutine driver and no
-  `nova_run_root` peer, so async is rejected at type-check rather than mis-compiled. This is a
+  `kyte_run_root` peer, so async is rejected at type-check rather than mis-compiled. This is a
   *correct* fail-closed choice, not a bug -- but it means the concurrency half of the language is
   simply absent on wasm.
 - **WASM has no host ABI for I/O.** The target is `unknown-unknown` (not WASI), `is_posix = false`,
@@ -134,9 +134,9 @@ weighted heavily.
   native-first and never grew `@wasm` alternatives, so the escape hatch has nothing to escape to.
 - **Proactor readiness (Windows/IOCP, Linux/io_uring) is fundamentally awkward.** A proactor gives
   you "tell me when this operation completed", not "tell me when this fd is readable". The zero-byte
-  receive trick (`armZeroByte` in `iocp.nova`) synthesises a readiness edge from a completion -- it
+  receive trick (`armZeroByte` in `iocp.ky`) synthesises a readiness edge from a completion -- it
   works but is why `armRead`/`armWrite` needed bespoke Windows code and why cases 192/194/195 lagged.
-- **`nova_run_root` is per-OS by construction.** Each reactor model needs its own driver
+- **`kyte_run_root` is per-OS by construction.** Each reactor model needs its own driver
   (kqueue/IOCP/epoll). The `#else abort` fallback is why any *new* target starts life aborting until
   someone writes its driver -- this is the shape that produced the (now-stale) "Linux aborts" note and
   would recur for, say, FreeBSD or WASI-threads.
@@ -163,7 +163,7 @@ weighted heavily.
 
 ### P-3. Wire `--asan`/`--arc` on Windows (item 1c-3)
 - Plan: build the ASAN/ARC runtime variants in the PowerShell install step (the host already builds
-  `novacore_asan.o` on macOS/Linux). Mostly a build-graph addition.
+  `kytecore_asan.o` on macOS/Linux). Mostly a build-graph addition.
 - Confidence: **medium**. Unknown: MSVC ASAN interop with the existing link line (`/OPT:REF`,
   compiler-rt) may need flag work; clang-cl `-fsanitize=address` vs MSVC `link.exe` is finicky.
 
@@ -180,8 +180,8 @@ weighted heavily.
   "best-effort"; networking in a browser means fetch/WebSocket host imports, a design not started.
 
 ### P-5. Generalise the reactor-driver seam
-- Plan: make `#else abort` in `nova_run_root` the *only* place a new target is missing, and document
-  `NOVA_HAVE_*` as the template (CLAUDE.md already frames IOCP as the template). No code change
+- Plan: make `#else abort` in `kyte_run_root` the *only* place a new target is missing, and document
+  `KYTE_HAVE_*` as the template (CLAUDE.md already frames IOCP as the template). No code change
   needed today; it is a documented extension point.
 - Confidence: **high** as documentation; **low** value until a 4th native target is actually wanted.
 
@@ -207,16 +207,16 @@ All effort/risk labels are engineering guesses, not benchmarked estimates.
 
 - **macOS / kqueue** (verified reachable here): `cd lang/conformance && ./run.sh` -- the primary gate;
   `./run.sh --asan` is the memory gate (ASAN is the authority per CLAUDE.md, "verify with --asan not
-  --arc"). ASAN runtime present at `~/.nova/lib/novacore_asan.o`.
+  --arc"). ASAN runtime present at `~/.kyte/lib/kytecore_asan.o`.
 - **Linux / epoll** (documented, host-dependent): same `./run.sh` inside WSL2/Linux; io_uring via
-  `NOVA_REACTOR=uring ./run.sh`. Documented pass set: 225 (epoll and io_uring identical failure list).
+  `KYTE_REACTOR=uring ./run.sh`. Documented pass set: 225 (epoll and io_uring identical failure list).
   Structural fails: 8 DB/codec cases (need `packages/`), `189_epoll_event_layout` (asserts epoll
-  layout, passes only on Linux). `nova_run_root` epoll branch confirmed in code, so async cases are
+  layout, passes only on Linux). `kyte_run_root` epoll branch confirmed in code, so async cases are
   expected to run -- not re-verified here.
 - **Windows / IOCP** (documented, host-dependent, and UNDER-GATED): CLAUDE.md cites 224-passing, but
   `conformance/windows-baseline.txt` is **absent from the repo** -- there is no in-tree gate. Author it
   (P-1) before trusting the number. `188_kqueue_readiness` is inapplicable off macOS by design.
-- **Cross-compile** (verified here): the emit gate is `nova <case> --target <triple> -o out` +
+- **Cross-compile** (verified here): the emit gate is `kyte <case> --target <triple> -o out` +
   `file out` shows the right container. All three ran clean here. No execution gate for cross targets
   on a foreign host from macOS (you can build a PE/ELF but not run it here).
 - **WASM** (verified here): `./run.sh --wasm` compiles+links every case, baseline-gated against
@@ -228,10 +228,10 @@ All effort/risk labels are engineering guesses, not benchmarked estimates.
 ---
 
 ### Corrections to CLAUDE.md found during verification
-1. "Linux still aborts in `nova_run_root`" (Still-open item 3) is **stale** -- the `NOVA_HAVE_EPOLL`
+1. "Linux still aborts in `kyte_run_root`" (Still-open item 3) is **stale** -- the `KYTE_HAVE_EPOLL`
    branch exists in `concurrency.cpp:1016+`.
 2. "Readiness cases 192/194/195 have no IOCP analogue" (Still-open item 1) is **partially stale**  -- 
-   `iocp.nova:263-264` implement `armRead`/`armWrite` via `armZeroByte`; only their pass/fail on a
+   `iocp.ky:263-264` implement `armRead`/`armWrite` via `armZeroByte`; only their pass/fail on a
    Windows host is genuinely open.
 3. `conformance/windows-baseline.txt` is referenced (CLAUDE.md:75) but **does not exist** -- the
    Windows corpus is not gated in-tree.

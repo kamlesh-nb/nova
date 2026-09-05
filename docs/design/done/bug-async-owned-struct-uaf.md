@@ -1,12 +1,12 @@
 > **SUPERSEDED 2026-08-08 — the diagnosis below is WRONG.** This was never an ARC / coroutine-frame
 > liveness bug. Reading the app's IR proved the real cause: a same-named `struct Cursor` collision across
-> modules (`mongodb.nova` both `import db;` and declares its own `Cursor`). `find(): Cursor`'s return-type
+> modules (`mongodb.ky` both `import db;` and declares its own `Cursor`). `find(): Cursor`'s return-type
 > annotation mis-binds to the imported `db.Cursor` while the body builds the local `mongodb.Cursor`, so the
 > caller dispatches `data_db_Cursor_next` (+ destructor) on a `mongodb.Cursor` and reads a conn pointer as
 > `batch: List<Row>` → `List_Row_size` faults. Deterministic repro (no async/reactor):
-> `bug-samename-type-repros/{seam,drv,main}.nova`. Real fix = module-scoped type-name resolution (local decl
-> shadows same-named import), the F1-4 work. The ASAN capabilities this investigation produced (`nova build`
-> ASAN-by-default + `NOVA_ASAN_CODEGEN=1`) are real and kept. The ARC/liveness narrative below is retained
+> `bug-samename-type-repros/{seam,drv,main}.ky`. Real fix = module-scoped type-name resolution (local decl
+> shadows same-named import), the F1-4 work. The ASAN capabilities this investigation produced (`kyte build`
+> ASAN-by-default + `KYTE_ASAN_CODEGEN=1`) are real and kept. The ARC/liveness narrative below is retained
 > only for the tool-method record (lldb, runtime-ASAN, codegen-ASAN provenance chain).
 
 # BUG: use-after-free of an owned struct held across `await` in the reactor path
@@ -26,7 +26,7 @@ string, so the load of the list's backing pointer faults.
 
 `nova-mongodb`'s native document API, driven from a `web.app` handler:
 
-```nova
+```kyte
 // store.categories() -- async handler path
 let cur  = await coll.find(mongodb.all(), mongodb.findOptions()); // find() is async; returns a Cursor
                                                                   //   that OWNS `batch: List<Doc>`
@@ -40,7 +40,7 @@ while (true) {
 
 `Cursor.next()` (driver) first line:
 
-```nova
+```kyte
 pub async fn next(self: Cursor): document.Doc | undefined {
     if (self.pos < self.batch.size()) { ... self.batch.get(self.pos) ... }  // <-- faults here on 1st call
 ```
@@ -51,9 +51,9 @@ Every request 500s/aborts; under load the benchmark shows `0.00% ok`.
 
 ```
 stop reason = EXC_BAD_ACCESS (code=1, address=0x627568617acda030)
-frame #0: 0x…  nova`List_Row_get + 120
+frame #0: 0x…  kyte`List_Row_get + 120
 ->  ldr  x0, [x8]        ; x8 = the list's backing-data pointer
-    bl   nova_retain
+    bl   kyte_retain
 ```
 
 * The faulting load is `List<T>.get` reading the list's **backing pointer**, which is
@@ -92,7 +92,7 @@ Confirmed the crash is intrinsic to the cursor, not the store loop: switching th
 ## Repro boundary (honest: the exact codegen trigger is NOT yet pinned)
 
 Standalone, block-driven reductions of the shape **all pass** — see
-`scratchpad/repro{1..6}.nova`. They cover: async fn returning a struct that owns a `List`; an async
+`scratchpad/repro{1..6}.ky`. They cover: async fn returning a struct that owns a `List`; an async
 method taking `self` by value and reading the list; nested element structs owning strings (incl.
 heap-allocated); the cursor also owning a large by-value struct field (a `MongoConnection` stand-in);
 `next()` mutating `self.pos`; a real suspension via `spawn`; and returning `Item | undefined` from the
@@ -120,13 +120,13 @@ because no conformance case holds an owned aggregate across `await method()` und
 
 ## ASAN pin-down (2026-08-08) — CONFIRMS coroutine-frame corruption
 
-`nova build` was made ASAN-aware (default ON for debug native builds; see main.zig `asan` in the
+`kyte build` was made ASAN-aware (default ON for debug native builds; see main.zig `asan` in the
 `--native` path). Building the app with it and firing one request:
 
 ```
 ==ERROR: AddressSanitizer: BUS on unknown address (pc 0x000d00001103 ...)
     #0 0x000d00001103  (<unknown module>)               <- jumped to a GARBAGE pc
-    #1 web_app_reactorWorkerBody+0x210 (nova)            <- the reactor resuming a coroutine
+    #1 web_app_reactorWorkerBody+0x210 (kyte)            <- the reactor resuming a coroutine
 SUMMARY: AddressSanitizer: BUS (<unknown module>)
 ```
 
@@ -139,17 +139,17 @@ reactor resume path — cf. `lang/CLAUDE.md`: "A coroutine handle is a FRAME ADD
 recycled."
 
 Limitation: ASAN reports this as a BUS/SEGV with no alloc/free provenance, because the faulting access is
-in **Nova-generated code, which is not ASAN-instrumented** (the `--asan` gate and this `nova build` ASAN
-mode both rely on the sanitized *runtime* `novacore_asan`, not on instrumenting Nova code — deliberately,
-to avoid false positives on Nova's `ptr-8` header idioms). Getting the exact premature `nova_release` line
-would require adding the AddressSanitizer LLVM pass to the Nova codegen pipeline (`emitModule`), which is a
+in **Kyte-generated code, which is not ASAN-instrumented** (the `--asan` gate and this `kyte build` ASAN
+mode both rely on the sanitized *runtime* `kytecore_asan`, not on instrumenting Kyte code — deliberately,
+to avoid false positives on Kyte's `ptr-8` header idioms). Getting the exact premature `kyte_release` line
+would require adding the AddressSanitizer LLVM pass to the Kyte codegen pipeline (`emitModule`), which is a
 larger, riskier change; the crash class is now confirmed without it.
 
 ## Codegen-ASAN provenance (2026-08-08) — UAF proven
 
-Added opt-in `NOVA_ASAN_CODEGEN=1` (main.zig sets `codegen_arc.asan_codegen_enabled`; emitModule tags every
+Added opt-in `KYTE_ASAN_CODEGEN=1` (main.zig sets `codegen_arc.asan_codegen_enabled`; emitModule tags every
 defined function with `sanitize_address` and runs the LLVM `asan` module pass after the main pipeline). It
-does NOT false-positive on good Nova code (verified), and on the failing app it produces a clean report with
+does NOT false-positive on good Kyte code (verified), and on the failing app it produces a clean report with
 allocation provenance:
 
 ```
@@ -157,7 +157,7 @@ ERROR: AddressSanitizer: heap-buffer-overflow  READ of size 4 at 0x6020000005e0
     #0 List_Row_size+0x60                 <- Cursor.next() reading self.batch.size()
     #1 web_app_reactorWorkerBody+0x364
 allocated by thread T0 here:
-    #1 nova_bytes_alloc  alloc.cpp:230
+    #1 kyte_bytes_alloc  alloc.cpp:230
     #2 string_allocString+0x10            <- that heap slot is now a STRING
     #3 web_app_reactorWorkerBody+0x364
 ```
@@ -171,7 +171,7 @@ reuse is a legitimate same-request string alloc.) The read happens inside `web_a
 coroutine frame -- consistent with the owned `Cursor` (its `batch`) being released one drop early across the
 `await`.
 
-Still open: naming the exact premature `nova_release` on `batch`. ASAN can't (the slot is live-as-a-string,
+Still open: naming the exact premature `kyte_release` on `batch`. ASAN can't (the slot is live-as-a-string,
 not poisoned, at the read). Next: an lldb write-watchpoint on the `batch` field once `find()` returns, or an
 ARC-audit trace of the Cursor's refcount across the `await cur.next()` loop.
 
@@ -181,9 +181,9 @@ Clean symbolized stack under the codegen-ASAN build:
 ```
 #1 List_Row_size+100
 #2 data_db_Cursor_next.resume+388     <- inside the RESUMED Cursor.next() coroutine
-#3 raw_coro_resume  #4 reactor_pump  #5 nova_reactor_resume
+#3 raw_coro_resume  #4 reactor_pump  #5 kyte_reactor_resume
 ```
-A conditional breakpoint on `nova_release` for the faulting address (`0x6020000005e0`) NEVER fired before
+A conditional breakpoint on `kyte_release` for the faulting address (`0x6020000005e0`) NEVER fired before
 the crash. That address is the STRING now in the slot ("allocated by string_allocString"), so the negative
 result only proves the string is live -- but combined with the stack it means: `self.batch` was not
 released-then-reused, it was **clobbered by coroutine-frame slot reuse**. The owned `Cursor` `cur` is live
@@ -205,8 +205,8 @@ its ORIGINAL address, captured inside find() by walking the Cursor.batch offset 
    cross-suspend local spill) and `src/codegen/arc.zig` (retain/release emission); ownership comes from
    the TypeId engine.
 2. **Pin it first, don't guess** (I have guessed wrong on this bug before): build the failing app against
-   `libnova_runtime_asan.a` (`NOVA_ASAN=1`) and run one request — ASAN will report the exact
-   alloc/free/use stacks and name the premature `nova_release`. Alternatively, an lldb **watchpoint** on
+   `libkyte_runtime_asan.a` (`KYTE_ASAN=1`) and run one request — ASAN will report the exact
+   alloc/free/use stacks and name the premature `kyte_release`. Alternatively, an lldb **watchpoint** on
    the `Cursor`'s refcount word (`ptr-8`) will stop on the drop-to-zero, giving the offending frame.
 
 ## Validation plan
@@ -226,6 +226,6 @@ that list synchronously — the same shape the SQL drivers use.
 
 ## Artifacts
 
-* Crash: `~/Library/Logs/DiagnosticReports/nova-2026-08-08-11*.ips` (+ the lldb transcript above).
-* Repro boundary set: `scratchpad/repro{1..6}.nova` (all pass — they bound the problem).
-* Live reproducer: `plancksystems/perf/compare/nova-mongo` (document-API store) against a seeded mongod.
+* Crash: `~/Library/Logs/DiagnosticReports/kyte-2026-08-08-11*.ips` (+ the lldb transcript above).
+* Repro boundary set: `scratchpad/repro{1..6}.ky` (all pass — they bound the problem).
+* Live reproducer: `plancksystems/perf/compare/kyte-mongo` (document-API store) against a seeded mongod.

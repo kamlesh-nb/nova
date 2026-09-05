@@ -1,17 +1,17 @@
 # 18. Data access: the db seam, drivers, and the repository pattern
 
 The web service in the previous chapter stored its products in memory. Real services keep their data in
-a database. This chapter shows how Nova talks to one: the `db` seam that every driver implements, the
+a database. This chapter shows how Kyte talks to one: the `db` seam that every driver implements, the
 drivers themselves (PostgreSQL, MySQL, SQL Server, MongoDB), the micro-ORM that turns rows into your
 typed structs, and the repository pattern that keeps all of this out of your handlers. At the end we take
 the exact web app from Chapter 17 and point it at a live PostgreSQL, changing one file.
 
-The running code for this chapter is `examples/28_db_drivers.nova` (the seam and the ORM, verifiable
-offline) and `examples/webapp/main_postgres.nova` (the same web app, backed by PostgreSQL).
+The running code for this chapter is `examples/28_db_drivers.ky` (the seam and the ORM, verifiable
+offline) and `examples/webapp/main_postgres.ky` (the same web app, backed by PostgreSQL).
 
 ## One seam, many drivers
 
-Nova has a single data-access interface, the `Connection` trait in `data.db`. Every driver is a separate
+Kyte has a single data-access interface, the `Connection` trait in `data.db`. Every driver is a separate
 package that implements it:
 
 | Database   | Import            | Open a connection |
@@ -39,7 +39,7 @@ postgresql://user:password@host:port/database?sslmode=verify-full&sslrootcert=/e
 
 Everything except the host is optional, so all of these are valid:
 
-```nova
+```kyte
 PgDriver().connect("postgresql://app:secret@db.internal:5432/shop");   // full URL
 PgDriver().connect("postgresql://127.0.0.1:5432/shop");                // no credentials
 PgDriver().connect("postgresql://127.0.0.1/shop");                     // minimal; defaults fill the rest
@@ -52,11 +52,11 @@ user defaults to `postgres`, and the database defaults to the user.
 
 ## Values and parameters
 
-Never build SQL by concatenating strings. Nova passes values as typed `DbValue` parameters, with `$1`,
+Never build SQL by concatenating strings. Kyte passes values as typed `DbValue` parameters, with `$1`,
 `$2`, ... placeholders in the SQL that the driver fills in safely. You construct `DbValue`s with the
 small constructors in `db`:
 
-```nova
+```kyte
 import list;
 import data.db;
 
@@ -69,14 +69,14 @@ params.push(db.dbLong(90000));    // a 64-bit value
 
 This is identical for every driver. A query then looks like:
 
-```nova
+```kyte
 let rs = await conn.query("SELECT id, name FROM users WHERE id = $1", params);
 ```
 
 `query` returns a `ResultSet`: a list of `Column`s (name plus `DbType`) and a list of `Row`s. You can
 read a row positionally when you do not want a struct:
 
-```nova
+```kyte
 let r = rs.row(0);
 let id   = r.getInt(0);
 let name = r.getText(1);
@@ -91,7 +91,7 @@ Reading cells by index gets tedious and fragile. The micro-ORM in `data.orm` bin
 into typed structs, mapping columns to fields by name. Mark the target struct `@serializable` so the
 compiler generates the binder:
 
-```nova
+```kyte
 import data.orm;
 
 @serializable pub struct Product {
@@ -103,10 +103,10 @@ let products = orm.bindAll<Product>(rs);          // List<Product>
 let one      = orm.bindOne<Product>(rs);          // Product | undefined (first row, or none)
 ```
 
-`bindOne` returns `undefined` for an empty result set, so it fits Nova's optionals: you narrow it with
-`if (one == undefined)` before using it. `examples/28_db_drivers.nova` exercises all of this offline,
+`bindOne` returns `undefined` for an empty result set, so it fits Kyte's optionals: you narrow it with
+`if (one == undefined)` before using it. `examples/28_db_drivers.ky` exercises all of this offline,
 building a `ResultSet` by hand exactly as a driver would return it, then binding it. Run it with
-`nova test examples/28_db_drivers.nova`.
+`kyte test examples/28_db_drivers.ky`.
 
 ## The repository pattern
 
@@ -114,7 +114,7 @@ Put the data access behind a repository so your handlers never see SQL. The impo
 field type: the repository holds the `Connection` **trait**, not a concrete driver type, so the same
 repository runs against the in-memory database, PostgreSQL, or any other driver.
 
-```nova
+```kyte
 import data.db;
 import data.orm;
 
@@ -149,7 +149,7 @@ When a repository is a thin wrapper over one table, the stdlib gives you a ready
 `data.repository.Repository<T>`. Bind it to an entity type and a table, and it maps rows to `T` by name
 for you, so a slice never writes bind code:
 
-```nova
+```kyte
 import data.db;
 import data.repository;
 
@@ -181,18 +181,18 @@ the difference. To move the app onto a real database, change the composition roo
 is no container and no downcast: you construct a different `Connection` and pass it to the same
 `ProductRepository`.
 
-`examples/webapp/src/main.nova` (the default, in-memory build):
+`examples/webapp/src/main.ky` (the default, in-memory build):
 
-```nova
+```kyte
 let conn = InMemoryConnection();
 let repo = ProductRepository(conn);
 registerProducts(app, repo);
 ```
 
-`examples/webapp/main_postgres.nova` is the same app with a live PostgreSQL. The only change is the
+`examples/webapp/main_postgres.ky` is the same app with a live PostgreSQL. The only change is the
 connection:
 
-```nova
+```kyte
 let conn = PooledConnection(dsn, poolSize);   // a Connection backed by a PostgreSQL pool
 let repo = ProductRepository(conn);
 registerProducts(app, repo);
@@ -204,8 +204,8 @@ the event loop starts. So `PooledConnection` wraps a `pool.Pool(PgDriver(), dsn,
 constructed synchronously and opens its connections LAZILY, inside a request, where the handler is already
 awaiting:
 
-```nova
-// Features/Products/Shared/pooled_connection.nova (a Connection over a pool)
+```kyte
+// Features/Products/Shared/pooled_connection.ky (a Connection over a pool)
 pub struct PooledConnection impl Connection {
     p: pool.Pool,
     init(dsn: string, size: int) {
@@ -224,7 +224,7 @@ pub struct PooledConnection impl Connection {
 
 Everything else, the features, handlers, DTOs, validators, routes, and views, is shared between the two
 builds without a single change. That is the payoff of writing the repository against the seam. Because
-`main_postgres.nova` imports the `postgres` package, the project needs that dependency and the driver
+`main_postgres.ky` imports the `postgres` package, the project needs that dependency and the driver
 reachable; `run-live.sh` wires it up and builds it for you.
 
 ## Transactions
@@ -234,7 +234,7 @@ connection, so you acquire a connection from the pool, run `begin`, do the write
 connection (a `Repository<T>` built over it, or direct `exec` calls), then `commit` or `rollback`, and
 release it:
 
-```nova
+```kyte
 let c = await pool.acquire();
 let _ = await c.begin();
 let repo = Repository<Order>(c, "orders");
@@ -254,7 +254,7 @@ millions. Each SQL driver's concrete connection (from `postgres.open` / `mysql.o
 offers `queryStream`, which returns an async cursor that pulls rows from the server in batches so the
 full set never materialises:
 
-```nova
+```kyte
 import postgres;
 
 let conn = await postgres.open("postgresql://user@host/db");
@@ -295,7 +295,7 @@ typed model) and `mongodb` (the client seam you import).
 
 `mongodb.open` returns a live `MongoConnection`. The DSN is a standard MongoDB URI:
 
-```nova
+```kyte
 import mongodb;
 
 // A single server.
@@ -318,7 +318,7 @@ Authentication is SCRAM-SHA-256 by default (username and password in the URI). A
 supports **X.509 client-certificate auth**, where the certificate presented during the TLS handshake is
 the credential:
 
-```nova
+```kyte
 // The client certificate is the identity: no password. tlsCertificateKeyFile is the combined cert+key
 // PEM. Add tls=verify + tlsCAFile to also verify the server's chain (fully mutual, verified TLS).
 let conn = await mongodb.open(
@@ -333,7 +333,7 @@ let conn = await mongodb.open(
 A `Doc` wraps a BSON document. You build one with fluent, typed setters, and read fields back with typed
 getters that return `T | undefined`, so a missing or wrong-typed field is never a silent zero:
 
-```nova
+```kyte
 let d = mongodb.doc()
     .setStr("name", "Margherita")
     .setInt("price", 9)
@@ -351,7 +351,7 @@ presence.
 
 Build a filter with the fluent `Filter`, and options (projection, sort, skip, limit) with `FindOptions`:
 
-```nova
+```kyte
 let f = mongodb.filter()
     .eqStr("category", "pizza")
     .gtInt("price", 5);
@@ -383,7 +383,7 @@ operator not wrapped yet. `mongodb.all()` is the empty filter that matches every
 Every write returns a small result carrying `.ok()` and a normalised `.err` (a `DbError` you can classify
 with `isUniqueViolation()` and friends):
 
-```nova
+```kyte
 let ins = await coll.insertOne(mongodb.doc().setStr("name", "Calzone").setInt("price", 11));
 // insertOne generates an ObjectId _id when the document has none, returned in ins.insertedIds.
 
@@ -410,7 +410,7 @@ form) rather than nesting a large array in the command.
 
 Hand-building a `Doc` per field is tedious. Mark a struct `@serializable` and let the driver serialise it:
 
-```nova
+```kyte
 @serializable pub struct Product {
     pub name: string,
     pub price: int,
@@ -437,7 +437,7 @@ then bind split the SQL micro-ORM uses.
 `distinct` returns strings; `distinctValues` returns a typed `Value` for each element, so numbers stay
 numbers:
 
-```nova
+```kyte
 let prices = await coll.distinctValues("price", mongodb.all());
 let i = 0;
 while (i < prices.size()) {
@@ -455,7 +455,7 @@ while (i < prices.size()) {
 
 ### Aggregation, counting, and indexes
 
-```nova
+```kyte
 let cur = await coll.aggregate(pipeline);              // a List<Doc> of stages, returns a lazy cursor
 let n   = await coll.countDocuments(mongodb.all());    // exact count
 let est = await coll.estimatedDocumentCount();         // fast metadata count
@@ -470,7 +470,7 @@ await coll.dropIndex("name_idx");
 Multi-document transactions need a replica set. Open a session, bind a collection to it, and commit or
 abort:
 
-```nova
+```kyte
 let s = await conn.startSession();
 s.startTransaction();
 let acct = s.collection("bank", "accounts");        // this collection's writes join the transaction
@@ -484,7 +484,7 @@ if (!err.isEmpty()) { /* both updates rolled back atomically */ }
 
 Queue a mix of operations and send them in grouped batches:
 
-```nova
+```kyte
 let res = await coll.bulk()
     .insertOne(mongodb.doc().setStr("name", "A"))
     .updateOne(mongodb.filter().eqStr("name", "B"), mongodb.update().setInt("price", 5), true)
@@ -512,7 +512,7 @@ preference (`readPreference=secondary`, etc.) selects which member reads go to.
 A change stream is a live feed of a collection's changes (insert, update, replace, delete). It needs a
 replica set, since it reads from the oplog. `watch` opens one; poll it for events:
 
-```nova
+```kyte
 let cs = await coll.watch(mongodb.docList(), "updateLookup");   // extra pipeline stages, fullDocument mode
 while (true) {
     let ev = await cs.next(0);            // blocks for the next event (0 = poll forever)
@@ -539,7 +539,7 @@ BSON documents cap at 16 MB, so larger files (images, videos, backups) go in Gri
 into fixed-size chunks across two collections (`<bucket>.files` for metadata, `<bucket>.chunks` for the
 bytes). The `gridfs` module is a separate import, matching the Go driver's layout:
 
-```nova
+```kyte
 import mongodb;
 import gridfs;
 
@@ -564,7 +564,7 @@ MongoDB driver, and vice versa.
 ## Where to go next
 
 - Chapter 17 for the web framework the repository plugs into.
-- Chapter 19 for package management: how you add a driver dependency with `nova get`.
+- Chapter 19 for package management: how you add a driver dependency with `kyte get`.
 - Chapter 20 for the database drivers, each with its intro, package deployment, and connection string.
 - Chapter 23 for deploying this PostgreSQL-backed app under the orchestrator (service, orchd, orchctl).
 - Chapter 16 for `@serializable`, which powers both JSON responses and the ORM binder.

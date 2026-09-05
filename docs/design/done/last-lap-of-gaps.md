@@ -1,6 +1,6 @@
 # Last lap of gaps
 
-This is the final gap register for Nova before a go-or-scrap decision. It lists every gap behind the honest
+This is the final gap register for Kyte before a go-or-scrap decision. It lists every gap behind the honest
 percentage report, and for each one a design to close it. Each gap has a deep, code-grounded analysis in
 `lastlap/gapN-*.md`; this file is the map, the summary, the dependency matrix, and the honest overall read.
 
@@ -39,14 +39,14 @@ Six agents each built or read the real code to prove their gap. The result corre
 guesses in both directions, which is the point of verifying instead of asserting:
 
 - **Soundness (I guessed the correctness drag was the root cause): too pessimistic.** The corruption-class
-  soundness gap is *not live*. The `NOVA_SEMA_SHADOW` gate shows 0 disagreements on the ownership guard cases.
+  soundness gap is *not live*. The `KYTE_SEMA_SHADOW` gate shows 0 disagreements on the ownership guard cases.
   What remains is name-based dispatch/mangling cleanup whose failure mode is a loud link error, not silent
   corruption. (gap1)
 - **Stability (I guessed ~50%, "you can hit bugs"): too pessimistic.** An empirical hunt of 49 realistic
   feature-combination programs found 47 ran correctly under ASAN and exactly 1 genuine crash, a single known
   class (generic struct method through a trait vtable). Everyday paths are solid. (gap2)
 - **Optimiser (I guessed ~40%): confirmed, and if anything generous.** Real per-function emit coverage on
-  ordinary Nova is ~10-12%; the perf goal is ~0% realised. (gap3)
+  ordinary Kyte is ~10-12%; the perf goal is ~0% realised. (gap3)
 - **Stdlib (~70%): confirmed** - deep on the spine, thin at the leaves, the real risk is test coverage. (gap8)
 - **Cross-platform (~70%): native + cross is closer to ~90%, WASM is the real best-effort gap.** (gap7)
 - **Tooling/ecosystem: confirmed rough** - a good LSP and formatter, a placeholder package manager, no
@@ -63,21 +63,21 @@ Severity is "how much this blocks a usable, buildable-on beta," not how much wor
 
 ## ⭐ REFRAMING 2026-08-16 (after the Swift architectural comparison) — READ THIS
 
-Gap 1 (soundness) and Gap 3 (perf) are NOT two gaps. They are ONE: **Nova has no ownership IR** (no
+Gap 1 (soundness) and Gap 3 (perf) are NOT two gaps. They are ONE: **Kyte has no ownership IR** (no
 Swift-SIL/OSSA analog). See `swift-arch-comparison.md`. Consequences:
-- Nova's memory safety is **ASAN-TESTED at runtime, not compile-time VERIFIED** (no OSSA verifier). "Gap 1
+- Kyte's memory safety is **ASAN-TESTED at runtime, not compile-time VERIFIED** (no OSSA verifier). "Gap 1
   soundness fixed" honestly means "no live UAF found by ASAN + the shadow engines agree" — not "proven safe".
-- Nova has **nowhere to do ARC optimisation** (the scrapped optimiser's arc_elision fired 0×). That is Gap 3.
+- Kyte has **nowhere to do ARC optimisation** (the scrapped optimiser's arc_elision fired 0×). That is Gap 3.
 - ONE investment closes both: an OSSA-lite ownership IR + a build-gating verifier (soundness) + a borrow-skip
   ARC pass on the same IR (perf, gated on a measured delta).
 
 **HONEST SCALE — it is NOT 20-30 years.** That figure is the FULL Swift SIL (SILGen + OSSA + ~100 passes +
-generic specialization + devirt), a large team over 10+ years. Nova needs a MINIMAL version and already has
+generic specialization + devirt), a large team over 10+ years. Kyte needs a MINIMAL version and already has
 most raw materials: typed sema (TypedIr), monomorphisation, ownership.zig (move-check), escape.zig (escape
-analysis), and a typed-SSA IR (mir.zig, in discards). Nova's language is also SIMPLER than Swift (no
+analysis), and a typed-SSA IR (mir.zig, in discards). Kyte's language is also SIMPLER than Swift (no
 protocol-associated-types, no exclusivity model, mono-only generics). A minimal ownership-IR + verifier +
 one ARC pass is a **months-scale** focused project (rough, high-uncertainty: ~3-6 months single-dev), NOT
-decades. **And critically: Nova does NOT need it to be usable.** It already has ASAN-tested safety (works on
+decades. **And critically: Kyte does NOT need it to be usable.** It already has ASAN-tested safety (works on
 the corpus + real apps) and competitive AST+LLVM-O3 perf (beat Rust/Go per-core on some benchmarks). The
 ownership IR upgrades tested→verified safety and adds ARC perf — REFINEMENTS of a working system, an optional
 future investment, NOT a beta blocker. Do NOT re-enter the endless-gap loop treating it as one.
@@ -100,7 +100,7 @@ residue is the vestigial "string engine": one string-only ownership-decision fun
 erased bodies, plus ~74 `resolveExpressionTypeName` and ~76 `typeRefToString` sites that are TypeId-first or
 name-mangling-only. PLAN (confidence medium): migrate the remaining decision sites to TypeId predicates and
 delete the string engine + shadow scaffolding; the hard part is threading the instantiation context through
-the two divergence cases (292/341). Verify: `NOVA_SEMA_SHADOW` corpus-wide 0 disagreements + `--asan` green.
+the two divergence cases (292/341). Verify: `KYTE_SEMA_SHADOW` corpus-wide 0 disagreements + `--asan` green.
 
 **Gap 2 - crash surface.** PROVEN small: 47/48 clean, one crash class. The crash is a generic struct's method
 dispatched through a trait vtable using its `T`-typed field concretely, because `getGlobalVTable`/

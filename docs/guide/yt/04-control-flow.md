@@ -2,26 +2,26 @@
 
 - Chapter: [04-control-flow.md](../04-control-flow.md)
 - Estimated length: ~9 minutes
-- You will need: the `nova` compiler installed, a terminal, and the guide's `examples/` folder open
+- You will need: the `kyte` compiler installed, a terminal, and the guide's `examples/` folder open
 
 ## Hook (0:00)
 
-**Say:** In this video we will learn how Nova makes decisions and repeats work. By the end you will know how to write `if` both as a statement and as an expression, all four shapes of the `for` loop, and how `switch` can pull a value out of an enum in a single line. It is a small set of tools, but together they cover almost everything you will do day to day.
+**Say:** In this video we will learn how Kyte makes decisions and repeats work. By the end you will know how to write `if` both as a statement and as an expression, all four shapes of the `for` loop, and how `switch` can pull a value out of an enum in a single line. It is a small set of tools, but together they cover almost everything you will do day to day.
 
 ## What we will cover (0:20)
 
 - `if` and `while`, and using `if` as an expression
-- The four `for` forms in Nova
+- The four `for` forms in Kyte
 - `break` and `continue`
 - `switch` and binding a variant's payload
 
 ## Segment: if and while (0:45)
 
-**Say:** Let us start with the basics. One rule to remember up front: in Nova a condition must be a `bool`. Nova does not treat integers or pointers as truthy, so you always compare explicitly. Here is a small program that mixes an `if`, an `if` used as an expression, and a `while` loop.
+**Say:** Let us start with the basics. One rule to remember up front: in Kyte a condition must be a `bool`. Kyte does not treat integers or pointers as truthy, so you always compare explicitly. Here is a small program that mixes an `if`, an `if` used as an expression, and a `while` loop.
 
 **On screen:**
-```nova
-// examples/05_control_flow.nova
+```kyte
+// examples/05_control_flow.ky
 fn main(): void {
     let n = 7;
     if (n % 2 == 0) {
@@ -49,7 +49,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/05_control_flow.nova -o out && ./out
+kyte examples/05_control_flow.ky -o out && ./out
 ```
 
 ```
@@ -62,11 +62,11 @@ sum 0..4 = 10
 
 ## Segment: the four for forms (3:00)
 
-**Say:** Nova has one loop keyword, `for`, but it comes in four shapes. The nice detail is that the increment lives in its own block, so `continue` still runs the increment in every form. Let us see all four.
+**Say:** Kyte has one loop keyword, `for`, but it comes in four shapes. The nice detail is that the increment lives in its own block, so `continue` still runs the increment in every form. Let us see all four.
 
 **On screen:**
-```nova
-// examples/06_for_loops.nova
+```kyte
+// examples/06_for_loops.ky
 import collections.list;
 
 fn main(): void {
@@ -101,7 +101,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/06_for_loops.nova -o out && ./out
+kyte examples/06_for_loops.ky -o out && ./out
 ```
 
 ```
@@ -124,11 +124,11 @@ odd sum below 5 = 4
 
 ## Segment: switch (6:30)
 
-**Say:** Last tool for this video: `switch`. In Nova, `switch` matches enum values, and it can bind a variant's payload right in the case label. That last part is what makes it powerful. Here is an enum for shapes, where a circle and a square each carry an integer.
+**Say:** Last tool for this video: `switch`. In Kyte, `switch` matches enum values, and it can bind a variant's payload right in the case label. That last part is what makes it powerful. Here is an enum for shapes, where a circle and a square each carry an integer.
 
 **On screen:**
-```nova
-// examples/07_switch.nova
+```kyte
+// examples/07_switch.ky
 enum Shape { Circle(int), Square(int), Point }
 
 fn area(s: Shape): int {
@@ -151,7 +151,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/07_switch.nova -o out && ./out
+kyte examples/07_switch.ky -o out && ./out
 ```
 
 ```
@@ -166,7 +166,7 @@ point      area  = 0
 
 **Say:** Quick recap of what we learned:
 
-- Conditions in Nova must be `bool`, no truthy integers or pointers.
+- Conditions in Kyte must be `bool`, no truthy integers or pointers.
 - `if` works as a statement and as an expression you can bind to a variable.
 - `for` has four forms: C-style, exclusive range, inclusive range with `..=`, and over a collection, plus `break` and `continue`.
 - `switch` matches enum variants and binds their payload in the case label.

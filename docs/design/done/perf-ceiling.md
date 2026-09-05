@@ -1,6 +1,6 @@
-# Nova — Closing the Performance Gap to Rust
+# Kyte — Closing the Performance Gap to Rust
 
-**Goal.** Match Rust (and beat Go/C#) on CPU-bound compute. Today Nova is competitive on scalar loops
+**Goal.** Match Rust (and beat Go/C#) on CPU-bound compute. Today Kyte is competitive on scalar loops
 but 1.15×-2.22× slower on array and allocation workloads. This document diagnoses *why*, to the exact
 codegen site, and lays out the ordered engineering to close it. Nothing here is research; every step is
 precedented compiler work.
@@ -12,7 +12,7 @@ precedented compiler work.
 
 ## 1. Current standing (Apple M1, best of 10, absolute ms)
 
-| Benchmark | Rust | Go | C# | Nova | Nova vs fastest |
+| Benchmark | Rust | Go | C# | Kyte | Kyte vs fastest |
 |---|---:|---:|---:|---:|---|
 | nbody (N=1M) | 28.9 | 75.1 | 81.8 | 29.1 | 1.01× — competitive |
 | fannkuch-redux (n=11) | 2061 | 1938 | 1973 | 1916 | fastest |
@@ -21,13 +21,13 @@ precedented compiler work.
 | spectral-norm (N=1000) | 38.2 | 39.9 | 68.3 | 55.0 | 1.44× slower (vs Rust) |
 | binary-trees (depth 16) | 276.0 | 270.4 | 193.7 | 429.4 | 2.22× slower (vs C#) |
 
-Correctness: every Nova program matches the reference golden output; binary-trees is ASAN-clean.
-Nova is *slower, not wrong*. Full report + sources: `lang/bench/`.
+Correctness: every Kyte program matches the reference golden output; binary-trees is ASAN-clean.
+Kyte is *slower, not wrong*. Full report + sources: `lang/bench/`.
 
 **Precedent that the ceiling is high.** Two gaps this size were already closed by single changes:
 `math.fsqrt` (a 30-iteration Newton loop → the `llvm.sqrt.f64` intrinsic) took nbody from ~20× to 1×,
-and the `List<double>` closure-ABI fix unblocked float containers entirely. When Nova hands LLVM clean
-IR, LLVM makes it competitive. The remaining gaps are where Nova hands LLVM *dirty* IR.
+and the `List<double>` closure-ABI fix unblocked float containers entirely. When Kyte hands LLVM clean
+IR, LLVM makes it competitive. The remaining gaps are where Kyte hands LLVM *dirty* IR.
 
 ---
 
@@ -37,7 +37,7 @@ IR, LLVM makes it competitive. The remaining gaps are where Nova hands LLVM *dir
 
 **Root cause: the uniform i64 value-word defeats LLVM alias analysis.**
 
-Nova represents *every* value — pointers included — as an `i64` word (`slotTypeForLocalId`,
+Kyte represents *every* value — pointers included — as an `i64` word (`slotTypeForLocalId`,
 `src/codegen/types.zig`, returns `val_type` for any type that isn't a scalar prim or `f64x4`). An array
 parameter is therefore an `i64`; every element access recovers a pointer with **`inttoptr`**
 (`src/codegen/expressions.zig`, sites `arr_base` / `arr_store_base` / `simd_base`) and then `GEP`s.
@@ -45,7 +45,7 @@ parameter is therefore an `i64`; every element access recovers a pointer with **
 LLVM's alias analysis is **blind through `inttoptr`**: a pointer with no provenance is assumed to alias
 all memory. Consequences, all measured:
 - The loop vectorizer will not run — it cannot prove `a[]` and `b[]` are distinct, so `c[i]=a[i]*b[i]`
-  stays scalar. A textbook saxpy/dot in Nova compiles to scalar code identical in speed to *scalar*
+  stays scalar. A textbook saxpy/dot in Kyte compiles to scalar code identical in speed to *scalar*
   Rust; both are ~4× off a vectorized version.
 - LICM/GVN cannot hoist or coalesce array loads as aggressively.
 - `noalias` is **inapplicable**: the parameters are `i64`, not `ptr`, and LLVM ignores `noalias` on
@@ -83,10 +83,10 @@ is that alias-sensitive optimization is off the table until pointer-typed values
 
 **Root cause: naive, unoptimized reference counting.**
 
-Every heap object carries a refcount touched on every `nova_retain` / `nova_release`
+Every heap object carries a refcount touched on every `kyte_retain` / `kyte_release`
 (`src/codegen/arc.zig`), and reclamation is per-object. binary-trees allocates ~millions of short-lived
-nodes; Nova pays a refcount round-trip and a free per node, where a generational GC (C#, the winner at
-0.70×) bump-allocates and sweeps a young generation. Nova emits **no ARC optimization at all** today:
+nodes; Kyte pays a refcount round-trip and a free per node, where a generational GC (C#, the winner at
+0.70×) bump-allocates and sweeps a young generation. Kyte emits **no ARC optimization at all** today:
 no redundant retain/release elimination, no escape analysis, no stack promotion of non-escaping
 allocations. This is the entire 2.22×.
 
@@ -120,7 +120,7 @@ every value is a large refactor; the perf win is concentrated in array-typed val
 4. Element loads/stores use the **real element type** (the reverted typed-load change — re-land it here).
 5. **`noalias` on distinct array parameters** — mark `ptr` params whose sema type is an array with the
    LLVM `noalias` attribute (safe: a fresh `[v;n]` allocation is unique; two array params are distinct
-   objects by Nova's value semantics). This is what lets the vectorizer fire on `c[i]=a[i]*b[i]`.
+   objects by Kyte's value semantics). This is what lets the vectorizer fire on `c[i]=a[i]*b[i]`.
 
 **Watch:** the seam where an array value crosses into a context that still expects the i64 word (e.g.
 stored in a `List`, an `any`, or passed where an i64 is expected). Insert an explicit `ptrtoint` at
@@ -133,9 +133,9 @@ exactly those boundaries — do not let the i64 leak back into the hot path.
 - [x] Array params flow as `ptr` in the signature (caller inttoptr's at the call via existing arg
       coercion). **Part 1.** (No `noalias`: unsound if the same array is passed to two params.)
 - [ ] **Part 2 (the payoff, remaining): array construction must return a real `ptr`.**
-      `nova_bytes_alloc` is declared to return the i64 word, so `[v;n]` / `[...]` produce a laundered
+      `kyte_bytes_alloc` is declared to return the i64 word, so `[v;n]` / `[...]` produce a laundered
       pointer (`inttoptr(ptrtoint(malloc))`), which LLVM treats as provenance-less — so even with `ptr`
-      slots the loop does **not** vectorize (verified: a Nova saxpy stays scalar). Fix: declare the
+      slots the loop does **not** vectorize (verified: a Kyte saxpy stays scalar). Fix: declare the
       array allocation path to return `ptr` (or add an array-specific `ptr`-returning alloc), and update
       the array-literal/repeat codegen to GEP element stores from that `ptr` instead of `inttoptr`+add.
       This ripples to every `compileAlloc` caller (tuples, boxes, structs) via `coerceToSlotType`, so it
@@ -145,14 +145,14 @@ exactly those boundaries — do not let the i64 leak back into the hot path.
       mandelbrot's byte buffer won't vectorize regardless; the clean win is on elementwise float kernels).
 - [ ] Corpus green, ASAN-clean, ARC gate unchanged.
 
-- [x] **Part 2 landed** — array construction returns a real `ptr` (`nova_array_alloc`), element stores
+- [x] **Part 2 landed** — array construction returns a real `ptr` (`kyte_array_alloc`), element stores
       GEP from it. Provenance is now pure ptr from alloc → slot → access.
 - [x] **Auto-vectorization enabled** — the release pass pipeline set neither loop nor SLP vectorization
       (C PassBuilder API defaults them OFF), and the TargetMachine used CPU `"generic"` (pessimistic
       cost model). Now: `SetLoopVectorization`/`SetSLPVectorization(1)` + host CPU/features on native.
 - [x] **i0 zero-init bug fixed** — local slot zero-init did `LLVMConstInt(ptr_ty, 0)` → invalid `i0 0`
       (exposed by the new ptr slots), which poisoned the optimizer. Now `ConstNull` for ptr/vector slots.
-- [x] `double[]` loops **auto-vectorize** — a Nova poly/saxpy kernel emits `.2d` NEON vector ops; a
+- [x] `double[]` loops **auto-vectorize** — a Kyte poly/saxpy kernel emits `.2d` NEON vector ops; a
       compute-bound poly kernel is **~7× faster** (51 ms vs 357 ms scalar). Corpus 254/254, ASAN-clean.
       Case `262_array_vectorization`.
 
@@ -160,7 +160,7 @@ exactly those boundaries — do not let the i64 leak back into the hot path.
 vectorize and run ~7× the scalar version. Corpus 254/254 + ASAN clean.
 
 **One follow-on remains for the benchmark set — and it's harder than it looks (investigated).** An
-**i32 loop counter** (`let i = 0`, Nova's default `int`) does not vectorize; `let i: long = 0` does
+**i32 loop counter** (`let i = 0`, Kyte's default `int`) does not vectorize; `let i: long = 0` does
 (measured: the same poly kernel is scalar 357 ms with `int`, vectorized 51 ms with `long`).
 
 Why: `int` is honest 32-bit but lives in an **i64 slot** (canonicalized after each op). So the induction
@@ -182,7 +182,7 @@ considered, and the safe one already exists:
   it safely needs real induction-variable analysis (prove the counter stays in range and is used only
   for indexing/comparison), a substantial safety-critical pass. Not worth it given the next point.
 
-- **✅ `for (i in 0..n)` already IS the scoped, vectorizable loop induction variable.** Nova's range-for
+- **✅ `for (i in 0..n)` already IS the scoped, vectorizable loop induction variable.** Kyte's range-for
   emits the counter increment as a plain `add i64` (statements.zig, `for_stmt`), bypassing the 32-bit
   canonicalization the `while` + `int` path applies — so it's a clean affine i64 IV that LLVM's
   scalar-evolution recognizes and the loop auto-vectorizes. It is safe *by construction* (the counter is
@@ -200,14 +200,14 @@ allocation through the slot to the GEP — any `ptrtoint`/`inttoptr` round-trip 
 pointer and LLVM's alias analysis gives up. Part 1 made the slot/param/access ptr-clean; the allocator
 return type is the last laundering site.
 
-**Part 2 precise shape (verified against the runtime).** `nova_bytes_alloc` returns `long long` (i64),
-not a pointer (`src/runtime/alloc.cpp`, `nova_abi.h`) — the address is an integer at the C boundary. Two
+**Part 2 precise shape (verified against the runtime).** `kyte_bytes_alloc` returns `long long` (i64),
+not a pointer (`src/runtime/alloc.cpp`, `kyte_abi.h`) — the address is an integer at the C boundary. Two
 ways to get a provenance-carrying `ptr` for array construction:
-  1. **Scoped (recommended):** add `void* nova_array_alloc(long long)` to the runtime (`return (void*)nova_bytes_alloc(n)`),
-     declare it `ptr @nova_array_alloc(i64)` in codegen, and route ONLY the array-literal / `[v;n]`
+  1. **Scoped (recommended):** add `void* kyte_array_alloc(long long)` to the runtime (`return (void*)kyte_bytes_alloc(n)`),
+     declare it `ptr @kyte_array_alloc(i64)` in codegen, and route ONLY the array-literal / `[v;n]`
      codegen through it (GEP the element stores from the returned `ptr`, return the `ptr`). Non-array
      `compileAlloc` callers (tuples, boxes, structs) are untouched. Smallest blast radius.
-  2. **ABI-compat hack:** redeclare `nova_bytes_alloc` itself as `ptr`-returning — works on arm64/x86-64
+  2. **ABI-compat hack:** redeclare `kyte_bytes_alloc` itself as `ptr`-returning — works on arm64/x86-64
      (pointer and `long long` share the return register) but ripples to every `compileAlloc` caller and
      is not portable. Avoid.
 Either way this is a focused, gated change (runtime rebuild + array-literal codegen + full corpus/ASAN),
@@ -219,7 +219,7 @@ Closes the binary-trees / allocation gap. Precedent: Swift's ARC optimizer remov
 of naive refcount traffic. Ordered sub-steps, cheapest first:
 
 1. **Redundant retain/release elimination** — a `retain` immediately followed by a `release` on the same
-   SSA value within a block (and the CFG-extended version) cancels. Nova's ownership pass
+   SSA value within a block (and the CFG-extended version) cancels. Kyte's ownership pass
    (`src/sema/` ownership + `src/codegen/arc.zig`) already tracks per-edge drops; add a local peephole
    that cancels balanced pairs before emission.
 2. **Non-escaping stack promotion** — an object whose reference provably never escapes its creating
@@ -232,7 +232,7 @@ of naive refcount traffic. Ordered sub-steps, cheapest first:
 **Definition of Done:**
 - [ ] binary-trees re-measured; target ≤ 1.5× the fastest peer (from 2.22×).
 - [ ] ARC gate + ASAN green (no new leaks/UAF — this is the load-bearing invariant).
-- [ ] `NOVA_ARC_AUDIT` shows reduced retain/release counts on an allocation microbench.
+- [ ] `KYTE_ARC_AUDIT` shows reduced retain/release counts on an allocation microbench.
 
 **Tracking:** _pending_
 
@@ -252,9 +252,9 @@ After §3.1, confirm the loop accumulator and loop-invariant array bases are reg
   lives. A global typed-value-model rewrite is out of scope unless a later benchmark demands it.
 - **Not beating a tracing GC on allocation-pathological microbenchmarks.** Optimized ARC targets
   Swift-level (competitive for real workloads), not GC-parity on binary-trees-style churn.
-- **Perspective:** Nova's target is I/O-bound server services (the reactor sustains ~75k req/s); these
+- **Perspective:** Kyte's target is I/O-bound server services (the reactor sustains ~75k req/s); these
   compute microbenchmarks measure *codegen maturity*, not the shipping workload. This plan exists
-  because raw-compute parity was made an explicit goal, not because the current numbers block Nova's
+  because raw-compute parity was made an explicit goal, not because the current numbers block Kyte's
   purpose.
 
 ---
@@ -264,7 +264,7 @@ After §3.1, confirm the loop accumulator and loop-invariant array bases are reg
 1. Re-run `lang/bench/` (all six benchmarks + the SIMD kernel), best of 10, absolute ms; update
    `lang/bench/benchmark.md`.
 2. Full corpus green: `conformance/run.sh -j`.
-3. ASAN-clean: `NOVA_ASAN=1 zig build` then the targeted `--asan` cases (mandatory — the array/ARC
+3. ASAN-clean: `KYTE_ASAN=1 zig build` then the targeted `--asan` cases (mandatory — the array/ARC
    changes touch memory).
 4. ARC gate unchanged or improved.
 5. Record the before/after ms in the phase's Tracking line, with the commit SHA.

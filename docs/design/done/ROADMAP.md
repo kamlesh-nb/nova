@@ -1,22 +1,22 @@
-# Nova — design roadmap (front door, 2026-08-16)
+# Kyte — design roadmap (front door, 2026-08-16)
 
 Single entry point to the design state: what is done, what is locked, what decisions are open, and the
 sequence to beta. Every claim is tagged **[verified]** (checked against code this session) / **[register]**
 (from a doc/note) / **[reverify]** (recall, must re-run before trusting).
 
-## 1. Where Nova is (honest one-paragraph)
-Nova compiles Nova → LLVM IR → native, ARC-managed, with a **self-hosted C++20 reactor runtime** — its own
+## 1. Where Kyte is (honest one-paragraph)
+Kyte compiles Kyte → LLVM IR → native, ARC-managed, with a **self-hosted C++20 reactor runtime** — its own
 async event loop over kqueue/epoll/io_uring/IOCP (all tested). Boost.Asio is retired and wolfSSL deleted
-(build.zig: "no Boost, no wolfSSL; reactor runtime"); TLS and crypto are pure Nova. This cycle closed the reframed "no ownership IR" gap: a real
+(build.zig: "no Boost, no wolfSSL; reactor runtime"); TLS and crypto are pure Kyte. This cycle closed the reframed "no ownership IR" gap: a real
 compile-time ownership (ARC release-balance) verifier now covers **100% of functions**, 0 false positives,
 and is **gated** in CI; the in-house LLVM-emit optimiser was **scrapped** (measured ~0 realized perf) and
 the ARC-optimisation perf lever was **measured to have ~0 headroom** and closed. Self-contained static
-delivery already ships (web devs download `nova`, never LLVM). Remaining work is the package manager (fully
+delivery already ships (web devs download `kyte`, never LLVM). Remaining work is the package manager (fully
 designed, not built), a handful of narrow polish items, and the bigger post-beta pieces (debugger, perf).
 
 ## 2. Done / locked this cycle **[verified]**
 - **Ownership verifier (soundness).** OSSA-lite lowering + release-balance verifier, 100% coverage, 0 false
-  positives (329-case sweep), enforced via `NOVA_OSSA=hard` + `conformance/ossa-gate.sh` in `gate.sh`.
+  positives (329-case sweep), enforced via `KYTE_OSSA=hard` + `conformance/ossa-gate.sh` in `gate.sh`.
   Rationale + IR: `swift-arch-comparison.md`, `ossa-lite-tasks.md`. Verify: `bash conformance/ossa-gate.sh`.
 - **Gap 3 (optimiser / ARC-perf) CLOSED.** No in-house optimiser; `--release` = LLVM `default<O3>` +
   vectorization. ARC-forwarding measured at ~0 headroom twice (E2 + Track A), re-verified fresh. The only
@@ -29,7 +29,7 @@ designed, not built), a handful of narrow polish items, and the bigger post-beta
 - **Package manager** — `pkg-manager.md`. Cargo-style: by-name imports; a dep's name comes from its own
   manifest; `url#ref` pins version; `project.lock.json` records resolved SHAs; versions COEXIST (cache
   `<name>-<sha8>`, per-owning-package resolution, feasible because mangling is path-derived); recursive
-  transitive fetch; `nova publish` = annotated tag + push. No MVS/registry/proxy. **Fully locked; the one
+  transitive fetch; `kyte publish` = annotated tag + push. No MVS/registry/proxy. **Fully locked; the one
   real build risk is the version-aware resolver in `pipeline.zig` — spike it first.**
 - **Connection forwarding (orchestrator)** — `remaining-gaps-design.md` Gap 6. fd-handoff is the data path
   on ALL platforms (proxy out of the path, best perf); Linux adds veth+netns as an ISOLATION fence (k8s-pod
@@ -49,7 +49,7 @@ designed, not built), a handful of narrow polish items, and the bigger post-beta
 - **Perf (Gap 5): ACTIVE** — targeted, measure-first allocation reduction. Harness built; win #1 landed
   (JSON parse+bind 114→58 allocs, 49%). Next candidates in `gap5-perf-plan.md`. Not a stop condition that
   we beat Rust/Go.
-- **nls:** ship in the same archive as `nova` vs a companion artifact? version-lock via `check-version-sync.sh`?
+- **nls:** ship in the same archive as `kyte` vs a companion artifact? version-lock via `check-version-sync.sh`?
 - **Beta bar (Gap 7):** lock the 6-item release checklist.
 
 ## 5. Roadmap sequence (recommended, not a decree)

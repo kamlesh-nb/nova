@@ -1,7 +1,7 @@
-//! The `nova test` runner.
+//! The `kyte test` runner.
 //!
 //! This drives the whole test pipeline: it loads the program the user asked to
-//! test (a named file, or every `.nova` file under the project), collects the
+//! test (a named file, or every `.ky` file under the project), collects the
 //! `@test` functions THAT USER wrote, synthesises a `main()` harness that calls
 //! each one and tallies pass/fail, then runs the normal compile + link pipeline
 //! on the combined program and executes the resulting binary.
@@ -10,7 +10,7 @@
 //!
 //!   1. Only the USER's `@test`s run. The stdlib is merged into the program like
 //!      any import and carries its own `@test`s, but re-running those on every
-//!      `nova test` would be noise (they are already covered by the conformance
+//!      `kyte test` would be noise (they are already covered by the conformance
 //!      corpus). [`collectTestFunctions`] filters by source file so stdlib and
 //!      package tests are excluded.
 //!   2. A file with no `@test` of its own is still COMPILED (it just reports
@@ -18,7 +18,7 @@
 //!      is why the runner falls through to build a trivial harness rather than
 //!      returning early when no tests are found.
 //!
-//! The harness also gates on the ARC leak audit: if `nova_arc_audit_report`
+//! The harness also gates on the ARC leak audit: if `kyte_arc_audit_report`
 //! reports survivors the process exits non-zero, so a leak fails the test run.
 
 const std = @import("std");
@@ -51,7 +51,7 @@ const packages = @import("packages.zig");
 /// `span.file` (stamped by the parser with the source path) matches one of
 /// `user_files`, AND it carries the `@test` attribute. The `span.file` filter is
 /// what excludes the stdlib's and imported packages' own tests, which are merged
-/// into the program but are not what `nova test <file>` is asking to run. The
+/// into the program but are not what `kyte test <file>` is asking to run. The
 /// returned slice is owned by the caller.
 fn collectTestFunctions(declarations: []const ast.Declaration, user_files: []const []const u8, allocator: std.mem.Allocator) ![][]const u8 {
     var test_fns = std.ArrayList([]const u8).empty;
@@ -83,16 +83,16 @@ fn collectTestFunctions(declarations: []const ast.Declaration, user_files: []con
     return try test_fns.toOwnedSlice(allocator);
 }
 
-/// Generates the Nova source of the harness `main()` that drives the tests.
+/// Generates the Kyte source of the harness `main()` that drives the tests.
 ///
 /// Emits a `main` that, for each test name, resets the per-test state
-/// (`nova_test_reset`), marks the current test (`nova_test_begin`), calls the
-/// test function, and prints `PASS`/`FAIL` based on `nova_test_did_fail`,
+/// (`kyte_test_reset`), marks the current test (`kyte_test_begin`), calls the
+/// test function, and prints `PASS`/`FAIL` based on `kyte_test_did_fail`,
 /// accumulating counts. After all tests it prints the `Results:` summary and
 /// exits non-zero if the ARC audit reports survivors OR any test failed, so a
-/// leak or a failure both fail the process. The result is Nova source text,
+/// leak or a failure both fail the process. The result is Kyte source text,
 /// parsed and merged into the program alongside the user's code. `console.log`
-/// string concatenation is used because the harness is plain Nova, not Zig.
+/// string concatenation is used because the harness is plain Kyte, not Zig.
 fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.Allocator) ![]const u8 {
     var src = std.ArrayList(u8).empty;
     defer src.deinit(allocator);
@@ -105,15 +105,15 @@ fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.All
     try src.appendSlice(allocator, "    console.log(\"\");\n");
 
     for (test_fn_names) |name| {
-        try src.appendSlice(allocator, "    nova_test_reset();\n");
-        try src.print(allocator, "    nova_test_begin(\"{s}\");\n", .{name});
+        try src.appendSlice(allocator, "    kyte_test_reset();\n");
+        try src.print(allocator, "    kyte_test_begin(\"{s}\");\n", .{name});
         try src.print(allocator, "    {s}();\n", .{name});
-        try src.appendSlice(allocator, "    if (nova_test_did_fail() == 0) {\n");
+        try src.appendSlice(allocator, "    if (kyte_test_did_fail() == 0) {\n");
         try src.print(allocator, "        console.log(\"  PASS  {s}\");\n", .{name});
         try src.appendSlice(allocator, "        __test_passed = __test_passed + 1;\n");
         try src.appendSlice(allocator, "    } else {\n");
         try src.print(allocator, "        console.log(\"  FAIL  {s}\");\n", .{name});
-        try src.appendSlice(allocator, "        let msg = nova_test_fail_message();\n");
+        try src.appendSlice(allocator, "        let msg = kyte_test_fail_message();\n");
         try src.appendSlice(allocator, "        console.log(\"        \" + msg);\n");
         try src.appendSlice(allocator, "        __test_failed = __test_failed + 1;\n");
         try src.appendSlice(allocator, "    }\n");
@@ -122,25 +122,25 @@ fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.All
     try src.appendSlice(allocator, "    console.log(\"\");\n");
     try src.appendSlice(allocator, "    console.log(\"Results: \" + __test_passed + \" passed, \" + __test_failed + \" failed, \" + __test_total + \" total\");\n");
 
-    try src.appendSlice(allocator, "    if (nova_arc_audit_report() > 0) {\n");
-    try src.appendSlice(allocator, "        nova_exit(1);\n");
+    try src.appendSlice(allocator, "    if (kyte_arc_audit_report() > 0) {\n");
+    try src.appendSlice(allocator, "        kyte_exit(1);\n");
     try src.appendSlice(allocator, "    }\n");
     try src.appendSlice(allocator, "    if (__test_failed > 0) {\n");
-    try src.appendSlice(allocator, "        nova_exit(1);\n");
+    try src.appendSlice(allocator, "        kyte_exit(1);\n");
     try src.appendSlice(allocator, "    }\n");
     try src.appendSlice(allocator, "}\n");
 
     return try src.toOwnedSlice(allocator);
 }
 
-/// Entry point for the `nova test` subcommand.
+/// Entry point for the `kyte test` subcommand.
 ///
 /// Runs the full test pipeline end to end:
 ///
 ///   1. Ensures dependencies are fetched, then parses the build-tuning flags
 ///      (`--split-objects`, `--prune`, `--emit-llvm`, `--mem-stats`, `--wasm`/
 ///      `--native`, `--asan`/`--tsan`) and the optional target file.
-///   2. Determines the files to test: the given file, or every `.nova` file
+///   2. Determines the files to test: the given file, or every `.ky` file
 ///      under the current directory when none is named.
 ///   3. Loads and merges those files (plus `string_builder` and small runtime
 ///      helpers) into one declaration list, resolving imports transitively.
@@ -150,9 +150,9 @@ fn generateTestHarness(test_fn_names: []const []const u8, allocator: std.mem.All
 ///   5. Runs the normal frontend (synthetic generators, alpha-rename, id
 ///      assignment, type check, TypeId sema, monomorphise, optional
 ///      reach/escape/ownership/OSSA passes) exactly as a real build does, so a
-///      test build exercises the same pipeline as `nova build`.
-///   6. Emits objects, links against the C++ runtime (`novacore`, or the
-///      `_asan`/`_tsan` variant), and runs the produced `__nova_test` binary.
+///      test build exercises the same pipeline as `kyte build`.
+///   6. Emits objects, links against the C++ runtime (`kytecore`, or the
+///      `_asan`/`_tsan` variant), and runs the produced `__kyte_test` binary.
 ///
 /// The whole `build/test` tree is cleaned up afterwards. The process exits
 /// non-zero if the test binary reports failure (which itself covers both a
@@ -187,12 +187,12 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     }
 
     if (file_path.len == 0) {
-        pipeline.findNovaFiles(allocator, init.io, .cwd(), ".", &file_paths) catch |err| {
+        pipeline.findKyteFiles(allocator, init.io, .cwd(), ".", &file_paths) catch |err| {
             std.debug.print("Failed to scan project directory: {any}\n", .{err});
             return;
         };
         if (file_paths.items.len == 0) {
-            std.debug.print("No .nova files found in the current directory.\n", .{});
+            std.debug.print("No .ky files found in the current directory.\n", .{});
             return;
         }
     } else {
@@ -228,7 +228,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     const is_wasm = std.mem.eql(u8, target, "--wasm");
     const tinfo = pipeline.deriveTargetInfo(target, null);
 
-    pipeline.loadProgram(allocator, init, "src/std/collections/string_builder.nova", &visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
+    pipeline.loadProgram(allocator, init, "src/std/collections/string_builder.ky", &visited, &visiting, &merged, &declarations, is_wasm, &file_sources, tinfo) catch |err| {
         std.debug.print("Warning: Failed to load string_builder in test harness: {any}\n", .{err});
     };
 
@@ -265,7 +265,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         }
     }
 
-    var harness_parser = try parser.Parser.init(allocator, harness_src, "test_harness.nova", is_wasm);
+    var harness_parser = try parser.Parser.init(allocator, harness_src, "test_harness.ky", is_wasm);
     defer harness_parser.deinit();
     const harness_prog = try harness_parser.parseProgram();
     try filtered_decls.appendSlice(allocator, harness_prog.declarations);
@@ -292,7 +292,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         \\}
         \\
     ;
-    var helpers_p = try parser.Parser.init(allocator, helpers, "helpers.nova", is_wasm);
+    var helpers_p = try parser.Parser.init(allocator, helpers, "helpers.ky", is_wasm);
     defer helpers_p.deinit();
     const helpers_prog = try helpers_p.parseProgram();
     try filtered_decls.appendSlice(allocator, helpers_prog.declarations);
@@ -318,10 +318,10 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     tc.is_wasm = is_wasm;
     try tc.check(program);
 
-    sema_shadow.report_enabled = init.environ_map.get("NOVA_SEMA_SHADOW") != null;
-    sema_shadow.tid_census = init.environ_map.get("NOVA_TID_CENSUS") != null;
-    codegen_arc.elide_enabled = init.environ_map.get("NOVA_ARC_ELIDE_OFF") == null;
-    codegen_arc.arc_census = init.environ_map.get("NOVA_ARC_CENSUS") != null;
+    sema_shadow.report_enabled = init.environ_map.get("KYTE_SEMA_SHADOW") != null;
+    sema_shadow.tid_census = init.environ_map.get("KYTE_TID_CENSUS") != null;
+    codegen_arc.elide_enabled = init.environ_map.get("KYTE_ARC_ELIDE_OFF") == null;
+    codegen_arc.arc_census = init.environ_map.get("KYTE_ARC_CENSUS") != null;
     pipeline.configureValueStructs(allocator, init.environ_map);
     sema_shadow.trace_resolution = sema_shadow.report_enabled;
     sema_shadow.f2_types_enabled = true;
@@ -349,8 +349,8 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     {
         const reach = @import("frontend/sema/reach.zig");
-        const shadow = init.environ_map.get("NOVA_REACH_SHADOW") != null;
-        const gate = init.environ_map.get("NOVA_REACH_ON") != null;
+        const shadow = init.environ_map.get("KYTE_REACH_SHADOW") != null;
+        const gate = init.environ_map.get("KYTE_REACH_ON") != null;
         if (shadow or gate) {
             var rr = reach.compute(allocator, &owned_sema.tab, &owned_sema.ir, program, true) catch reach.Result{};
             defer rr.deinit(allocator);
@@ -362,10 +362,10 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         }
     }
 
-    sema_escape.report_enabled = init.environ_map.get("NOVA_ESCAPE_REPORT") != null;
+    sema_escape.report_enabled = init.environ_map.get("KYTE_ESCAPE_REPORT") != null;
     if (sema_escape.report_enabled) _ = sema_escape.analyze(allocator, &owned_sema.store, &owned_sema.ir, &program);
 
-    if (init.environ_map.get("NOVA_OWN_VERIFY")) |v| {
+    if (init.environ_map.get("KYTE_OWN_VERIFY")) |v| {
         const hard = std.mem.eql(u8, v, "hard");
         sema_ownership.runVerify(allocator, &owned_sema.store, &owned_sema.ir, &program, hard);
         codegen_arc.balance_verify = true;
@@ -373,7 +373,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     }
 
     {
-        const ossa = init.environ_map.get("NOVA_OSSA");
+        const ossa = init.environ_map.get("KYTE_OSSA");
         const disabled = ossa != null and std.mem.eql(u8, ossa.?, "off");
         if (!disabled) {
             const report_only = ossa != null and std.mem.eql(u8, ossa.?, "1");
@@ -385,7 +385,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     const test_dir = "build/test";
     Io.Dir.createDirPath(.cwd(), init.io, test_dir) catch {};
-    const output_path = "build/test/__nova_test";
+    const output_path = "build/test/__kyte_test";
     const obj_path = try std.fmt.allocPrint(allocator, "{s}.o", .{output_path});
     defer allocator.free(obj_path);
     const t6_split = llvm_codegen.flags.split_per_file;
@@ -406,8 +406,8 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     sema_mono.dumpMethodInsts();
 
     const home = init.environ_map.get("HOME") orelse init.environ_map.get("USERPROFILE") orelse "/";
-    const shared_nova = try std.fmt.allocPrint(allocator, "{s}/.nova", .{ home });
-    const shared_nova_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_nova});
+    const shared_kyte = try std.fmt.allocPrint(allocator, "{s}/.kyte", .{ home });
+    const shared_kyte_arg = try std.fmt.allocPrint(allocator, "-I{s}", .{shared_kyte});
 
     const asan = pipeline.hasFlag(args, "--asan");
     const tsan = pipeline.hasFlag(args, "--tsan");
@@ -422,7 +422,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     try test_clang_args.append(allocator, pipeline.dead_strip_flag);
     try test_clang_args.appendSlice(allocator, pipeline.pie_flags);
     try test_clang_args.append(allocator, "-I.");
-    try test_clang_args.append(allocator, shared_nova_arg);
+    try test_clang_args.append(allocator, shared_kyte_arg);
     if (asan) {
         try test_clang_args.append(allocator, "-fsanitize=address");
         try test_clang_args.append(allocator, "-fno-omit-frame-pointer");
@@ -433,16 +433,16 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     for (link_objs) |o| try test_clang_args.append(allocator, o);
 
-    try pipeline.appendRuntimeLink(&test_clang_args, allocator, shared_nova, if (asan)
-        "novacore_asan"
+    try pipeline.appendRuntimeLink(&test_clang_args, allocator, shared_kyte, if (asan)
+        "kytecore_asan"
     else if (tsan)
-        "novacore_tsan"
+        "kytecore_tsan"
     else
-        "novacore");
-    try pipeline.appendWolfsslLink(&test_clang_args, allocator, shared_nova, init.io);
+        "kytecore");
+    try pipeline.appendWolfsslLink(&test_clang_args, allocator, shared_kyte, init.io);
 
     for (try pipeline.collectFfiLibs(allocator, program)) |lib| {
-        try pipeline.appendFfiLib(&test_clang_args, allocator, shared_nova, init.io, lib);
+        try pipeline.appendFfiLib(&test_clang_args, allocator, shared_kyte, init.io, lib);
     }
     try test_clang_args.append(allocator, "-o");
     try test_clang_args.append(allocator, output_path);
@@ -467,7 +467,7 @@ pub fn cmdTest(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     std.debug.print("\n", .{});
     var test_child = try std.process.spawn(init.io, .{
-        .argv = &[_][]const u8{"./build/test/__nova_test"},
+        .argv = &[_][]const u8{"./build/test/__kyte_test"},
     });
     const test_term = try test_child.wait(init.io);
 

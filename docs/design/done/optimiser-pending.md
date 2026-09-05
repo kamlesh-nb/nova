@@ -1,6 +1,6 @@
 # Optimiser integration: pending work
 
-Tracking table for the HIR/MIR/LIR emit path (`NOVA_OPT_EMIT`). Companion to `optimiser.md` (design +
+Tracking table for the HIR/MIR/LIR emit path (`KYTE_OPT_EMIT`). Companion to `optimiser.md` (design +
 landed history). The emit path is byte-faithful to the AST backend for everything it accepts, off by default,
 with per-function AST fallback (an unhandled construct never breaks a build -- it falls back). As of
 2026-08-15. Detail for each row lives in **§ Item detail** below, keyed by ID -- the table stays one line.
@@ -106,7 +106,7 @@ function on ANY verify violation → AST fallback. Would have caught the M6-C da
 
 **B1** — 2026-08-15. `self` is an EXPLICIT `params[0]`, so AST params line up 1:1 with the LLVM args. The
 method FunctionInfo sites just were not setting `.params = fn_decl.params` (constructors stay empty). Coverage
-~1→13 emitted in a sha256 build; rejects ~99→6 (constructors). Pinned by `341_opt_emit_methods.nova`. Class
+~1→13 emitted in a sha256 build; rejects ~99→6 (constructors). Pinned by `341_opt_emit_methods.ky`. Class
 methods emit (heap `self`); value-struct methods and constructors fall back.
 **B2** — 2026-08-15: string PARAMS (C0+D2, 334ccf5) and string RETURNS (e83f819) emit. Method calls named
 `string_<m>`; string ARC (retain/release, null dtor) threaded + emitted; a returned borrowed string is
@@ -127,9 +127,9 @@ on a value struct is `base + offset` + store, the identical address the AST writ
 ASAN-clean; pinned by `350` `mutate()`). RETURNS also emit, and need NO sret ABI: this backend has no
 by-value copy-out — whole-program escape analysis (`computeValueEscapeSet`, honoured by `isValueStructName`)
 HEAP-PROMOTES any struct that is constructed-and-returned, so a returned struct is a reference-counted heap
-struct (`nova_bytes_alloc` + return the payload pointer), NOT a dead stack address. The existing fresh-
+struct (`kyte_bytes_alloc` + return the payload pointer), NOT a dead stack address. The existing fresh-
 construction heap-return path already emits it, byte-identical to the AST and ASAN-clean even with an
-intervening call between the return and the field read (`NOVA_ASAN_CODEGEN` verified). Pinned by `350`
+intervening call between the return and the field read (`KYTE_ASAN_CODEGEN` verified). Pinned by `350`
 `mkVec`/`mkVec3`. (My earlier "value-struct return = use-after-return, needs sret" note was WRONG for this
 codebase: escape analysis prevents the stack case entirely. This is the exact kind of ABI fact that belongs
 in a written representation spec, per the design-debt note.) The one shape still on the AST: a returned heap-
@@ -138,13 +138,13 @@ struct BORROW (`return p`) — that is D4, now DONE.
 They are a plain nullable pointer word (0 == absent), the AST does NOT box them, so the signature threads as
 the payload pointer, `== undefined` is a bare `icmp eq/ne i64` (new `isRefWordEq` path, incl. the `ptr`-repr
 word a passed-in optional is typed as), and a `string`-payload optional's ARC is a plain string's (null dtor).
-Pinned by `351_opt_emit_ref_optional.nova`. A function that MATERIALISES `undefined`/`null` in its body still
+Pinned by `351_opt_emit_ref_optional.ky`. A function that MATERIALISES `undefined`/`null` in its body still
 falls back: `.undefined` lowers to `const_int 0`, exact for a reference optional but WRONG for a VALUE
 optional, which boxes to a non-zero absent-sentinel. **Verified this session that admitting `.undefined`
 MISCOMPILES `f(undefined)` for a value-optional param (AST=10 vs EMIT=134 + ASAN errors): the arg is passed
 as 0, not the boxed sentinel.** So value optionals stay fallback. **VALUE-OPTIONAL BOX ABI (reverse-engineered
-this session):** a value optional is a nullable pointer to an 8-byte ARC box — `nova_valopt_box(word)` =
-`nova_bytes_alloc(8)` storing the raw i64 word; unbox = `box==0 ? 0 : *box`; absent = the NULL word `0`;
+this session):** a value optional is a nullable pointer to an 8-byte ARC box — `kyte_valopt_box(word)` =
+`kyte_bytes_alloc(8)` storing the raw i64 word; unbox = `box==0 ? 0 : *box`; absent = the NULL word `0`;
 a present value (even `0`) is a NON-null box (that is why boxing exists). The AST boxes on every store into a
 value-optional slot (arg into a valopt param, let/assign, valopt return) and unboxes on every payload read.
 **A second latent miscompile was found + closed (591153e):** the whole-function gate rejected a value-optional
@@ -168,7 +168,7 @@ receivers (generics, user structs) still nameless → a follow-up (general type-
 **C1** — DONE for int/long discriminants (verified 2026-08-15, not assumed). `lower_ast_hir.lowerSwitch`
 desugars a switch to an if-chain BEFORE MIR: it binds the discriminant once to a typed temp, and each case
 becomes an OR of side-effect-free `disc == vK` eq compares (stamped with the discriminant TypeId), so the
-`.switch_` MIR terminator is never produced and the reject for it is a dormant safety net. `NOVA_OPT_EMIT_
+`.switch_` MIR terminator is never produced and the reject for it is a dormant safety net. `KYTE_OPT_EMIT_
 VERBOSE` confirms switch functions land in "emitted fn", not "reject"; exit + checksum identical to the AST,
 ASAN-clean, across multi-value cases, default, no-default fall-through, negative long labels, expression
 discriminant, and nested switch (case 347). Enum switch falls back only because enums aren't in the emit
@@ -190,7 +190,7 @@ safety gate.
 **Payloadless ENUMS emit (4130c17):** a HIR post-pass folds `EnumName.Variant` → an int discriminant node,
 and `intKindForTid` classifies a payloadless-enum TypeId as a signed 64-bit int — so enum values, `==`/`!=`,
 params, returns, locals, AND `switch`-on-enum (C1's if-chain, for free) emit. Case `354`. **Scalar TUPLES emit
-(1d222dc):** new `tuple_new` op; a tuple is a positional heap aggregate (`nova_bytes_alloc(N*8)`, element k at
+(1d222dc):** new `tuple_new` op; a tuple is a positional heap aggregate (`kyte_bytes_alloc(N*8)`, element k at
 `k*8`), `t.N` is desugared by the parser to `t[N]` → `index_get`. Landmine fixed: a tuple element is a raw
 64-bit word with NO 32-bit wrap (unlike an `int` local), so it must be word-typed. Case `358`. **All-string
 TEMPLATES emit (a4dc6f8):** new `template` op; reverse-engineering found this backend lowers `` `${…}` `` to a
@@ -215,7 +215,7 @@ literals fall back.
 **D1** — `lower_ast_hir` ALREADY threads retain (owned-copy) + releases (scope-end / pre-return-except-moved /
 pre-break) from `TypedIr.ownedOf`; the emit path supplies `typed_ir`. The ops exist; the emit path just gates
 them. Remaining work is D2 (emit) + C0.
-**D2** — 2026-08-15 (334ccf5): emit `nova_retain` / `nova_release(ptr, null)` for string operands (no dtor);
+**D2** — 2026-08-15 (334ccf5): emit `kyte_retain` / `kyte_release(ptr, null)` for string operands (no dtor);
 owned-local TypeIds threaded so mirEmittable gates ARC ops to strings. ARC-balanced vs the AST baseline (--arc
 0 failures). Non-string owned types reject → D3.
 **D3** — DONE for STRING-owned-field structs (2026-08-15). A `struct` with only bare-`string` owned fields,
@@ -224,11 +224,11 @@ needed), and the release resolves the struct's REAL destructor — heap/class vi
 CreateDestructorPreferId(name, tid))` (real `__destruct_<Struct>`), value struct via `dropValueStruct(v,
 name, tid)` (direct destructor call on the inline-storage address, no free), selected at `.release` by the
 value's type. Key finding: plain `struct` is a VALUE struct in this build, so a string-field struct is
-usually dropped via `dropValueStruct`, not `nova_release`. Verified byte-identical + ASAN-clean incl. a 1000-
+usually dropped via `dropValueStruct`, not `kyte_release`. Verified byte-identical + ASAN-clean incl. a 1000-
 iteration construct/drop loop (case 352). Non-literal string args, returned string fields, and any non-string
 owned field (class/list/nested-struct/error-union) still fall back.
 **D4** — DONE for heap/class structs (2026-08-15). A returned BORROWED heap struct (a param, not a fresh
-`struct_new` and not a moved owned local) now emits: `lower_ast_hir` threads a return-acquisition `nova_retain`
+`struct_new` and not a moved owned local) now emits: `lower_ast_hir` threads a return-acquisition `kyte_retain`
 (the caller owns the matching release), the `.retain` gate admits a heap-struct pointer word (a refcount bump
 needs no dtor), and the `.ret` gate admits a retained result (`isRetainedResult`) alongside the fresh
 `struct_new` case. Verified byte-identical + ASAN-clean + ARC-audit-clean incl. a 1000-iteration loop (case
@@ -256,7 +256,7 @@ whole-program MIR (a larger restructuring). Implemented + unit-tested; stays dor
 call once B+D coverage is high. Not flipped autonomously.
 **E2** — with the subset still small, emit buys near-zero end-to-end speed; the win needs the hard B/D tier +
 elision on hot functions. Re-measure after those.
-**E3** — the `NOVA_OPT` report-only path can go once emit is broadly trusted; removing it now loses the
+**E3** — the `KYTE_OPT` report-only path can go once emit is broadly trusted; removing it now loses the
 coverage gauge. Not done autonomously.
 **E4** — the emit path is off by default, so it does not affect Windows/wasm builds today. Validation belongs
 with the E1 flip.

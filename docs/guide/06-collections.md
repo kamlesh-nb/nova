@@ -1,6 +1,6 @@
 # 6. Collections
 
-Nova ships three generic collections in the standard library: `List<T>`, `Map<K, V>`, and `Set<T>`.
+Kyte ships three generic collections in the standard library: `List<T>`, `Map<K, V>`, and `Set<T>`.
 They are monomorphized like any other generic: a `List<int>` and a `List<string>` are distinct
 types. Import each from its module under `collections`.
 
@@ -14,8 +14,8 @@ nullish-coalescing operator `?? default`, which yields the value if present and 
 A `List<T>` is a growable, indexed vector. `get(i)` returns `T | undefined` (so an out-of-range index
 is safe), while `map` / `filter` / `reduce` take the closures from [chapter 5](05-functions-and-closures.md).
 
-```nova
-// examples/10_collections.nova
+```kyte
+// examples/10_collections.ky
 import collections.list;
 
 fn main(): void {
@@ -75,8 +75,8 @@ A `Map<K, V>` is a hash map. Its constructor takes an initial capacity **and a h
 key type** (`Map<string, int>(16, string.hash)`). `get(k)` returns `V | undefined`; `has` tests
 membership; `delete_key` removes; and `for ((k, v) in m)` iterates entries.
 
-```nova
-// examples/11_maps.nova
+```kyte
+// examples/11_maps.ky
 import collections.map;
 import string;
 
@@ -139,8 +139,8 @@ keys the `set` module exports `i32Hash`.
 A `Set<T>` stores **unique** elements; adding a value that is already present is a no-op. Like `Map`
 it takes a capacity hint and a hash function (`Set<T>` is a thin wrapper over `Map<T, bool>`).
 
-```nova
-// examples/12_sets.nova
+```kyte
+// examples/12_sets.ky
 import collections.set;
 import collections.map;
 import string;

@@ -81,7 +81,7 @@ F2-6 must give these a **TypeId-keyed** path: `getOrCreateDestructor(t: TypeId)`
 `mangle(t: TypeId)`, deriving the symbol from the store, not a rendered name. This is what finally lets
 `renderLegacy`/`substTypeParams` be **deleted** rather than merely bypassed. Until then the string
 path survives as a name-generator only (no *decisions*), which is already the F5 posture
-(`[[nova-f5-typeid-migration]]`: 9.7k name-only sites deferred as "rider on F2-6").
+(`[[kyte-f5-typeid-migration]]`: 9.7k name-only sites deferred as "rider on F2-6").
 
 ---
 
@@ -143,7 +143,7 @@ Each stage lands green on the full suite; nothing is deleted until its replaceme
 - **Stage 1 — Close coverage (medium). ✅ LARGELY DONE 2026-07-19d — and the finding rewrote the
   problem.** Named the genuine shapes, then discovered the "gap" was ~90% MEASUREMENT NOISE: on top of
   `namespace` idents, the dominant "genuine field_access" was **method-call callees** (`xs.push`,
-  `self.data.get`) — a method REFERENCE is not-a-value (Nova has no bound-method values; it is only
+  `self.data.get`) — a method REFERENCE is not-a-value (Kyte has no bound-method values; it is only
   called), so an unresolved one is not a coverage gap. Classifying those (an `in_call_callee` flag)
   collapsed the genuine debt: serde 201→20, map 125→11, http 137→12, closures 61→7. **The typed IR is
   already ~complete for VALUES (~99.5%+).** The true remainder is: (a) honest LITERALS — empty
@@ -353,7 +353,7 @@ Each stage lands green on the full suite; nothing is deleted until its replaceme
   vacuity. Report-only; codegen untouched. Gates: FUNC 70/70, ARC 119/119, SHADOW 119/119, ASAN 119/119,
   unit.
   **THIRD sub-step (CFG last-use / per-edge drops) LANDED (2026-07-19d):** extended `ownership.zig` from
-  straight-line to full structured control flow. Nova has no gotos, so backward last-use is a forward walk
+  straight-line to full structured control flow. Kyte has no gotos, so backward last-use is a forward walk
   with a per-path ownership state (`live`/`moved`) and a branch-MERGE: where one `if` arm moves the local
   and the other does not, a PER-EDGE `drop` is inserted on the non-moving arm so every path consumes it
   exactly once (the Perceus rule). Loops are modeled as borrow-across-iterations (a move-in-loop still
@@ -477,7 +477,7 @@ stage 1.
 
 ## 11. Relationship to the other docs
 - **arc.md** — the ownership model & rule table; F2-6 stage 5 is where arc.md's `disposition` + balance
-  check land *in sema* (arc.md built the codegen-level version; F2-6 promotes it). [[nova-arc-acquisition-rewrite]]
+  check land *in sema* (arc.md built the codegen-level version; F2-6 promotes it). [[kyte-arc-acquisition-rewrite]]
 - **chained-map-leak-findings.md** — the closure-param residual F2-6 stage 2 closes.
 - **FOUNDATION-STATUS.md** — F2-6 is the one open item on F2 (96%) and the enabler for F4-5/F5 O4.
-- Spec-first: no new syntax, so no `specs.md` change — F2-6 is internal correctness. [[nova-spec-first-workflow]]
+- Spec-first: no new syntax, so no `specs.md` change — F2-6 is internal correctness. [[kyte-spec-first-workflow]]

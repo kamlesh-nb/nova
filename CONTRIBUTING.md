@@ -1,6 +1,6 @@
-# Contributing to Nova
+# Contributing to Kyte
 
-Nova is in Beta and this document is meant to lower the barrier to a first contribution: how to build,
+Kyte is in Beta and this document is meant to lower the barrier to a first contribution: how to build,
 how to prove a change is correct, and the conventions that keep the tree green. If anything here is
 wrong or stale, fixing this file is itself a welcome contribution.
 
@@ -11,9 +11,9 @@ Prerequisites: **Zig 0.16.0** (pinned) and an **LLVM 21** install.
 ```bash
 cd lang
 export PATH="$(scripts/bootstrap-zig.sh | tail -1):$PATH"       # fetch + checksum-verify the pinned Zig (see .zig-version)
-export NOVA_LLVM_PREFIX=/path/to/llvm     # macOS: $(brew --prefix llvm@21)
-zig build                                 # builds nova -> ~/.nova/bin/nova, syncs std+runtime to ~/.nova
-NOVA_ASAN=1 zig build                     # ALSO builds the ASAN runtime (needed for the --asan gate)
+export KYTE_LLVM_PREFIX=/path/to/llvm     # macOS: $(brew --prefix llvm@21)
+zig build                                 # builds kyte -> ~/.kyte/bin/kyte, syncs std+runtime to ~/.kyte
+KYTE_ASAN=1 zig build                     # ALSO builds the ASAN runtime (needed for the --asan gate)
 ```
 
 The build is pinned to exactly Zig 0.16.0; a different Zig fails the configure step with a clear
@@ -27,7 +27,7 @@ Run the gates **before and after** every change. They are the definition of corr
 ```bash
 conformance/run.sh -j          # positive corpus + negative (expect_fail) + harness self-test. ~2 min.
 conformance/run.sh --shadow    # soundness: ownership-engine agreement + disposition + balance.
-NOVA_ASAN=1 zig build && conformance/run.sh --asan   # use-after-free / double-free gate.
+KYTE_ASAN=1 zig build && conformance/run.sh --asan   # use-after-free / double-free gate.
 zig build test                 # the Zig unit tests.
 ```
 
@@ -39,14 +39,14 @@ on a socket, so a sequential run **hangs forever** on them. `-j` runs each case 
 with a per-case timeout, so it terminates and is the **authoritative** result.
 
 - Need an ASAN signal without the hang? Run the ownership-relevant cases individually under
-  `NOVA_ASAN=1` with your own timeout wrapper, in parallel. A sequential `--asan` over the whole
+  `KYTE_ASAN=1` with your own timeout wrapper, in parallel. A sequential `--asan` over the whole
   corpus is not worth waiting on.
 - A `-j` failure on a genuinely multi-threaded case (`195_multicore_reactors`) can be a load flake on
   a small box. Re-check that one case on its own before believing it.
 
 ### The soundness gate (`--shadow`)
 
-`--shadow` runs every case under `NOVA_SEMA_SHADOW=1` and fails on any `FOUNDATION GATE FAILED`. It
+`--shadow` runs every case under `KYTE_SEMA_SHADOW=1` and fails on any `FOUNDATION GATE FAILED`. It
 bundles three invariants, all of which must stay at zero divergences:
 
 1. **Engine agreement** -- the resolved-TypeId ownership engine agrees with the legacy string-rule
@@ -91,6 +91,6 @@ and update [docs/language-specification.md](docs/language-specification.md) firs
 
 ## Reporting problems
 
-An issue is most actionable with: the `nova version` output, the smallest program that reproduces it,
+An issue is most actionable with: the `kyte version` output, the smallest program that reproduces it,
 the exact command, and the full compiler/runtime output. For a suspected miscompilation, a case that
 fails under `--asan` is the strongest possible report.

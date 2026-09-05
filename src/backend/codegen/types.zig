@@ -2,7 +2,7 @@
 //!
 //! This is the codegen layer's "what IS this type" oracle. Every other codegen
 //! file (`expressions.zig`, `statements.zig`, `arc.zig`, `declarations.zig`)
-//! reaches into here whenever it needs to translate a Nova type into an LLVM
+//! reaches into here whenever it needs to translate a Kyte type into an LLVM
 //! representation, mangle a name into a valid symbol, or answer the single
 //! most consequential question the backend asks: "does this value OWN a heap
 //! allocation, so that a copy must retain it and its last use must release it?"
@@ -14,16 +14,16 @@
 //! The file has four intertwined jobs:
 //!
 //!   1. Name canonicalisation and mangling ([`getStructBaseName`],
-//!      [`mangleTypeName`], [`methodSymbol`], [`qualifySelfType`]). Nova's
+//!      [`mangleTypeName`], [`methodSymbol`], [`qualifySelfType`]). Kyte's
 //!      human-readable type spellings (`List<Map<string, int>>`, `Foo.Bar`,
 //!      `int`) become stable, collision-free LLVM symbol names. The primitive
 //!      aliases are canonicalised first (`int`→`i32`, `long`→`i64`, ...) so that
 //!      two spellings of the same type never mangle to two different symbols.
 //!
 //!   2. The codegen representation of primitives ([`CgRepr`], [`CgPrim`],
-//!      [`cgPrim`], [`reprBitWidth`]) and the mapping from a Nova type to a
+//!      [`cgPrim`], [`reprBitWidth`]) and the mapping from a Kyte type to a
 //!      concrete `LLVMTypeRef` ([`toLLVMType`], [`llvmForRepr`],
-//!      [`slotTypeForLocal`], the SIMD-vector helpers). Most Nova values live
+//!      [`slotTypeForLocal`], the SIMD-vector helpers). Most Kyte values live
 //!      in a uniform 64-bit "val" slot; the exceptions handled here are
 //!      floats/doubles (kept in their FP register), SIMD vectors, and value
 //!      optionals.
@@ -40,7 +40,7 @@
 //!      STRING-name path ([`ownedByName`]) kept as a fallback for the cases the
 //!      typed IR cannot resolve (erased type params without an instantiation,
 //!      un-lowered names). [`tdShadowDiff`] cross-checks the two whenever
-//!      `NOVA_SEMA_SHADOW` reporting is on, and the whole file is part of the
+//!      `KYTE_SEMA_SHADOW` reporting is on, and the whole file is part of the
 //!      long migration off string-based ownership (`irct_*` counters). Sitting
 //!      alongside is the VALUE-STRUCT classifier ([`isValueStructName`],
 //!      [`computeValueEscapeSet`]): a plain `struct` is value-semantic (copied,
@@ -100,7 +100,7 @@ const core = llvm.core;
 /// These functions are logically methods of it, split out by topic.
 const LlvmCompiler = @import("llvm_codegen.zig").LlvmCompiler;
 
-/// Strips a Nova type name down to its bare struct/enum identifier.
+/// Strips a Kyte type name down to its bare struct/enum identifier.
 ///
 /// Drops any module qualifier before the last `.` (`foo.Bar` → `Bar`) and any
 /// generic argument list starting at `<` (`List<int>` → `List`). The result is
@@ -118,7 +118,7 @@ pub fn getStructBaseName(name: []const u8) []const u8 {
     return base;
 }
 
-/// Maps a Nova primitive alias to its canonical LLVM-integer spelling, or null
+/// Maps a Kyte primitive alias to its canonical LLVM-integer spelling, or null
 /// for anything that is not one of the ten aliases.
 ///
 /// This is what makes mangling collision-free across spellings: `int` and `i32`
@@ -145,7 +145,7 @@ fn isTokenChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
 }
 
-/// Turns a Nova type spelling into a valid, collision-free LLVM symbol name.
+/// Turns a Kyte type spelling into a valid, collision-free LLVM symbol name.
 ///
 /// Identifier runs are copied through [`canonicalPrimAlias`] so alias spellings
 /// unify, and the type-syntax punctuation is encoded so distinct types never
@@ -289,7 +289,7 @@ pub const CgPrim = struct { repr: CgRepr, signed: bool };
 
 /// Classifies a type name as a primitive, or null if it is not one.
 ///
-/// Recognises both the Nova alias spellings (`int`, `long`, `byte`, `float`, ...)
+/// Recognises both the Kyte alias spellings (`int`, `long`, `byte`, `float`, ...)
 /// and the explicit-width spellings (`i32`, `u64`, `f64`, ...), plus `bool` (as
 /// `i1`) and `ptr` (as an unsigned `word`). Note the deliberate collapse:
 /// `byte`/`ubyte`/`u8` are all unsigned `i8` while `sbyte`/`i8` are signed
@@ -528,7 +528,7 @@ pub fn castToValType(self: *LlvmCompiler, val: types.LLVMValueRef, type_ref: ast
 /// Converts a uniform `val_type` value back OUT to a concrete LLVM type.
 ///
 /// The inverse of [`castToValType`], driven by the target's LLVM type KIND
-/// rather than a Nova `TypeRef`: to a pointer → int-to-ptr; to a double →
+/// rather than a Kyte `TypeRef`: to a pointer → int-to-ptr; to a double →
 /// bitcast; to a float → bitcast-to-double then FP-truncate; to an integer →
 /// truncate or sign-extend to width, or, for a full 64-bit integer target that
 /// actually holds float/double bits, bitcast (with a float first FP-extended to
@@ -568,7 +568,7 @@ pub fn castFromValType(self: *LlvmCompiler, val: types.LLVMValueRef, target_type
     return val;
 }
 
-/// Renders an `ast.TypeRef` back to its canonical Nova type-name string.
+/// Renders an `ast.TypeRef` back to its canonical Kyte type-name string.
 ///
 /// This is the codegen spelling of a type as it will key mangling, ownership,
 /// and the struct tables. It runs type-param substitution on bare identifiers
@@ -1402,7 +1402,7 @@ pub fn isOwnedErrUnionErr(self: *LlvmCompiler, expr_ptr: *const ast.Expression, 
 ///
 /// When `obj_ptr` resolves to a concrete `.storage` type, defers to
 /// [`isOwnedTypeId`] on its element; otherwise falls back to [`ownedByName`] on
-/// `elem_string`. Storage is Nova's backing container primitive; this decides
+/// `elem_string`. Storage is Kyte's backing container primitive; this decides
 /// whether removing/overwriting an element must release it. See
 /// [`isOwnedStorageElemByName`] for the name-only variant.
 pub fn isOwnedStorageElem(self: *LlvmCompiler, obj_ptr: *const ast.Expression, elem_string: []const u8) bool {
@@ -1859,7 +1859,7 @@ fn isOwnedRenderedFallback(self: *LlvmCompiler, t: typesys.TypeId) bool {
 /// Maps a bare struct name to its module-unique SCOPED name for a given source
 /// file.
 ///
-/// Nova lets same-named structs coexist across modules by giving each a
+/// Kyte lets same-named structs coexist across modules by giving each a
 /// module-unique name; this resolves the visible `name` in `file` to that
 /// unique spelling via the sema symbol table (`scopedNameFor`). Returns `name`
 /// unchanged if there is no live sema or no scoped mapping. Takes `self` only
@@ -2049,7 +2049,7 @@ pub fn symbolName(self: *LlvmCompiler, tid: typesys.TypeId) anyerror![]const u8 
 /// Resolves an unqualified callee name to the actual emitted FUNCTION symbol,
 /// trying each naming scope in priority order.
 ///
-/// Nova method/free-function calls are written unqualified but the emitted
+/// Kyte method/free-function calls are written unqualified but the emitted
 /// symbol may be mangled or prefixed. This tries, and returns the first that
 /// [`hasFunction`] confirms exists: (1) the bare name as-is; (2) the
 /// monomorphised method symbol under the current instantiation

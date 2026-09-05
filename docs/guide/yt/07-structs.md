@@ -2,11 +2,11 @@
 
 - Chapter: [07-structs.md](../07-structs.md)
 - Estimated length: ~10 minutes
-- You will need: Nova installed and on your PATH, a terminal, and the file `examples/13_structs.nova` from the guide.
+- You will need: Kyte installed and on your PATH, a terminal, and the file `examples/13_structs.ky` from the guide.
 
 ## Hook (0:00)
 
-**Say:** So far we have worked with plain values: numbers, strings, lists, and maps. In this video we group related data under one type and give it behaviour. By the end you will be able to write a Nova `struct` with private and public fields, a constructor, instance methods, and a static factory, and you will understand how Nova frees all of it for you automatically. We will build a small bank account type and watch it run.
+**Say:** So far we have worked with plain values: numbers, strings, lists, and maps. In this video we group related data under one type and give it behaviour. By the end you will be able to write a Kyte `struct` with private and public fields, a constructor, instance methods, and a static factory, and you will understand how Kyte frees all of it for you automatically. We will build a small bank account type and watch it run.
 
 ## What we will cover (0:20)
 
@@ -19,10 +19,10 @@
 
 ## Segment: What a struct is (0:45)
 
-**Say:** A `struct` groups named fields under a single type. Some fields you want the outside world to read, and some you want to keep to yourself. In Nova you mark a field `pub` to make it readable from outside the struct. A field with no annotation is private, which means only the struct's own methods can touch it. Let us look at the header of our account type.
+**Say:** A `struct` groups named fields under a single type. Some fields you want the outside world to read, and some you want to keep to yourself. In Kyte you mark a field `pub` to make it readable from outside the struct. A field with no annotation is private, which means only the struct's own methods can touch it. Let us look at the header of our account type.
 
 **On screen:**
-```nova
+```kyte
 struct Account {
     pub owner: string,        // pub fields are readable from outside
     balance: int,             // no `pub` -> private to the struct's methods
@@ -32,10 +32,10 @@ struct Account {
 
 ## Segment: The init constructor (2:00)
 
-**Say:** Next we need a way to build an account. In Nova the constructor is written with `init`, and notice there is no `fn` keyword in front of it. The job of `init` is to assign every field through `self`.
+**Say:** Next we need a way to build an account. In Kyte the constructor is written with `init`, and notice there is no `fn` keyword in front of it. The job of `init` is to assign every field through `self`.
 
 **On screen:**
-```nova
+```kyte
     init(owner: string, opening: int) {
         self.owner = owner;
         self.balance = opening;
@@ -49,7 +49,7 @@ struct Account {
 **Say:** Sometimes you want a named way to build a common case. A static method, also called an associated method, has no `self` parameter, and you call it on the type itself as `Account.something`. Here is a factory that makes a fresh account with a zero opening balance.
 
 **On screen:**
-```nova
+```kyte
     // Static factory: no `self`, called as `Account.newAccount(...)`.
     pub fn newAccount(owner: string): Account {
         return Account(owner, 0);
@@ -63,7 +63,7 @@ struct Account {
 **Say:** Now the real behaviour. Instance methods take `self: Account` as their first parameter. That `self` is the particular account you are calling the method on. Here are deposit and withdraw.
 
 **On screen:**
-```nova
+```kyte
     // Instance methods take `self: Account` first.
     pub fn deposit(self: Account, amount: int): void {
         self.balance = self.balance + amount;
@@ -88,7 +88,7 @@ struct Account {
 **Say:** Let us put it to work in `main`. There are two ways to construct a struct. The first is to call the constructor directly, which runs `init`.
 
 **On screen:**
-```nova
+```kyte
 fn main(): void {
     // Construct via the init constructor.
     let a = Account("Ada", 100);
@@ -109,7 +109,7 @@ fn main(): void {
 **Say:** Now the second half of `main` shows the static factory and reading a public field directly.
 
 **On screen:**
-```nova
+```kyte
     // Static factory -> a fresh account with a zero opening balance.
     let b = Account.newAccount("Bob");
     console.log(b.statement());
@@ -123,7 +123,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/13_structs.nova -o out && ./out
+kyte examples/13_structs.ky -o out && ./out
 ```
 
 ```
@@ -139,7 +139,7 @@ owner of b = Bob
 
 ## Segment: Memory, the easy part (8:30)
 
-**Say:** One thing worth calling out. Nova is ARC managed, which stands for automatic reference counting. A struct and everything it owns is freed for you, deterministically, when its last owner goes away. There is no `free` to call and there is no garbage collector pausing your program. You write the logic, Nova cleans up.
+**Say:** One thing worth calling out. Kyte is ARC managed, which stands for automatic reference counting. A struct and everything it owns is freed for you, deterministically, when its last owner goes away. There is no `free` to call and there is no garbage collector pausing your program. You write the logic, Kyte cleans up.
 
 ## Segment: The two ways to build, recapped (9:00)
 
@@ -157,4 +157,4 @@ owner of b = Bob
 
 ## Outro (10:00)
 
-**Say:** Next up we look at enums, Nova's tagged unions, where a value is exactly one of a fixed set of variants and can even carry a payload. If this helped, a like and subscribe keeps these coming. See you in the next one.
+**Say:** Next up we look at enums, Kyte's tagged unions, where a value is exactly one of a fixed set of variants and can even carry a payload. If this helped, a like and subscribe keeps these coming. See you in the next one.

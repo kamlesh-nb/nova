@@ -1,0 +1,109 @@
+//! AES in CTR (counter) mode.
+//!
+//! This file turns the raw AES block cipher (see [`aes.Aes`]) into a stream
+//! cipher. In CTR mode the cipher never touches the plaintext directly. Instead
+//! it encrypts a running 128-bit counter block to produce a pseudo-random
+//! keystream, and the keystream is XORed byte for byte with the data. Because
+//! XOR is its own inverse, the SAME routine both encrypts and decrypts: feed it
+//! ciphertext and you get plaintext back. That is why there is a single
+//! [`crypt`] entry point rather than separate encrypt and decrypt functions.
+//!
+//! CTR is the mode Kyte's higher-level constructions build on, most notably
+//! AES-GCM, where CTR provides the confidentiality layer and a separate GHASH
+//! pass provides authentication. On its own CTR gives NO integrity: an attacker
+//! who flips a ciphertext bit flips exactly the matching plaintext bit, and no
+//! error surfaces. Callers who need tamper detection must layer a MAC on top,
+//! which is precisely what the AEAD wrappers do.
+//!
+//! The one invariant a caller MUST uphold is nonce/counter uniqueness. A given
+//! (key, starting counter) pair must never be reused for two different
+//! messages: reuse produces the same keystream twice, and XORing two
+//! ciphertexts made with the same keystream cancels the keystream and leaks the
+//! XOR of the two plaintexts. The counter is treated here as a full 128-bit
+//! big-endian integer (see [`incFull`]), so a caller that seeds the low bytes
+//! with a message counter and the high bytes with a nonce gets a very large
+//! non-repeating sequence per key.
+//!
+//! The implementation works block by block over 16-byte units, generating one
+//! keystream block per counter value and consuming a partial final block
+//! without padding, so the ciphertext length always equals the plaintext
+//! length. All buffers are raw `ptr`s into byte memory, addressed through the
+//! [`bytes`] helpers.
+
+import bytes;
+import crypto.cipher.aes;
+
+/// Size in bytes of one AES block, and therefore of one CTR keystream block and
+/// the counter itself. AES is a 128-bit block cipher, so this is fixed at 16
+/// regardless of key length (128, 192, or 256-bit keys all use 16-byte blocks).
+pub const AES_CTR_BLOCK_LEN: int = 16;
+
+/// Increments the 16-byte counter block in place as a big-endian 128-bit
+/// integer, wrapping on overflow.
+///
+/// The counter is stored most-significant byte first, so incrementing starts at
+/// the last byte (index 15) and carries leftwards towards index 0. Each byte is
+/// masked back to 8 bits with `& 0xff` and the carry (`v >> 8`) is propagated to
+/// the next byte up. Once every byte has been all-ones the carry falls off the
+/// front and the counter wraps to zero, matching standard CTR arithmetic over
+/// the full block width. Called once per encrypted block by [`crypt`] to advance
+/// to the next keystream value.
+fn incFull(ctr: ptr): void {
+    let i = 15;
+    let carry = 1;
+    while (i >= 0) {
+        let v = bytes.read_byte(ctr, i) + carry;
+        bytes.write_byte(ctr, i, v & 0xff);
+        carry = v >> 8;
+        i = i - 1;
+    }
+}
+
+/// Encrypts or decrypts `len` bytes under AES-CTR, writing the result to `out`.
+///
+/// Because CTR is a stream cipher, this one function serves both directions:
+/// applying it to plaintext yields ciphertext, and applying it again with the
+/// same `key` and starting `counter` recovers the plaintext. `out` may point at
+/// the same buffer as `dataIn` for in-place operation.
+///
+/// Parameters:
+///   - `key` / `keyLen`: the AES key bytes and their length, forwarded straight
+///     to [`aes.Aes.create`] (16, 24, or 32 bytes for AES-128/192/256).
+///   - `counter`: the initial 16-byte counter block. It is COPIED into a local
+///     working buffer, so the caller's block is left untouched and can be reused
+///     across calls.
+///   - `dataIn` / `len`: the input bytes and their count. `len` need not be a
+///     multiple of [`AES_CTR_BLOCK_LEN`]; the final partial block is handled.
+///   - `out`: destination buffer, which must have room for `len` bytes.
+///
+/// For each 16-byte window it encrypts the current counter into a keystream
+/// block `ks`, XORs `min(16, remaining)` keystream bytes into the output, then
+/// advances the counter with [`incFull`]. The AES context and the two scratch
+/// buffers (`ctr`, `ks`) are freed before returning, so this leaves no heap
+/// allocations behind.
+///
+/// Caller obligations: the (key, counter) pair must be unique per message, since
+/// keystream reuse is catastrophic (see the file header). CTR provides no
+/// authentication, so use an AEAD construction when tamper detection is needed.
+pub fn crypt(key: ptr, keyLen: int, counter: ptr, dataIn: ptr, len: int, out: ptr): void {
+    let ctx = aes.Aes.create(key, keyLen);
+    let ctr = bytes.alloc(16);
+    let i = 0;
+    while (i < 16) { bytes.write_byte(ctr, i, bytes.read_byte(counter, i)); i = i + 1; }
+    let ks = bytes.alloc(16);
+    let done = 0;
+    while (done < len) {
+        ctx.encryptBlock(ctr, ks);
+        let n = if (len - done < 16) (len - done) else 16;
+        let k = 0;
+        while (k < n) {
+            bytes.write_byte(out, done + k, bytes.read_byte(dataIn, done + k) ^ bytes.read_byte(ks, k));
+            k = k + 1;
+        }
+        incFull(ctr);
+        done = done + n;
+    }
+    ctx.delete();
+    bytes.free(ctr);
+    bytes.free(ks);
+}

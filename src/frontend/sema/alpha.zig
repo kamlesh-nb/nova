@@ -1,6 +1,6 @@
 //! Alpha-renaming (alpha-conversion) pass over the parsed AST.
 //!
-//! Nova lets an inner `let` shadow an outer name that is still in scope
+//! Kyte lets an inner `let` shadow an outer name that is still in scope
 //! (`let x = 1; { let x = x + 1; ... }`). The source reads correctly under
 //! lexical scoping, but the codegen backend lowers every local in a function
 //! into ONE flat namespace keyed by identifier text. Two distinct variables

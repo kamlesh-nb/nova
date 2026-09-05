@@ -10,7 +10,7 @@ Last updated: 2026-08-08.
 ## 0. The one-paragraph honest state
 
 The hard infrastructure is **built and validated**, which is the opposite of "unstarted". The checker/sema
-already emit a `TypeId` per expression; a shadow harness (`NOVA_SEMA_SHADOW=1`) runs the typed-IR path and
+already emit a `TypeId` per expression; a shadow harness (`KYTE_SEMA_SHADOW=1`) runs the typed-IR path and
 the legacy string path side by side on every compile and counts where they agree or disagree. On a
 representative program the typed path agrees with the string path on **6723 type resolutions with 0
 disagreements**, ownership drop/move on **172 agree / 4 disagree**, disposition on **6957 agree / 8
@@ -22,7 +22,7 @@ the string path, and (d) build the gen→compile→ASAN→oracle fuzzer that `fu
 ## 1. How to read the progress gauge (re-run this to update the table)
 
 ```
-NOVA_SEMA_SHADOW=1 nova test conformance/cases/123_any_container.nova 2>&1 \
+KYTE_SEMA_SHADOW=1 kyte test conformance/cases/123_any_container.ky 2>&1 \
   | grep -iE "agree|disagree|served|fellback|NOT-CONCRETE|dtor_name|tuple_elem|no-id|flip"
 ```
 
@@ -39,7 +39,7 @@ Status legend: ✅ done · 🟢 built+validated (shadow agrees, not yet cut over
 | # | Workstream | Status | Evidence / measure | Remaining |
 |---|---|---|---|---|
 | W1 | Sema emits a `TypeId` per expression (TypedIr) | ✅ | TypedIr SymbolId resolve **62 agree / 0 disagree**; `typeOf`/`typeOfInst`/`symOf`/`methodArgsOf`/`opOf` all live | — |
-| W2 | Shadow validation harness (typed vs string, per compile) | ✅ | `NOVA_SEMA_SHADOW=1` report with agree/disagree counters across ~10 dimensions | keep green as sites flip |
+| W2 | Shadow validation harness (typed vs string, per compile) | ✅ | `KYTE_SEMA_SHADOW=1` report with agree/disagree counters across ~10 dimensions | keep green as sites flip |
 | W3 | F2 type engine serves resolved types | 🟢 | **6723 agree / 0 disagree**; 36 NOT-CONCRETE (keystone cannot substitute; all `struct_`) | the 36 not-concrete (see W7) |
 | W4 | Ownership pass: dup/drop ops + balance (tasks F2-6 s5 s2/s3) | ✅ | op drop/move **172 agree / 4 disagree (struct_)**; release-site flip **255 store-native** | reconcile the 4 struct_ op-disagreements |
 | W5 | Disposition (owned/borrowed) from store | 🟢 | **6957 agree / 8 disagree, ALL safe-direction** (7 `.not_owned`, checker under-claims, never over-claims; ASAN-clean) | reclassify the 8 as known-safe, then flip |

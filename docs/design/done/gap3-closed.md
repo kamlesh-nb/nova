@@ -1,6 +1,6 @@
 # Gap 3 (optimiser / ARC-semantic perf) — CLOSED (2026-08-16)
 
-Final decision of record. Gap 3 was "the optimiser": build an in-house IR + passes to make Nova faster than
+Final decision of record. Gap 3 was "the optimiser": build an in-house IR + passes to make Kyte faster than
 what LLVM alone produces. It is **closed as resolved** — not deferred — on the strength of two independent
 measurements. Do not reopen an in-house optimiser without a measured perf delta over AST+LLVM-O3.
 
@@ -18,20 +18,20 @@ is closed separately by the shipped ownership verifier (`ossa-lite-tasks.md`, ga
    one non-redundant pass (arc_elision) fired 0/44. Net realized optimisation = 0.
 2. **The only thing LLVM cannot do is ARC-semantic optimisation** — eliding retain/release LLVM must treat
    as opaque. Two independent measurements both found ~0 headroom for it:
-   - **E2 — LLVM level** (`arc.zig` census, `NOVA_ARC_CENSUS`): borrow-skip candidates = **0** intra-block
-     AND **0** function-scope, across the whole stdlib. Nova's ARC traffic is genuine ownership
+   - **E2 — LLVM level** (`arc.zig` census, `KYTE_ARC_CENSUS`): borrow-skip candidates = **0** intra-block
+     AND **0** function-scope, across the whole stdlib. Kyte's ARC traffic is genuine ownership
      (retain-as-dup → store into an owned slot → scope-end release, value live between), not redundant
      borrow pairs.
-   - **Track A — OSSA level** (`ossa/forward.zig`, `NOVA_OSSA`): owned-dup redundant copies = **0**,
-     forwardable = **0**, across the corpus. Real Nova code does not create redundant owned aliases.
+   - **Track A — OSSA level** (`ossa/forward.zig`, `KYTE_OSSA`): owned-dup redundant copies = **0**,
+     forwardable = **0**, across the corpus. Real Kyte code does not create redundant owned aliases.
    Re-verified fresh 2026-08-16 on `13_serde` (7929 ARC calls): current elision removes 0% of traffic;
    borrow-skip 0/0; forwarding 0/0.
 
 ## Why this is a real close, not a punt
-Nova's ARC cost is the FUNDAMENTAL per-object retain/release of genuinely-owned values — the callee needs
+Kyte's ARC cost is the FUNDAMENTAL per-object retain/release of genuinely-owned values — the callee needs
 its own +1 when it stores, the returned value carries its +1 to the caller. An ARC optimiser cannot remove
 that; forwarding/borrow-skip only remove REDUNDANT refcount traffic, of which there is essentially none.
-LLVM O3 already gives Nova competitive scalar/loop/vectorized codegen (it beats Rust axum and Go net/http
+LLVM O3 already gives Kyte competitive scalar/loop/vectorized codegen (it beats Rust axum and Go net/http
 per-core on some benches — see CLAUDE.md throughput tables). So the optimiser was the wrong lever, and there
 is no in-house ARC optimisation worth building.
 
@@ -42,8 +42,8 @@ pass on any IR. That is Gap 5 in `remaining-gaps-design.md`, gated on a measured
 already regressed 28% and was rolled back). It is intentionally NOT part of Gap 3's closure.
 
 ## Verify (reproduce the close)
-- `NOVA_ARC_CENSUS=1 nova test conformance/cases/13_serde.nova` → borrow-skip candidates 0/0.
-- `NOVA_OSSA=1 nova test conformance/cases/13_serde.nova` → owned-dup copies 0, forwardable 0.
+- `KYTE_ARC_CENSUS=1 kyte test conformance/cases/13_serde.ky` → borrow-skip candidates 0/0.
+- `KYTE_OSSA=1 kyte test conformance/cases/13_serde.ky` → owned-dup copies 0, forwardable 0.
 - `grep -n 'passes.*is_release' src/backend/codegen/declarations.zig` → `default<O3>,globaldce` in release.
 - Scrapped optimiser preserved at `discards/optimiser-2026-08-16/`; rationale in
   `docs/design/sil-arc-optimiser-direction.md`.

@@ -6,25 +6,25 @@ the per-coroutine-strand pooling limit *structurally* (a connection lives on one
 freely reused by any coroutine on that reactor) and removes three global mutexes.
 
 See `network-io-stack-tradeoff.md` for why this over a from-scratch loop. Reactor count is **cores − 1**
-(leave one core for the OS / accept bookkeeping / the block-drive caller); `NOVA_THREADS` overrides.
+(leave one core for the OS / accept bookkeeping / the block-drive caller); `KYTE_THREADS` overrides.
 
 ---
 
 ## Current state (verified, `src/runtime/concurrency.cpp`)
 
-- One global `g_io` (`io_context`); `nova_run()` runs it on N threads (work-stealing). Coroutines
+- One global `g_io` (`io_context`); `kyte_run()` runs it on N threads (work-stealing). Coroutines
   **migrate** threads across suspends.
 - Because of migration, the coroutine bookkeeping is **shared and mutex-guarded**: `g_corostates`
   (+`g_corostates_mu`), `g_waiters` (+`g_waiters_mu`), `g_heldargs` (+`g_heldargs_mu`), plus a per-
   `CoroState` mutex. Every schedule/lookup takes a global lock.
 - Thread-safety within a coroutine's ops comes from `CoroState.strand = make_strand(g_io)` — one strand
   per coroutine = per socket. **This is the reuse limiter.**
-- `nova_thread_id()` = worker index (0 = main, 1..N−1 pool); Nova's per-thread lock-free pools key off it.
+- `kyte_thread_id()` = worker index (0 = main, 1..N−1 pool); Kyte's per-thread lock-free pools key off it.
 
 ## Target state
 
 - N reactors, each `{io_context io; std::thread; int id;}`, one pinned thread each, **N = max(1,
-  hardware_concurrency() − 1)** (cap 16; `NOVA_THREADS` overrides).
+  hardware_concurrency() − 1)** (cap 16; `KYTE_THREADS` overrides).
 - A coroutine is **assigned to one reactor at creation and never migrates**. All its resumes, socket ops,
   and timers post to *its* reactor's executor.
 - Because each reactor is single-threaded, **strands are unnecessary** — the io_context's own executor
@@ -34,10 +34,10 @@ See `network-io-stack-tradeoff.md` for why this over a from-scratch loop. Reacto
   reactor thread).
 - Accept fan-out via **`SO_REUSEPORT`**: each reactor binds its own listener on the server port; the
   kernel load-balances new connections; an accepted connection stays on the reactor that accepted it.
-- Connection pools stay per-reactor lock-free (already keyed by `nova_thread_id()` = reactor id) → the
+- Connection pools stay per-reactor lock-free (already keyed by `kyte_thread_id()` = reactor id) → the
   proxy reuse gate is **lifted** (`Backend.reuse = true` always).
 
-`NOVA_THREADS=1` ⇒ exactly one reactor ⇒ **behaviorally identical to today** → the built-in rollback.
+`KYTE_THREADS=1` ⇒ exactly one reactor ⇒ **behaviorally identical to today** → the built-in rollback.
 
 ---
 
@@ -54,7 +54,7 @@ io_context and the strand is what serializes each coroutine's ops across those t
 reactors are single-threaded (P3) would race. So P1 only adds the *affinity*, and routes the strand
 **through the reactor**:
 - `thread_local int g_reactor_id` (the reactor the current worker serves; 0 in P0/P1; per-reactor in P3).
-  Distinct from `g_nova_tid` (thread index) — they coincide only in P3 (one thread per reactor).
+  Distinct from `g_kyte_tid` (thread index) — they coincide only in P3 (one thread per reactor).
 - `CoroState` gains `int reactor_id = g_reactor_id` (captured at creation, never changed); the strand is
   built from `g_reactors[reactor_id]->io` instead of `g_io` — identical while there is one reactor.
 - `spawn`'s child CoroState is created on the parent's thread, so it **inherits the parent's reactor**
@@ -68,7 +68,7 @@ reactors are single-threaded (P3) would race. So P1 only adds the *affinity*, an
 ### P2 — Contention relief via LOCK STRIPING (not thread_local) ✅
 DECISION (user, 2026-07-27): the scoped "thread_local + delete mutexes" was assessed HIGH-RISK and
 UNVERIFIABLE by our tools — the mutexes guard documented races the code says "vanish under
-NOVA_THREADS=1 and under ASAN" (ASAN catches memory errors, NOT races — that's TSAN), and making the
+KYTE_THREADS=1 and under ASAN" (ASAN catches memory errors, NOT races — that's TSAN), and making the
 maps thread_local would need every state touched by exactly one reactor thread, which is FALSE across
 the fan-out spawn / cross-reactor wakeups (would cascade into a bootstrap-post + timer-routing rewrite).
 Chose the VERIFIABLE variant instead: **hash-stripe** the maps into NSTRIPES=64 independent {mutex, map}
@@ -78,12 +78,12 @@ mutex-protected; the load-bearing lock-ordering stripe-mutex→state->mu is pres
 map `g_corostates` (every schedule) + `g_heldargs`; left `g_waiters` on its single mutex (select/whenAny
 arm+disarm a SET of handles under ONE lock — striping would break that atomicity; also cold). The
 `StripedMap` template lives in an `extern "C++"` block (the TU is `extern "C"`; templates need C++
-linkage). **Proven:** native 177/177, ASAN 324/324, live fan-out server 30/30 at NOVA_THREADS=6.
+linkage). **Proven:** native 177/177, ASAN 324/324, live fan-out server 30/30 at KYTE_THREADS=6.
 
 ### P3 — Multi-reactor drive: N = cores − 1 ✅
-- `nova_run()` starts N reactors, each `io.run()` on its pinned thread (`g_nova_tid = reactor id`); the
-  main thread drives reactor 0 (or joins). `nova_worker_count()` = N.
-- Block-drive (`nova_run` for the sync→async boundary) drives all N until drained.
+- `kyte_run()` starts N reactors, each `io.run()` on its pinned thread (`g_kyte_tid = reactor id`); the
+  main thread drives reactor 0 (or joins). `kyte_worker_count()` = N.
+- Block-drive (`kyte_run` for the sync→async boundary) drives all N until drained.
 - **Prove:** the async runtime gate (multi-core 8-task parallelism) still speeds up; gates 113/114/115
   green across reactors; ASAN clean. Benchmark note: **separate hosts** — single-box proxy+backends+load
   is too noisy (run-to-run 77↔3700 rps observed).
@@ -93,16 +93,16 @@ linkage). **Proven:** native 177/177, ASAN 324/324, live fan-out server 30/30 at
 resolver constructed on the owning coroutine's reactor io_context (not global g_io). Identical at
 reactor 0. Native 177/177, ASAN 324/324.
 
-**P4c** (this): the accept fan-out, isolated from the transient scheduler (option 3 — nova_run UNTOUCHED).
-- `spawnOn` = a thread-local one-shot pin: `nova_pin_next_coro(rid)` (asyncio.pinNextCoro) stamps the next
+**P4c** (this): the accept fan-out, isolated from the transient scheduler (option 3 — kyte_run UNTOUCHED).
+- `spawnOn` = a thread-local one-shot pin: `kyte_pin_next_coro(rid)` (asyncio.pinNextCoro) stamps the next
   spawned coroutine's reactor in its lazily-created CoroState. No codegen change, no new spawn form.
-- Persistence WITHOUT touching nova_run: `nova_hold_all_reactors` (asyncio.holdReactors) installs a leaked
+- Persistence WITHOUT touching kyte_run: `kyte_hold_all_reactors` (asyncio.holdReactors) installs a leaked
   work_guard per reactor so each reactor's run() blocks instead of returning on idle. `App.run` calls it
-  BEFORE the block-drive, so when nova_run starts the N reactor threads they all persist (no empty-reactor
+  BEFORE the block-drive, so when kyte_run starts the N reactor threads they all persist (no empty-reactor
   early-exit race), then the (async, so it can `spawn`) `runServer` fans out one accept loop per reactor
   (pinNextCoro + spawn for reactors 1..N-1; reactor 0's loop inline). The block-drive never returns.
 - **KEY INSIGHT that made option-3 clean:** `spawn` is checker-gated to async fns, so the launcher stays
-  async + block-driven; persistence is external state (guards), so the transient nova_run and all 177
+  async + block-driven; persistence is external state (guards), so the transient kyte_run and all 177
   gates + 324 ASAN are untouched.
 - **Proven functional (live, macOS):** the fan-out server binds per-reactor SO_REUSEPORT acceptors,
   accepts, and responds correctly; native 177/177 (transient path + gates unchanged).
@@ -113,14 +113,14 @@ reactor 0. Native 177/177, ASAN 324/324.
   observing multi-core distribution requires Linux (verify via Docker/colima).
   **VERIFIED on Linux (Docker, gcc:13):** a minimal N=7 SO_REUSEPORT listener test (mirroring the
   fan-out) load-balanced 60 connections evenly across ALL 7 listeners (12/10/10/9/7/6/6) — the exact
-  kernel behavior the per-reactor accept fan-out relies on. Combined with nova's functional
+  kernel behavior the per-reactor accept fan-out relies on. Combined with kyte's functional
   correctness on macOS, P4c delivers multi-core connection distribution on the Linux deploy target.
   This is the "verification
   reality" caveat — the multi-core proof is Linux-only, unlike the ASAN/gate proofs.
 
 ### P5 — Lift the pooling reuse gate ✅
-- `src/std/net/proxy.nova`: `Backend.reuse = true` unconditionally (per-reactor pools are single-threaded);
-  remove the `nova_worker_count() == 1` guard. Add a gate: multi-reactor keep-alive reuse across requests
+- `src/std/net/proxy.ky`: `Backend.reuse = true` unconditionally (per-reactor pools are single-threaded);
+  remove the `kyte_worker_count() == 1` guard. Add a gate: multi-reactor keep-alive reuse across requests
   on the same reactor (round-robin A,B,A with reuse, N>1). This is the payoff — multi-core pooled proxy.
 
 ### P6 — Cross-reactor primitives (only what breaks)
@@ -144,7 +144,7 @@ reactor 0. Native 177/177, ASAN 324/324.
 | benchmark noise hides regressions/wins | P3/P5 | separate hosts; fixed core pinning; report per-reactor throughput |
 
 ## Rollback
-`NOVA_THREADS=1` → one reactor → today's behavior exactly. Every phase preserves this, so a regression at
+`KYTE_THREADS=1` → one reactor → today's behavior exactly. Every phase preserves this, so a regression at
 any phase is bisectable and single-reactor stays a safe fallback.
 
 ## Out of scope (Path B territory, do NOT pull in here)
@@ -153,6 +153,6 @@ The executor-agnostic TLS+timer refactor (the enabler for a future io_uring back
 threading but the reactor swap itself is a separate project.
 
 ## First concrete step
-P0 + P1 together behind `NOVA_THREADS=1` (no observable change), landing the `Reactor` struct, the
+P0 + P1 together behind `KYTE_THREADS=1` (no observable change), landing the `Reactor` struct, the
 `g_io → g_reactors[0].io` substitution, `CoroState.reactor_id`, and strand→reactor-executor — the
 mechanical spine, fully gated identical, before any multi-reactor semantics.

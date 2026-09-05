@@ -1,6 +1,6 @@
 # 13. Ownership & memory
 
-Nova has **no garbage collector and no manual `free`**. Memory is managed by deterministic **ARC**
+Kyte has **no garbage collector and no manual `free`**. Memory is managed by deterministic **ARC**
 (automatic reference counting): every heap object carries a reference count, and it is freed the instant
 its last owner goes away. Cleanup is predictable: it happens at a known point in the program, not
 whenever a collector decides to run, and you never write a `free` call yourself.
@@ -22,9 +22,9 @@ The example below builds a struct that owns a `List<string>`, returns it from a 
 transfers to the caller), uses it, and lets it drop at the end of `main`, all memory-safe, with zero
 manual management.
 
-```nova
-// examples/19_ownership.nova
-// Nova manages memory with deterministic ARC (automatic reference counting):
+```kyte
+// examples/19_ownership.ky
+// Kyte manages memory with deterministic ARC (automatic reference counting):
 // no garbage collector, no manual free. You never call `free`.
 //
 //   * Value types (int, long, float, bool, struct, tuple) are copied, not tracked.
@@ -115,7 +115,7 @@ memory safety of a managed language with the determinism of manual management, a
 either.
 
 One honest limit to know: reference counting does not reclaim a **cycle** of strong references (A owns B
-and B owns A), and Nova has no `weak` reference to break one for you, so such a cycle leaks. Keep
+and B owns A), and Kyte has no `weak` reference to break one for you, so such a cycle leaks. Keep
 ownership a one-way tree and, where a child must refer back to its parent, hold it by an id or index
 rather than a second strong reference. The mechanism, and why this is the one case ARC cannot handle, is
 in [Chapter 21](21-architecture.md#reference-cycles).

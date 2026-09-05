@@ -1,0 +1,12 @@
+import assert;
+import io.file;
+
+fn main(): int {
+    let path = "kyte_ci_fileio.txt";
+    file.File.writeText(path, "hello-from-kyte");
+    assert.isTrue(file.File.exists(path));
+    let got = file.File.readText(path);
+    assert.equalStr(got, "hello-from-kyte");
+    console.log("t02_fileio ok");
+    return 0;
+}

@@ -1,4 +1,4 @@
-# Head-to-head: Nova vs Go vs Rust vs C#
+# Head-to-head: Kyte vs Go vs Rust vs C#
 
 A same-box, same-load comparison of end-to-end HTTP throughput. Each peer is a minimal
 server that answers `GET /` with the **same constant JSON body**
@@ -13,7 +13,7 @@ NOT rps), these ARE real requests over TCP, measured with a load generator.
 
 | Dir | Stack | Notes |
 |-----|-------|-------|
-| `nova/` | `web.App` | The real framework the flagship uses: typed mediator routing, per-request `ValueSource`, trait dispatch. |
+| `kyte/` | `web.App` | The real framework the flagship uses: typed mediator routing, per-request `ValueSource`, trait dispatch. |
 | `go/` | `net/http` | The standard library server. |
 | `rust/` | `axum` + `tokio` | The idiomatic async web stack. Release build: LTO, 1 codegen unit, panic=abort. |
 | `csharp/` | ASP.NET Core minimal API on Kestrel | `Results.Content` (constant string, no serializer). |
@@ -31,19 +31,19 @@ example, Rust with no crates.io access) are skipped, not fatal. `oha` is require
 
 ## Results after the self-hosted reactor (2026-07-29, Apple Silicon, 8 cores, 15s @ 64 connections)
 
-With the async runtime moved off Boost.Asio onto the Nova reactor (see
+With the async runtime moved off Boost.Asio onto the Kyte reactor (see
 `../../../docs/design/cpp-runtime-retirement-plan.md`, M0 to M4). Two things changed: `web.App`
 now serves on the reactor, and there is a raw-reactor path that runs the real request pipeline
 without the framework abstraction.
 
 | Stack | Requests/sec | Success | Note |
 |-------|-------------:|--------:|------|
-| **Nova raw reactor + flagship pipeline** (one core) | **164,196** | 100% | zero-copy parse + serde bind + validate + render, no `web.App` |
+| **Kyte raw reactor + flagship pipeline** (one core) | **164,196** | 100% | zero-copy parse + serde bind + validate + render, no `web.App` |
 | Rust (axum) | 134,755 | 100% | 8 cores |
 | C# (ASP.NET minimal API on Kestrel) | 124,554 | 100% | 8 cores |
 | Go (net/http) | 121,743 | 100% | 8 cores |
-| **Nova (`web.App`, reactor)** | **69,404** | 100% | the framework, now on the reactor |
-| Nova (`web.App`, Asio, retired) | 55,409 | 100% | the previous baseline |
+| **Kyte (`web.App`, reactor)** | **69,404** | 100% | the framework, now on the reactor |
+| Kyte (`web.App`, Asio, retired) | 55,409 | 100% | the previous baseline |
 
 Two readings, both true:
 
@@ -66,17 +66,17 @@ load-gen machine would show higher multi-core throughput; these are conservative
 
 ### Results before the reactor (optimization pass 1)
 
-| Language (stack) | Requests/sec | Nova as fraction |
+| Language (stack) | Requests/sec | Kyte as fraction |
 |------------------|-------------:|-----------------:|
 | Rust (axum) | 134,755 | 0.41x |
 | C# (ASP.NET minimal API) | 124,554 | 0.44x |
 | Go (net/http) | 121,743 | 0.46x |
-| **Nova (web.App, Asio)** | **55,409** | 1.00x |
+| **Kyte (web.App, Asio)** | **55,409** | 1.00x |
 
-Nova was roughly 2.2x to 2.4x behind the tuned frameworks on the Asio `web.App`, down from 2.5x to
+Kyte was roughly 2.2x to 2.4x behind the tuned frameworks on the Asio `web.App`, down from 2.5x to
 2.9x after pass 1.
 
-### Optimization pass 1 (measured, +14 percent for Nova)
+### Optimization pass 1 (measured, +14 percent for Kyte)
 
 Guided by the profile in `../PROFILE.md`, two low-risk changes:
 
@@ -84,32 +84,32 @@ Guided by the profile in `../PROFILE.md`, two low-risk changes:
    function-local `static` (`audit_enabled()` / `dump_enabled()`), which compiles to a
    thread-safe-static guard check on every alloc and free and also blocks inlining. Changed
    to a load-once global, so the disabled path folds away and the hooks inline. (The audit
-   feature still works when `NOVA_ARC_AUDIT` is set.)
+   feature still works when `KYTE_ARC_AUDIT` is set.)
 2. **Framework: less eager per-request allocation.** `Request.fromString` built three
    `Map<string,string>` hash maps (query, headers, cookies) at capacity 16 on every
    request, even when unused. Query and cookies (usually empty) now start at capacity 1 to
    4, headers at 8; the maps still auto-resize, so behaviour is unchanged.
 
-Nova went from 48,737 to 55,409 rps at c=64 (reproduced twice). Native corpus 180/180 and
+Kyte went from 48,737 to 55,409 rps at c=64 (reproduced twice). Native corpus 180/180 and
 ASAN 329/329 remained green. This is a first pass; the larger levers (a per-reactor
 lockless CoroState, full per-request arena, and syscall batching) are still open, per
 `../PROFILE.md`.
 
 ### Earlier baseline (before pass 1)
 
-| Rust | Go | C# | Nova |
+| Rust | Go | C# | Kyte |
 |-----:|---:|---:|-----:|
 | 143,120 | 121,954 | 120,107 | 48,737 |
 
 ## Honest reading
 
-Nova serves this workload at roughly **one third** of the tuned frameworks: about 2.5x
+Kyte serves this workload at roughly **one third** of the tuned frameworks: about 2.5x
 behind Go and C#, and about 2.9x behind Rust. That is the real end-to-end story today, and
 it is worth stating plainly rather than leaning on the flattering compute-core number.
 
 Two things to keep separate:
 
-1. **This is not a codegen gap.** Nova compiles through LLVM, the same backend as Rust and
+1. **This is not a codegen gap.** Kyte compiles through LLVM, the same backend as Rust and
    Clang, and the `compute_core` bench shows the per-request CPU work is already in the
    native tier (about 1.95 microseconds for parse plus render). The throughput gap is in
    everything around that: the socket and HTTP machinery, the coroutine scheduling, and
@@ -117,12 +117,12 @@ Two things to keep separate:
 
 2. **Framework versus framework, and the frameworks are not equal in maturity.** Go's
    `net/http`, Rust's `axum`, and Kestrel have each had years of profiling and zero-copy,
-   zero-allocation tuning on the hot path. Nova's `web.App` is young, and it does real
+   zero-allocation tuning on the hot path. Kyte's `web.App` is young, and it does real
    per-request work here (typed mediator dispatch, a `ValueSource`, trait-object dispatch)
    that a bare `net/http` handler does not. Part of the gap is the HTTP and I/O stack; part
    is the framework doing more per request.
 
-So the placement is: **Nova's language and codegen belong in the Rust/Go/C# tier, but its
+So the placement is: **Kyte's language and codegen belong in the Rust/Go/C# tier, but its
 web stack does not yet deliver that tier's throughput.** Closing the gap is engineering on
 the runtime and framework hot path (zero-copy request parsing, fewer per-request
 allocations, cheaper dispatch), not a change of compiler or memory model. The headroom is
@@ -130,7 +130,7 @@ real and identifiable, which is the useful outcome of measuring instead of estim
 
 ## Reconciling with the earlier "~108k rps" figure
 
-An earlier note recorded the Nova web framework at ~108k rps (2.25x a same-machine Zig
+An earlier note recorded the Kyte web framework at ~108k rps (2.25x a same-machine Zig
 baseline). That is **not** the same measurement as the 48.7k here, and the difference is
 methodology, not a regression:
 
@@ -163,5 +163,5 @@ pipelined-throughput ceiling versus realistic per-request throughput.
   submission. Absolute numbers move with hardware, connection count, and payload.
 - None of the peers is tuned; each is the straightforward minimal server. That is fair, but
   it means the ceiling for every language here is higher than shown.
-- Nova was built with `--release` (`-O3`); Go with `go build`; Rust with
+- Kyte was built with `--release` (`-O3`); Go with `go build`; Rust with
   `cargo build --release` (LTO); C# with `dotnet publish -c Release`.

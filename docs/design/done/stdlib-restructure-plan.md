@@ -1,4 +1,4 @@
-# Nova Stdlib Restructure Plan -- platform-axis folders (os/arch)
+# Kyte Stdlib Restructure Plan -- platform-axis folders (os/arch)
 
 Status date: 2026-08-03
 Owner: language/stdlib
@@ -11,10 +11,10 @@ Target-varying stdlib code is encoded with filename suffixes/prefixes and a flat
 and the compiler selects files by a bespoke `_<os>` string scan that is disconnected from the
 `platform` module. It reads as naive and does not scale:
 
-- Suffix variants: `os/sys.nova` + `os/sys_windows.nova`, `os/socket.nova` + `os/socket_windows.nova`,
-  `os/backend_{darwin,linux,windows}.nova`, `net/eventloop_{darwin,linux,windows}.nova`.
-- Win-prefix single-OS modules: `os/windows.nova`, `os/winfs.nova`, `os/winproc.nova`, `os/winsock.nova`.
-- Flat single-OS syscall wrappers: `os/kqueue.nova` (darwin), `os/epoll.nova` (linux).
+- Suffix variants: `os/sys.ky` + `os/sys_windows.ky`, `os/socket.ky` + `os/socket_windows.ky`,
+  `os/backend_{darwin,linux,windows}.ky`, `net/eventloop_{darwin,linux,windows}.ky`.
+- Win-prefix single-OS modules: `os/windows.ky`, `os/winfs.ky`, `os/winproc.ky`, `os/winsock.ky`.
+- Flat single-OS syscall wrappers: `os/kqueue.ky` (darwin), `os/epoll.ky` (linux).
 
 Two concrete defects (the reason for this rewrite):
 1. Selection keys on `os` ONLY, never `arch`. The moment we need aarch64-vs-x86_64 syscall numbers,
@@ -38,14 +38,14 @@ platform.pointerSize
 platform.isDarwin / isLinux / isWindows / isWasm / isPosix
 ```
 
-It is live: `os/socket.nova:21-23` uses `platform.isLinux` to pick the darwin-vs-linux errno/sockopt
+It is live: `os/socket.ky:21-23` uses `platform.isLinux` to pick the darwin-vs-linux errno/sockopt
 constants inside ONE shared file. The variant resolver must derive its target axes from these SAME
 values, so there is exactly one notion of the target.
 
 ## Two mechanisms, kept distinct (do not conflate)
 
 - `platform.*` in-code conditionals -- for divergences where EVERY branch compiles AND links on EVERY
-  target (integer constants, small branches). Example: `os/socket.nova` is a single file for both POSIX
+  target (integer constants, small branches). Example: `os/socket.ky` is a single file for both POSIX
   targets, switching constants with `if platform.isLinux`.
 - Whole-file variant selection -- MANDATORY where the branches cannot coexist in one translation unit.
   The decisive reason is FFI: an `extern` symbol absent on the target is a hard LINK error, not a dead
@@ -60,11 +60,11 @@ One rule, `resolvePlatformVariant(module, os, arch)`, derives an ordered candida
 platform axes and returns the first file that exists (most specific wins). For an import `dir/name`
 (e.g. `os/sys`):
 
-1. `dir/<os>/<arch>/name.nova`   (os + arch specific; e.g. `os/linux/aarch64/sys.nova`)
-2. `dir/<os>/name.nova`          (os specific;        e.g. `os/windows/sys.nova`, `os/linux/backend.nova`)
-3. `dir/posix/<arch>/name.nova`  (posix-family + arch; only when `isPosix`)
-4. `dir/posix/name.nova`         (posix-family shared; only when `isPosix`; e.g. `os/posix/sys.nova`)
-5. `dir/name.nova`               (flat base; back-compat fallback)
+1. `dir/<os>/<arch>/name.ky`   (os + arch specific; e.g. `os/linux/aarch64/sys.ky`)
+2. `dir/<os>/name.ky`          (os specific;        e.g. `os/windows/sys.ky`, `os/linux/backend.ky`)
+3. `dir/posix/<arch>/name.ky`  (posix-family + arch; only when `isPosix`)
+4. `dir/posix/name.ky`         (posix-family shared; only when `isPosix`; e.g. `os/posix/sys.ky`)
+5. `dir/name.ky`               (flat base; back-compat fallback)
 
 The MODULE IDENTITY stays the base import name (`os.sys`), independent of which file compiled, so
 `import os.sys;` links on every target and its importers never change. Properties:
@@ -83,12 +83,12 @@ wrong target.
 
 ## Constraint: epoll and io_uring are both Linux, selected at RUNTIME
 
-`eventloop_linux.nova` holds BOTH the epoll and io_uring paths and dispatches per call via
-`usingUring()` / `nova_reactor_backend()` (`eventloop_linux.nova:85,401`; runtime `uring.cpp:295`). They
+`eventloop_linux.ky` holds BOTH the epoll and io_uring paths and dispatches per call via
+`usingUring()` / `kyte_reactor_backend()` (`eventloop_linux.ky:85,401`; runtime `uring.cpp:295`). They
 are not compile-time-separable by target. To give io_uring its own file, the Linux eventloop VARIANT
 becomes a thin selector that imports BOTH `net/ev/epoll` and `net/ev/io_uring` and runtime-dispatches.
 Mechanism impls live in `net/ev/` by name (readability); the os-variant `net/eventloop` selects them.
-(Alternative: leave io_uring inside `ev/epoll.nova` -> 3 files, no linux selector. Rejected: does not
+(Alternative: leave io_uring inside `ev/epoll.ky` -> 3 files, no linux selector. Rejected: does not
 match the requested four-file layout.)
 
 ## Target tree
@@ -96,32 +96,32 @@ match the requested four-file layout.)
 ```
 src/std/os/
   posix/                shared non-windows variant impls (rule 4)
-    sys.nova            (was os/sys.nova)
-    socket.nova         (was os/socket.nova)
+    sys.ky            (was os/sys.ky)
+    socket.ky         (was os/socket.ky)
   windows/              windows variant impls (rule 2) + windows-only modules
-    sys.nova            (was os/sys_windows.nova)
-    socket.nova         (was os/socket_windows.nova)
-    win32.nova          (was os/windows.nova    -- Win32 FFI)
-    fs.nova             (was os/winfs.nova)
-    proc.nova           (was os/winproc.nova)
-    winsock.nova        (was os/winsock.nova     -- raw WinSock FFI; distinct from windows/socket.nova)
+    sys.ky            (was os/sys_windows.ky)
+    socket.ky         (was os/socket_windows.ky)
+    win32.ky          (was os/windows.ky    -- Win32 FFI)
+    fs.ky             (was os/winfs.ky)
+    proc.ky           (was os/winproc.ky)
+    winsock.ky        (was os/winsock.ky     -- raw WinSock FFI; distinct from windows/socket.ky)
   darwin/               darwin-only modules (path-qualified, not variant-resolved)
-    kqueue.nova         (was os/kqueue.nova)
-    backend.nova        (was os/backend_darwin.nova)   [or folded into net/ev/kqueue -- see R0]
+    kqueue.ky         (was os/kqueue.ky)
+    backend.ky        (was os/backend_darwin.ky)   [or folded into net/ev/kqueue -- see R0]
   linux/                linux-only modules
-    epoll.nova          (was os/epoll.nova)
-    backend.nova        (was os/backend_linux.nova)    [or folded -- see R0]
-  # os/windows/backend.nova (was backend_windows) likewise per R0
+    epoll.ky          (was os/epoll.ky)
+    backend.ky        (was os/backend_linux.ky)    [or folded -- see R0]
+  # os/windows/backend.ky (was backend_windows) likewise per R0
 
 src/std/net/
   ev/                   event-loop backend impls, named by mechanism (path-qualified, not resolved)
-    kqueue.nova         (was net/eventloop_darwin.nova)
-    epoll.nova          (was net/eventloop_linux.nova, epoll path)
-    io_uring.nova       (split out of net/eventloop_linux.nova, io_uring path)
-    iocp.nova           (was net/eventloop_windows.nova)
-  darwin/eventloop.nova   (NEW selector: re-exports net.ev.kqueue)
-  linux/eventloop.nova    (NEW selector: imports net.ev.epoll + net.ev.io_uring, runtime dispatch)
-  windows/eventloop.nova  (NEW selector: re-exports net.ev.iocp)
+    kqueue.ky         (was net/eventloop_darwin.ky)
+    epoll.ky          (was net/eventloop_linux.ky, epoll path)
+    io_uring.ky       (split out of net/eventloop_linux.ky, io_uring path)
+    iocp.ky           (was net/eventloop_windows.ky)
+  darwin/eventloop.ky   (NEW selector: re-exports net.ev.kqueue)
+  linux/eventloop.ky    (NEW selector: imports net.ev.epoll + net.ev.io_uring, runtime dispatch)
+  windows/eventloop.ky  (NEW selector: re-exports net.ev.iocp)
 ```
 
 Import names that DO NOT change (resolver-only): `os.sys`, `os.socket`, `net.eventloop`.
@@ -160,58 +160,58 @@ Legend: [ ] not started, [~] in progress, [x] done.
 
 | # | Item | From | To / Action | Kind | Status |
 |---|---|---|---|---|---|
-| R0 | Decide os.backend: fold identity into net/ev/* vs keep slim per-os `os/<os>/backend.nova` | -- | Phase 0 decision | design | [x] kept slim per-os `os/<os>/backend.nova` |
+| R0 | Decide os.backend: fold identity into net/ev/* vs keep slim per-os `os/<os>/backend.ky` | -- | Phase 0 decision | design | [x] kept slim per-os `os/<os>/backend.ky` |
 | R1 | Compiler: `targetVariantPath(os,arch)` 6-rule resolver (5 folder/legacy + 1 mechanism map), keyed off the same axes as `platform` | `targetSuffixedPath` main.zig | replace | compiler | [x] main.zig:375 |
 | R2 | Compiler: update `resolveImportPath` + `std_modules` allow-list | main.zig | edit | compiler | [x] dead single-os entries removed |
 | R3 | genPlatformSource: document as single source of truth; cross-link resolver | main.zig:326 | docs | compiler | [x] resolver comment cross-links |
-| R4 | Move os.sys posix impl | os/sys.nova | os/posix/sys.nova | move | [x] |
-| R5 | Move os.sys windows impl | os/sys_windows.nova | os/windows/sys.nova | move | [x] |
-| R6 | Move os.socket posix impl | os/socket.nova | os/posix/socket.nova | move | [x] |
-| R7 | Move os.socket windows impl | os/socket_windows.nova | os/windows/socket.nova | move | [x] |
-| R8 | Move darwin syscalls | os/kqueue.nova | os/darwin/kqueue.nova | move | [x] |
-| R9 | Move linux syscalls | os/epoll.nova | os/linux/epoll.nova | move | [x] |
-| R10 | Move Win32 FFI | os/windows.nova | os/windows/win32.nova | move+rename | [x] windows.->win32. |
-| R11 | Move Windows fs | os/winfs.nova | os/windows/fs.nova | move+rename | [x] winfs.->fs. |
-| R12 | Move Windows proc | os/winproc.nova | os/windows/proc.nova | move+rename | [x] winproc.->proc. |
-| R13 | Move WinSock FFI | os/winsock.nova | os/windows/winsock.nova | move | [x] |
-| R14 | Move os.backend (per R0) | backend_{darwin,linux,windows}.nova | os/<os>/backend.nova | move | [x] |
-| R15 | Move kqueue eventloop backend | net/eventloop_darwin.nova | net/ev/kqueue.nova | move+rename | [x] |
-| R16 | Move epoll eventloop backend | net/eventloop_linux.nova (epoll path) | net/ev/epoll.nova | move+split | [x] |
-| R17 | Split io_uring backend out | net/eventloop_linux.nova (uring path) | net/ev/io_uring.nova | split | [~] DEVIATION: kept inside net/ev/epoll.nova (see Deviations) |
-| R18 | Move iocp eventloop backend | net/eventloop_windows.nova | net/ev/iocp.nova | move+rename | [x] |
-| R19 | Create per-os eventloop selectors | -- | net/{darwin,linux,windows}/eventloop.nova | new | [x] DEVIATION: resolver mechanism-map instead of selector files (see Deviations) |
+| R4 | Move os.sys posix impl | os/sys.ky | os/posix/sys.ky | move | [x] |
+| R5 | Move os.sys windows impl | os/sys_windows.ky | os/windows/sys.ky | move | [x] |
+| R6 | Move os.socket posix impl | os/socket.ky | os/posix/socket.ky | move | [x] |
+| R7 | Move os.socket windows impl | os/socket_windows.ky | os/windows/socket.ky | move | [x] |
+| R8 | Move darwin syscalls | os/kqueue.ky | os/darwin/kqueue.ky | move | [x] |
+| R9 | Move linux syscalls | os/epoll.ky | os/linux/epoll.ky | move | [x] |
+| R10 | Move Win32 FFI | os/windows.ky | os/windows/win32.ky | move+rename | [x] windows.->win32. |
+| R11 | Move Windows fs | os/winfs.ky | os/windows/fs.ky | move+rename | [x] winfs.->fs. |
+| R12 | Move Windows proc | os/winproc.ky | os/windows/proc.ky | move+rename | [x] winproc.->proc. |
+| R13 | Move WinSock FFI | os/winsock.ky | os/windows/winsock.ky | move | [x] |
+| R14 | Move os.backend (per R0) | backend_{darwin,linux,windows}.ky | os/<os>/backend.ky | move | [x] |
+| R15 | Move kqueue eventloop backend | net/eventloop_darwin.ky | net/ev/kqueue.ky | move+rename | [x] |
+| R16 | Move epoll eventloop backend | net/eventloop_linux.ky (epoll path) | net/ev/epoll.ky | move+split | [x] |
+| R17 | Split io_uring backend out | net/eventloop_linux.ky (uring path) | net/ev/io_uring.ky | split | [~] DEVIATION: kept inside net/ev/epoll.ky (see Deviations) |
+| R18 | Move iocp eventloop backend | net/eventloop_windows.ky | net/ev/iocp.ky | move+rename | [x] |
+| R19 | Create per-os eventloop selectors | -- | net/{darwin,linux,windows}/eventloop.ky | new | [x] DEVIATION: resolver mechanism-map instead of selector files (see Deviations) |
 | R20 | Update importers of os.kqueue/os.epoll | 2 files | os.darwin.* / os.linux.* | edit | [x] net/ev/{kqueue,epoll} |
 | R21 | Update importers of os.win* | ~7 files | os.windows.* | edit | [x] iocp, windows/{socket,sys}, process_windows |
 | R22 | Update importers of os.backend | 3 files | per R0 | edit | [x] os.backend import unchanged (variant-mapped) |
-| R23 | build.zig: verify std sync carries nested folders | build.zig | verify/patch | build | [x] ~/.nova/std/os/{darwin,linux,posix,windows} + net/ev/ synced |
+| R23 | build.zig: verify std sync carries nested folders | build.zig | verify/patch | build | [x] ~/.kyte/std/os/{darwin,linux,posix,windows} + net/ev/ synced |
 | R24 | Update internal cross-imports among moved files | moved files | new paths | edit | [x] |
 | R25 | Update docs referencing old paths/suffix rule | CLAUDE.md, specs, design docs | edit | docs | [x] this doc + CLAUDE.md |
 | G1 | Gate: `zig build` clean (host = darwin) | -- | run | gate | [x] |
 | G2 | Gate: `conformance/run.sh -j` corpus | -- | run | gate | [x] 213/234 -j; the 21 are the documented reactor-under-load contention, all green sequentially -> effectively 234/234 |
-| G3 | Gate: cross-compile linux x86_64 + windows-x86_64 still link | -- | `nova x --target ...` | gate | [x] linux x86_64 + arm64 ELF + windows PE all link |
+| G3 | Gate: cross-compile linux x86_64 + windows-x86_64 still link | -- | `kyte x --target ...` | gate | [x] linux x86_64 + arm64 ELF + windows PE all link |
 | G4 | Gate: reactor cases 192-210 green (darwin) | -- | run | gate | [x] sequential |
-| G5 | Gate: residual sweep -- no `_darwin`/`_linux`/`_windows`/`win*` paths or old imports remain | -- | grep | gate | [x] only process_windows.nova (legacy-suffix, in scope of rule 5) |
-| G6 | Gate: arch axis proof -- a throwaway `os/posix/aarch64/sys.nova` resolves over `os/posix/sys.nova` for linux-arm64 | -- | targeted build | gate | [x] proven (parse-error probe) |
+| G5 | Gate: residual sweep -- no `_darwin`/`_linux`/`_windows`/`win*` paths or old imports remain | -- | grep | gate | [x] only process_windows.ky (legacy-suffix, in scope of rule 5) |
+| G6 | Gate: arch axis proof -- a throwaway `os/posix/aarch64/sys.ky` resolves over `os/posix/sys.ky` for linux-arm64 | -- | targeted build | gate | [x] proven (parse-error probe) |
 
 ## Deviations (deliberate, verified)
 
-1. **R17 -- io_uring NOT split into net/ev/io_uring.nova.** In the source Linux backend, epoll and
-   io_uring are interleaved and RUNTIME-dispatched (`usingUring()` / `nova_reactor_backend()`) within
+1. **R17 -- io_uring NOT split into net/ev/io_uring.ky.** In the source Linux backend, epoll and
+   io_uring are interleaved and RUNTIME-dispatched (`usingUring()` / `kyte_reactor_backend()`) within
    one compilation unit -- the target-conditional file rule selects by OS and so cannot choose between
    two Linux files; the choice is made once per process at runtime. Splitting them is a Linux-only
    hot-path refactor that cannot be run-verified on this macOS host, so io_uring stays inside
-   `net/ev/epoll.nova`. Recorded as a Linux-validated follow-on, not silently dropped.
+   `net/ev/epoll.ky`. Recorded as a Linux-validated follow-on, not silently dropped.
 
 2. **R19 -- resolver mechanism-map instead of per-os selector files.** Rather than three thin
-   `net/{darwin,linux,windows}/eventloop.nova` selector files that each re-export a mechanism backend
-   (Nova has no re-export), the R1 resolver maps the `net/eventloop` module to `net/ev/<mechanism>.nova`
+   `net/{darwin,linux,windows}/eventloop.ky` selector files that each re-export a mechanism backend
+   (Kyte has no re-export), the R1 resolver maps the `net/eventloop` module to `net/ev/<mechanism>.ky`
    per target (darwin=kqueue, windows=iocp, else=epoll). The module identity stays `net/eventloop` so
    every importer's `eventloop.X` resolves unchanged. This is strictly less code and avoids the
    re-export gap; the net/ev/ mechanism folder (the plan's real intent) is realized exactly.
 
-3. **process_windows.nova retained on the legacy `_<os>` suffix.** `process` is a top-level
+3. **process_windows.ky retained on the legacy `_<os>` suffix.** `process` is a top-level
    cross-platform std module, not an `os.*` FFI module, so it is outside the R4-R13 os-folder cohort.
-   Its Windows variant stays `process_windows.nova`, selected by resolver rule 5 (the legacy suffix,
+   Its Windows variant stays `process_windows.ky`, selected by resolver rule 5 (the legacy suffix,
    deliberately kept in the dual-resolution design). Moving it would need a `process/` variant folder
    with no natural owner; left as-is by design, noted here so the lone `_windows` file is not mistaken
    for an incomplete move.
@@ -235,7 +235,7 @@ Legend: [ ] not started, [~] in progress, [x] done.
 - io_uring split (R17) + selectors (R19) change how the Linux reactor picks a backend; a mistake
   regresses throughput or deadlocks the reactor, and cannot be run-verified on the darwin dev host
   (relies on G3 link checks + the Linux CI cell). Do R16/R17/R19 as the smallest possible diff and keep
-  the `nova_reactor_backend()` runtime contract byte-identical.
+  the `kyte_reactor_backend()` runtime contract byte-identical.
 - The resolver change (R1) affects EVERY os.* import; a wrong candidate order silently compiles the
   wrong-target file. G5 (residual grep) + G2 + G3 must all pass before removing the rule-5 fallback.
 - Do not let the resolver and `genPlatformSource` diverge: both must read `tinfo.os`/`tinfo.arch`. R3
