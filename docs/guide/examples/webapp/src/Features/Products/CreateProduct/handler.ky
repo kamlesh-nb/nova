@@ -1,0 +1,29 @@
+import web.routing;
+import web.response;
+import web.status;
+import Features.Products.CreateProduct.command;
+import Features.Products.CreateProduct.validator;
+import Features.Products.Shared.repository;
+import Features.Products.views.product_card;
+
+// Handles POST /api/products. A `RouteHandler` is a plain struct that holds its dependencies as
+// fields (here the ProductRepository, injected in routes.ky) and exposes ONE uniform method,
+// `serve(ctx)`. It reads its typed input with `ctx.bind<CreateProduct>()`, does its work, and
+// returns a `Response`. This is a hypermedia app, so the response body is an HTML fragment (the new
+// product's card) that the browser swaps into the page; return JSON instead if you are building an API.
+pub struct CreateProductHandler impl RouteHandler {
+    repo: ProductRepository,
+    init(repo: ProductRepository) { self.repo = repo; }
+
+    async fn serve(self: CreateProductHandler, ctx: Context): Response {
+        let cmd = ctx.bind<CreateProduct>();
+        let err = validateCreateProduct(cmd);
+        if (err.length != 0) {
+            return response.Response(Status.BadRequest, err);
+        }
+        let _ = await self.repo.create(cmd.name, cmd.price);
+        let html = productCard(cmd.name, cmd.price);
+        return response.Response(Status.Created, html)
+            .setHeader("Content-Type", "text/html; charset=utf-8");
+    }
+}

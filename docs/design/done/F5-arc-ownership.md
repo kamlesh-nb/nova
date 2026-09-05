@@ -27,7 +27,7 @@ released nothing. **A `throw` is a third jumping exit and is covered by no rule*
 And the second claim, which matters more:
 
 > **There is no ownership model.** There is no document, anywhere, stating who owns what and where
-> retain/release are inserted. `list.nova:165` asserts a rule the compiler never implemented. This
+> retain/release are inserted. `list.ky:165` asserts a rule the compiler never implemented. This
 > document is the model that was missing.
 
 ---
@@ -58,7 +58,7 @@ primitives. **Nothing is released.**
 Two independent reasons the elements are invisible:
 1. `isRefCountedType("T")` → `false`, hardcoded (`arc.zig:13-15`).
 2. Elements live inside `data`, a raw `bytes.alloc_persistent` buffer written via `bytes.write_ptr`
-   (`list.nova:4-9`). **ARC has no view into raw memory.** Even if (1) were fixed, there is no traversal.
+   (`list.ky:4-9`). **ARC has no view into raw memory.** Even if (1) were fixed, there is no traversal.
 
 ### 2.2 The measurement that proves the model
 
@@ -93,7 +93,7 @@ generic into a raw buffer.* F5 is not "build ARC" — it is "close the two holes
 
 ### 2.4 The false comment
 
-`list.nova:165-170`:
+`list.ky:165-170`:
 > *"ARC: elements are reference-counted; ARC releases them, **NOT this method**. The old pre-ARC loop
 > `bytes.free`'d each element by raw pointer — wrong under ARC…"*
 
@@ -115,21 +115,21 @@ boxes are never retained or released. Box and env are `alloc_persistent`'d
 (`expressions.zig:1676`, `:1689`) and **nothing frees them** — ~46 B leaked per closure created, forever.
 Captured ref-counted values are never released either.
 
-Roadmap A1 flagged this on delivery: *"env/box use `nova_bytes_alloc_persistent` (they leak, same as the
+Roadmap A1 flagged this on delivery: *"env/box use `kyte_bytes_alloc_persistent` (they leak, same as the
 old scheme — no regression) → add ARC on environments + retain captured ref-counted values."*
 
 ### 2.6 The arena confound
 
-`nova_bytes_alloc` (`alloc.cpp:45-78`) bump-allocates from a **per-thread 32MB arena**, and arena objects
-are **refcount-exempt** — `nova_retain`, `nova_release`, `nova_bytes_free` are all no-ops for them
+`kyte_bytes_alloc` (`alloc.cpp:45-78`) bump-allocates from a **per-thread 32MB arena**, and arena objects
+are **refcount-exempt** — `kyte_retain`, `kyte_release`, `kyte_bytes_free` are all no-ops for them
 (`alloc.cpp:105-113`, `:114-125`). The pointer only moves forward; the arena is never reset. Past 32MB,
 allocations fall back to `malloc` and *are* honestly counted.
 
 **Consequence for anyone measuring ARC:** in the first 32MB per thread, ARC bugs are invisible — retain
-and release both no-op, so an imbalance has no effect. `-DNOVA_DROP_ARENA` exists precisely to expose
+and release both no-op, so an imbalance has no effect. `-DKYTE_DROP_ARENA` exists precisely to expose
 this (*"Reveals latent retain/release imbalances the arena used to hide"* — `alloc.cpp:49-52`).
 
-**Every ARC correctness test in F5 must run with `NOVA_DROP_ARENA`.** Without it, a passing test proves
+**Every ARC correctness test in F5 must run with `KYTE_DROP_ARENA`.** Without it, a passing test proves
 nothing. This is why §2.2's numbers are the ones that matter — they exceed 32MB.
 
 ---
@@ -188,7 +188,7 @@ slot. Each is `+1`.
 >
 > **Consequence for §3.4b's chain.** "Map on `Storage<T>` → `Map.get` returns owned → the Level-0 borrow
 > dies" **only holds if `get` retains**. Migrating `Map` alone would move it onto Storage and leave
-> `map.nova:125` a borrow exactly as it is. So `get`'s retain must be enabled first — and it cannot be
+> `map.ky:125` a borrow exactly as it is. So `get`'s retain must be enabled first — and it cannot be
 > enabled alone: `List.grow`'s `newData.set(i, self.data.get(i))` becomes `+2` with nothing owning the
 > temporary. **get-retains and temporary-release land together, or neither** (the "three rules are ONE
 > system" note above, now with a concrete instance).
@@ -254,7 +254,7 @@ scope here; recorded so it is not assumed.
 ### 3.3a Who allocates a collection's buffer — *not* codegen
 
 **Question raised 2026-07-15:** every collection hand-writes `bytes.alloc_persistent` in `init` (10 sites
-— `list.nova:6,17,26,70`, `map.nova:11`, `string_builder.nova:13,37,50`). Should codegen inject it, the
+— `list.ky:6,17,26,70`, `map.ky:11`, `string_builder.ky:13,37,50`). Should codegen inject it, the
 way it injects the refcount header?
 
 **No — and the distinction is the point.**
@@ -278,7 +278,7 @@ exist to remove them.
 
 **The fix is a typed, owned buffer**, not injection:
 
-```nova
+```kyte
 struct List<T> {
     data: Storage<T>,      // compiler-known: owns cap slots of T; ARC-visible
     len:  int,
@@ -292,11 +292,11 @@ struct List<T> {
 > | Rejected | Why |
 > |---|---|
 > | `Heap<T>` | `Heap<T>` means **priority queue** in Rust (`BinaryHeap`), Java, C++, Python (`heapq`), Go. Collections are graded "~half the API missing" — that name will be wanted. Also collides with "the heap" as a region, which `specs.md` uses 10× ("heap object layout", "heap box"). |
-> | `Arc<T>` | Rust's `Arc<T>` is a **shared pointer to one value**, not storage for N — it reads exactly backwards. Collides with Nova's own ARC *model* (§8, `arc.zig`, this document): *"`Arc<T>` is ARC'd — and so is `string`, which is not an `Arc<T>`"* is unwritable. And it forecloses `Arc<T>` for a real shared-ownership pointer later (§6 Q4's cross-task sharing). |
-> | `Buffer<T>` | Node's `Buffer` is a **byte array**; Nova targets web developers, so it invites the raw-bytes reading this design exists to remove. |
+> | `Arc<T>` | Rust's `Arc<T>` is a **shared pointer to one value**, not storage for N — it reads exactly backwards. Collides with Kyte's own ARC *model* (§8, `arc.zig`, this document): *"`Arc<T>` is ARC'd — and so is `string`, which is not an `Arc<T>`"* is unwritable. And it forecloses `Arc<T>` for a real shared-ownership pointer later (§6 Q4's cross-task sharing). |
+> | `Buffer<T>` | Node's `Buffer` is a **byte array**; Kyte targets web developers, so it invites the raw-bytes reading this design exists to remove. |
 > | `Memory<T>` | .NET's `Memory<T>`/`Span<T>` are **non-owning views** — actively misleading, worse than a neutral name. |
 >
-> **The principle:** in Nova, *heap-allocated* and *reference-counted* are true of **every** `string`,
+> **The principle:** in Kyte, *heap-allocated* and *reference-counted* are true of **every** `string`,
 > `List`, `Map` and struct (§3.2). A name built on either property distinguishes nothing. The name must
 > say what the thing **is** — it owns N contiguous slots of `T`. Precedent: Swift's `ManagedBuffer` /
 > `_ContiguousArrayStorage`.
@@ -319,11 +319,11 @@ Measured 2026-07-15:
 
 | Model | Users | Implementations |
 |---|---|---|
-| explicit `Allocator` struct (`mem/allocator.nova`) | `File`, `Dir`, `TcpListener`, `Channel` (4 types, 11 call sites) | **1** — `globalAllocator()` |
+| explicit `Allocator` struct (`mem/allocator.ky`) | `File`, `Dir`, `TcpListener`, `Channel` (4 types, 11 call sites) | **1** — `globalAllocator()` |
 | raw `bytes.alloc_persistent` | `List`, `Map`, `StringBuilder` | — |
 
 `new_with_allocator<T>` is called 3 times, **always with `globalAllocator()`**. `ArenaAllocator` exists
-with an adapter (`arena_allocator.nova:40`) and **nothing uses it**. So the `Allocator` abstraction has
+with an adapter (`arena_allocator.ky:40`) and **nothing uses it**. So the `Allocator` abstraction has
 no second case — it is ceremony — while the collections bypass it entirely. That is the §11 *"different
 different things"* divergence, in the memory model.
 
@@ -335,8 +335,8 @@ different things"* divergence, in the memory model.
 
 **Live bug found while measuring — `globalAllocator()` allocates per call.** It returns a *struct
 literal*, so every call heap-allocates a fresh `Allocator` (verified: two calls compare unequal). At 11
-sites, including hot paths — `file.nova:111` is `allocator.globalAllocator().alloc(size + 1)`, i.e. **an
-allocation in order to allocate**, plus a retain/release since `Allocator` is a struct. `dir.nova:48,117`
+sites, including hot paths — `file.ky:111` is `allocator.globalAllocator().alloc(size + 1)`, i.e. **an
+allocation in order to allocate**, plus a retain/release since `Allocator` is a struct. `dir.ky:48,117`
 likewise. It must be a singleton regardless of which model wins. Filed in specs §10.
 
 ### 3.4 Closure envs
@@ -367,13 +367,13 @@ After the #18 fix, a fn value is uniformly a box `{fn_ptr, env}` — but it come
 | **static bare-fn box** | `expressions.zig:buildBareFnBox` | module-level global, **`LLVMSetGlobalConstant(box_g, 1)`** (`:97`) → `__DATA_CONST` | **must not be** |
 
 `__DATA_CONST` is **mapped read-only at runtime**. So `isOwned(.func) == true` (§3.2) makes ARC retain a
-static bare-fn box → `nova_retain` writes the refcount at `[box-8]` → **BUS**.
+static bare-fn box → `kyte_retain` writes the refcount at `[box-8]` → **BUS**.
 
 **Not speculative — this exact crash was traced today.** `___fnbox_payload` at `0x10011cb00`, inside
-`__DATA_CONST,__const`, faulting in `nova_retain` (`alloc.cpp:123`) on a *write* after the refcount
+`__DATA_CONST,__const`, faulting in `kyte_retain` (`alloc.cpp:123`) on a *write* after the refcount
 *read* succeeded — the signature of a read-only page. `nm -n` named the symbol outright.
 
-And there is a live instance waiting: `mem/allocator.nova` declares
+And there is a live instance waiting: `mem/allocator.ky` declares
 `allocFn: (i32, i32) -> i32` and stores the **bare fn** `cAllocFn` in it. The emitted globals
 `__fnbox_..._cAllocFn` / `__fnbox_..._cFreeFn` are read-only constants today. This is safe **only**
 because `isRefCountedType` currently returns `false` for any name containing `->` (§2.5) — the very
@@ -405,7 +405,7 @@ vtable is a dispatch table, never a fn **value**, and is never retained.)*
 
 **Measured 2026-07-15/16.** The last of the `List<string>` leak is not about generics at all:
 
-```nova
+```kyte
 ignore(string.concat("a", "b"))   // `ignore(s: string)` — NOT generic
 ```
 leaks **exactly one object per call** (108 live at N=100; floor is 8). Bind it first —
@@ -421,7 +421,7 @@ Implemented and **measured working**: `List<string>` 208 → **8, flat across N=
 
 ```
 release temporaries  needs ->  every call returns OWNED
-Map.get              returns ->  a BORROW (`return bytes.read_ptr(self.valsPtr, ..)`, map.nova:125)
+Map.get              returns ->  a BORROW (`return bytes.read_ptr(self.valsPtr, ..)`, map.ky:125)
                                   the ONLY Level-0 borrow left (see F4's audit)
 fixing Map.get       needs ->  Map on Storage<T>  (Storage.get retains)
 Storage<K> inside Map<K,V> needs ->  K concrete in the method body  =  F4 stage 4b
@@ -433,7 +433,7 @@ another idea.
 
 > ### ✅ RESOLVED 2026-07-16 — `Map` is on `Storage<K>`/`Storage<V>`, and mono is MANDATORY
 >
-> 4b landed, `Map` migrated, the exclusion is deleted, and **the `NOVA_F4_MONO` flag is gone**. Corpus
+> 4b landed, `Map` migrated, the exclusion is deleted, and **the `KYTE_F4_MONO` flag is gone**. Corpus
 > 28/28 **stable across 6 runs**; 107/107 unit tests. Measured, `Map_string_i32_set`:
 > **`retain=0, write_ptr=14` → `retain=3, release=2, write_ptr=4`** (the 4 remaining are tombstone byte
 > writes, which correctly stay raw). The container now owns its keys.
@@ -452,9 +452,9 @@ another idea.
 >    **108 live at N=100, 408 at N=400**, against a floor of 8. Linear. The rule has a real customer and
 >    is the cause of the 1898-object leak on `14_collections_map`.
 >
->    > ### ⚠️ `nova test` DOES NOT RUN `main()` — and it cost me three false conclusions
+>    > ### ⚠️ `kyte test` DOES NOT RUN `main()` — and it cost me three false conclusions
 >    >
->    > Every repro written as `fn main() { ... }` and run under `nova test` **never executed**. The
+>    > Every repro written as `fn main() { ... }` and run under `kyte test` **never executed**. The
 >    > harness runs `@test` functions only. `main` is silently skipped: no error, no warning, exit 0, and
 >    > a **passing audit at the floor of 8** — which reads exactly like "clean".
 >    >
@@ -468,7 +468,7 @@ another idea.
 >    >
 >    > **The rule: an ARC repro must be an `@test` function, and you must confirm it ran.** A number from
 >    > code that did not execute is not a weaker measurement, it is not a measurement — and it looks
->    > identical to a good result. This is the stale-binary trap (§3.5, and `nova-arc-storage-model`
+>    > identical to a good result. This is the stale-binary trap (§3.5, and `kyte-arc-storage-model`
 >    > trap #1) wearing a third costume: *check that the thing you are measuring actually happened.*
 > 2. **Migrating `Map` did not kill the Level-0 borrow**, because `Storage.get` never retained (see §3.3's
 >    correction — `a53827f` landed in dead code). `get` now retains for real, which costs **+2 objects on
@@ -525,11 +525,11 @@ and re-zeroed after each release, or the next loop iteration releases a freed po
    object at scope exit. **Ownership flows through the phi**: `.nullish_coalesce` consumes both operands
    and is registered in their place. This was the whole of the 5/8 flake on 13_serde.
 
-**A double release is invisible until it isn't.** `nova_release` on a freed object returns early on the
+**A double release is invisible until it isn't.** `kyte_release` on a freed object returns early on the
 -999 sentinel and looks harmless — until malloc REUSES the block, and then it decrements a *different*
 object's refcount. The crash lands somewhere unrelated, and its location depends on the allocator, not
 the bug. That is why this presented as an intermittent failure in a test that does not contain the bug.
-`NOVA_ARC_DUMP=1` now reports it at the release (§3.5.1).
+`KYTE_ARC_DUMP=1` now reports it at the release (§3.5.1).
 
 **Two leaks fixed alongside, both found by looking at the survivors rather than reasoning:**
 
@@ -563,7 +563,7 @@ and the cause is isolated:
 | one key via `concat`, no template | **CLEAN** |
 
 So it is `resize`, not `set`, not probing, not the template. **The refcounts name the shape** (add
-`NOVA_ARC_DUMP=1`):
+`KYTE_ARC_DUMP=1`):
 
 ```
 x1  size=4  rc=2   "k188"
@@ -707,7 +707,7 @@ Per-test, after the trait fix: `list_of_structs` 78, `list_of_primitives` 50, `s
 1. ~~"`convertValueToType` builds Lists via `getFunc("List_push")` — the ERASED symbol — so it does not
    retain."~~ True about the code, irrelevant to serde: **that path is never reached by 13_serde**
    (instrumented: **0 hits**). `convertValueToType` serves `db.query<T>()`, not the generated binder.
-   The binder is ordinary Nova source, so its `push` already monomorphizes. Making the four `getFunc`
+   The binder is ordinary Kyte source, so its `push` already monomorphizes. Making the four `getFunc`
    lookups instantiation-aware changed 13_serde by **exactly zero** and was reverted — a correct change
    to a path with no test and no customer is speculation. **It remains a latent bug for `db.query<T>()`**,
    and the fix is one line each: prefer `methodSymbol("List<elem>", "push")` with the erased name as
@@ -715,7 +715,7 @@ Per-test, after the trait fix: `list_of_structs` 78, `list_of_primitives` 50, `s
 2. ~~"The 5 argument-borrow retains in `convertValueToType` leak."~~ Real O4 violations, but removing
    them also changed 13_serde by **exactly zero**. Same verdict, same reason.
 
-**What the survivors actually say** (`NOVA_ARC_DUMP=1` on `{"tags":["a","b"]}`): the JSON tree's LEAF
+**What the survivors actually say** (`KYTE_ARC_DUMP=1` on `{"tags":["a","b"]}`): the JSON tree's LEAF
 `JsonValue`s survive at **rc=1** — nobody released them — while `"a"`/`"b"` sit at **rc=2** (one ref from
 the leaf's `sval`, one from the bound `List<string>`, which is correct). The array `JsonValue` (kind=4)
 is NOT among them, so it was freed — its `arr` list's elements were not. So the next question is narrow:
@@ -728,7 +728,7 @@ replaces it, so the ownership of the parser's list is the thing to audit.
 `13_serde` **157 → 129**, `List<string>` binding **18 → 2** (floor); corpus 226 → 198.
 
 `return x ?? default` had a special-case retain, to balance the `releaseLocalVariables` that frees the
-returned value when it is a local (nova-nested-arc-corruption). **It was written when `Map.get`/`List.get`
+returned value when it is a local (kyte-nested-arc-corruption). **It was written when `Map.get`/`List.get`
 returned BORROWS.** They now return OWNED (Storage.get transfers), and `??` consumes its operands, so for
 `return arr.get(i) ?? JsonValue(0)` the return already owns the value — the retain is an unbalanced `+1`
 nothing releases.
@@ -774,7 +774,7 @@ N=10 → 22 live, N=40 → 82, N=160 → 322, i.e. **2 per closure** (the 16-byt
 
 **Root cause:** `isRefCountedType` returns FALSE for any type containing `=>`/`->`, so a closure-typed
 `let` local is never registered as owned and never released. The box and env are
-`nova_bytes_alloc_persistent`'d and dropped.
+`kyte_bytes_alloc_persistent`'d and dropped.
 
 **Why the one-line "flip isRefCountedType for function types" is UNSAFE — proven, not assumed.** Function
 values are NOT uniform:
@@ -783,7 +783,7 @@ values are NOT uniform:
 - `let g = dbl` (a bare function) → a **raw code pointer**, `store i64 ptrtoint(@dbl)`, no allocation,
   and already clean at the floor.
 
-Releasing a raw code pointer makes `nova_release` read `[@dbl - 8]` as a refcount and corrupt the code
+Releasing a raw code pointer makes `kyte_release` read `[@dbl - 8]` as a refcount and corrupt the code
 segment — and raw function pointers are everywhere: `string.hash` as a value, vtable method slots,
 callbacks. So the release must reach heap closures WITHOUT touching function pointers.
 
@@ -791,8 +791,8 @@ callbacks. So the release must reach heap closures WITHOUT touching function poi
 1. **Uniform boxing** — box every function value (even `dbl`) so all function-typed values are heap
    closures; then `isRefCountedType` can safely say true. Touches every function-value site (vtables,
    `hashFn` fields, method refs) — the biggest change, but the cleanest invariant.
-2. **A closure tag / distinguishable header** — mark heap closures so `nova_release` (or a dedicated
-   `nova_release_closure`) can no-op on a raw pointer. Localised, but adds a runtime check.
+2. **A closure tag / distinguishable header** — mark heap closures so `kyte_release` (or a dedicated
+   `kyte_release_closure`) can no-op on a raw pointer. Localised, but adds a runtime check.
 3. **Init-expression tracking** — treat a `let`/return whose value is a `.closure` literal as an owned
    heap closure; leave `.call`-returned function values alone. Contained, but misses closures that
    escape through a returning call (`let add5 = make_adder(5)`), so incomplete.
@@ -814,7 +814,7 @@ Five pieces:
    because the payload address is stable.
 2. **`isRefCountedType` returns true for function types.** Both box kinds (heap closure, sentinel global)
    are safe to release, so a closure-typed `let` local finally gets released.
-3. **A generic `__destruct_closure`** frees the env at `box[8]` (`nova_bytes_free`, null-safe).
+3. **A generic `__destruct_closure`** frees the env at `box[8]` (`kyte_bytes_free`, null-safe).
 4. **`isFunctionType` — the load-bearing distinction.** A closure destructor must fire for a function
    type `(int) => int` but NOT for `List<(int) => int>` (a container OF functions). The test is the
    arrow's bracket DEPTH: depth 0 = function, depth 1 (inside `<>`) = container. Getting this wrong gave
@@ -859,7 +859,7 @@ WHAT WORKED (measured, then reverted with the rest):
   (`self.hashFn == string.hash`) still holds because the payload address is stable. Inert; corpus green.
 - **inc2 — `isRefCountedType` returns true for `=>`/`->` types.** Both box kinds are now safe to release
   (heap closure, or sentinel global). Closure-typed `let` locals get released → the box is freed.
-- **inc3 — a generic `__destruct_closure`** frees the env at `box[8]` (`nova_bytes_free`, null-safe for a
+- **inc3 — a generic `__destruct_closure`** frees the env at `box[8]` (`kyte_bytes_free`, null-safe for a
   bare-fn box). ONE function for every closure — the env is a raw buffer at a fixed offset.
 - **Result on non-container closures: the unbounded leak is GONE.** `cl_local` → floor; the dose-response
   went flat (N=10/160 → 2, was 22/322). `test_capture_string`, `test_returned_closures`,
@@ -869,7 +869,7 @@ THE WALL — `List<(int) => int>` (closures in a container):
 - Fn-typed instantiations were skipped by `mono` (the §3.4 mangling-collision guard). An injective
   `mangleTypeName` (distinct tokens `_lp _rp _da _eq` for `( ) - =`) let them monomorphize —
   `List__lpi32_rp__da_i32_push/get` emit — BUT `__destruct_Storage_<fntype>` was NOT generated (the
-  Storage destructor for the fn element type is missing), and a `nova_bytes_free` fired on `env == 0x3`
+  Storage destructor for the fn element type is missing), and a `kyte_bytes_free` fired on `env == 0x3`
   (a garbage pointer): `__destruct_closure` ran on something that was not a closure box. So fn-typed
   monomorphization has its own bugs (missing Storage destructor; a value released as a closure). Adding
   `.closure` to `producesOwnedTemporary` (the right ownership model — a closure literal is a `+1`) did
@@ -889,14 +889,14 @@ its own object) remains after that, and needs per-lambda capture types from `lam
 Per README non-negotiable #2 — an invariant nobody can check is a comment, and §2.4 shows what comments
 are worth.
 
-1. **Debug refcount audit.** Under `NOVA_ARC_AUDIT`, the runtime tracks every live object and, at exit,
+1. **Debug refcount audit.** Under `KYTE_ARC_AUDIT`, the runtime tracks every live object and, at exit,
    reports non-zero refcounts by allocation site. **A leak becomes a test failure, not a 900MB RSS
    reading.**
 2. **Dose-response cases in the corpus.** Encode §2.2: allocate N and 4N, assert peak RSS grows
    sub-linearly. This is the *only* method that distinguishes a leak from a high-water mark — `ps`
    sampling missed peaks by 3× and RSS plateaus produced a false "bounded" reading during the
    2026-07-15 investigation.
-3. **All ARC cases run with `NOVA_DROP_ARENA`** (§2.6), or they prove nothing.
+3. **All ARC cases run with `KYTE_DROP_ARENA`** (§2.6), or they prove nothing.
 
 ---
 
@@ -905,7 +905,7 @@ are worth.
 - **§10 #15** closure envs leak — measured 46 B/closure, linear (§2.2)
 - **§10 #17** `List`/`Map` element leaks — measured, linear (§2.2)
 - `isRefCountedType`'s two hardcodes — made unrepresentable, not patched
-- The false contract at `list.nova:165` — the comment becomes true
+- The false contract at `list.ky:165` — the comment becomes true
 - The `captured_globals` release-skip (`arc.zig:164-168`) and the dormant path — deleted (roadmap A1)
 - **The absence of a written ownership model** — the actual root
 
@@ -922,7 +922,7 @@ the one the user can see.
 
 | # | Stage | Content | Guard |
 |---|---|---|---|
-| 1 | **Make leaks measurable** | `NOVA_ARC_AUDIT` (§3.5.1) + dose-response harness. **Land before any fix** — otherwise "fixed" is an opinion. | new cases: today's leaks **fail** |
+| 1 | **Make leaks measurable** | `KYTE_ARC_AUDIT` (§3.5.1) + dose-response harness. **Land before any fix** — otherwise "fixed" is an opinion. | new cases: today's leaks **fail** |
 | 2 | **`isOwned(TypeId)`** | Replace `isRefCountedType([]const u8)`. Needs F2. `.type_param`/`.unresolved` → `unreachable`. | corpus green; audit unchanged |
 | 2a | **Static fn boxes become writable + sentinel** | §3.4a. `expressions.zig:97` → `SetGlobalConstant(0)`, add the 8-byte header, refcount = `100000000`. **MUST land before stage 3** — otherwise `.func => true` BUSes on `Allocator.allocFn`. | new case: retain/release a **bare fn** stored in a struct field (would BUS without this) |
 | 3 | **Closure env ARC** | §3.4. Needs F2 only — **not F4**. Delete the `=>` hardcode and the `captured_globals` skip. | audit: closure test leak-free; 16M-closure case bounded (**fails today**) |
@@ -941,16 +941,16 @@ believed.**
 
 1. **Cycles.** ARC cannot collect them. `weak`/`unowned` (Swift), or documented and ignored? A parent↔
    child graph leaks today and will still leak after F5. *Recommendation:* document in F5, design `weak`
-   separately — but **say so in specs**, because "Nova has ARC" implies a cycle story to anyone from
+   separately — but **say so in specs**, because "Kyte has ARC" implies a cycle story to anyone from
    Swift.
 2. **The arena's refcount exemption (§2.6).** Keep (fast, hides bugs) or drop (honest, slower, exposes
    every latent imbalance)? *Recommendation:* keep for release, **drop for debug/test by default** so
    correctness is what CI measures. Note `alloc.cpp:6-13` says the exemption is load-bearing for
-   `string.nova`'s `bytes.alloc(4+len)`/`ptr+4` trick — that trick must go (F3's `ptr`) before the arena
+   `string.ky`'s `bytes.alloc(4+len)`/`ptr+4` trick — that trick must go (F3's `ptr`) before the arena
    can be dropped wholesale.
 3. **Elision.** Naive ARC retains/releases on every store. Swift elides aggressively. Out of scope, but
    confirm the model permits it later (it does, if O4 is honoured).
-4. **Thread safety.** `nova_retain` uses `__atomic_fetch_add` relaxed (`alloc.cpp:123`). Is a
+4. **Thread safety.** `kyte_retain` uses `__atomic_fetch_add` relaxed (`alloc.cpp:123`). Is a
    ref-counted value shareable across `go` tasks? If yes, relaxed ordering on the *release* path needs
    review (`alloc.cpp:132` uses acq_rel — probably right, but it is unstated).
 5. **`delete()` naming.** It is `deinit`. Keep the name and document it, or rename? It currently reads
@@ -970,10 +970,10 @@ believed.**
 
 - [ ] A written ownership model exists (§3.1) and specs §8 links it
 - [ ] `isOwned(TypeId)`; zero ownership decisions from a string; both hardcodes unrepresentable
-- [ ] `NOVA_ARC_AUDIT` reports zero live objects at exit for the whole corpus, **with `NOVA_DROP_ARENA`**
+- [ ] `KYTE_ARC_AUDIT` reports zero live objects at exit for the whole corpus, **with `KYTE_DROP_ARENA`**
 - [ ] Dose-response cases: closures (16M) and `List<string>` (800k) **bounded** — both fail today
 - [ ] `retainIfGenericStore` deleted
-- [ ] `list.nova:165`'s comment is **true**, and the `arc.zig:34-40` "until reified-generic destructors
+- [ ] `list.ky:165`'s comment is **true**, and the `arc.zig:34-40` "until reified-generic destructors
       exist" caveat is deleted
 - [ ] `captured_globals` skip + dormant path deleted (closes roadmap A1)
 - [ ] specs §10 #15 and #17 marked FIXED with the measurement that proves it

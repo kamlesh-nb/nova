@@ -1,7 +1,7 @@
 # Route Handling via Mediator — Generic Traits + Minimal-API Design
 
 **Status:** Planned. Start date: 2026-07-17.
-**Goal:** Give Nova the developer experience of **.NET MediatR** (typed `IRequestHandler<TReq, TResp>`,
+**Goal:** Give Kyte the developer experience of **.NET MediatR** (typed `IRequestHandler<TReq, TResp>`,
 handlers auto-discovered, pipeline behaviors) fused with **.NET 7 Minimal API** (`app.MapGet<T>`,
 automatic model-binding, automatic JSON serialization of the returned object).
 
@@ -13,7 +13,7 @@ separate `on<T>` registration). See "Working-tree state" at the end for what to 
 
 ## 1. Target developer experience
 
-```nova
+```kyte
 @serializable
 struct GetUser { pub id: int }
 
@@ -41,7 +41,7 @@ Behind `mapGet<GetUser>(route)` the compiler/framework:
    missing/ambiguous handler is a **compile error**),
 2. reifies the generated `GetUser__bind(src)` binder,
 3. builds the request `ValueSource` (route params `@fromRoute` overlaid on body `@fromBody`),
-4. dispatches through the **canonical mediator pipeline** (`web/mediator.nova`: behaviors, pre/post,
+4. dispatches through the **canonical mediator pipeline** (`web/mediator.ky`: behaviors, pre/post,
    exception handlers),
 5. serializes the returned `UserDto` via the generated `UserDto__toJson`,
 6. wraps it in a `Response`.
@@ -56,7 +56,7 @@ feel and the compiler already has all the information.
 ## 1.5 Naming standard (traits & type parameters)
 
 Adopted for the framework and any generic trait going forward. Mirrors .NET MediatR's clarity
-(`IRequestHandler<TRequest, TResponse>`) without the C# `I`-prefix, which Nova doesn't need — a trait
+(`IRequestHandler<TRequest, TResponse>`) without the C# `I`-prefix, which Kyte doesn't need — a trait
 is already declared with `trait`/`impl`, so the kind is explicit at every use site.
 
 **Type parameters**
@@ -66,7 +66,7 @@ is already declared with `trait`/`impl`, so the kind is explicit at every use si
   has no domain meaning: `List<T>`, `Map<K, V>`, `Storage<T>`.
 
 **Framework traits** (MediatR-shaped)
-| Nova trait | .NET analogue | shape |
+| Kyte trait | .NET analogue | shape |
 |---|---|---|
 | `Request<TResponse>` | `IRequest<TResponse>` | marker on a message struct; declares its response type |
 | `RequestHandler<TRequest, TResponse>` | `IRequestHandler<TRequest, TResponse>` | `fn handle(self, req: TRequest): TResponse` |
@@ -79,7 +79,7 @@ is already declared with `trait`/`impl`, so the kind is explicit at every use si
 match .NET one-for-one — trivial to switch, purely stylistic.)
 
 Example, fully spelled out:
-```nova
+```kyte
 @serializable
 struct GetUser impl Request<UserDto> { pub id: int }
 
@@ -103,7 +103,7 @@ So the literal `impl Handler<GetUser, UserDto>` syntax requires building **gener
 ## 3. Generic traits: feasibility & scope (the enabling feature)
 
 **Verdict: possible, and cheaper than a typical generic-traits feature — because trait dispatch in
-Nova is already fully type-erased.** Every value is one i64 handle (`val_type = i64`,
+Kyte is already fully type-erased.** Every value is one i64 handle (`val_type = i64`,
 `llvm_codegen.zig:339`); the trait vtable call is built with all-i64 params + i64 return regardless of
 declared types (`llvm_codegen.zig:1318-1323`), so `Handler<GetUser,UserDto>::handle` and
 `Handler<Foo,Bar>::handle` compile to byte-identical call sites — **one vtable slot per method serves
@@ -157,7 +157,7 @@ substitution; codegen (the historically risky part) is untouched.
 
 After generic traits land, build the minimal-API/mediator framework:
 
-1. **`Handler<Q, R>` trait** in `web/mediator.nova`: `fn handle(self, req: Q): R;`. Replaces the
+1. **`Handler<Q, R>` trait** in `web/mediator.ky`: `fn handle(self, req: Q): R;`. Replaces the
    `any`-based `RequestHandler`. Pipeline traits (`PipelineBehavior`, pre/post, exception) stay.
 2. **Handler discovery**: at compile time, scan structs impl-ing `Handler<Q, _>` to build a
    request-type → (handler, `handle` fn-ptr, response type) map. Ambiguous/missing = compile error.
@@ -171,7 +171,7 @@ After generic traits land, build the minimal-API/mediator framework:
    `R__toJson`.
 
 Much of this plumbing was prototyped this session and is reusable: `serde.callBinder`, `CompositeSource`
-(both in `serde/source.nova`), the async server framing in `app.nova` (Content-Length, 100-continue,
+(both in `serde/source.ky`), the async server framing in `app.ky` (Content-Length, 100-continue,
 keep-header-read), and the codegen reify pattern for `<T>__bind` fn-pointers.
 
 ---
@@ -179,7 +179,7 @@ keep-header-read), and the codegen reify pattern for `<T>__bind` fn-pointers.
 ## 5. Foundational fixes already landed / in-tree this session
 
 These are **keepers regardless of the framework design** — general compiler bug fixes surfaced while
-prototyping (web/request.nova and app.nova had never actually compiled):
+prototyping (web/request.ky and app.ky had never actually compiled):
 
 - **Tuple-return ARC** (COMMITTED `4464c04`): returning a tuple of computed heap values corrupted them;
   now retains refcounted elements at the return boundary. Gate `28_tuple_return_heap`.
@@ -187,7 +187,7 @@ prototyping (web/request.nova and app.nova had never actually compiled):
   UNCOMMITTED in `llvm_codegen.zig`): a module/type receiver used inside a closure was captured as a
   phantom free variable (`url.decode`, then `response.Response(...)` inside `mediator.send`'s closures).
   `isNamespaceReceiver` now also recognizes module-qualified types (member is a struct/enum). This makes
-  `mediator.nova` compile. **Held uncommitted for the framework work** — it only benefits the framework,
+  `mediator.ky` compile. **Held uncommitted for the framework work** — it only benefits the framework,
   and it cannot be gated standalone yet (see the new bug below). Commit it tomorrow WITH a gate once the
   module-qualified-type-in-closure codegen bug is addressed.
 - **Optional see-through for member access** (COMMITTED — the keeper commit): `list.get(i).field` /
@@ -198,7 +198,7 @@ prototyping (web/request.nova and app.nova had never actually compiled):
 Constructing or calling a method on a MODULE-QUALIFIED TYPE **inside a closure in the main program**
 fails in codegen — `response.Response(...)` → `StructTypeNotFound` (`llvm_codegen.zig:868`
 `getFieldOffset`, via `expressions.zig:2173`); `Status.Ok.toCode()` → `MethodOrFunctionNotFound`. The
-lifted closure function loses the struct/enum resolution for the qualified name. `mediator.nova` works
+lifted closure function loses the struct/enum resolution for the qualified name. `mediator.ky` works
 only because it is compiled IN its own module context. The framework's user code (handlers returning
 `app.json(...)`) likely avoids this, but it blocks a clean standalone conformance gate for the
 namespace-type capture fix, and should be fixed so module-qualified types work uniformly in closures.
@@ -211,12 +211,12 @@ Uncommitted changes implement the **rejected** string-keyed design mixed with ke
 
 - **KEEP:** optional see-through (`infer.zig` `fieldType`/`methodReturn`), `isNamespaceReceiver`
   module-qualified-type extension (`llvm_codegen.zig`), `serde.callBinder` + `CompositeSource`
-  (`serde/source.nova`), the `app.nova` async-server + `HttpRequest`/parser + response helpers +
+  (`serde/source.ky`), the `app.ky` async-server + `HttpRequest`/parser + response helpers +
   form/multipart sources.
 - **REPLACE:** the `app.get<T>`/`on<T>` codegen lowering (`expressions.zig` App-routing block) and the
   App-void sema branch (`infer.zig` generic_call) → become `mapGet<T>` with generic-trait handlers.
   The `App.addRoute`/`registerFor` string-keyed helpers and the `RequestHandler(any)` wiring in
-  `app.nova` → replaced by `Handler<Q,R>` + discovery.
+  `app.ky` → replaced by `Handler<Q,R>` + discovery.
 - **DELETE eventually:** the rejected `app.on<T>` path once `mapGet<T>` + discovery is in.
 
 Suggested first commit tomorrow: split out the keeper fixes (optional see-through, namespace-type
@@ -231,10 +231,10 @@ capture) as their own commit with conformance gates, so the framework rewrite st
 3. `Handler<Q,R>` trait + compile-time handler discovery.
 4. `mapGet<T>`/`mapPost<T>`/... lowering + typed dispatch + auto-JSON.
 5. End-to-end conformance: typed handler, route+query bind, `@fromRoute`+`@fromBody`, 404/405, auto-JSON.
-6. Update `nova-readiness-roadmap.md`; refresh the `nova init app` template to the new API.
+6. Update `kyte-readiness-roadmap.md`; refresh the `kyte init app` template to the new API.
 
-See also: `nova-app-generic-mediator` memory, `nova-serde-codegen`, `nova-f4b-monomorphization`,
-`nova-trait-dispatch-foundation`, `docs/design/F4-generics.md`.
+See also: `kyte-app-generic-mediator` memory, `kyte-serde-codegen`, `kyte-f4b-monomorphization`,
+`kyte-trait-dispatch-foundation`, `docs/design/F4-generics.md`.
 
 ---
 
@@ -257,7 +257,7 @@ every negative result below is unfalsifiable and any check can regress silently.
 - **A1. `expect_fail` judges by exit code only.** `conformance/run.sh` treats any non-zero exit as
   "rejected as expected". A **segfault also exits non-zero**, so a case that compiles and crashes is
   reported as a passing negative test. Must assert the *reason* (typechecker diagnostic) not just exit≠0.
-- **A2. `return_type_mismatch` has silently REGRESSED.** `conformance/expect_fail/return_type_mismatch.nova`
+- **A2. `return_type_mismatch` has silently REGRESSED.** `conformance/expect_fail/return_type_mismatch.ky`
   (`fn f(): string { return 42; }`) **compiles and segfaults** today. `expect_fail/PENDING.md` documents
   this check as DONE and enabled (`checkReturnType` wired into `.return_stmt`). The harness reports it
   PASS because of A1. Measured: 10/16 negative cases genuinely reject; this one does not.
@@ -265,9 +265,9 @@ every negative result below is unfalsifiable and any check can regress silently.
   `undefined_function`, `method_shadowed_by_global_fn`, `ambiguous_bare_call` exit non-zero by throwing
   an unhandled Zig error with a stack trace (`error: IdentifierNotFound` etc.), not a user-facing
   diagnostic. Sound but terrible UX; they should become real diagnostics.
-- **A4. The corpus runs with leak checking OFF.** `conformance/run.sh` never sets `NOVA_ARC_AUDIT`, so
+- **A4. The corpus runs with leak checking OFF.** `conformance/run.sh` never sets `KYTE_ARC_AUDIT`, so
   no case has ever gated on leaks. Turning it on is how 8.D3 stayed invisible. (Note: the audit env var
-  is `NOVA_ARC_AUDIT`; `NOVA_ARC_DUMP` alone reports nothing — `alloc.cpp:59`.)
+  is `KYTE_ARC_AUDIT`; `KYTE_ARC_DUMP` alone reports nothing — `alloc.cpp:59`.)
 - **A5. No enum conformance case exists at all.** `grep` over `conformance/cases/` finds none, which is
   why 8.E1 was never caught.
 
@@ -308,7 +308,7 @@ produce correct values (verified). The **static half does not exist**.
 Current `throw`/`catch` is **not** exceptions in any usable sense; recommendation is to remove it rather
 than invest in it. Evidence:
 
-- **C1. `throw` is an integer longjmp.** `nova_throw(long long)` (`runtime/core.cpp:162`) does
+- **C1. `throw` is an integer longjmp.** `kyte_throw(long long)` (`runtime/core.cpp:162`) does
   `std::longjmp`; the catch binding is `zext(setjmp_res)` — an **i32** (`statements.zig:587`). You cannot
   throw a string/struct/enum; the value is truncated to 32 bits, and `throw 0` silently becomes `1`.
 - **C2. No unwinding ⇒ guaranteed ARC leaks.** The catch path only releases locals collected lexically
@@ -334,7 +334,7 @@ than invest in it. Evidence:
   (x86-64 SysV / AArch64 AAPCS both return 16-byte aggregates in registers, zero memory traffic). Codegen
   returns a single i64 today. **This same capability is what fixes tuples properly (8.D6)** — one
   foundation, two payoffs.
-- **C7. Stack traces: none exist today.** `nova_get_stacktrace()` is a stub — `return nova_bytes_alloc(0)`
+- **C7. Stack traces: none exist today.** `kyte_get_stacktrace()` is a stub — `return kyte_bytes_alloc(0)`
   (`core.cpp:172`); `exception.getStackTrace()` returns a zero-length string (verified). So `throw`
   provides **no** trace and there is nothing to lose by dropping it.
 - **C8. Stack traces are compatible with `T | Error`.** Capture at error *construction* (same site a
@@ -377,8 +377,8 @@ than invest in it. Evidence:
 
 
 
-Tuples are **not** a candidate for the error model, but they are live in `web/request.nova`,
-`datetime.nova` (a 6-element destructure) and `yaml.nova`, so these are real bugs today. What works:
+Tuples are **not** a candidate for the error model, but they are live in `web/request.ky`,
+`datetime.ky` (a 6-element destructure) and `yaml.ky`, so these are real bugs today. What works:
 tuple types parse in every position; `let (v, e) = f()` destructures; heap elements survive the
 happy path.
 
@@ -388,7 +388,7 @@ happy path.
 - **D2. Consequence: element types are unchecked.** `let (v, e) = divide(10,2)` where `e: string`, then
   `v + e` compiles and yields `4304536869` — a **raw string pointer added to 5**, no diagnostic.
 - **D3. Every tuple leaks — and the leak is LOAD-BEARING.** Measured over 100 iterations with
-  `NOVA_ARC_AUDIT=1`: single-`string` return → 3 survivors (flat baseline); `struct` return → 3 (flat);
+  `KYTE_ARC_AUDIT=1`: single-`string` return → 3 survivors (flat baseline); `struct` return → 3 (flat);
   `(string,string)` return → **303** (box + both elements, every call). The unbalanced retain is the only
   thing preventing use-after-free.
 - **D4. Arity unchecked in both directions.** Destructuring 3 names from a 2-tuple compiles (reads out of
@@ -401,7 +401,7 @@ happy path.
   **Case 28 gates the one shape that works.**
 - **D6. No tuple destructor exists.** `getOrCreateDestructor` returns null for any tuple
   (`arc.zig:407-409` — not in `self.structs`), while `isRefCountedType` is a catch-all returning true
-  (`arc.zig:12-31`). Net: the box is freed via `nova_release(box, null)` and **every element leaks**.
+  (`arc.zig:12-31`). Net: the box is freed via `kyte_release(box, null)` and **every element leaks**.
 - **D7. Root cause of D6, and the cheapest high-leverage fix: `shadow.zig:588` renders every tuple type
   as the literal string `"<tuple>"`.** That doesn't start with `(`, so `getTupleElementType`
   (`llvm_codegen.zig:419-434`) returns `"i32"` for **every element of every destructuring, always**
@@ -427,7 +427,7 @@ happy path.
   binding never happens. **Workaround: annotate — `let e: E = E.BadDigit(7)` passes** (verified,
   including a string payload under ARC audit).
 - **E2. This is on the `T | Error` critical path.** `let r = parse(s); switch (r)` — switching on a local
-  — is precisely the idiomatic shape. `yaml.nova` never hit it because every switch there is on a
+  — is precisely the idiomatic shape. `yaml.ky` never hit it because every switch there is on a
   parameter.
 - **E3. Fails loudly (compile error), unlike 8.D which fails silently at runtime.** Narrow and fixable;
   it is local type inference for enum-constructor initialisers, not a design flaw.
@@ -442,5 +442,5 @@ happy path.
 
 - **G1. The `let` convention gap is the same shape as B1.** Spec §5.1 admits `let` is not
   enforced-immutable; optionals are now a second "working convention with no static guarantee". Worth
-  deciding whether Nova claims enforcement or documents convention — consistently.
-- **G2. Deferred items already tracked in the `nova-deferred-backlog` memory are not duplicated here.**
+  deciding whether Kyte claims enforcement or documents convention — consistently.
+- **G2. Deferred items already tracked in the `kyte-deferred-backlog` memory are not duplicated here.**

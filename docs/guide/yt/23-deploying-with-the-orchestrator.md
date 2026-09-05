@@ -2,11 +2,11 @@
 
 - Chapter: [23-deploying-with-the-orchestrator.md](../23-deploying-with-the-orchestrator.md)
 - Estimated length: ~14 minutes
-- You will need: Nova installed, a PostgreSQL server, curl, and the guide's `examples/` folder. Watching Video 18 on data access first is essential, since we deploy that PostgreSQL-backed app.
+- You will need: Kyte installed, a PostgreSQL server, curl, and the guide's `examples/` folder. Watching Video 18 on data access first is essential, since we deploy that PostgreSQL-backed app.
 
 ## Hook (0:00)
 
-**Say:** You have a PostgreSQL-backed web service. In this video we run it the way you would in production: several replicas behind a load balancer, supervised and kept at their desired count. Nova ships a small orchestrator for exactly this. The parts we use here are three binaries that mirror the Kubernetes control-plane and data-plane split, service, orchd, and orchctl; a fourth binary, artifactd, delivers the actual application binaries and hosts the orchestrator's own config store. By the end of this one you will have curled your app through a real load balancer and operated its config store from the command line.
+**Say:** You have a PostgreSQL-backed web service. In this video we run it the way you would in production: several replicas behind a load balancer, supervised and kept at their desired count. Kyte ships a small orchestrator for exactly this. The parts we use here are three binaries that mirror the Kubernetes control-plane and data-plane split, service, orchd, and orchctl; a fourth binary, artifactd, delivers the actual application binaries and hosts the orchestrator's own config store. By the end of this one you will have curled your app through a real load balancer and operated its config store from the command line.
 
 ## What we will cover (0:30)
 
@@ -69,7 +69,7 @@ service service.json --check     # validate the config, print backends + strateg
 service service.json             # serve
 ```
 
-**Say:** Strategies are round-robin, weighted, least-connections, and consistent-hash. Health checks poll the path you give; a backend drops out after `fall` failures and comes back after `rise` successes. service refuses to start with zero live backends, so a bad pool fails loudly instead of black-holing traffic. And because our app honours `NOVA_PORT`, we can run two replicas of the same binary on one host, on 8080 and 8081, for service to balance.
+**Say:** Strategies are round-robin, weighted, least-connections, and consistent-hash. Health checks poll the path you give; a backend drops out after `fall` failures and comes back after `rise` successes. service refuses to start with zero live backends, so a bad pool fails loudly instead of black-holing traffic. And because our app honours `KYTE_PORT`, we can run two replicas of the same binary on one host, on 8080 and 8081, for service to balance.
 
 ## Segment: orchd, the control plane (5:30)
 

@@ -1,7 +1,7 @@
-# The Nova optimiser: a HIR / MIR / LIR middle-end
+# The Kyte optimiser: a HIR / MIR / LIR middle-end
 
 Status: design, not yet implemented. Home for all code: `lang/src/optimiser/`.
-Author's intent: give Nova a real optimising middle-end between the typed frontend and the LLVM
+Author's intent: give Kyte a real optimising middle-end between the typed frontend and the LLVM
 backend, with automatic reference counting (ARC) modelled as first-class IR operations so that
 redundant retain/release pairs can be elided. ARC-elision is the headline payoff; a clean multi-tier
 IR is the enabling structure.
@@ -28,12 +28,12 @@ This has served well, but it has three structural limits:
    that takes ownership). We cannot elide them because by the time they exist they are opaque LLVM
    calls, and LLVM does not know they are balanced. The per-request allocation-and-refcount count is
    the measured per-core gap against Rust (see `docs/design/perf-improvement.md` and the
-   `nova-per-core-perf-vs-rust` note): ~3000 ARC objects per request against ~50 for hand-written
+   `kyte-per-core-perf-vs-rust` note): ~3000 ARC objects per request against ~50 for hand-written
    code. Removing provably-redundant traffic is the single biggest perf lever left.
 
 2. **Optimisation has nowhere to live.** Constant folding, dead-code elimination, copy propagation,
    inlining of tiny accessors, and branch simplification all have to be either done ad-hoc on the AST
-   (fragile, and the AST is not in a normal form) or left entirely to LLVM (which cannot see Nova-level
+   (fragile, and the AST is not in a normal form) or left entirely to LLVM (which cannot see Kyte-level
    invariants like "this optional is statically present" or "this trait call has one concrete target").
    A normalised IR with a pass pipeline is where these belong.
 
@@ -49,7 +49,7 @@ tiers, not one, because each tier answers a different question and a pass wants 
 
 | Tier | Full name | Shape | What it is good for |
 |---|---|---|---|
-| **HIR** | High-level IR | Tree, typed, desugared | Nova semantics made explicit; source-level rewrites |
+| **HIR** | High-level IR | Tree, typed, desugared | Kyte semantics made explicit; source-level rewrites |
 | **MIR** | Mid-level IR | SSA over a CFG of basic blocks | Data-flow analysis and the optimiser; ARC-elision lives here |
 | **LIR** | Low-level IR | Linear, near-LLVM, no SSA phis needed | A thin, mechanical hand-off to LLVM |
 
@@ -64,7 +64,7 @@ Codegen stops walking the AST and starts walking LIR.
 
 ### HIR: high-level IR
 
-HIR is a **typed, desugared tree**. It is the AST with all the Nova sugar removed and every node
+HIR is a **typed, desugared tree**. It is the AST with all the Kyte sugar removed and every node
 carrying a concrete `TypeId` (post-monomorphisation, so `List<int>` not `List<T>`). Desugaring makes
 implicit work explicit so later tiers have fewer cases:
 
@@ -94,7 +94,7 @@ of **basic blocks**. Each function becomes:
   one definition and def-use chains are trivial to walk;
 - block arguments (our spelling of phi nodes) to merge values at control-flow joins.
 
-MIR instructions are typed (every SSA value has a `TypeId`) and include the Nova-specific operations
+MIR instructions are typed (every SSA value has a `TypeId`) and include the Kyte-specific operations
 that must survive to the backend: `retain`, `release`, `alloc`, field load/store, `call`,
 `indirect_call` (trait dispatch), `await`, `spawn`, and the arithmetic/comparison/cast set.
 
@@ -111,7 +111,7 @@ backend is a dumb, mechanical translator with no decisions left to make: no owne
 name mangling logic, no type-decision work. It walks LIR and calls `LLVMBuild*`.
 
 LIR keeps the async and ARC operations explicit (LLVM coroutine intrinsics and the
-`nova_retain`/`nova_release` runtime calls are emitted here), but it makes no further choices about
+`kyte_retain`/`kyte_release` runtime calls are emitted here), but it makes no further choices about
 them; the choices were made in MIR.
 
 ## The optimiser: passes over MIR
@@ -129,7 +129,7 @@ isolation. The initial set, in dependency order:
 4. **Dead-code elimination.** Remove instructions whose results are unused and have no side effects.
    Crucially, a `retain` whose only use was elided becomes dead here.
 5. **ARC-elision (the headline pass).** See below.
-6. **Inlining (bounded).** Inline trivial accessors and single-call-site functions. Nova generates
+6. **Inlining (bounded).** Inline trivial accessors and single-call-site functions. Kyte generates
    many tiny getters and generated binders (`__bind`, serde); inlining them removes call overhead and
    exposes cross-call ARC pairs to elision. Bounded by a size/blow-up budget.
 7. **Simplify-CFG.** Merge straight-line blocks, remove unreachable blocks, fold trivial branches. Run
@@ -140,7 +140,7 @@ Passes 2 to 7 iterate to a fixpoint (bounded), because each pass exposes opportu
 
 ### ARC-elision, in detail
 
-This is why the whole structure exists. Nova's ownership is decided in sema
+This is why the whole structure exists. Kyte's ownership is decided in sema
 (`TypedIr.expr_owned` / `expr_owned_inst`, the TypeId ownership predicates) and HIR turns each decision
 into an explicit `retain`/`release`. On MIR we then apply the standard ARC optimisation moves, all of
 which are sound because the IR is SSA and typed:
@@ -155,7 +155,7 @@ which are sound because the IR is SSA and typed:
 - **Borrow detection.** A value that is only read through and never stored, returned, captured, or
   passed to a `+1` sink does not need to be retained at all for the duration of the borrow; its
   provider keeps it alive. This is the function-local case the escape-analysis gauge already measures
-  (`sema/escape.zig`, `NOVA_ESCAPE_REPORT`); MIR is where we can finally act on it.
+  (`sema/escape.zig`, `KYTE_ESCAPE_REPORT`); MIR is where we can finally act on it.
 - **Release sinking.** Move a release to the earliest point where the value is provably last-used,
   shortening lifetimes and enabling earlier frees.
 
@@ -165,7 +165,7 @@ gate. The safety rule is conservative by construction: when in doubt, keep the r
 a needed retain is a use-after-free (ASAN catches it); keeping a redundant one is merely slow. We only
 ever remove when the data flow proves the pair balanced with no interleaved observer.
 
-Note the relationship to the request-arena work (`nova-p7-request-arena-infra`,
+Note the relationship to the request-arena work (`kyte-p7-request-arena-infra`,
 `docs/design/p7-sound-arena.md`): arena allocation removes the *free*; ARC-elision removes the
 *retain/release traffic*. They are complementary. Escape analysis feeds both. The arena work found that
 function-escape is the wrong granularity for allocation; ARC-elision works at exactly the right
@@ -259,13 +259,13 @@ and it is our correctness oracle. We follow the same shadow-then-cut methodology
   `driver.run` that is not on the critical path. Reference the modules from `root.zig` so `zig build`
   type-checks them. No behaviour change. This is the code home the user asked for.
 - **Milestone M1 (lower + round-trip, off).** Implement AST->HIR->MIR->LIR with **no** optimisation
-  passes, plus a `lir_to_llvm` emitter. Gate it behind `NOVA_OPT=1` (off by default). When on, codegen
+  passes, plus a `lir_to_llvm` emitter. Gate it behind `KYTE_OPT=1` (off by default). When on, codegen
   emits from LIR instead of the AST. Success = the corpus + ASAN pass byte-for-byte equivalently
-  (same behaviour) with `NOVA_OPT=1`. This proves the lowering is faithful before any pass touches it.
+  (same behaviour) with `KYTE_OPT=1`. This proves the lowering is faithful before any pass touches it.
 - **Milestone M2 (verifier + differential shadow).** Add `verify.zig` (SSA well-formedness, type
   consistency, and an ARC-balance check: every value's retains and releases net to its ownership
   contract). Add a differential mode that runs BOTH paths and asserts identical observable behaviour,
-  exactly like `NOVA_SEMA_SHADOW` / the census did for the string engine.
+  exactly like `KYTE_SEMA_SHADOW` / the census did for the string engine.
 - **Milestone M3 (safe passes).** Turn on the non-ARC passes (mem2reg, constfold, copyprop, dce,
   simplifycfg) one at a time, each gated by the full corpus + ASAN + the verifier. These change
   generated code but not behaviour.
@@ -276,12 +276,12 @@ and it is our correctness oracle. We follow the same shadow-then-cut methodology
   the pair stays.
 - **Milestone M5 (inlining).** Bounded inlining of accessors/binders, which multiplies M4's wins by
   exposing cross-call pairs.
-- **Milestone M6 (cut over).** Once `NOVA_OPT=1` has been the measured-better, corpus-and-ASAN-clean
+- **Milestone M6 (cut over).** Once `KYTE_OPT=1` has been the measured-better, corpus-and-ASAN-clean
   path for long enough, make it the default and retire the AST->LLVM emitter. The backend becomes a
   LIR emitter only.
 
 At every milestone the fallback is the current path, and the gate is unchanged: `conformance/run.sh -j`
-(fast, catches miscompiles as loud failures) and `NOVA_ASAN=1 zig build && conformance/run.sh --asan`
+(fast, catches miscompiles as loud failures) and `KYTE_ASAN=1 zig build && conformance/run.sh --asan`
 (catches any ARC mistake as a use-after-free). Perf is measured on the web/ORM/YCSB benchmarks, since
 ARC-elision is the reason we are here.
 
@@ -309,7 +309,7 @@ ARC-elision is the reason we are here.
 - **Risk: scope creep into a general optimiser.** Non-goal for now: loop optimisations (LICM,
   unrolling), vectorisation (LLVM already does this well for our array/SIMD paths), and interprocedural
   analysis beyond bounded inlining. LLVM remains our backend optimiser for the classical scalar work;
-  our passes exist for the Nova-specific wins LLVM cannot see, chiefly ARC.
+  our passes exist for the Kyte-specific wins LLVM cannot see, chiefly ARC.
 - **Non-goal: replacing sema.** The frontend, the TypeId type system, and monomorphisation are
   unchanged. The middle-end consumes their output.
 
@@ -319,7 +319,7 @@ ARC-elision is the reason we are here.
 ## ✅ Resolution (2026-08-15) — genuine emit is now 348/349 (was 272/348 when the gate went honest)
 
 Once the gate was honest (below), the 75-case gap turned out to be three root causes, each fixed as a
-clean, differentially-verified increment. Genuine `NOVA_OPT_EMIT=1 conformance/run.sh -j` is now **348/349**
+clean, differentially-verified increment. Genuine `KYTE_OPT_EMIT=1 conformance/run.sh -j` is now **348/349**
 (only `189_epoll_event_layout`, the expected off-Linux structural fail) — identical to the default build,
 and clean under `--asan`. Default build (emit off) stays **348/349**, users unaffected.
 
@@ -342,7 +342,7 @@ and clean under `--asan`. Default build (emit off) stays **348/349**, users unaf
    and `continue`d before the coro prologue → malformed coroutine → CoroSplit crash. Fix (fail-closed):
    `tryEmitInner` rejects `func.is_async` up front. Cleared the 9-case async cluster.
 
-Pinned by `conformance/cases/339_opt_emit_unop.nova` (neg/bit_not/not + INT_MIN boundary, AST vs emit).
+Pinned by `conformance/cases/339_opt_emit_unop.ky` (neg/bit_not/not + INT_MIN boundary, AST vs emit).
 The history below (the vacuous-gate correction) is kept for the record.
 
 ### Subset growth (2026-08-15) — module-level const references now emit
@@ -356,7 +356,7 @@ scalar int/bool (arrays/structs/strings and bare function references fall back).
 verbatim (NOT re-canonicalised: a `long` mask whose threaded MIR type reads as `int` would otherwise be
 width-32 sign-extended, turning `0xffffffff` into `-1` and unmasking `x & MASK32`). Gates: default / emit /
 emit-`--asan` all 349/350 (only off-Linux `189_epoll`). Pinned by
-`conformance/cases/340_opt_emit_global_const.nova` (mask/rotate idiom + scalar/bool/computed consts).
+`conformance/cases/340_opt_emit_global_const.ky` (mask/rotate idiom + scalar/bool/computed consts).
 
 **Known orthogonal follow-up (pre-existing, exposed by more functions now emitting):** a hex literal with
 bit 31 set (e.g. `0x80000000`) used in a `== long` comparison is emitted as a 32-bit int (INT_MIN,
@@ -365,17 +365,17 @@ value before comparing), but `fn f(x:long){return x<<31;} … r == 0x80000000` d
 literal's threaded width in the emit const path — the same `long`-vs-`int` threading weakness — not the
 global-const work. Fix is a separate increment.
 
-## ⚠️ Correction (2026-08-15) — the NOVA_OPT_EMIT corpus gate was VACUOUS; genuine emit is 272/348
+## ⚠️ Correction (2026-08-15) — the KYTE_OPT_EMIT corpus gate was VACUOUS; genuine emit is 272/348
 
-Every prior claim below of "NOVA_OPT_EMIT=1 corpus 346/347" was measured through `nova test`, and
-`nova test` (tester.zig) NEVER set `lir_emit.emit_enabled` — only the `nova build` path (builder.zig:192)
-did. So `NOVA_OPT_EMIT=1 conformance/run.sh` ran the AST path the whole time: the emit gate proved nothing.
+Every prior claim below of "KYTE_OPT_EMIT=1 corpus 346/347" was measured through `kyte test`, and
+`kyte test` (tester.zig) NEVER set `lir_emit.emit_enabled` — only the `kyte build` path (builder.zig:192)
+did. So `KYTE_OPT_EMIT=1 conformance/run.sh` ran the AST path the whole time: the emit gate proved nothing.
 Per-increment BUILD-path differentials (M6-A..E) were real, but the corpus-wide emit gate was not.
 
 Fixed 2026-08-15: tester.zig now sets `emit_enabled`/`emit_verbose`/`mir.type_store` from the same env the
-build path reads, so `nova test` genuinely exercises emit. With the gate honest, the numbers are:
+build path reads, so `kyte test` genuinely exercises emit. With the gate honest, the numbers are:
 - **Default build (emit off): 347/348** (only 189_epoll, expected off-Linux) — unchanged, users unaffected.
-- **NOVA_OPT_EMIT=1 (genuine): 272/348 — 75 real failures.** The emit path (M6-A..D) is NOT corpus-correct;
+- **KYTE_OPT_EMIT=1 (genuine): 272/348 — 75 real failures.** The emit path (M6-A..D) is NOT corpus-correct;
   it was hardened against a gate that didn't run it.
 
 Two representative defects found immediately (there are ~75):
@@ -396,7 +396,7 @@ Everything below predates this correction; read it with the vacuous-gate caveat 
 
 ## Implementation status (2026-08-14) — honest milestone accounting
 
-The optimiser MACHINERY is built, tested, and proven on real code via the `NOVA_OPT` shadow. The backend
+The optimiser MACHINERY is built, tested, and proven on real code via the `KYTE_OPT` shadow. The backend
 EMIT cutover is deliberately NOT faked. Precisely:
 
 - **M0 scaffold — DONE.** `src/optimiser/` with the IR types + pass registry, compiled by `zig build`.
@@ -405,7 +405,7 @@ EMIT cutover is deliberately NOT faked. Precisely:
   tiers.
 - **M1 emit half — WIRED, airtight, and EMITTING the optimised IR for a growing subset.** `src/backend/codegen/lir_emit.zig`
   emits an LLVM function body from the optimised MIR, hooked into `declarations.zig` and gated by a SEPARATE
-  opt-in `NOVA_OPT_EMIT` (off by default, so default builds are byte-identical). It is a per-function
+  opt-in `KYTE_OPT_EMIT` (off by default, so default builds are byte-identical). It is a per-function
   FALLBACK: `tryEmit` returns false for anything outside a provable subset and codegen then emits that
   function from the AST unchanged. Every emit is validated by a dry pass (`mirEmittable`) BEFORE any IR is
   built, so a reject can never leave a half-filled block. The subset grew in gated increments (M6-A/B/C),
@@ -484,9 +484,9 @@ EMIT cutover is deliberately NOT faked. Precisely:
   increment at a time (never a half-cutover) with the trusted AST path covering everything not yet emitted.
 
 **Bottom line:** the middle-end and its optimiser are real, correct (verifier + unit tests), and
-measurably effective (27% MIR reduction) on the whole corpus, entirely behind `NOVA_OPT` with the trusted
+measurably effective (27% MIR reduction) on the whole corpus, entirely behind `KYTE_OPT` with the trusted
 AST path untouched. The backend EMIT path now exists and emits the OPTIMISED IR for a small, airtight,
-differentially-verified subset behind `NOVA_OPT_EMIT` (default corpus + `NOVA_OPT_EMIT=1` corpus + ASAN all
+differentially-verified subset behind `KYTE_OPT_EMIT` (default corpus + `KYTE_OPT_EMIT=1` corpus + ASAN all
 346/347). Unblocking it fixed a real whole-optimiser bug (the TypeId-0/unset collision — type-threading
 47%→84%) and made constfold width-honest. What remains is GROWING the emitted subset (params, control flow,
 calls, ARC, traits) toward the full backend and the two threading prerequisites (ownership→ARC ops,
@@ -494,7 +494,7 @@ symbols→call graph) that switch M4/M5 from unit-tested to firing — the M6 cu
 
 ## One-paragraph summary
 
-Insert a three-tier middle-end (`src/optimiser/`): HIR makes Nova semantics and ARC explicit, MIR puts
+Insert a three-tier middle-end (`src/optimiser/`): HIR makes Kyte semantics and ARC explicit, MIR puts
 it in SSA so the optimiser can reason, LIR hands a decision-free stream to the LLVM backend. The passes
 we care about are the ARC ones: turn the retain/release traffic that dominates our per-core gap from an
 opaque backend side effect into IR operations we can prove balanced and cancel. Land it behind a flag,

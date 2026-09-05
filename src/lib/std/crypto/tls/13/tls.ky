@@ -1,0 +1,435 @@
+//! TLS 1.3 key schedule and record protection (RFC 8446).
+//!
+//! This file is the cryptographic core of Kyte's self-hosted TLS 1.3 stack. It
+//! does two jobs that sit at the heart of every TLS 1.3 connection: it runs the
+//! HKDF-based KEY SCHEDULE that turns a shared secret into the traffic keys
+//! (RFC 8446 section 7.1), and it performs RECORD PROTECTION, the AEAD seal and
+//! open that wraps each application record on the wire (section 5.2). Everything
+//! above it, the handshake state machine and the TLS record layer, is expected
+//! to call into these routines rather than reimplementing them.
+//!
+//! WHY it exists as its own module: Kyte's runtime direction retired the
+//! Boost.Asio + wolfSSL dependency and moved all crypto and TLS into pure Kyte
+//! (see the runtime-direction notes in the project memory). So the key schedule
+//! that a C library would hide behind an opaque handle is spelled out here in
+//! Kyte, layered on the primitive modules it imports: HKDF for extract and
+//! expand, SHA-256 and SHA-384 for the transcript hash, and AES-GCM and
+//! ChaCha20-Poly1305 for the AEAD.
+//!
+//! DESIGN AND CONVENTIONS. The whole module works on RAW BYTE BUFFERS (`ptr`)
+//! rather than owned Kyte strings, because it lives on the hot path and must not
+//! mint or retain intermediate strings per record. The caller allocates the
+//! output buffers and owns their lifetime; each function writes into a `ptr` the
+//! caller passed in. Every temporary buffer allocated inside a function (labels,
+//! the all-zero salt, the empty-string hash) is freed before the function
+//! returns, so these routines allocate nothing that outlives the call.
+//!
+//! The `kind` parameter selects the hash family and therefore the HKDF output
+//! length: `0` means SHA-256 (32-byte secrets) and any other value means
+//! SHA-384 (48-byte secrets). It is threaded through every derivation so the
+//! entire schedule stays on one hash, as TLS 1.3 requires. The `suite` parameter
+//! selects the AEAD and its key length via [`keyLen`]; see [`SUITE_AES128_GCM`],
+//! [`SUITE_AES256_GCM`] and [`SUITE_CHACHA20`].
+//!
+//! INVARIANT the caller must uphold: output buffers must be large enough for the
+//! hash or key length implied by `kind` and `suite`. Secret outputs need
+//! `hkdf.hashLen(kind)` bytes, key outputs need `keyLen(suite)` bytes, IV and
+//! nonce outputs need 12 bytes, and record buffers need room for the 5-byte
+//! header plus the plaintext plus one content-type byte plus the 16-byte AEAD
+//! tag. None of these lengths are checked here.
+
+import bytes;
+import crypto.kdf.hkdf;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
+import crypto.aead.aesgcm;
+import crypto.aead.chachapoly;
+
+/// Cipher-suite tag for `TLS_AES_128_GCM_SHA256`: AES-128-GCM, 16-byte key.
+///
+/// Passed as the `suite` argument to [`keyLen`], [`deriveKeyIv`],
+/// [`recordProtect`] and [`recordUnprotect`]. This is the only suite whose key
+/// is 16 bytes; the other two are 32.
+const SUITE_AES128_GCM: int = 0;
+/// Cipher-suite tag for `TLS_AES_256_GCM_SHA384`: AES-256-GCM, 32-byte key.
+const SUITE_AES256_GCM: int = 1;
+/// Cipher-suite tag for `TLS_CHACHA20_POLY1305_SHA256`: ChaCha20-Poly1305,
+/// 32-byte key.
+///
+/// This value is special-cased in [`aeadSeal`] and [`aeadOpen`] because it
+/// dispatches to the ChaCha20-Poly1305 primitive rather than to AES-GCM.
+const SUITE_CHACHA20: int = 2;
+
+/// Returns the AEAD key length in bytes for a cipher suite.
+///
+/// AES-128-GCM ([`SUITE_AES128_GCM`]) uses a 16-byte key; every other suite
+/// (AES-256-GCM and ChaCha20-Poly1305) uses 32 bytes. Callers size their key
+/// output buffers by this value, and it is also handed to the AES-GCM primitive
+/// so it can pick AES-128 versus AES-256.
+pub fn keyLen(suite: int): int {
+    if (suite == SUITE_AES128_GCM) { return 16; }
+    return 32;
+}
+
+/// Copies the bytes of a Kyte `string` into a freshly allocated raw buffer.
+///
+/// The KDF primitives take label bytes as a `ptr` plus a length, not as a Kyte
+/// `string`, so labels like "c e traffic" or "key" are marshalled through here
+/// first. The returned buffer is OWNED by the caller and must be released with
+/// `bytes.free`; every caller in this file does so before returning. The buffer
+/// holds exactly `s.length` bytes with no NUL terminator, because the KDF is
+/// always given an explicit length.
+fn strBuf(s: string): ptr {
+    let b = bytes.alloc(s.length);
+    let i = 0;
+    while (i < s.length) { bytes.write_byte(b, i, s[i]); i = i + 1; }
+    return b;
+}
+
+/// Writes the hash of the EMPTY input into `out` for the given hash family.
+///
+/// TLS 1.3 repeatedly needs `Transcript-Hash("")`, the digest of the empty
+/// string, as the context for `Derive-Secret` when there is no transcript yet
+/// (for instance deriving the "derived" secret between stages). `kind == 0`
+/// computes SHA-256, otherwise SHA-384. A one-byte scratch buffer is allocated
+/// only to give the hash function a valid pointer; a length of 0 is passed, so
+/// no byte of it is actually read, and it is freed before returning. `out` must
+/// have room for the full digest (`hkdf.hashLen(kind)` bytes).
+fn hashEmpty(kind: int, out: ptr): void {
+    let d = bytes.alloc(1);
+    if (kind == 0) { sha256.hashInto(d, 0, out); } else { sha512.hash384Into(d, 0, out); }
+    bytes.free(d);
+}
+
+
+/// Computes the TLS 1.3 Early Secret for a connection WITHOUT a pre-shared key.
+///
+/// This is the root of the key schedule (RFC 8446 section 7.1): when no PSK is
+/// in use, the Early Secret is `HKDF-Extract(salt = 0, IKM = 0)`, where both the
+/// salt and the input keying material are a string of `hkdf.hashLen(kind)` zero
+/// bytes. The single zero buffer `z` is reused for both arguments and freed
+/// afterwards. Use [`earlySecretPsk`] instead when resuming with a PSK. `out`
+/// receives `hkdf.hashLen(kind)` bytes.
+pub fn earlySecret(kind: int, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let z = bytes.alloc(hl);
+    let i = 0;
+    while (i < hl) { bytes.write_byte(z, i, 0); i = i + 1; }
+    hkdf.extract(kind, z, hl, z, hl, out);
+    bytes.free(z);
+}
+
+/// Computes the TLS 1.3 Early Secret from a pre-shared key (PSK resumption).
+///
+/// Same root step as [`earlySecret`], but the input keying material is the PSK
+/// rather than zeros: `HKDF-Extract(salt = 0, IKM = psk)`. The salt is still a
+/// block of `hkdf.hashLen(kind)` zero bytes (buffer `z`, freed on return). The
+/// caller passes the PSK as `psk` with its length `pskLen`, and `out` receives
+/// `hkdf.hashLen(kind)` bytes.
+pub fn earlySecretPsk(kind: int, psk: ptr, pskLen: int, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let z = bytes.alloc(hl);
+    let i = 0;
+    while (i < hl) { bytes.write_byte(z, i, 0); i = i + 1; }
+    hkdf.extract(kind, z, hl, psk, pskLen, out);
+    bytes.free(z);
+}
+
+/// Derives the client early-traffic secret used for 0-RTT application data.
+///
+/// This is `Derive-Secret(Early Secret, "c e traffic", ClientHello)` from RFC
+/// 8446 section 7.1. The label is "c e traffic" (11 bytes) and the transcript
+/// context `chHash` is the hash of the ClientHello. The resulting secret feeds
+/// [`deriveKeyIv`] to produce the 0-RTT key and IV. `out` receives
+/// `hkdf.hashLen(kind)` bytes; the label buffer is freed before returning.
+pub fn deriveEarlyTraffic(kind: int, earlySec: ptr, chHash: ptr, out: ptr): void {
+    let lab = strBuf("c e traffic");
+    hkdf.deriveSecret(kind, earlySec, hkdf.hashLen(kind), lab, 11, chHash, out);
+    bytes.free(lab);
+}
+
+/// Derives the resumption binder key used to authenticate a PSK offer.
+///
+/// This is `Derive-Secret(Early Secret, "res binder", "")` from RFC 8446 section
+/// 4.2.11.2. The context is the hash of the EMPTY string (computed via
+/// [`hashEmpty`] into `eh`), not a transcript, because the binder is computed
+/// before the ClientHello transcript is complete. The label is "res binder" (10
+/// bytes). Both scratch buffers, `eh` and the label, are freed before returning.
+/// `out` receives `hkdf.hashLen(kind)` bytes.
+pub fn deriveResBinderKey(kind: int, earlySec: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let eh = bytes.alloc(hl);
+    hashEmpty(kind, eh);
+    let lab = strBuf("res binder");
+    hkdf.deriveSecret(kind, earlySec, hl, lab, 10, eh, out);
+    bytes.free(eh); bytes.free(lab);
+}
+
+/// Derives the "derived" secret that bridges two stages of the key schedule.
+///
+/// TLS 1.3 does not feed one secret straight into the next `HKDF-Extract`; it
+/// first runs `Derive-Secret(secret, "derived", "")` and uses that as the salt
+/// for the next stage (RFC 8446 section 7.1). This is how the Early Secret leads
+/// into the Handshake Secret and the Handshake Secret into the Master Secret.
+/// The context is the hash of the empty string ([`hashEmpty`] into `eh`), the
+/// label is "derived" (7 bytes), and the output goes to [`extractSecret`] as the
+/// salt. `eh` and the label are freed on return; `out` receives
+/// `hkdf.hashLen(kind)` bytes.
+pub fn deriveDerived(kind: int, secret: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let eh = bytes.alloc(hl);
+    hashEmpty(kind, eh);
+    let lab = strBuf("derived");
+    hkdf.deriveSecret(kind, secret, hl, lab, 7, eh, out);
+    bytes.free(eh); bytes.free(lab);
+}
+
+/// Runs `HKDF-Extract(salt, IKM)` to advance to the next key-schedule stage.
+///
+/// This is the generic extract step of the schedule: the Handshake Secret is
+/// `HKDF-Extract(derived, (EC)DHE)` and the Master Secret is
+/// `HKDF-Extract(derived, 0)`. The `salt` is normally the output of
+/// [`deriveDerived`], and `ikm`/`ikmLen` is the (EC)DHE shared secret (or zeros
+/// for the Master Secret). The salt length is fixed to `hkdf.hashLen(kind)`.
+/// `out` receives `hkdf.hashLen(kind)` bytes.
+pub fn extractSecret(kind: int, salt: ptr, ikm: ptr, ikmLen: int, out: ptr): void {
+    hkdf.extract(kind, salt, hkdf.hashLen(kind), ikm, ikmLen, out);
+}
+
+/// Derives a traffic secret with a caller-supplied label and transcript hash.
+///
+/// This is the general `Derive-Secret(secret, label, transcript)` used for the
+/// handshake and application traffic secrets, whose labels vary: "c hs traffic"
+/// and "s hs traffic" from the Handshake Secret, "c ap traffic" and
+/// "s ap traffic" and "exp master" from the Master Secret (RFC 8446 section
+/// 7.1). Unlike [`deriveEarlyTraffic`] and friends the label is not hard-coded,
+/// so the caller passes it as a Kyte `string`; it is marshalled to bytes via
+/// [`strBuf`] and freed on return. `transcript` is the running Transcript-Hash
+/// at the point the secret is derived, and `out` receives `hkdf.hashLen(kind)`
+/// bytes.
+pub fn deriveTraffic(kind: int, secret: ptr, label: string, transcript: ptr, out: ptr): void {
+    let lab = strBuf(label);
+    hkdf.deriveSecret(kind, secret, hkdf.hashLen(kind), lab, label.length, transcript, out);
+    bytes.free(lab);
+}
+
+/// Derives the NEXT application traffic secret for a key update.
+///
+/// TLS 1.3 lets either side rotate its keys mid-connection with a KeyUpdate
+/// message. The successor secret is
+/// `HKDF-Expand-Label(secret, "traffic upd", "", Hash.length)` (RFC 8446 section
+/// 7.2), with an EMPTY context rather than a transcript hash. Note this calls
+/// `hkdf.expandLabel` directly (not `deriveSecret`), because there is no
+/// transcript to hash; the empty context is passed as a one-byte scratch buffer
+/// with length 0. The label is "traffic upd" (11 bytes). `empty` and the label
+/// are freed on return, and `out` receives `hkdf.hashLen(kind)` bytes, which then
+/// feeds [`deriveKeyIv`] again for the new key and IV.
+pub fn deriveTrafficUpdate(kind: int, secret: ptr, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let empty = bytes.alloc(1);
+    let lab = strBuf("traffic upd");
+    hkdf.expandLabel(kind, secret, hl, lab, 11, empty, 0, out, hl);
+    bytes.free(empty); bytes.free(lab);
+}
+
+/// Derives the resumption master secret at the end of the handshake.
+///
+/// This is `Derive-Secret(Master Secret, "res master", transcript)` from RFC
+/// 8446 section 7.1, where the transcript runs up to and includes the client
+/// Finished. The label is "res master" (10 bytes). The result is not used
+/// directly as a PSK; it is fed into [`deriveResumptionPsk`] together with a
+/// per-ticket nonce. The label buffer is freed on return, and `out` receives
+/// `hkdf.hashLen(kind)` bytes.
+pub fn deriveResMaster(kind: int, master: ptr, transcriptHash: ptr, out: ptr): void {
+    let lab = strBuf("res master");
+    hkdf.deriveSecret(kind, master, hkdf.hashLen(kind), lab, 10, transcriptHash, out);
+    bytes.free(lab);
+}
+
+/// Derives the per-ticket resumption PSK from the resumption master secret.
+///
+/// Each session ticket carries its own nonce, and the PSK bound to that ticket
+/// is `HKDF-Expand-Label(resMaster, "resumption", ticket_nonce, Hash.length)`
+/// (RFC 8446 section 4.6.1). Because the nonce differs per ticket, one
+/// resumption master secret ([`deriveResMaster`]) yields many distinct PSKs.
+/// This calls `hkdf.expandLabel` directly with the nonce as the context. The
+/// label is "resumption" (10 bytes); the caller supplies `nonce`/`nonceLen`, and
+/// `out` receives `hkdf.hashLen(kind)` bytes. The label buffer is freed on
+/// return.
+pub fn deriveResumptionPsk(kind: int, resMaster: ptr, nonce: ptr, nonceLen: int, out: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let lab = strBuf("resumption");
+    hkdf.expandLabel(kind, resMaster, hl, lab, 10, nonce, nonceLen, out, hl);
+    bytes.free(lab);
+}
+
+/// Expands a traffic secret into the concrete AEAD key and IV for a suite.
+///
+/// This is the final step that turns a traffic secret into usable record-layer
+/// keys (RFC 8446 section 7.3):
+/// `key = HKDF-Expand-Label(secret, "key", "", key_length)` and
+/// `iv  = HKDF-Expand-Label(secret, "iv",  "", 12)`, both with an EMPTY context.
+/// The key length comes from [`keyLen`] so AES-128 gets 16 bytes and the others
+/// 32, while the IV is always 12 bytes. `keyOut` must have room for `keyLen(suite)`
+/// bytes and `ivOut` for 12. The IV produced here is the STATIC per-connection
+/// IV that [`recordNonce`] later XORs with the sequence number. The two label
+/// buffers and the empty-context buffer are freed on return.
+pub fn deriveKeyIv(kind: int, suite: int, trafficSecret: ptr, keyOut: ptr, ivOut: ptr): void {
+    let hl = hkdf.hashLen(kind);
+    let empty = bytes.alloc(1);
+    let kl = strBuf("key");
+    hkdf.expandLabel(kind, trafficSecret, hl, kl, 3, empty, 0, keyOut, keyLen(suite));
+    let il = strBuf("iv");
+    hkdf.expandLabel(kind, trafficSecret, hl, il, 2, empty, 0, ivOut, 12);
+    bytes.free(empty); bytes.free(kl); bytes.free(il);
+}
+
+
+/// Builds the per-record AEAD nonce by XORing the sequence number into the IV.
+///
+/// TLS 1.3 does not send an explicit nonce per record. Instead the 12-byte nonce
+/// is the static write IV from [`deriveKeyIv`] with the 64-bit record sequence
+/// number, big-endian and left-padded to 12 bytes, XORed into it (RFC 8446
+/// section 5.3). This first copies all 12 IV bytes into `out`, then XORs the 8
+/// bytes of `seq` into the LAST 8 bytes of `out` (offsets 4..11), most
+/// significant byte first. The leading 4 bytes are therefore untouched, matching
+/// the left-padding of the sequence number. The caller must pass a distinct
+/// `seq` for every record under one key, since AEAD nonce reuse is catastrophic.
+/// `out` must have room for 12 bytes.
+pub fn recordNonce(iv: ptr, seq: long, out: ptr): void {
+    let i = 0;
+    while (i < 12) { bytes.write_byte(out, i, bytes.read_byte(iv, i)); i = i + 1; }
+    i = 0;
+    while (i < 8) {
+        let b = ((seq >> (8 * (7 - i))) & 0xff) as int;
+        bytes.write_byte(out, 4 + i, bytes.read_byte(out, 4 + i) ^ b);
+        i = i + 1;
+    }
+}
+
+/// Encrypts and authenticates one record body with the suite's AEAD.
+///
+/// A thin dispatcher that hides the two AEAD backends behind one signature. For
+/// [`SUITE_CHACHA20`] it calls the ChaCha20-Poly1305 seal; for the two GCM
+/// suites it calls AES-GCM, passing `keyLen(suite)` so the primitive selects
+/// AES-128 versus AES-256, and a fixed 12-byte nonce length. The associated data
+/// `aad` is the record header, `pt`/`ptLen` is the inner plaintext, the
+/// ciphertext is written to `ctOut` (same length as the plaintext), and the
+/// 16-byte authentication tag to `tagOut`. Used by [`recordProtect`]; its
+/// inverse is [`aeadOpen`].
+fn aeadSeal(suite: int, key: ptr, nonce: ptr, aad: ptr, aadLen: int, pt: ptr, ptLen: int, ctOut: ptr, tagOut: ptr): void {
+    if (suite == SUITE_CHACHA20) {
+        chachapoly.seal(key, nonce, aad, aadLen, pt, ptLen, ctOut, tagOut);
+    } else {
+        aesgcm.seal(key, keyLen(suite), nonce, 12, aad, aadLen, pt, ptLen, ctOut, tagOut);
+    }
+}
+/// Verifies and decrypts one record body with the suite's AEAD.
+///
+/// The inverse of [`aeadSeal`], and it dispatches the same way: ChaCha20-Poly1305
+/// for [`SUITE_CHACHA20`], otherwise AES-GCM sized by `keyLen(suite)` with a
+/// 12-byte nonce. It checks the 16-byte `tag` against the ciphertext and the
+/// associated data `aad`. Returns `true` and writes the recovered plaintext to
+/// `ptOut` on success, or `false` WITHOUT trusting `ptOut` if authentication
+/// fails. Callers must treat a `false` result as a fatal record-layer error and
+/// never use the output. Used by [`recordUnprotect`].
+fn aeadOpen(suite: int, key: ptr, nonce: ptr, aad: ptr, aadLen: int, ct: ptr, ctLen: int, tag: ptr, ptOut: ptr): bool {
+    if (suite == SUITE_CHACHA20) {
+        return chachapoly.open(key, nonce, aad, aadLen, ct, ctLen, tag, ptOut);
+    }
+    return aesgcm.open(key, keyLen(suite), nonce, 12, aad, aadLen, ct, ctLen, tag, ptOut);
+}
+
+/// Wraps one plaintext record into a complete protected TLS 1.3 record.
+///
+/// This performs the full record-protection step of RFC 8446 section 5.2 and
+/// writes the finished wire record into `out`, returning its total length. The
+/// steps, in order:
+///
+///   1. Build the TLSInnerPlaintext by appending the real `contentType` byte
+///      after the `contentLen` content bytes (no extra padding is added here),
+///      giving an inner length of `contentLen + 1`.
+///   2. Write the 5-byte outer record header: type `0x17`
+///      (application_data, the outer type is always this once encrypted),
+///      legacy version `0x0303`, and the two-byte big-endian length of the
+///      ciphertext, which is the inner length plus the 16-byte tag.
+///   3. Compute the record nonce from `iv` and `seq` via [`recordNonce`].
+///   4. AEAD-seal the inner plaintext via [`aeadSeal`], using the 5-byte header
+///      as the associated data, writing the ciphertext at `out + 5` and the tag
+///      immediately after it at `out + 5 + innerLen`.
+///
+/// The scratch inner buffer and the nonce are freed before returning. The caller
+/// must size `out` for at least `5 + contentLen + 1 + 16` bytes. The return value
+/// is `5 + ctLen`, the full length to put on the wire. The inverse is
+/// [`recordUnprotect`].
+pub fn recordProtect(suite: int, key: ptr, iv: ptr, seq: long,
+                     content: ptr, contentLen: int, contentType: int, out: ptr): int {
+    let innerLen = contentLen + 1;
+    let ctLen = innerLen + 16;
+    let inner = bytes.alloc(innerLen);
+    let i = 0;
+    while (i < contentLen) { bytes.write_byte(inner, i, bytes.read_byte(content, i)); i = i + 1; }
+    bytes.write_byte(inner, contentLen, contentType);
+
+    bytes.write_byte(out, 0, 0x17);
+    bytes.write_byte(out, 1, 0x03);
+    bytes.write_byte(out, 2, 0x03);
+    bytes.write_byte(out, 3, (ctLen >> 8) & 0xff);
+    bytes.write_byte(out, 4, ctLen & 0xff);
+
+    let nonce = bytes.alloc(12);
+    recordNonce(iv, seq, nonce);
+    aeadSeal(suite, key, nonce, out, 5, inner, innerLen, (out as long + 5) as ptr, (out as long + 5 + innerLen) as ptr);
+    bytes.free(inner); bytes.free(nonce);
+    return 5 + ctLen;
+}
+
+/// Decrypts and authenticates one protected record, recovering its inner bytes.
+///
+/// The inverse of [`recordProtect`]. Given the whole wire record (`record` of
+/// length `recLen`, including the 5-byte header), it derives the ciphertext
+/// length as `recLen - 5` and the plaintext length as `ctLen - 16` (the trailing
+/// 16 bytes are the AEAD tag). It recomputes the nonce from `iv` and `seq` via
+/// [`recordNonce`], then points `ct` at `record + 5` and `tag` at
+/// `record + 5 + ptLen` and calls [`aeadOpen`], using the 5-byte header as the
+/// associated data.
+///
+/// Returns the RECOVERED INNER length (the TLSInnerPlaintext, still carrying the
+/// trailing content-type byte and any zero padding) on success, or `-1` if
+/// authentication fails, in which case `out` must not be trusted. The recovered
+/// inner bytes are written to `out`; feed them to [`innerParse`] to strip the
+/// padding and read the true content type. The nonce buffer is freed before
+/// returning. The caller must pass the SAME `seq` that the sender used for this
+/// record.
+pub fn recordUnprotect(suite: int, key: ptr, iv: ptr, seq: long, record: ptr, recLen: int, out: ptr): int {
+    let ctLen = recLen - 5;
+    let ptLen = ctLen - 16;
+    let nonce = bytes.alloc(12);
+    recordNonce(iv, seq, nonce);
+    let ct = (record as long + 5) as ptr;
+    let tag = (record as long + 5 + ptLen) as ptr;
+    let ok = aeadOpen(suite, key, nonce, record, 5, ct, ptLen, tag, out);
+    bytes.free(nonce);
+    if (!ok) { return -1; }
+    return ptLen;
+}
+
+/// Strips zero padding from a decrypted inner plaintext and reads its true type.
+///
+/// TLS 1.3 hides the real content type inside the encrypted body and may append
+/// any number of zero bytes as padding (RFC 8446 section 5.2 and 5.4). To
+/// recover the record, scan BACKWARDS from the last byte skipping zeros; the
+/// first non-zero byte encountered is the real content type. This writes that
+/// type byte to `typeOut` and returns its offset, which is exactly the length of
+/// the genuine content that precedes it (bytes `0 .. return-1`).
+///
+/// Returns `-1` if the inner plaintext is all zeros, which is a malformed record
+/// with no content type (a "unexpected_message"-class error the caller should
+/// reject). `inner`/`innerLen` is normally the output of [`recordUnprotect`].
+pub fn innerParse(inner: ptr, innerLen: int, typeOut: ptr): int {
+    let i = innerLen - 1;
+    while (i >= 0 && bytes.read_byte(inner, i) == 0) { i = i - 1; }
+    if (i < 0) { return -1; }
+    bytes.write_byte(typeOut, 0, bytes.read_byte(inner, i));
+    return i;
+}

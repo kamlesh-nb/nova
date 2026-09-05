@@ -15,8 +15,8 @@ You get at the value four ways:
 
 Member access *through* an optional is memory-safe: it is guarded at runtime, never a silent null-deref.
 
-```nova
-// examples/16_optionals.nova
+```kyte
+// examples/16_optionals.ky
 // An optional is `T | undefined`, where `undefined` means ABSENCE (not an
 // error). `List<T>.get(i)` and `Map<K,V>.get(k)` return `T | undefined`.
 // Narrow with `if (x != undefined) { use(x) }`; coalesce a default with `??`;

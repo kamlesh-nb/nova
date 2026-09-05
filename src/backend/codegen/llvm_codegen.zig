@@ -1,5 +1,5 @@
 //! The LLVM code-generation backend: the compiler's final lowering stage, where
-//! the type-checked Nova program becomes an LLVM module ready to be optimised and
+//! the type-checked Kyte program becomes an LLVM module ready to be optimised and
 //! emitted as a native object (or a WASM module).
 //!
 //! This file defines [`LlvmCompiler`], the single large stateful object that owns
@@ -17,7 +17,7 @@
 //!
 //! Key design decisions and invariants this file embodies:
 //!
-//!   - **One machine word is `i64` (`val_type`).** Almost every Nova value flows
+//!   - **One machine word is `i64` (`val_type`).** Almost every Kyte value flows
 //!     through codegen as a 64-bit integer, whether it is a real integer, a float
 //!     bit-cast into a word, or a heap address. Heap addresses MUST stay 64-bit:
 //!     computing `addr + offset` at `i32` truncates the pointer and produces a
@@ -36,7 +36,7 @@
 //!
 //!   - **ARC, decided in codegen.** There is no garbage collector. Ownership is
 //!     resolved here and in `arc.zig`: heap objects carry an 8-byte header
-//!     (refcount at -8, length at -4), `nova_retain`/`nova_release` bracket
+//!     (refcount at -8, length at -4), `kyte_retain`/`kyte_release` bracket
 //!     borrows and drops, and value structs are copied inline with their owned
 //!     fields deep-retained. This file provides the allocation primitives
 //!     ([`LlvmCompiler.compileAlloc`], [`LlvmCompiler.compileAllocPersistent`],
@@ -127,7 +127,7 @@ const declarations_mod = @import("declarations.zig");
 /// Expression lowering (the bulk of `compile*` methods), grafted on below.
 const expressions_mod = @import("expressions.zig");
 
-/// Decodes the C-style backslash escapes in a Nova string literal into their
+/// Decodes the C-style backslash escapes in a Kyte string literal into their
 /// actual bytes, returning a freshly allocated slice the caller owns.
 ///
 /// The lexer keeps literals in their escaped source form (`\n`, `\t`, `\\`,
@@ -218,7 +218,7 @@ pub const FunctionInfo = struct {
 /// One lexical scope on the codegen scope stack, holding the cleanup work that
 /// must run when control leaves the scope.
 ///
-/// Nova's `defer` and `errdefer` and its ARC drops are all resolved by walking
+/// Kyte's `defer` and `errdefer` and its ARC drops are all resolved by walking
 /// this stack. On normal exit the deferred statements run and `owned_locals` are
 /// released; on the error path the errdeferred statements additionally run.
 pub const Scope = struct {
@@ -334,7 +334,7 @@ pub const LlvmCompiler = struct {
     scopes: std.ArrayList(Scope),
     /// Name -> stack-slot for the locals in the function currently being emitted.
     locals: std.StringHashMap(types.LLVMValueRef),
-    /// Compile-time SQL schema, loaded lazily from `schema.sql` (or `$NOVA_SQL_SCHEMA`)
+    /// Compile-time SQL schema, loaded lazily from `schema.sql` (or `$KYTE_SQL_SCHEMA`)
     /// once, on the first typed query with a literal SELECT. Maps table name -> (column
     /// name -> SQL type, first word uppercased, e.g. "DECIMAL"/"UUID"/"BIGSERIAL"). Used
     /// to check that a SELECTed column exists and that its type is bind-compatible with
@@ -345,7 +345,7 @@ pub const LlvmCompiler = struct {
     sql_schema_src: ?[]u8 = null,
     sql_schema_loaded: bool = false,
     /// Symbol name -> LLVM function value, the authoritative call target table
-    /// (also used to lazily declare runtime `nova_*` externs).
+    /// (also used to lazily declare runtime `kyte_*` externs).
     func_map: std.StringHashMap(types.LLVMValueRef),
     /// Cache for [`LlvmCompiler.getFunctionParamTypeRef`], keyed by `name\0index`.
     param_type_cache: std.StringHashMap(?ast.TypeRef),
@@ -507,7 +507,7 @@ pub const LlvmCompiler = struct {
     void_type: types.LLVMTypeRef,
     /// Cached opaque pointer LLVM type.
     ptr_type: types.LLVMTypeRef,
-    /// The universal Nova value type: `i64`. Nearly every value flows through
+    /// The universal Kyte value type: `i64`. Nearly every value flows through
     /// codegen as this word (integer, bit-cast float, or heap address).
     val_type: types.LLVMTypeRef,
 
@@ -526,14 +526,14 @@ pub const LlvmCompiler = struct {
     puts_fn: ?types.LLVMValueRef = null,
     /// Lazily-declared `printf` runtime function.
     printf_fn: ?types.LLVMValueRef = null,
-    /// Lazily-declared `nova_log_string` runtime function.
-    nova_log_string_fn: ?types.LLVMValueRef = null,
-    /// Lazily-declared `nova_log_info` runtime function.
-    nova_log_info_fn: ?types.LLVMValueRef = null,
-    /// Lazily-declared `nova_log_debug` runtime function.
-    nova_log_debug_fn: ?types.LLVMValueRef = null,
-    /// Lazily-declared `nova_log_err` runtime function.
-    nova_log_err_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `kyte_log_string` runtime function.
+    kyte_log_string_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `kyte_log_info` runtime function.
+    kyte_log_info_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `kyte_log_debug` runtime function.
+    kyte_log_debug_fn: ?types.LLVMValueRef = null,
+    /// Lazily-declared `kyte_log_err` runtime function.
+    kyte_log_err_fn: ?types.LLVMValueRef = null,
     /// Lazily-declared generic log function.
     log_fn: ?types.LLVMValueRef = null,
     /// The bump-allocator heap pointer global (used by the in-IR WASM allocator).
@@ -603,7 +603,7 @@ pub const LlvmCompiler = struct {
             code_model,
         ) orelse return error.LLVMTargetMachineCreationError;
 
-        const module = core.LLVMModuleCreateWithName("nova_module");
+        const module = core.LLVMModuleCreateWithName("kyte_module");
         const builder = core.LLVMCreateBuilder();
 
         core.LLVMSetTarget(module, triple_z.ptr);
@@ -699,7 +699,7 @@ pub const LlvmCompiler = struct {
     ///
     /// Synthetic files (basename starting with `<`) and already-absolute paths are
     /// used as-is; `src/std/...` paths are remapped to the installed
-    /// `~/.nova/std/...` location; everything else is joined against `di_cwd`. If
+    /// `~/.kyte/std/...` location; everything else is joined against `di_cwd`. If
     /// the resolved absolute file does not actually exist on disk, it caches and
     /// returns null so no bogus DWARF file is emitted. A null `di_builder` short-
     /// circuits to null.
@@ -717,7 +717,7 @@ pub const LlvmCompiler = struct {
             if (std.mem.startsWith(u8, dir_rel, "src/std")) {
                 if (std.c.getenv("HOME")) |home_c| {
                     const rest = dir_rel["src/std".len..];
-                    const joined = std.fmt.bufPrint(&abs_buf, "{s}/.nova/std{s}", .{ std.mem.span(home_c), rest }) catch break :blk dir_rel;
+                    const joined = std.fmt.bufPrint(&abs_buf, "{s}/.kyte/std{s}", .{ std.mem.span(home_c), rest }) catch break :blk dir_rel;
                     break :blk joined;
                 }
             }
@@ -744,7 +744,7 @@ pub const LlvmCompiler = struct {
 
     /// Lazily creates the single DWARF compile unit on first use, anchored to the
     /// given source file. Idempotent: does nothing once `di_cu` exists or when
-    /// debug info is off. The producer is labelled `"nova"` and the source
+    /// debug info is off. The producer is labelled `"kyte"` and the source
     /// language is recorded as C99 (the closest DWARF language LLVM offers here).
     fn ensureDebugCU(self: *LlvmCompiler, path: []const u8) void {
         if (self.di_builder == null or self.di_cu != null) return;
@@ -753,8 +753,8 @@ pub const LlvmCompiler = struct {
             self.di_builder,
             .LLVMDWARFSourceLanguageC99,
             self.di_file,
-            "nova",
-            "nova".len,
+            "kyte",
+            "kyte".len,
             0,
             "",
             0,
@@ -842,7 +842,7 @@ pub const LlvmCompiler = struct {
         return t;
     }
 
-    /// Maps a Nova local's type to its best DWARF descriptor, given both the
+    /// Maps a Kyte local's type to its best DWARF descriptor, given both the
     /// rendered type name and the LLVM slot type.
     ///
     /// Doubles map to `f64`; for integer slots it dispatches on the name:
@@ -1257,7 +1257,7 @@ pub const LlvmCompiler = struct {
     ///
     /// Because decimal parsing is not a compile-time constant here, this emits a
     /// lazy-init pattern: load the cache global, and if it is still zero, branch to
-    /// an init block that calls `nova_decimal_from_string`, stamps the parsed
+    /// an init block that calls `kyte_decimal_from_string`, stamps the parsed
     /// object's header refcount to the -1000000000 sentinel (so it is treated as a
     /// non-freed constant) and stores it back, then a phi merges the cached and
     /// freshly-parsed values. The cache global's key slice is owned.
@@ -1271,7 +1271,7 @@ pub const LlvmCompiler = struct {
             break :blk g;
         };
 
-        const from_fn = self.func_map.get("nova_decimal_from_string").?;
+        const from_fn = self.func_map.get("kyte_decimal_from_string").?;
         const from_t = core.LLVMGlobalGetValueType(from_fn);
 
         const cur_fn = core.LLVMGetBasicBlockParent(core.LLVMGetInsertBlock(self.builder));
@@ -1305,13 +1305,13 @@ pub const LlvmCompiler = struct {
         return phi;
     }
 
-    /// Grafted from `arc.zig`: emits a `nova_retain` on a heap value (increments refcount).
+    /// Grafted from `arc.zig`: emits a `kyte_retain` on a heap value (increments refcount).
     pub const compileRetain = arc_mod.compileRetain;
     /// Grafted from `arc.zig`: splits an error-union value into its ok/err parts.
     pub const errUnionParts = arc_mod.errUnionParts;
     /// Grafted from `arc.zig`: constructs an error-union value from a payload/error.
     pub const buildErrUnion = arc_mod.buildErrUnion;
-    /// Grafted from `arc.zig`: emits a `nova_release` with the appropriate destructor.
+    /// Grafted from `arc.zig`: emits a `kyte_release` with the appropriate destructor.
     pub const compileRelease = arc_mod.compileRelease;
     /// Grafted from `arc.zig`: elides a retain/release pair that is provably a borrow.
     pub const elideBorrowedArc = arc_mod.elideBorrowedArc;
@@ -1355,15 +1355,15 @@ pub const LlvmCompiler = struct {
     /// concrete owner under the current instantiation.
     pub const qualifySelfType = types_mod.qualifySelfType;
 
-    /// Emits a heap allocation of `size` bytes via the `nova_bytes_alloc` runtime
+    /// Emits a heap allocation of `size` bytes via the `kyte_bytes_alloc` runtime
     /// function, declaring that extern lazily on first use. Returns the client
     /// pointer as an `i64` word.
     pub fn compileAlloc(self: *LlvmCompiler, size: types.LLVMValueRef) anyerror!types.LLVMValueRef {
-        const alloc_fn = if (self.func_map.get("nova_bytes_alloc")) |f| f else blk: {
+        const alloc_fn = if (self.func_map.get("kyte_bytes_alloc")) |f| f else blk: {
             var arg_types = [_]types.LLVMTypeRef{self.val_type};
             const fn_type = core.LLVMFunctionType(self.val_type, &arg_types, 1, 0);
-            const f = core.LLVMAddFunction(self.module, "nova_bytes_alloc", fn_type);
-            try self.func_map.put("nova_bytes_alloc", f);
+            const f = core.LLVMAddFunction(self.module, "kyte_bytes_alloc", fn_type);
+            try self.func_map.put("kyte_bytes_alloc", f);
             break :blk f;
         };
         const fn_t = core.LLVMGlobalGetValueType(alloc_fn);
@@ -1371,15 +1371,15 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, fn_t, alloc_fn, &args, 1, "alloc_tmp");
     }
 
-    /// Emits an array allocation of `size` bytes via `nova_array_alloc`, declaring
+    /// Emits an array allocation of `size` bytes via `kyte_array_alloc`, declaring
     /// the extern lazily. Unlike [`LlvmCompiler.compileAlloc`] this returns a real
     /// pointer (`ptr_type`), used where a typed array base is needed.
     pub fn compileAllocArray(self: *LlvmCompiler, size: types.LLVMValueRef) anyerror!types.LLVMValueRef {
-        const alloc_fn = if (self.func_map.get("nova_array_alloc")) |f| f else blk: {
+        const alloc_fn = if (self.func_map.get("kyte_array_alloc")) |f| f else blk: {
             var arg_types = [_]types.LLVMTypeRef{self.val_type};
             const fn_type = core.LLVMFunctionType(self.ptr_type, &arg_types, 1, 0);
-            const f = core.LLVMAddFunction(self.module, "nova_array_alloc", fn_type);
-            try self.func_map.put("nova_array_alloc", f);
+            const f = core.LLVMAddFunction(self.module, "kyte_array_alloc", fn_type);
+            try self.func_map.put("kyte_array_alloc", f);
             break :blk f;
         };
         const fn_t = core.LLVMGlobalGetValueType(alloc_fn);
@@ -1388,14 +1388,14 @@ pub const LlvmCompiler = struct {
     }
 
     /// Emits an allocation from the persistent arena via
-    /// `nova_bytes_alloc_persistent`, for objects (like interned constants) that
+    /// `kyte_bytes_alloc_persistent`, for objects (like interned constants) that
     /// must outlive the normal request/arena lifetime and are never freed.
     pub fn compileAllocPersistent(self: *LlvmCompiler, size: types.LLVMValueRef) anyerror!types.LLVMValueRef {
-        const alloc_fn = if (self.func_map.get("nova_bytes_alloc_persistent")) |f| f else blk: {
+        const alloc_fn = if (self.func_map.get("kyte_bytes_alloc_persistent")) |f| f else blk: {
             var arg_types = [_]types.LLVMTypeRef{self.val_type};
             const fn_type = core.LLVMFunctionType(self.val_type, &arg_types, 1, 0);
-            const f = core.LLVMAddFunction(self.module, "nova_bytes_alloc_persistent", fn_type);
-            try self.func_map.put("nova_bytes_alloc_persistent", f);
+            const f = core.LLVMAddFunction(self.module, "kyte_bytes_alloc_persistent", fn_type);
+            try self.func_map.put("kyte_bytes_alloc_persistent", f);
             break :blk f;
         };
         const fn_t = core.LLVMGlobalGetValueType(alloc_fn);
@@ -1437,15 +1437,15 @@ pub const LlvmCompiler = struct {
         return d;
     }
 
-    /// Boxes a bare value into a value-optional via `nova_valopt_box`, so a present
+    /// Boxes a bare value into a value-optional via `kyte_valopt_box`, so a present
     /// value (including a present zero) is distinguishable from absence. Declares
     /// the extern lazily.
     pub fn buildValoptBox(self: *LlvmCompiler, value: types.LLVMValueRef) anyerror!types.LLVMValueRef {
-        const f = if (self.func_map.get("nova_valopt_box")) |g| g else blk: {
+        const f = if (self.func_map.get("kyte_valopt_box")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{self.val_type};
             const ft = core.LLVMFunctionType(self.val_type, &at, 1, 0);
-            const g = core.LLVMAddFunction(self.module, "nova_valopt_box", ft);
-            try self.func_map.put("nova_valopt_box", g);
+            const g = core.LLVMAddFunction(self.module, "kyte_valopt_box", ft);
+            try self.func_map.put("kyte_valopt_box", g);
             break :blk g;
         };
         const ft = core.LLVMGlobalGetValueType(f);
@@ -1453,14 +1453,14 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "valopt_box");
     }
 
-    /// Unboxes one value-optional layer via `nova_valopt_unbox`, recovering the
+    /// Unboxes one value-optional layer via `kyte_valopt_unbox`, recovering the
     /// underlying value word. The inverse of [`LlvmCompiler.buildValoptBox`].
     pub fn buildValoptUnbox(self: *LlvmCompiler, box: types.LLVMValueRef) anyerror!types.LLVMValueRef {
-        const f = if (self.func_map.get("nova_valopt_unbox")) |g| g else blk: {
+        const f = if (self.func_map.get("kyte_valopt_unbox")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{self.val_type};
             const ft = core.LLVMFunctionType(self.val_type, &at, 1, 0);
-            const g = core.LLVMAddFunction(self.module, "nova_valopt_unbox", ft);
-            try self.func_map.put("nova_valopt_unbox", g);
+            const g = core.LLVMAddFunction(self.module, "kyte_valopt_unbox", ft);
+            try self.func_map.put("kyte_valopt_unbox", g);
             break :blk g;
         };
         const ft = core.LLVMGlobalGetValueType(f);
@@ -1468,12 +1468,12 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 1, "valopt_unbox");
     }
 
-    /// Boxes a value into an `any` via `nova_any_box`, pairing the payload word with
+    /// Boxes a value into an `any` via `kyte_any_box`, pairing the payload word with
     /// a destructor function pointer (zero for a non-owning payload) so the boxed
     /// value can be released correctly later. Declares the extern lazily.
     /// Get-or-declare an `i64 name(i64)` runtime extern (memoised in `func_map`).
     /// Used for always-linked runtime helpers the codegen calls directly, e.g. the
-    /// NSX child-escape `nova_html_escape`.
+    /// NSX child-escape `kyte_html_escape`.
     pub fn getOrDeclareI64Fn(self: *LlvmCompiler, name: [:0]const u8) types.LLVMValueRef {
         if (self.func_map.get(name)) |g| return g;
         var at = [_]types.LLVMTypeRef{self.val_type};
@@ -1484,11 +1484,11 @@ pub const LlvmCompiler = struct {
     }
 
     pub fn buildAnyBox(self: *LlvmCompiler, payload: types.LLVMValueRef, dtor: types.LLVMValueRef) anyerror!types.LLVMValueRef {
-        const f = if (self.func_map.get("nova_any_box")) |g| g else blk: {
+        const f = if (self.func_map.get("kyte_any_box")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{ self.val_type, self.val_type };
             const ft = core.LLVMFunctionType(self.val_type, &at, 2, 0);
-            const g = core.LLVMAddFunction(self.module, "nova_any_box", ft);
-            try self.func_map.put("nova_any_box", g);
+            const g = core.LLVMAddFunction(self.module, "kyte_any_box", ft);
+            try self.func_map.put("kyte_any_box", g);
             break :blk g;
         };
         const ft = core.LLVMGlobalGetValueType(f);
@@ -1496,14 +1496,14 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildCall2(self.builder, ft, f, &args, 2, "any_box");
     }
 
-    /// Recovers the payload word from an `any` box via `nova_any_unbox`. The inverse
+    /// Recovers the payload word from an `any` box via `kyte_any_unbox`. The inverse
     /// of [`LlvmCompiler.buildAnyBox`].
     pub fn buildAnyUnbox(self: *LlvmCompiler, box: types.LLVMValueRef) anyerror!types.LLVMValueRef {
-        const f = if (self.func_map.get("nova_any_unbox")) |g| g else blk: {
+        const f = if (self.func_map.get("kyte_any_unbox")) |g| g else blk: {
             var at = [_]types.LLVMTypeRef{self.val_type};
             const ft = core.LLVMFunctionType(self.val_type, &at, 1, 0);
-            const g = core.LLVMAddFunction(self.module, "nova_any_unbox", ft);
-            try self.func_map.put("nova_any_unbox", g);
+            const g = core.LLVMAddFunction(self.module, "kyte_any_unbox", ft);
+            try self.func_map.put("kyte_any_unbox", g);
             break :blk g;
         };
         const ft = core.LLVMGlobalGetValueType(f);
@@ -1538,7 +1538,7 @@ pub const LlvmCompiler = struct {
             const sp = src_expr.span;
             std.debug.print(
                 "\x1b[1m{s}:{d}:{d}: \x1b[31merror:\x1b[0m\x1b[1m cannot store a trait value (`{s}`) into `any`\x1b[0m\n" ++
-                "  Boxing a trait object into `any` is not sound in Nova today: the erased box loses the\n" ++
+                "  Boxing a trait object into `any` is not sound in Kyte today: the erased box loses the\n" ++
                 "  fat-pointer shape and its destructor corrupts memory when the container is torn down.\n" ++
                 "  Use a homogeneous trait container instead, e.g. `List<{s}>` dispatched by trait method,\n" ++
                 "  or downcast to the concrete type before boxing (`let c: ConcreteType = value;`).\n",
@@ -1723,14 +1723,14 @@ pub const LlvmCompiler = struct {
         return core.LLVMBuildAdd(self.builder, env_ptr, off, "env_slot_addr");
     }
 
-    /// Emits a `nova_bytes_free` on a heap pointer (declaring the extern lazily) and
+    /// Emits a `kyte_bytes_free` on a heap pointer (declaring the extern lazily) and
     /// returns a zero word, so it can be used where an expression value is expected.
     pub fn compileFree(self: *LlvmCompiler, ptr: types.LLVMValueRef) anyerror!types.LLVMValueRef {
-        const free_fn = if (self.func_map.get("nova_bytes_free")) |f| f else blk: {
+        const free_fn = if (self.func_map.get("kyte_bytes_free")) |f| f else blk: {
             var arg_types = [_]types.LLVMTypeRef{self.val_type};
             const fn_type = core.LLVMFunctionType(self.void_type, &arg_types, 1, 0);
-            const f = core.LLVMAddFunction(self.module, "nova_bytes_free", fn_type);
-            try self.func_map.put("nova_bytes_free", f);
+            const f = core.LLVMAddFunction(self.module, "kyte_bytes_free", fn_type);
+            try self.func_map.put("kyte_bytes_free", f);
             break :blk f;
         };
         const fn_t = core.LLVMGlobalGetValueType(free_fn);
@@ -1742,19 +1742,19 @@ pub const LlvmCompiler = struct {
     /// Emits the whole memory-management runtime directly as LLVM IR, for targets
     /// (chiefly WASM) that cannot link the C++ runtime.
     ///
-    /// It defines, in IR: `nova_bytes_free` (a free-list push that no-ops for null,
-    /// arena-region and, on WASM, all pointers), a bump-pointer `nova_bytes_alloc`
+    /// It defines, in IR: `kyte_bytes_free` (a free-list push that no-ops for null,
+    /// arena-region and, on WASM, all pointers), a bump-pointer `kyte_bytes_alloc`
     /// (writing a 4-byte size header, 8-byte aligning, seeding the heap from
-    /// `__heap_base` on WASM), a first-fit persistent `nova_bytes_alloc_persistent`
+    /// `__heap_base` on WASM), a first-fit persistent `kyte_bytes_alloc_persistent`
     /// that reuses the free list before bumping the persistent arena, and no-op
-    /// `nova_retain`/`nova_release` stubs (WASM programs run to completion without
+    /// `kyte_retain`/`kyte_release` stubs (WASM programs run to completion without
     /// reclamation). Each function is built with its own temporary IR builder.
     pub fn generateWasmMemoryFunctions(self: *LlvmCompiler) !void {
 
         var free_params = [_]types.LLVMTypeRef{self.val_type};
         const free_type = core.LLVMFunctionType(self.void_type, &free_params, 1, 0);
-        const free_fn = core.LLVMAddFunction(self.module, "nova_bytes_free", free_type);
-        try self.func_map.put("nova_bytes_free", free_fn);
+        const free_fn = core.LLVMAddFunction(self.module, "kyte_bytes_free", free_type);
+        try self.func_map.put("kyte_bytes_free", free_fn);
 
         const entry_bb = core.LLVMAppendBasicBlock(free_fn, "entry");
         const do_free_bb = core.LLVMAppendBasicBlock(free_fn, "do_free");
@@ -1790,8 +1790,8 @@ pub const LlvmCompiler = struct {
 
         var alloc_params = [_]types.LLVMTypeRef{self.val_type};
         const alloc_type = core.LLVMFunctionType(self.val_type, &alloc_params, 1, 0);
-        const alloc_fn = core.LLVMAddFunction(self.module, "nova_bytes_alloc", alloc_type);
-        try self.func_map.put("nova_bytes_alloc", alloc_fn);
+        const alloc_fn = core.LLVMAddFunction(self.module, "kyte_bytes_alloc", alloc_type);
+        try self.func_map.put("kyte_bytes_alloc", alloc_fn);
 
         const a_entry_bb = core.LLVMAppendBasicBlock(alloc_fn, "entry");
         const ab = core.LLVMCreateBuilder();
@@ -1836,8 +1836,8 @@ pub const LlvmCompiler = struct {
 
         var p_alloc_params = [_]types.LLVMTypeRef{self.val_type};
         const p_alloc_type = core.LLVMFunctionType(self.val_type, &p_alloc_params, 1, 0);
-        const p_alloc_fn = core.LLVMAddFunction(self.module, "nova_bytes_alloc_persistent", p_alloc_type);
-        try self.func_map.put("nova_bytes_alloc_persistent", p_alloc_fn);
+        const p_alloc_fn = core.LLVMAddFunction(self.module, "kyte_bytes_alloc_persistent", p_alloc_type);
+        try self.func_map.put("kyte_bytes_alloc_persistent", p_alloc_fn);
 
         const ap_entry_bb = core.LLVMAppendBasicBlock(p_alloc_fn, "entry");
         const ap_cond_bb = core.LLVMAppendBasicBlock(p_alloc_fn, "alloc_cond");
@@ -1924,8 +1924,8 @@ pub const LlvmCompiler = struct {
 
         var retain_params = [_]types.LLVMTypeRef{self.val_type};
         const retain_type = core.LLVMFunctionType(self.void_type, &retain_params, 1, 0);
-        const retain_fn = core.LLVMAddFunction(self.module, "nova_retain", retain_type);
-        try self.func_map.put("nova_retain", retain_fn);
+        const retain_fn = core.LLVMAddFunction(self.module, "kyte_retain", retain_type);
+        try self.func_map.put("kyte_retain", retain_fn);
         const r_entry = core.LLVMAppendBasicBlock(retain_fn, "entry");
         const rb = core.LLVMCreateBuilder();
         defer core.LLVMDisposeBuilder(rb);
@@ -1935,8 +1935,8 @@ pub const LlvmCompiler = struct {
         const ptr_type = core.LLVMPointerType(self.void_type, 0);
         var release_params = [_]types.LLVMTypeRef{self.val_type, ptr_type};
         const release_type = core.LLVMFunctionType(self.void_type, &release_params, 2, 0);
-        const release_fn = core.LLVMAddFunction(self.module, "nova_release", release_type);
-        try self.func_map.put("nova_release", release_fn);
+        const release_fn = core.LLVMAddFunction(self.module, "kyte_release", release_type);
+        try self.func_map.put("kyte_release", release_fn);
         const rel_entry = core.LLVMAppendBasicBlock(release_fn, "entry");
         const relb = core.LLVMCreateBuilder();
         defer core.LLVMDisposeBuilder(relb);
@@ -2033,7 +2033,7 @@ pub const LlvmCompiler = struct {
     /// That is what broke `ActorCell<M> { mbox: Mailbox<M>, behavior: Behavior<M> }`:
     /// the inline copy of the 16-byte `Mailbox` wrote its `signal` word on top of
     /// `behavior`, and the next assignment to `behavior` released that word as the
-    /// field's previous value. `signal` holds a raw `nova_chan_new` pointer, which
+    /// field's previous value. `signal` holds a raw `kyte_chan_new` pointer, which
     /// has no ARC header, so the release read the refcount 8 bytes before a plain
     /// malloc block. Conformance 118, located by `--asan`.
     ///
@@ -2145,7 +2145,7 @@ pub const LlvmCompiler = struct {
         return size;
     }
 
-    /// Grafted from `types.zig`: maps a Nova type name to its LLVM type.
+    /// Grafted from `types.zig`: maps a Kyte type name to its LLVM type.
     pub const toLLVMType = types_mod.toLLVMType;
     /// Grafted from `types.zig`: maps a primitive repr kind to its LLVM type.
     pub const llvmForRepr = types_mod.llvmForRepr;
@@ -2669,14 +2669,14 @@ pub const LlvmCompiler = struct {
         return f;
     }
 
-    /// Lowers a method call on an `Atomic<T>` to the matching `nova_atomic_*`
+    /// Lowers a method call on an `Atomic<T>` to the matching `kyte_atomic_*`
     /// runtime call.
     ///
     /// Parses the element type `T` out of the `Atomic<T>` name, loads the atomic
-    /// cell's inner pointer, selects the `nova_atomic_{add,sub,load,store,cas}_{i32,
+    /// cell's inner pointer, selects the `kyte_atomic_{add,sub,load,store,cas}_{i32,
     /// i64,bool}` function by method and width, and coerces each argument to the
     /// element's LLVM type. `store` produces no value; `compareAndSwap`'s `i32`
-    /// result is truncated to `i1` (a Nova bool). Errors on an unknown method.
+    /// result is truncated to `i1` (a Kyte bool). Errors on an unknown method.
     pub fn compileAtomicCall(self: *LlvmCompiler, obj_type: []const u8, method_name: []const u8, obj_expr: ast.Expression, args_exprs: []const ast.Expression) !types.LLVMValueRef {
         var t_name: []const u8 = "i32";
         if (std.mem.indexOfScalar(u8, obj_type, '<')) |start_idx| {
@@ -2695,39 +2695,39 @@ pub const LlvmCompiler = struct {
         const is_i64 = if (types_mod.cgPrim(t_name)) |pr| types_mod.reprBitWidth(pr.repr) == 64 else false;
         if (std.mem.eql(u8, method_name, "add")) {
             if (is_i64) {
-                fn_name = "nova_atomic_add_i64";
+                fn_name = "kyte_atomic_add_i64";
             } else {
-                fn_name = "nova_atomic_add_i32";
+                fn_name = "kyte_atomic_add_i32";
             }
         } else if (std.mem.eql(u8, method_name, "sub")) {
             if (is_i64) {
-                fn_name = "nova_atomic_sub_i64";
+                fn_name = "kyte_atomic_sub_i64";
             } else {
-                fn_name = "nova_atomic_sub_i32";
+                fn_name = "kyte_atomic_sub_i32";
             }
         } else if (std.mem.eql(u8, method_name, "load")) {
             if (is_i64) {
-                fn_name = "nova_atomic_load_i64";
+                fn_name = "kyte_atomic_load_i64";
             } else if (std.mem.eql(u8, t_name, "bool")) {
-                fn_name = "nova_atomic_load_bool";
+                fn_name = "kyte_atomic_load_bool";
             } else {
-                fn_name = "nova_atomic_load_i32";
+                fn_name = "kyte_atomic_load_i32";
             }
         } else if (std.mem.eql(u8, method_name, "store")) {
             if (is_i64) {
-                fn_name = "nova_atomic_store_i64";
+                fn_name = "kyte_atomic_store_i64";
             } else if (std.mem.eql(u8, t_name, "bool")) {
-                fn_name = "nova_atomic_store_bool";
+                fn_name = "kyte_atomic_store_bool";
             } else {
-                fn_name = "nova_atomic_store_i32";
+                fn_name = "kyte_atomic_store_i32";
             }
         } else if (std.mem.eql(u8, method_name, "compareAndSwap")) {
             if (is_i64) {
-                fn_name = "nova_atomic_cas_i64";
+                fn_name = "kyte_atomic_cas_i64";
             } else if (std.mem.eql(u8, t_name, "bool")) {
-                fn_name = "nova_atomic_cas_bool";
+                fn_name = "kyte_atomic_cas_bool";
             } else {
-                fn_name = "nova_atomic_cas_i32";
+                fn_name = "kyte_atomic_cas_i32";
             }
         } else {
             return error.UnknownAtomicMethod;
@@ -3894,17 +3894,17 @@ pub const LlvmCompiler = struct {
     ///
     /// Returns null for the main program file and a few well-known synthetic files
     /// (so their symbols stay unprefixed). Otherwise it strips a leading
-    /// `src/std/`, `src/lib/`, `.nova/std/` or `.nova/lib/` root and the file
+    /// `src/std/`, `src/lib/`, `.kyte/std/` or `.kyte/lib/` root and the file
     /// extension, then replaces path separators and dots with `_`. Caller owns the
     /// returned slice.
     pub fn getModulePrefix(self: *LlvmCompiler, span: ast.Span) ?[]const u8 {
 
-        if (span.file.len == 0 or std.mem.eql(u8, span.file, self.program.span.file) or std.mem.eql(u8, span.file, "helpers.nova") or std.mem.eql(u8, span.file, "test_harness.nova") or std.mem.eql(u8, span.file, "<serde-generated>")) {
+        if (span.file.len == 0 or std.mem.eql(u8, span.file, self.program.span.file) or std.mem.eql(u8, span.file, "helpers.ky") or std.mem.eql(u8, span.file, "test_harness.ky") or std.mem.eql(u8, span.file, "<serde-generated>")) {
             return null;
         }
 
         var path = span.file;
-        const std_roots = [_][]const u8{ "src/std/", "src/lib/", ".nova/std/", ".nova/lib/" };
+        const std_roots = [_][]const u8{ "src/std/", "src/lib/", ".kyte/std/", ".kyte/lib/" };
         for (std_roots) |root| {
             if (std.mem.indexOf(u8, path, root)) |pos| {
                 path = path[pos + root.len ..];
@@ -4968,13 +4968,13 @@ pub const LlvmCompiler = struct {
     }
 
     /// Emits the instrumentation that bumps the coverage counter for one basic
-    /// block: loads the external `__nova_cov_counters` array pointer (declaring the
+    /// block: loads the external `__kyte_cov_counters` array pointer (declaring the
     /// global on first use), indexes it by `block_id`, and stores `counter + 1`.
     /// Only called when `coverage_enabled`.
     pub fn compileCoverageIncrement(self: *LlvmCompiler, block_id: usize) anyerror!void {
-        const counters_glob = core.LLVMGetNamedGlobal(self.module, "__nova_cov_counters") orelse blk: {
+        const counters_glob = core.LLVMGetNamedGlobal(self.module, "__kyte_cov_counters") orelse blk: {
             const ptr_to_ptr = core.LLVMPointerType(self.i64_type, 0);
-            const glob = core.LLVMAddGlobal(self.module, ptr_to_ptr, "__nova_cov_counters");
+            const glob = core.LLVMAddGlobal(self.module, ptr_to_ptr, "__kyte_cov_counters");
             core.LLVMSetLinkage(glob, types.LLVMLinkage.LLVMExternalLinkage);
             break :blk glob;
         };
@@ -5222,7 +5222,7 @@ pub const LlvmCompiler = struct {
     /// (the ORM fast path).
     pub const compileDecodeBinaryRow = expressions_mod.compileDecodeBinaryRow;
     /// Grafted from `expressions.zig`: lowers a NovaDB query expression.
-    pub const compileNovaQuery = expressions_mod.compileNovaQuery;
+    pub const compileKyteQuery = expressions_mod.compileKyteQuery;
     /// Grafted from `expressions.zig`: converts a value to a target type.
     pub const convertValueToType = expressions_mod.convertValueToType;
     /// Grafted from `expressions.zig`: resolves the type name for a reification/`reify` site.

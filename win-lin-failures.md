@@ -51,7 +51,7 @@ mirror image of each other and neither is fixable off its own platform.
 to a variable first did not. Minimised to: a struct literal used as a field
 initialiser inside another struct literal, where the inner struct owns a container.
 Element type and the presence of other fields were both irrelevant.
-`NOVA_VALUE_STRUCTS_OFF=1` made it pass, which located it in the value-struct path.
+`KYTE_VALUE_STRUCTS_OFF=1` made it pass, which located it in the value-struct path.
 
 `buildValueStructCopyInto` duplicates inline bytes and explicitly does not touch
 refcounts — its own doc-comment says callers must follow it with
@@ -68,13 +68,13 @@ and the field-assign path already use: a borrow deep-retains, a temporary is con
 Located by `--asan`, which is the only reason it was findable:
 
 ```
-READ of size 4 in nova_release (alloc.cpp:534)
+READ of size 4 in kyte_release (alloc.cpp:534)
     #1 ActorCell_i32_init
 0x...038 is located 8 bytes before 160-byte region [0x...040,0x...0e0)
-allocated by: nova_chan_new (concurrency.cpp:1221)  #3 Mailbox_i32_init
+allocated by: kyte_chan_new (concurrency.cpp:1221)  #3 Mailbox_i32_init
 ```
 
-The pointer being released was the wake channel from `nova_chan_new` — a plain
+The pointer being released was the wake channel from `kyte_chan_new` — a plain
 `malloc` block with no ARC header, hence the read 8 bytes before the region.
 
 `getFieldOffset` sizes fields with `getTypeSize(type_ref, true)`, whose `.generic`
@@ -122,7 +122,7 @@ having nothing to do with epoll: a `const … : int` set to `2147483648`, OR-ed 
 `write_i32`/`read_i32` yields `-2147483647`.
 
 Fixed by spelling the constant as the signed bit pattern, `-2147483648`. The kernel
-mask is a `uint32_t` and Nova's `int` is signed, so the top bit has no positive
+mask is a `uint32_t` and Kyte's `int` is signed, so the top bit has no positive
 spelling. `setEvent`'s `write_i32` still puts `0x80000000` on the wire, and constant,
 fold and round trip now agree. `EPOLLET` is not used by the reactor itself —
 `eventsFor` only uses `EPOLLIN`/`EPOLLOUT`/`EPOLLONESHOT`, all of which fit — so the
@@ -147,7 +147,7 @@ prefix, which is why the POSIX module branches and the Windows one does not.
 
 ### `413_file_write_ok` — the test was wrong, not the stdlib
 
-Hardcoded `/tmp/nova_writeok_413.txt`. On Windows a leading `/` resolves against the
+Hardcoded `/tmp/kyte_writeok_413.txt`. On Windows a leading `/` resolves against the
 current drive root, so this asked for `C:\tmp\`, which need not exist; the write
 failed and the case read as a stdlib gap. Now uses `dir.Dir.tempDir()`, the idiom
 conformance 211 already used.
@@ -174,13 +174,13 @@ that the fixes are correct everywhere, not that macOS was previously broken.
 
 ```bash
 # Windows (PowerShell), needs C:\LLVM\bin on PATH at RUN time too
-$env:NOVA_LLVM_PREFIX = 'C:/LLVM'; zig build -Doptimize=ReleaseFast
+$env:KYTE_LLVM_PREFIX = 'C:/LLVM'; zig build -Doptimize=ReleaseFast
 conformance/run.sh -j 3
 
 # Linux / WSL2
-export NOVA_LLVM_PREFIX=/usr/lib/llvm-21; zig build -Doptimize=ReleaseFast
+export KYTE_LLVM_PREFIX=/usr/lib/llvm-21; zig build -Doptimize=ReleaseFast
 conformance/run.sh -j 3
-NOVA_ASAN=1 zig build -Doptimize=ReleaseFast && conformance/run.sh --asan -j 3
+KYTE_ASAN=1 zig build -Doptimize=ReleaseFast && conformance/run.sh --asan -j 3
 ```
 
 Two traps that both present as a mass compiler regression and are neither:
@@ -189,6 +189,6 @@ Two traps that both present as a mass compiler regression and are neither:
   leak-detecting allocator and exits 1 on leaks; the driver legitimately leaks ~12k
   allocations, so every case prints `Results: N passed, 0 failed` and still exits 1.
 - On Windows, `C:\LLVM\bin` missing from PATH at run time makes every case report
-  `<compile/link error>` with `nova.exe` exiting `0xC0000135`. Measured this session:
+  `<compile/link error>` with `kyte.exe` exiting `0xC0000135`. Measured this session:
   it also trips the harness self-test and aborts with `HARNESS INTEGRITY BROKEN`,
   which reads like a classifier regression rather than a missing DLL.

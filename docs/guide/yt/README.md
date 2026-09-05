@@ -1,6 +1,6 @@
-# Nova video tutorials
+# Kyte video tutorials
 
-This folder holds presenter-ready scripts for a full video series on the Nova language, following the
+This folder holds presenter-ready scripts for a full video series on the Kyte language, following the
 [written guide](../README.md) in order. There is a script per usage chapter; the two reference chapters,
 19 Architecture and 20 Building and distributing, have no companion video, so the series runs
 17, 18, then 21. Each script is a spoken walkthrough with on-screen code and live runs, so you can record
@@ -42,7 +42,7 @@ The timestamps are a guide, not a rule. Speak at your own pace and adjust.
 | 16 | [Serialization](16-serialization.md) | JSON serde, `@serializable` |
 | 17 | [Web](17-web.md) | Vertical slices, `RouteHandler`, `ctx.bind`, NSX views, the composition root |
 | 18 | [Data access and the ORM](18-data-access.md) | The `db` seam, `DbValue`, the micro-ORM, `Repository<T>`, connection strings, backing the web app with PostgreSQL |
-| 19 | [Package management](19-package-management.md) | `project.json`, `nova get`, the lockfile, `nova init`, import resolution, publishing |
+| 19 | [Package management](19-package-management.md) | `project.json`, `kyte get`, the lockfile, `kyte init`, import resolution, publishing |
 | 20 | [Database drivers](20-database-drivers.md) | PostgreSQL, MySQL, SQL Server, MongoDB: add, import, connect |
 | 23 | [Deploying with the orchestrator](23-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on artifactd |
 | 24 | [Artifact delivery: the blob store](24-blob-store.md) | content-addressed `artifactd`, sha PUT/GET, Bearer auth, deploy by digest |

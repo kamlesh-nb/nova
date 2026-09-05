@@ -1,13 +1,13 @@
 # The Orchestrator, Architecture
 
-`nova-orchestrator` is a native, container free orchestration stack written **in Nova**. It is a
+`nova-orchestrator` is a native, container free orchestration stack written **in Kyte**. It is a
 Kubernetes style control plane that runs workloads as **native binaries, and not containers**. It is an
-*application* built upon the Nova language and runtime, and it is therefore **not** a part of the standard
+*application* built upon the Kyte language and runtime, and it is therefore **not** a part of the standard
 library; it ships as a separate published package (`github.com/kamlesh-nb/nova-orchestrator`), fetched via
-`nova get`, in the same manner as the database drivers. Only the runtime *seams* upon which it depends
+`kyte get`, in the same manner as the database drivers. Only the runtime *seams* upon which it depends
 reside in the language.
 
-> This document is a navigable overview of the package. It complements the Nova language architecture set;
+> This document is a navigable overview of the package. It complements the Kyte language architecture set;
 > the orchestrator's own repository carries its README and tests (gates 167 and 178 to 183).
 
 ## The Tiers (I1 to I4)
@@ -57,7 +57,7 @@ desired and the observed spec; and `shouldRestart` encodes the restart policy lo
 ### Replica Supervision, `orch/supervisor`
 
 A `Supervisor` keeps one workload's replica set running. `ensureReplicas` spawns up to the desired count;
-`poll` observes each replica (through the non blocking `nova_process_try_wait`, with WNOHANG) and **restarts
+`poll` observes each replica (through the non blocking `kyte_process_try_wait`, with WNOHANG) and **restarts
 on crash** as per the policy; and `stopAll` performs a graceful stop (a SIGTERM followed, if required, by a
 SIGKILL). The identity of a replica is its kernel PID.
 
@@ -84,7 +84,7 @@ the cgroup CPU metric) `decide`s a target replica count and adjusts the supervis
 ## Isolation, `os/sandbox`
 
 `os/sandbox` exposes an **isolation dial** with levels 0, 1, and 3. It is a thin surface over the runtime
-primitive `nova_process_spawn_isolated` (see [03-runtime.md](03-runtime.md)), which, on Linux, does a
+primitive `kyte_process_spawn_isolated` (see [03-runtime.md](03-runtime.md)), which, on Linux, does a
 `clone()` into the PID, mount, UTS, IPC, net, and user namespaces, then a `pivot_root` into a private
 rootfs, then drops all capabilities, then installs a seccomp BPF filter, and finally `execve`s the target.
 `IsolationSpec` describes the desired level and rootfs, and `spawn` launches under it. The I2 supervisor
@@ -96,18 +96,18 @@ cleanly to a plain process spawn, so that the orchestrator still runs (albeit wi
 `net/service` provides Kubernetes Service style **virtual endpoints**. A `Service` is a stable front
 address (a VIP) that load balances to backend replicas on ephemeral ports, over the I1 proxy, with health
 gated membership. It maintains a name to endpoint registry and a discovery file (in the manner of
-`/etc/hosts`), and it binds the specific VIP through the runtime's `nova_aserver_listen_addr` (which binds a
+`/etc/hosts`), and it binds the specific VIP through the runtime's `kyte_aserver_listen_addr` (which binds a
 particular address rather than INADDR_ANY). The kernel tier (network namespaces, veth pairs, overlays,
 IPVS, or eBPF) is deliberately deferred; the present implementation is the userspace tier over the proxy.
 
 ## The Runtime Seams It Relies Upon
 
-The orchestrator is pure Nova, yet it stands upon a small set of runtime seams that were added in the
+The orchestrator is pure Kyte, yet it stands upon a small set of runtime seams that were added in the
 language expressly for it, and which remain in the language while the orchestrator itself is a package:
 
-- `nova_process_spawn`, `nova_process_try_wait`, `nova_process_pid`, and `nova_process_spawn_isolated`, that
+- `kyte_process_spawn`, `kyte_process_try_wait`, `kyte_process_pid`, and `kyte_process_spawn_isolated`, that
   is, the process and isolation primitives.
-- `nova_aserver_listen_addr`, for binding a specific service VIP.
+- `kyte_aserver_listen_addr`, for binding a specific service VIP.
 - The async socket and timer primitives (`net/asyncio`), and the `process`, `io/file`, `io/dir`, and
   `serde/json` standard library modules.
 

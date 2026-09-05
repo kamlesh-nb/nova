@@ -1,7 +1,7 @@
-//! Package-index lookup and dependency resolution for the Nova package manager.
+//! Package-index lookup and dependency resolution for the Kyte package manager.
 //!
 //! This module is the bridge between a human-written dependency string (what a
-//! manifest spells, e.g. `"nova-http@^1.2.0"`) and a concrete, fetchable git
+//! manifest spells, e.g. `"kyte-http@^1.2.0"`) and a concrete, fetchable git
 //! location (a URL plus an optional ref/tag). It sits directly on top of
 //! [`semver`]: this file knows the on-disk shape of the index and how to read
 //! it, and it delegates every version-comparison decision to `semver.zig`.
@@ -195,8 +195,8 @@ pub fn unify(allocator: std.mem.Allocator, io: std.Io, index_dir: []const u8, na
 /// Rewrites a manifest dependency string into a concrete fetch spec, passing it
 /// through unchanged when it cannot (or should not) be rewritten.
 ///
-/// The intended flow: `"nova-http@^1.2.0"` becomes the matching version's
-/// `url#ref` (e.g. `https://ex/nova-http#9f3c`), or just its `url` when the
+/// The intended flow: `"kyte-http@^1.2.0"` becomes the matching version's
+/// `url#ref` (e.g. `https://ex/kyte-http#9f3c`), or just its `url` when the
 /// chosen version has no `ref`. Any of the following returns `dep` verbatim, so
 /// the caller can feed the result straight to the fetcher regardless:
 ///   * `dep` is not a bare name+range ([`parseNameDep`] returns `null`, e.g. it
@@ -221,11 +221,11 @@ pub fn rewriteDep(allocator: std.mem.Allocator, io: std.Io, index_dir: []const u
 test "parseNameDep" {
     try std.testing.expect(parseNameDep("https://github.com/x/y") == null);
     try std.testing.expect(parseNameDep("github.com/x/y") == null);
-    const a = parseNameDep("nova-http").?;
-    try std.testing.expectEqualStrings("nova-http", a.name);
+    const a = parseNameDep("kyte-http").?;
+    try std.testing.expectEqualStrings("kyte-http", a.name);
     try std.testing.expectEqualStrings("*", a.range);
-    const b = parseNameDep("nova-http@^1.2.0").?;
-    try std.testing.expectEqualStrings("nova-http", b.name);
+    const b = parseNameDep("kyte-http@^1.2.0").?;
+    try std.testing.expectEqualStrings("kyte-http", b.name);
     try std.testing.expectEqualStrings("^1.2.0", b.range);
 }
 
@@ -239,11 +239,11 @@ test "resolve + unify against an index entry (JSON-parsed)" {
     defer arena.deinit();
     const a = arena.allocator();
     const json =
-        \\{ "name": "nova-http",
-        \\  "versions": [ {"version":"1.0.0","url":"https://ex/nova-http","ref":"v1.0.0"},
-        \\                {"version":"1.2.0","url":"https://ex/nova-http","ref":"v1.2.0"},
-        \\                {"version":"1.4.1","url":"https://ex/nova-http","ref":"9f3c"},
-        \\                {"version":"2.0.0","url":"https://ex/nova-http","ref":"v2.0.0"} ] }
+        \\{ "name": "kyte-http",
+        \\  "versions": [ {"version":"1.0.0","url":"https://ex/kyte-http","ref":"v1.0.0"},
+        \\                {"version":"1.2.0","url":"https://ex/kyte-http","ref":"v1.2.0"},
+        \\                {"version":"1.4.1","url":"https://ex/kyte-http","ref":"9f3c"},
+        \\                {"version":"2.0.0","url":"https://ex/kyte-http","ref":"v2.0.0"} ] }
     ;
     const parsed = try std.json.parseFromSlice(IndexEntry, a, json, .{ .ignore_unknown_fields = true });
     const entry = parsed.value;
@@ -251,7 +251,7 @@ test "resolve + unify against an index entry (JSON-parsed)" {
     const r = resolveEntry(a, entry, "^1.2.0").?;
     try std.testing.expectEqualStrings("1.4.1", r.version);
     try std.testing.expectEqualStrings("9f3c", r.ref.?);
-    try std.testing.expectEqualStrings("https://ex/nova-http", r.url);
+    try std.testing.expectEqualStrings("https://ex/kyte-http", r.url);
 
     try std.testing.expectEqualStrings("1.2.0", resolveEntry(a, entry, "~1.2").?.version);
     try std.testing.expectEqualStrings("2.0.0", resolveEntry(a, entry, ">=2.0.0").?.version);

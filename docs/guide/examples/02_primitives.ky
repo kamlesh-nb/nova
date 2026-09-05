@@ -1,0 +1,25 @@
+fn main(): void {
+    let i: int = 42;
+    let big: long = 10000000000;
+    let pi: float = 3.14159;
+    let ok: bool = true;
+    let name: string = "Kyte";
+
+    console.log(`int:    ${i}`);
+    console.log(`long:   ${big}`);
+    console.log(`float:  ${pi}`);
+    console.log(`bool:   ${ok}`);
+    console.log(`string: ${name}`);
+
+    console.log(`7 / 2   = ${7 / 2}`);
+    console.log(`7 % 2   = ${7 % 2}`);
+    console.log(`2 ** via mul 2*2*2 = ${2 * 2 * 2}`);
+    console.log(`1 << 4  = ${1 << 4}`);
+    console.log(`6 & 3   = ${6 & 3}`);
+    console.log(`6 | 1   = ${6 | 1}`);
+    console.log(`5 ^ 1   = ${5 ^ 1}`);
+
+    let f: float = i as float;
+    let back: int = pi as int;
+    console.log(`42 as float = ${f}, 3.14159 as int = ${back}`);
+}

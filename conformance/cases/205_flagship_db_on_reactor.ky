@@ -1,0 +1,177 @@
+import assert;
+import bytes;
+import os.sys;
+import net.poller;
+import net.eventedio;
+import net.aio;
+import web.app;
+import web.request;
+import web.response;
+import web.status;
+import web.routing;
+
+const SO_REUSEADDR: int = 4;
+
+fn bump(cell: long): void {
+    bytes.write_i32(cell, 0, (bytes.read_i32(cell, 0) as int) + 1);
+}
+fn count(cell: long): int {
+    return bytes.read_i32(cell, 0) as int;
+}
+
+fn containsAscii(buf: long, n: int, s: string): bool {
+    if (s.length == 0 || n < s.length) { return false; }
+    let i = 0;
+    while (i + s.length <= n) {
+        let j = 0;
+        let eq = true;
+        while (j < s.length) {
+            if ((bytes.read_byte(buf, i + j) as int) != s[j]) { eq = false; j = s.length; }
+            else { j = j + 1; }
+        }
+        if (eq) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Config the handler holds as a plain field (direct composition, no DI container).
+struct DbConfig {
+    pub port: int,
+    init(port: int) { self.port = port; }
+}
+
+// Direct RouteHandler: on GET /user it reaches out to the (fake) DB over the
+// reactor, reads a value, and returns it as JSON. Its dependency (DbConfig) is a
+// plain constructor argument wired at registration.
+struct GetUserHandler impl RouteHandler {
+    cfg: DbConfig,
+    init(cfg: DbConfig) { self.cfg = cfg; }
+    async fn serve(self: GetUserHandler, ctx: routing.Context): Response {
+        let db = await aio.asyncConnect("127.0.0.1", self.cfg.port);
+        let val = 0;
+        if (db.isOpen()) {
+            let _ = await db.sendStr("Q");
+            let buf = bytes.alloc(64);
+            let n = await db.recvInto(buf, 64);
+            if (n >= 2) {
+                val = ((bytes.read_byte(buf, 0) as int) - 48) * 10 + ((bytes.read_byte(buf, 1) as int) - 48);
+            }
+            bytes.free(buf);
+            db.close();
+        }
+        return response.Response(Status.Ok, `{"val":${val}}`);
+    }
+}
+
+fn makeApp(dbPort: int): App {
+    let a = App();
+    a.get("/user", GetUserHandler(DbConfig(dbPort)));
+    return a;
+}
+
+async fn dbServe(fd: int, kq: int, done: long): void {
+    let s = eventedio.ReactorStream(fd, kq);
+    let buf = bytes.alloc(64);
+    let n = await s.recvInto(buf, 64);
+    if (n > 0) {
+        let reply = bytes.alloc(2);
+        bytes.write_byte(reply, 0, 52);
+        bytes.write_byte(reply, 1, 50);
+        let _ = await s.sendBuf(reply, 2);
+        bytes.free(reply);
+    }
+    bytes.free(buf);
+    s.close();
+    bump(done);
+}
+
+async fn webServe(application: App, fd: int, kq: int, done: long): void {
+    let _ = await app.serveReactorConn(application, fd, kq);
+    bump(done);
+}
+
+async fn webAcceptOne(application: App, lfd: int, kq: int, done: long): void {
+    let s = await eventedio.reactorAccept(lfd, kq);
+    if (s.isOpen()) { coroStart(webServe(application, s.fdOf(), kq, done)); }
+}
+async fn dbAcceptOne(lfd: int, kq: int, done: long): void {
+    let s = await eventedio.reactorAccept(lfd, kq);
+    if (s.isOpen()) { coroStart(dbServe(s.fdOf(), kq, done)); }
+}
+
+async fn webClient(webPort: int, kq: int, done: long, gotOk: long): void {
+    let s = await eventedio.reactorConnect("127.0.0.1", webPort, kq);
+    if (s.isOpen()) {
+        let _ = await s.sendStr("GET /user HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let buf = bytes.alloc(2048);
+        let n = await s.recvInto(buf, 2048);
+        if (containsAscii(buf, n, `"val":42`)) { bytes.write_i32(gotOk, 0, 1); }
+        bytes.free(buf);
+        s.close();
+    }
+    bump(done);
+}
+
+fn bindListener(port: int): int {
+    let fd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    let one = bytes.alloc(4); bytes.write_i32(one, 0, 1);
+    sys.setsockopt(fd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
+    bytes.free(one);
+    let sa = sys.makeSockaddrIn(0, eventedio.parseIPv4("127.0.0.1"));
+    let br = sys.bind(fd, sa, 16);
+    bytes.free(sa);
+    if (br != 0) { return -1; }
+    sys.listen(fd, 16);
+    sys.setNonBlocking(fd);
+    return fd;
+}
+
+fn acceptAll(lfd: int, addrBuf: long, addrLen: long): int {
+    bytes.write_i32(addrLen, 0, 16);
+    let c = sys.accept(lfd, addrBuf, addrLen);
+    if (c >= 0) { sys.setNonBlocking(c); }
+    return c;
+}
+
+@test
+fn test_flagship_request_with_db_on_reactor(): void {
+    let dbLfd = bindListener(0);
+    let webLfd = bindListener(0);
+    assert.isTrue(dbLfd >= 0 && webLfd >= 0);
+    let dbPort = sys.boundPort(dbLfd);
+    let webPort = sys.boundPort(webLfd);
+
+    let application = makeApp(dbPort);
+
+    let r = poller.Reactor(64, 8192, 32);
+    poller.setCurrent(r.kq);
+    let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
+    let gotOk = bytes.alloc(4); bytes.write_i32(gotOk, 0, 0);
+
+    coroStart(webAcceptOne(application, webLfd, r.kq, done));
+    coroStart(dbAcceptOne(dbLfd, r.kq, done));
+    coroStart(webClient(webPort, r.kq, done, gotOk));
+
+    let guard = 0;
+    while (count(done) < 3 && guard < 4000) {
+        let nev = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) {
+            kyte_reactor_resume(r.completedToken(i));
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(count(done), 3);
+    assert.equalInt(bytes.read_i32(gotOk, 0) as int, 1);
+
+    poller.setCurrent(0);
+    bytes.free(done);
+    bytes.free(gotOk);
+    r.destroy();
+    sys.close(webLfd);
+    sys.close(dbLfd);
+}

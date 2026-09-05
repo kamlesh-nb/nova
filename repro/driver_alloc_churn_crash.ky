@@ -1,0 +1,46 @@
+import data.btree.client;
+import list;
+import math;
+fn payload(n: int): string { var s = ""; var i = 0; while (i < n) { s = s + "x"; i = i + 1; } return s; }
+pub struct Rand {
+    pub state: i64,
+    init(seed: i64) { self.state = seed; }
+    pub fn nextDouble(self: Rand): f64 { self.state = (self.state * 48271) % 2147483647; return (self.state as f64) / 2147483647.0; }
+    pub fn nextInt(self: Rand, n: int): int { self.state = (self.state * 48271) % 2147483647; return (self.state % (n as i64)) as int; }
+}
+pub struct Stats {
+    pub ops: int,
+    pub hist: list.List<int>,
+    init() { self.ops = 0; self.hist = list.List<int>(); var i = 0; while (i <= 200) { self.hist.push(0); i = i + 1; } }
+}
+
+async fn wA(id: int, st: Stats): int {
+    let c = client.connect("127.0.0.1", 3009, "admin", "kyte");
+    let rnd = Rand((id * 7919) + 12345);
+    console.log("  w" + __i32_to_string(id) + ": rand ok");
+    let val = payload(100);
+    console.log("  w" + __i32_to_string(id) + ": payload ok len=" + __i32_to_string(val.length));
+    let i = 0;
+    while (i < 50) {
+        let r = client.query(c, "SELECT * FROM usertable WHERE ykey='user" + __i32_to_string(i % 200) + "'");
+        st.ops = st.ops + 1;
+        st.hist.set(5, st.hist.get(5) + 1);
+        i = i + 1;
+    }
+    client.close(c);
+    return st.ops;
+}
+async fn runA(): int {
+    let sts = list.List<Stats>(); var k = 0;
+    while (k < 2) { sts.push(Stats()); k = k + 1; }
+    let hs = list.List<i64>(); var t = 0;
+    while (t < 2) { hs.push(spawn wA(t, sts.get(t))); t = t + 1; }
+    let tot = 0; var j = 0;
+    while (j < hs.size()) { tot = tot + await hs.get(j); j = j + 1; }
+    return tot;
+}
+fn main(): void {
+    console.log("Stats{+List<i32> hist} + SELECT: start");
+    let n = runA();
+    console.log("Stats{+List<i32> hist} + SELECT: " + __i32_to_string(n));
+}

@@ -1,0 +1,788 @@
+//! X.509 certificate parsing and chain verification over raw DER bytes.
+//!
+//! This module is the certificate half of Kyte's self-hosted TLS stack. Once
+//! the handshake code has the peer's certificate message in a buffer, it hands
+//! the bytes here to answer one question: does this chain prove that the host we
+//! dialled is who it claims to be, signed by a root we trust, and valid right
+//! now? Everything needed to say yes or no lives in this one file: a DER (ASN.1)
+//! reader, the OID tables for the algorithms we accept, a certificate field
+//! locator, signature verification against RSA and P-256 keys, validity-window
+//! and name checks, and the two- and three-certificate chain walkers.
+//!
+//! The central design decision is ZERO-COPY parsing. We never decode a
+//! certificate into an owned tree of objects. Instead [`parseCert`] walks the
+//! DER once and records, for every field we care about, an OFFSET and LENGTH
+//! back into the caller's original buffer. A [`Cert`] is therefore just a bag of
+//! `int` cursors plus the `ptr` they index into. Nothing is allocated for the
+//! certificate itself, and the buffer the caller passed in MUST stay alive and
+//! unmodified for as long as the [`Cert`] is used, because every accessor reads
+//! straight out of it. The only heap traffic in the whole module is the handful
+//! of short scratch buffers [`verifySignedBy`] allocates for a digest and the
+//! decoded signature integers, each freed before it returns.
+//!
+//! DER is a tag-length-value (TLV) encoding, so the parser is built on one
+//! primitive, [`readTlv`], which reads a tag byte, decodes the short- or
+//! long-form length, and reports where the value starts and where the next TLV
+//! begins. Higher-level parsing is just readTlv walks driven by the fixed
+//! grammar of an X.509 TBSCertificate (serial, signature algorithm, issuer,
+//! validity, subject, SubjectPublicKeyInfo, then extensions). Algorithms and
+//! extensions are identified by their OID, matched byte for byte against the hex
+//! constants in [`oidEq`]'s callers rather than decoded into dotted notation.
+//!
+//! Scope and trust boundary. This is a deliberately small verifier for the
+//! common web PKI cases: RSA (PKCS#1 v1.5 and PSS) and ECDSA over P-256, with
+//! SHA-256/384/512, chains of length two or three, DNS SubjectAltName matching
+//! (including a single leading wildcard), Basic Constraints CA detection, and
+//! issuer/subject DN equality for linking. It is NOT a general X.509
+//! implementation: it does not check key usage beyond the CA flag, path-length
+//! constraints, name constraints, revocation (CRL/OCSP), or policy OIDs, and it
+//! trusts the caller to supply the trusted root DER out of band. The bytes it
+//! parses are attacker-controlled, so every read goes through the bounds-aware
+//! [`bytes`] helpers and every unrecognised algorithm or key type resolves to an
+//! `UNKNOWN` sentinel that makes verification fail closed rather than pass by
+//! accident.
+
+import bytes;
+import crypto.ecc.p256;
+import crypto.rsa;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
+
+/// Signature algorithm: ECDSA with SHA-256. Ordered so all ECDSA codes are
+/// numerically at or below [`SIG_ECDSA_SHA512`], which [`verifySignedBy`] relies
+/// on to branch between the ECDSA and RSA verification paths with a single
+/// comparison.
+const SIG_ECDSA_SHA256: int = 0;
+/// Signature algorithm: ECDSA with SHA-384.
+const SIG_ECDSA_SHA384: int = 1;
+/// Signature algorithm: ECDSA with SHA-512. Highest ECDSA code; the boundary
+/// [`verifySignedBy`] tests against.
+const SIG_ECDSA_SHA512: int = 2;
+/// Signature algorithm: RSA PKCS#1 v1.5 with SHA-256. First of the RSA codes,
+/// which run up to [`SIG_RSA_SHA512`].
+const SIG_RSA_SHA256: int = 3;
+/// Signature algorithm: RSA PKCS#1 v1.5 with SHA-384.
+const SIG_RSA_SHA384: int = 4;
+/// Signature algorithm: RSA PKCS#1 v1.5 with SHA-512. Highest PKCS#1 code; the
+/// upper boundary of the RSA branch in [`verifySignedBy`], above which only PSS
+/// remains.
+const SIG_RSA_SHA512: int = 5;
+/// Signature algorithm: RSA-PSS. Sits above every PKCS#1 code so it falls into
+/// the final `else` branch of [`verifySignedBy`].
+const SIG_RSA_PSS: int = 6;
+/// Sentinel for a signature algorithm OID we do not recognise. Verification
+/// treats this as an immediate failure, so an unknown algorithm can never be
+/// accepted by accident.
+const SIG_UNKNOWN: int = -1;
+
+/// Public-key type: RSA. Selects the PKCS#1/PSS verification path and the
+/// modulus/exponent fields of a [`Cert`].
+const KEY_RSA: int = 0;
+/// Public-key type: NIST P-256 (secp256r1) elliptic-curve key. Selects the
+/// ECDSA verification path and the `ec*` point fields of a [`Cert`].
+const KEY_EC_P256: int = 1;
+/// Sentinel for a SubjectPublicKeyInfo algorithm we do not support. A cert with
+/// this key type can never act as a verifying issuer.
+const KEY_UNKNOWN: int = -1;
+
+/// Forms a `ptr` `off` bytes past `buf`, for handing an interior slice of a
+/// certificate buffer to the RSA/ECDSA/hash helpers.
+///
+/// The arithmetic is done at `long` width deliberately: adding an `int` offset
+/// to a truncated address would corrupt any pointer above 4 GB (see the 32-bit
+/// address trap in the language notes), so `buf` is widened to `long` before the
+/// add and only then narrowed back to `ptr`.
+fn ptrAt(buf: ptr, off: int): ptr { return (buf as long + off) as ptr; }
+
+/// One decoded DER tag-length-value header: where its value sits and where the
+/// following TLV begins.
+///
+/// A [`Tlv`] holds no bytes of its own, only cursors into the buffer that
+/// [`readTlv`] was given. Walking a SEQUENCE means reading a [`Tlv`] at its
+/// `start`, then reading the next at the previous one's `next`, and so on until
+/// `next` reaches the parent's end.
+pub struct Tlv {
+    /// The DER tag byte, e.g. `0x30` for SEQUENCE, `0x02` for INTEGER, `0x03`
+    /// for BIT STRING. Context-specific tags such as `0xa0`/`0xa3` also appear
+    /// and are matched directly by the parser.
+    pub tag: int,
+    /// Offset of the first byte of the value, just past the tag and the encoded
+    /// length.
+    pub start: int,
+    /// Length in bytes of the value, decoded from the DER length octets (short
+    /// or long form).
+    pub len: int,
+    /// Offset of the next TLV, equal to `start + len`. Used to step past this
+    /// element when iterating siblings.
+    pub next: int,
+}
+
+/// Decodes the DER tag-length-value header at `pos` in `buf`.
+///
+/// Handles both length forms: a length byte below `0x80` IS the length
+/// (short form), otherwise its low seven bits give the count of following
+/// big-endian length octets (long form), which are folded into `len`. The
+/// returned [`Tlv`] reports the value span and the position of the next
+/// element. No bounds check is performed against the buffer end, so the caller
+/// must only read where the certificate grammar says a TLV exists; the DER being
+/// parsed is untrusted, hence the surrounding walkers are careful to stay within
+/// each container's declared length.
+pub fn readTlv(buf: ptr, pos: int): Tlv {
+    let tag = bytes.read_byte(buf, pos);
+    let p = pos + 1;
+    let b = bytes.read_byte(buf, p);
+    p = p + 1;
+    let len = 0;
+    if (b < 0x80) {
+        len = b;
+    } else {
+        let nb = b & 0x7f;
+        let i = 0;
+        while (i < nb) { len = (len << 8) | bytes.read_byte(buf, p); p = p + 1; i = i + 1; }
+    }
+    return Tlv { tag: tag, start: p, len: len, next: p + len };
+}
+
+/// Converts a single lowercase-hex ASCII character to its 0..15 value.
+///
+/// Digits `0`-`9` (ASCII 48..57) map directly; anything else is assumed to be a
+/// lowercase letter `a`-`f`, so `c - 87` turns `a` (97) into 10. Only ever
+/// called on the compile-time hex OID literals in this file, which are known to
+/// be well formed, so it does not guard against out-of-range input.
+fn hexNibble(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    return c - 87;
+}
+/// Tests whether the OID bytes at `[start, start+len)` in `buf` equal the OID
+/// spelled by the lowercase-hex string `hex`.
+///
+/// Rather than decode the OID into dotted-integer form, the parser compares its
+/// raw DER encoding byte for byte against a known hex constant. `hex` must be
+/// exactly twice as long as the OID (two hex characters per byte); a length
+/// mismatch is an immediate non-match. Each pair of hex characters is folded
+/// through [`hexNibble`] into the expected byte and compared. This is how every
+/// algorithm and extension OID in the module is recognised.
+fn oidEq(buf: ptr, start: int, len: int, hex: string): bool {
+    if (hex.length != len * 2) { return false; }
+    let i = 0;
+    while (i < len) {
+        let want = hexNibble(hex[i * 2]) * 16 + hexNibble(hex[i * 2 + 1]);
+        if (bytes.read_byte(buf, start + i) != want) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Maps a signature-algorithm OID (at `[start, start+len)` in `buf`) to one of
+/// the `SIG_*` codes.
+///
+/// The hex constants are the DER-encoded OIDs for the supported algorithms:
+/// `2a8648ce3d0403xx` is the `ecdsa-with-SHAxxx` family and `2a864886f70d0101xx`
+/// is the PKCS#1 `sha*WithRSAEncryption` family, with `...010a` being RSASSA-PSS.
+/// Any OID outside this set returns [`SIG_UNKNOWN`], which forces verification to
+/// fail closed.
+fn decodeSigOid(buf: ptr, start: int, len: int): int {
+    if (oidEq(buf, start, len, "2a8648ce3d040302")) { return SIG_ECDSA_SHA256; }
+    if (oidEq(buf, start, len, "2a8648ce3d040303")) { return SIG_ECDSA_SHA384; }
+    if (oidEq(buf, start, len, "2a8648ce3d040304")) { return SIG_ECDSA_SHA512; }
+    if (oidEq(buf, start, len, "2a864886f70d01010b")) { return SIG_RSA_SHA256; }
+    if (oidEq(buf, start, len, "2a864886f70d01010c")) { return SIG_RSA_SHA384; }
+    if (oidEq(buf, start, len, "2a864886f70d01010d")) { return SIG_RSA_SHA512; }
+    if (oidEq(buf, start, len, "2a864886f70d01010a")) { return SIG_RSA_PSS; }
+    return SIG_UNKNOWN;
+}
+
+/// A parsed X.509 certificate, stored as offsets into the caller's DER buffer.
+///
+/// This is the zero-copy heart of the module: a [`Cert`] owns no bytes, it only
+/// remembers `buf` and, for each interesting field, where that field starts and
+/// how long it is. Every function that reads a [`Cert`] re-reads out of `buf`, so
+/// `buf` MUST stay alive and unchanged for the whole lifetime of the [`Cert`].
+/// The struct is not `pub`: certificates are only ever produced by [`parseCert`]
+/// (and the list helpers that call it) and consumed by the verification
+/// functions here, never constructed by callers.
+///
+/// When parsing fails partway, [`parseCert`] returns a value with `ok == false`
+/// and zeroed fields; the verification entry points check `ok` first and refuse
+/// such a certificate.
+struct Cert {
+    /// The DER buffer this certificate's offsets index into. Borrowed, not
+    /// owned; the caller keeps it alive.
+    pub buf: ptr,
+    /// True only if [`parseCert`] walked the whole structure successfully. A
+    /// false value means every other field is meaningless and verification must
+    /// reject the certificate.
+    pub ok: bool,
+    /// Offset and length of the serial-number INTEGER value. Parsed and recorded
+    /// but not used by the verification logic here.
+    pub serialStart: int, pub serialLen: int,
+    /// Offset and length of the TBSCertificate (the "to be signed" portion). The
+    /// signature is computed over exactly these bytes, so [`verifySignedBy`]
+    /// hashes this span.
+    pub tbsStart: int, pub tbsLen: int,
+    /// The signature algorithm, one of the `SIG_*` codes, decoded from the
+    /// outer signatureAlgorithm OID by [`decodeSigOid`].
+    pub sigAlg: int,
+    /// Offset and length of the raw signature bytes, already stepped past the
+    /// BIT STRING's leading unused-bits octet, so it points at the signature
+    /// value itself.
+    pub sigStart: int, pub sigLen: int,
+    /// The public-key type, one of the `KEY_*` codes. Determines which of the
+    /// RSA or EC field groups below is populated.
+    pub keyType: int,
+    /// Offset and length of the RSA modulus (with any DER leading zero stripped),
+    /// valid only when `keyType == KEY_RSA`.
+    pub rsaNStart: int, pub rsaNLen: int,
+    /// Offset and length of the RSA public exponent, valid only when
+    /// `keyType == KEY_RSA`.
+    pub rsaEStart: int, pub rsaELen: int,
+    /// Offset and length of the uncompressed P-256 public-key point (the `0x04`
+    /// prefix already skipped), valid only when `keyType == KEY_EC_P256`.
+    pub ecStart: int, pub ecLen: int,
+    /// Offset and length of the subject distinguished name, as the raw DER of the
+    /// Name SEQUENCE. Compared byte for byte by [`nameMatches`].
+    pub subjectStart: int, pub subjectLen: int,
+    /// Offset and length of the issuer distinguished name, as raw DER. A child
+    /// links to its issuer when this equals the issuer's subject bytes.
+    pub issuerStart: int, pub issuerLen: int,
+    /// notBefore: value offset, length, and DER tag. The tag distinguishes
+    /// UTCTime (`0x17`, two-digit year) from GeneralizedTime (`0x18`, four-digit
+    /// year), which [`timeToNum`] needs to parse the year correctly.
+    pub nbStart: int, pub nbLen: int, pub nbTag: int,
+    /// notAfter: value offset, length, and DER tag, in the same encoding as the
+    /// notBefore fields above.
+    pub naStart: int, pub naLen: int, pub naTag: int,
+    /// True if the Basic Constraints extension is present with `cA` set. Only a
+    /// CA certificate may act as an issuer in [`verifyLink`].
+    pub isCa: bool,
+    /// Offset and length of the SubjectAltName extension's GeneralNames SEQUENCE
+    /// value, walked by [`matchHostname`] to check DNS names. Both zero when the
+    /// certificate carries no SAN.
+    pub sanStart: int, pub sanLen: int,
+}
+
+/// Parses a DER-encoded X.509 certificate at `buf` (of `len` bytes) into a
+/// [`Cert`] of field offsets.
+///
+/// The walk follows the fixed X.509 grammar: outer Certificate SEQUENCE, then
+/// the TBSCertificate SEQUENCE, then in order the optional `[0]` version tag, the
+/// serial INTEGER, the inner signature AlgorithmIdentifier (skipped), issuer
+/// Name, Validity (notBefore/notAfter), subject Name, and
+/// SubjectPublicKeyInfo. From the SPKI it identifies the key: the P-256 curve
+/// OID selects an EC key and records the point (dropping the `0x04`
+/// uncompressed-form prefix), while the RSA OID selects an RSA key and pulls the
+/// modulus and exponent out of the nested RSAPublicKey SEQUENCE, stripping the
+/// DER sign-padding zero from the modulus. If a `[3]` extensions block follows,
+/// it scans for Basic Constraints (`551d13`, to set `isCa`) and SubjectAltName
+/// (`551d11`, to record the SAN span). Finally it reads the outer
+/// signatureAlgorithm and signatureValue.
+///
+/// On any structural check that fails, chiefly a top-level tag that is not
+/// SEQUENCE, it returns the `bad` template with `ok == false`. It never
+/// validates the signature or dates; that is the job of the verification
+/// functions. The returned [`Cert`] borrows `buf`, which must outlive it. See
+/// [`Cert`] for the meaning of each recorded field.
+pub fn parseCert(buf: ptr, len: int): Cert {
+    let bad = Cert { buf: buf, ok: false, serialStart: 0, serialLen: 0,
+        tbsStart: 0, tbsLen: 0, sigAlg: SIG_UNKNOWN, sigStart: 0, sigLen: 0,
+        keyType: KEY_UNKNOWN, rsaNStart: 0, rsaNLen: 0, rsaEStart: 0, rsaELen: 0,
+        ecStart: 0, ecLen: 0, subjectStart: 0, subjectLen: 0, issuerStart: 0, issuerLen: 0,
+        nbStart: 0, nbLen: 0, nbTag: 0, naStart: 0, naLen: 0, naTag: 0, isCa: false, sanStart: 0, sanLen: 0 };
+
+    let cert = readTlv(buf, 0);
+    if (cert.tag != 0x30) { return bad; }
+    let tbs = readTlv(buf, cert.start);
+    if (tbs.tag != 0x30) { return bad; }
+    let tbsStart = cert.start;
+    let tbsLen = tbs.next - cert.start;
+
+    let q = tbs.start;
+    let f = readTlv(buf, q);
+    if (f.tag == 0xa0) { q = f.next; }
+    let serial = readTlv(buf, q); q = serial.next;
+    let serialStart = serial.start; let serialLen = serial.len;
+    let innerSig = readTlv(buf, q); q = innerSig.next;
+    let issuer = readTlv(buf, q);
+    let issuerStart = q; let issuerLen = issuer.next - q; q = issuer.next;
+    let validity = readTlv(buf, q);
+    let nb = readTlv(buf, validity.start);
+    let na = readTlv(buf, nb.next);
+    q = validity.next;
+    let subject = readTlv(buf, q);
+    let subjectStart = q; let subjectLen = subject.next - q; q = subject.next;
+    let spki = readTlv(buf, q);
+
+    let algSeq = readTlv(buf, spki.start);
+    let algOid = readTlv(buf, algSeq.start);
+    let spkBit = readTlv(buf, algSeq.next);
+
+    let keyType = KEY_UNKNOWN;
+    let rsaNStart = 0; let rsaNLen = 0; let rsaEStart = 0; let rsaELen = 0;
+    let ecStart = 0; let ecLen = 0;
+    if (oidEq(buf, algOid.start, algOid.len, "2a8648ce3d0201")) {
+        keyType = KEY_EC_P256;
+        ecStart = spkBit.start + 1;
+        ecLen = spkBit.len - 1;
+    } else if (oidEq(buf, algOid.start, algOid.len, "2a864886f70d010101")) {
+        keyType = KEY_RSA;
+        let rsaSeq = readTlv(buf, spkBit.start + 1);
+        let modInt = readTlv(buf, rsaSeq.start);
+        let ms = modInt.start; let ml = modInt.len;
+        if (bytes.read_byte(buf, ms) == 0) { ms = ms + 1; ml = ml - 1; }
+        rsaNStart = ms; rsaNLen = ml;
+        let expInt = readTlv(buf, modInt.next);
+        rsaEStart = expInt.start; rsaELen = expInt.len;
+    }
+
+    let isCa = false;
+    let sanStart = 0; let sanLen = 0;
+    q = spki.next;
+    if (q < tbs.next) {
+        let ex = readTlv(buf, q);
+        if (ex.tag == 0xa3) {
+            let extSeq = readTlv(buf, ex.start);
+            let ep = extSeq.start;
+            let extEnd = extSeq.start + extSeq.len;
+            while (ep < extEnd) {
+                let one = readTlv(buf, ep);
+                let oid = readTlv(buf, one.start);
+                let vpos = oid.next;
+                let maybe = readTlv(buf, vpos);
+                if (maybe.tag == 0x01) { vpos = maybe.next; }
+                let val = readTlv(buf, vpos);
+                if (oidEq(buf, oid.start, oid.len, "551d13")) {
+                    let bcSeq = readTlv(buf, val.start);
+                    if (bcSeq.len > 0) {
+                        let caFlag = readTlv(buf, bcSeq.start);
+                        if (caFlag.tag == 0x01 && bytes.read_byte(buf, caFlag.start) != 0) { isCa = true; }
+                    }
+                } else if (oidEq(buf, oid.start, oid.len, "551d11")) {
+                    let san = readTlv(buf, val.start);
+                    sanStart = san.start; sanLen = san.len;
+                }
+                ep = one.next;
+            }
+        }
+    }
+
+    let sigAlgSeq = readTlv(buf, tbs.next);
+    let sigOid = readTlv(buf, sigAlgSeq.start);
+    let sigAlg = decodeSigOid(buf, sigOid.start, sigOid.len);
+    let sigVal = readTlv(buf, sigAlgSeq.next);
+    let sigStart = sigVal.start + 1;
+    let sigLen = sigVal.len - 1;
+
+    return Cert { buf: buf, ok: true, serialStart: serialStart, serialLen: serialLen,
+        tbsStart: tbsStart, tbsLen: tbsLen, sigAlg: sigAlg, sigStart: sigStart, sigLen: sigLen,
+        keyType: keyType, rsaNStart: rsaNStart, rsaNLen: rsaNLen, rsaEStart: rsaEStart, rsaELen: rsaELen,
+        ecStart: ecStart, ecLen: ecLen, subjectStart: subjectStart, subjectLen: subjectLen,
+        issuerStart: issuerStart, issuerLen: issuerLen,
+        nbStart: nb.start, nbLen: nb.len, nbTag: nb.tag, naStart: na.start, naLen: na.len, naTag: na.tag,
+        isCa: isCa, sanStart: sanStart, sanLen: sanLen };
+}
+
+/// Reduces a `SIG_*` code to a compact hash identifier: 0 = SHA-256,
+/// 1 = SHA-384, 2 = SHA-512.
+///
+/// Both the ECDSA and RSA families carry the digest choice in the signature
+/// algorithm, so this collapses the two families to the single hash id shared by
+/// [`hLenOf`] and [`doHash`]. Anything not explicitly SHA-384 or SHA-512
+/// defaults to SHA-256.
+fn hashIdOf(sigAlg: int): int {
+    if (sigAlg == SIG_ECDSA_SHA384 || sigAlg == SIG_RSA_SHA384) { return 1; }
+    if (sigAlg == SIG_ECDSA_SHA512 || sigAlg == SIG_RSA_SHA512) { return 2; }
+    return 0;
+}
+/// Digest length in bytes for a hash id from [`hashIdOf`]: 48 for SHA-384, 64
+/// for SHA-512, else 32 for SHA-256. Used to size the digest scratch buffer.
+fn hLenOf(hid: int): int {
+    if (hid == 1) { return 48; }
+    if (hid == 2) { return 64; }
+    return 32;
+}
+/// Computes the digest of `data[0..len)` into `out`, selecting the algorithm by
+/// hash id: 0 uses SHA-256, 1 uses SHA-384, anything else SHA-512.
+///
+/// `out` must have room for the corresponding [`hLenOf`] length. This is the one
+/// hashing seam [`verifySignedBy`] uses so the same digest feeds both the ECDSA
+/// and RSA paths.
+fn doHash(hid: int, data: ptr, len: int, out: ptr): void {
+    if (hid == 0) { sha256.hashInto(data, len, out); return; }
+    if (hid == 1) { sha512.hash384Into(data, len, out); return; }
+    sha512.hashInto(data, len, out);
+}
+
+/// Copies a DER INTEGER into a fixed-width, left-zero-padded big-endian buffer.
+///
+/// ECDSA needs the `r` and `s` components as fixed 32-byte field elements, but
+/// DER encodes them as minimal INTEGERs that may carry a leading `0x00` sign
+/// byte or be shorter than 32 bytes. This first skips any leading zero bytes of
+/// the source, then zero-fills `out[0..outLen)`, then right-aligns the remaining
+/// `l` value bytes so the number is padded on the left to exactly `outLen`
+/// bytes. The caller guarantees the stripped value fits in `outLen`.
+fn derIntTo(buf: ptr, start: int, len: int, out: ptr, outLen: int): void {
+    let s = start; let l = len;
+    while (l > 0 && bytes.read_byte(buf, s) == 0) { s = s + 1; l = l - 1; }
+    let i = 0;
+    while (i < outLen) { bytes.write_byte(out, i, 0); i = i + 1; }
+    let pad = outLen - l;
+    i = 0;
+    while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
+}
+
+/// Verifies that `child`'s signature was produced by `issuer`'s public key.
+///
+/// This is the cryptographic core of a link. It hashes `child`'s TBSCertificate
+/// bytes with the digest named by `child.sigAlg`, then dispatches on the
+/// algorithm family (the ordering of the `SIG_*` codes makes this a pair of
+/// range checks): ECDSA codes verify against the issuer's P-256 key after
+/// decoding the DER `SEQUENCE { r, s }` into two 32-byte scalars via
+/// [`derIntTo`] and truncating or zero-extending the digest to a 32-byte scalar
+/// `e`; PKCS#1 codes call [`rsa.verifyPkcs1`]; the remaining PSS code calls
+/// [`rsa.verifyPss`]. Each path also requires the issuer's key type to match the
+/// signature family, so an RSA-signed cert cannot be checked against an EC key
+/// or vice versa.
+///
+/// Returns false without attempting anything if either certificate failed to
+/// parse (`!ok`) or the algorithm is [`SIG_UNKNOWN`], if the issuer's key type
+/// does not match the signature family, or if the underlying verify returns
+/// false. All scratch buffers (the digest, and on the ECDSA path `r`, `s`, `e`)
+/// are freed before returning, on every path.
+pub fn verifySignedBy(child: Cert, issuer: Cert): bool {
+    if (!child.ok || !issuer.ok || child.sigAlg == SIG_UNKNOWN) { return false; }
+    let hid = hashIdOf(child.sigAlg);
+    let hl = hLenOf(hid);
+    let digest = bytes.alloc(hl);
+    doHash(hid, ptrAt(child.buf, child.tbsStart), child.tbsLen, digest);
+
+    let ok = false;
+    if (child.sigAlg <= SIG_ECDSA_SHA512) {
+        if (issuer.keyType == KEY_EC_P256) {
+            let seq = readTlv(child.buf, child.sigStart);
+            let rInt = readTlv(child.buf, seq.start);
+            let sInt = readTlv(child.buf, rInt.next);
+            let r = bytes.alloc(32); let s = bytes.alloc(32);
+            derIntTo(child.buf, rInt.start, rInt.len, r, 32);
+            derIntTo(child.buf, sInt.start, sInt.len, s, 32);
+            let e = bytes.alloc(32);
+            let i = 0;
+            while (i < 32) {
+                if (i < hl) { bytes.write_byte(e, i, bytes.read_byte(digest, i)); }
+                else { bytes.write_byte(e, i, 0); }
+                i = i + 1;
+            }
+            ok = p256.ecdsaVerify(e, ptrAt(issuer.buf, issuer.ecStart), r, s);
+            bytes.free(r); bytes.free(s); bytes.free(e);
+        }
+    } else if (child.sigAlg <= SIG_RSA_SHA512) {
+        if (issuer.keyType == KEY_RSA) {
+            ok = rsa.verifyPkcs1(hid, digest, ptrAt(child.buf, child.sigStart), child.sigLen,
+                ptrAt(issuer.buf, issuer.rsaNStart), issuer.rsaNLen,
+                ptrAt(issuer.buf, issuer.rsaEStart), issuer.rsaELen);
+        }
+    } else {
+        if (issuer.keyType == KEY_RSA) {
+            ok = rsa.verifyPss(hid, digest, ptrAt(child.buf, child.sigStart), child.sigLen,
+                ptrAt(issuer.buf, issuer.rsaNStart), issuer.rsaNLen,
+                ptrAt(issuer.buf, issuer.rsaEStart), issuer.rsaELen);
+        }
+    }
+    bytes.free(digest);
+    return ok;
+}
+
+/// True if `child`'s issuer distinguished name equals `issuer`'s subject
+/// distinguished name, byte for byte.
+///
+/// X.509 links a certificate to its issuer by requiring the child's issuer DN to
+/// match the issuer's subject DN. Because both are recorded as raw DER spans,
+/// this is a length check followed by a plain byte comparison, with no name
+/// normalisation. This is a necessary but not sufficient link condition:
+/// [`verifyLink`] also demands a valid signature, so a forged name alone proves
+/// nothing.
+pub fn nameMatches(child: Cert, issuer: Cert): bool {
+    if (child.issuerLen != issuer.subjectLen) { return false; }
+    let i = 0;
+    while (i < child.issuerLen) {
+        if (bytes.read_byte(child.buf, child.issuerStart + i)
+            != bytes.read_byte(issuer.buf, issuer.subjectStart + i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+
+/// Reads two ASCII decimal digits at `p` as a number 0..99.
+///
+/// X.509 times are strings of two-digit fields, so this is the primitive
+/// [`timeToNum`] uses for every component. Returns a `long` so the running total
+/// it feeds does not overflow. It assumes valid ASCII digits (subtracting 48);
+/// the certificate is untrusted, but a malformed time simply yields a nonsense
+/// number that fails the validity comparison rather than being exploitable.
+fn digit2(buf: ptr, p: int): long {
+    return ((bytes.read_byte(buf, p) - 48) * 10 + (bytes.read_byte(buf, p + 1) - 48)) as long;
+}
+
+/// Encodes an X.509 time field as the sortable integer YYYYMMDDHHMMSS.
+///
+/// Handles both encodings by tag: GeneralizedTime (`0x18`) carries a four-digit
+/// year, so both century pairs are read; UTCTime (anything else, i.e. `0x17`)
+/// carries a two-digit year, which is windowed per RFC 5280 as 1900+yy for
+/// yy >= 50 and 2000+yy otherwise. The remaining month, day, hour, minute, and
+/// second pairs are then folded, most significant first, into a single
+/// comparable `long`. Producing one monotonic number means validity checks are a
+/// plain numeric range test. `now` passed to [`checkValidity`] must be in the
+/// same YYYYMMDDHHMMSS form. Fractional seconds and non-`Z` zones are not
+/// handled; certificates in the web PKI use `Z`-suffixed times.
+fn timeToNum(buf: ptr, start: int, tag: int): long {
+    let yyyy: long = 0;
+    let off = start;
+    if (tag == 0x18) {
+        yyyy = digit2(buf, start) * 100 + digit2(buf, start + 2);
+        off = start + 4;
+    } else {
+        let yy = digit2(buf, start);
+        if (yy >= 50) { yyyy = 1900 + yy; } else { yyyy = 2000 + yy; }
+        off = start + 2;
+    }
+    let mo = digit2(buf, off);
+    let da = digit2(buf, off + 2);
+    let hh = digit2(buf, off + 4);
+    let mi = digit2(buf, off + 6);
+    let ss = digit2(buf, off + 8);
+    return ((((yyyy * 100 + mo) * 100 + da) * 100 + hh) * 100 + mi) * 100 + ss;
+}
+
+/// True if `now` falls within the certificate's notBefore/notAfter window,
+/// inclusive.
+///
+/// Both certificate times and `now` are compared as YYYYMMDDHHMMSS integers via
+/// [`timeToNum`], so the caller must supply `now` in that same encoding (UTC).
+/// The bound is inclusive at both ends.
+pub fn checkValidity(cert: Cert, now: long): bool {
+    let nb = timeToNum(cert.buf, cert.nbStart, cert.nbTag);
+    let na = timeToNum(cert.buf, cert.naStart, cert.naTag);
+    return nb <= now && now <= na;
+}
+
+/// True if the certificate's Basic Constraints marked it as a CA. Exposes the
+/// `isCa` flag [`parseCert`] computed; [`verifyLink`] requires it of any issuer.
+pub fn isCA(cert: Cert): bool { return cert.isCa; }
+
+/// Lowercases an ASCII letter code, leaving every other byte unchanged.
+///
+/// DNS name matching is case-insensitive, so [`ciEqual`] folds both sides
+/// through this. Only affects `A`-`Z` (65..90); it is ASCII-only, which is
+/// correct because DNS host labels are ASCII (IDNs arrive already in punycode).
+fn lower(c: int): int { if (c >= 65 && c <= 90) { return c + 32; } return c; }
+
+/// Case-insensitive comparison of a certificate byte span against a slice of the
+/// host string.
+///
+/// Compares `buf[bstart..bstart+blen)` with `host[hstart..hstart+hlen)`, folding
+/// each byte through [`lower`]. A length mismatch is an immediate non-match. This
+/// is the leaf comparison behind both the exact and wildcard branches of
+/// [`dnsMatch`].
+fn ciEqual(buf: ptr, bstart: int, blen: int, host: string, hstart: int, hlen: int): bool {
+    if (blen != hlen) { return false; }
+    let i = 0;
+    while (i < blen) {
+        if (lower(bytes.read_byte(buf, bstart + i)) != lower(host[hstart + i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Matches a single SubjectAltName dNSName (at `[start, start+len)` in `buf`)
+/// against `host`, honouring one leading wildcard label.
+///
+/// If the SAN name begins with `*.` (bytes 42 then 46), it matches `host` only
+/// across the FIRST label: the code finds the first dot in `host` and compares
+/// the SAN's part after `*.` against the host's part after its first dot, with
+/// [`ciEqual`]. A wildcard therefore matches exactly one label and refuses a
+/// host with no dot or a leading dot (`hi <= 0 || hi >= host.length`). A name
+/// without the wildcard prefix is compared in full. This is the standard, narrow
+/// web-PKI wildcard rule: `*.example.com` matches `a.example.com` but not
+/// `example.com` and not `a.b.example.com`.
+fn dnsMatch(buf: ptr, start: int, len: int, host: string): bool {
+    if (len >= 2 && bytes.read_byte(buf, start) == 42 && bytes.read_byte(buf, start + 1) == 46) {
+        let hi = 0;
+        while (hi < host.length && host[hi] != 46) { hi = hi + 1; }
+        if (hi <= 0 || hi >= host.length) { return false; }
+        return ciEqual(buf, start + 2, len - 2, host, hi + 1, host.length - (hi + 1));
+    }
+    return ciEqual(buf, start, len, host, 0, host.length);
+}
+
+/// True if any dNSName in the certificate's SubjectAltName matches `host`.
+///
+/// Walks the GeneralNames SEQUENCE recorded in `sanStart`/`sanLen`, considering
+/// only entries tagged `0x82` (the context-specific tag for dNSName) and testing
+/// each with [`dnsMatch`]. Other GeneralName kinds (IP address, email, and so
+/// on) are skipped. Returns false when the certificate has no SAN or no DNS
+/// entry matches; note the Common Name is intentionally NOT consulted, matching
+/// modern practice.
+pub fn matchHostname(cert: Cert, host: string): bool {
+    let p = cert.sanStart;
+    let end = cert.sanStart + cert.sanLen;
+    while (p < end) {
+        let gn = readTlv(cert.buf, p);
+        if (gn.tag == 0x82) {
+            if (dnsMatch(cert.buf, gn.start, gn.len, host)) { return true; }
+        }
+        p = gn.next;
+    }
+    return false;
+}
+
+/// Verifies one issuer-to-child link in a chain: both parsed, the issuer is a
+/// CA, names line up, both are time-valid, and the signature checks out.
+///
+/// This bundles every per-edge condition so the chain walkers can compose links
+/// cleanly. The `&&` short-circuits, so the cheap structural and name checks run
+/// before the expensive [`verifySignedBy`]. Requiring `issuer.isCa` is what
+/// stops a leaf certificate from being used to sign another certificate.
+pub fn verifyLink(child: Cert, issuer: Cert, now: long): bool {
+    return child.ok && issuer.ok && issuer.isCa
+        && nameMatches(child, issuer)
+        && checkValidity(child, now) && checkValidity(issuer, now)
+        && verifySignedBy(child, issuer);
+}
+
+/// Verifies a two-certificate chain: `leaf` issued directly by trusted `root`,
+/// for `host` at time `now`.
+///
+/// Checks the leaf-to-root link with [`verifyLink`], confirms the root is
+/// self-signed (`verifySignedBy(root, root)`) so it is a genuine trust anchor,
+/// and finally that the leaf's SAN covers `host`. The caller is responsible for
+/// `root` actually being trusted; this only proves the leaf chains to it.
+pub fn verifyChain2(leaf: Cert, root: Cert, host: string, now: long): bool {
+    return verifyLink(leaf, root, now)
+        && verifySignedBy(root, root)
+        && matchHostname(leaf, host);
+}
+
+/// Verifies a three-certificate chain: `leaf` issued by `inter`, `inter` issued
+/// by trusted self-signed `root`, for `host` at time `now`.
+///
+/// The extra hop over [`verifyChain2`]: it checks the leaf-to-intermediate and
+/// intermediate-to-root links (each via [`verifyLink`], so each intermediate
+/// must itself be a CA), confirms `root` is self-signed, and matches the leaf
+/// SAN against `host`.
+pub fn verifyChain3(leaf: Cert, inter: Cert, root: Cert, host: string, now: long): bool {
+    return verifyLink(leaf, inter, now)
+        && verifyLink(inter, root, now)
+        && verifySignedBy(root, root)
+        && matchHostname(leaf, host);
+}
+
+/// Reads a 3-byte big-endian length at `p`, the framing used for each
+/// certificate entry in a TLS Certificate message.
+///
+/// TLS prefixes every certificate in the list with a 24-bit length. This folds
+/// those three bytes into an `int`, which the list walkers use to step from one
+/// certificate to the next.
+fn rd3(buf: ptr, p: int): int {
+    return (bytes.read_byte(buf, p) << 16) | (bytes.read_byte(buf, p + 1) << 8) | bytes.read_byte(buf, p + 2);
+}
+
+/// Verifies a TLS 1.3 certificate_list against a trusted root, for `host` at
+/// `now`, returning true only for a full valid chain.
+///
+/// `list` is the raw TLS certificate_list body: each entry is a 3-byte length,
+/// the certificate DER, then a 2-byte extensions length and that many extension
+/// bytes (the TLS 1.3 per-certificate extensions, which this skips). It parses
+/// the leaf, steps past its extensions, and then either treats the supplied
+/// `rootDer` as the direct issuer ([`verifyChain2`]) if the list ends there, or
+/// parses a second entry as the intermediate and verifies the three-cert chain
+/// ([`verifyChain3`]). Returns false for a list shorter than the minimum
+/// framing. The trusted root is supplied separately, out of band, not taken from
+/// the wire. Compare [`verifyCertList12`], which parses the same bytes without
+/// the TLS 1.3 per-certificate extensions.
+pub fn verifyCertList(list: ptr, listLen: int, rootDer: ptr, rootLen: int, host: string, now: long): bool {
+    if (listLen < 3) { return false; }
+    let c0len = rd3(list, 0);
+    let leaf = parseCert((list as long + 3) as ptr, c0len);
+    let p = 3 + c0len;
+    let ext0 = (bytes.read_byte(list, p) << 8) | bytes.read_byte(list, p + 1);
+    p = p + 2 + ext0;
+    let root = parseCert(rootDer, rootLen);
+    if (p + 3 > listLen) {
+        return verifyChain2(leaf, root, host, now);
+    }
+    let c1len = rd3(list, p);
+    let inter = parseCert((list as long + (p + 3) as long) as ptr, c1len);
+    return verifyChain3(leaf, inter, root, host, now);
+}
+
+/// Verifies a TLS 1.2 certificate_list against a trusted root, for `host` at
+/// `now`.
+///
+/// Same contract as [`verifyCertList`], but for the TLS 1.2 message framing,
+/// where each entry is a 3-byte length followed by the certificate DER with NO
+/// per-certificate extensions. So after the leaf it steps straight to the next
+/// entry rather than skipping an extensions block. Chooses between the two- and
+/// three-certificate paths the same way, and takes the trusted root out of band.
+pub fn verifyCertList12(list: ptr, listLen: int, rootDer: ptr, rootLen: int, host: string, now: long): bool {
+    if (listLen < 3) { return false; }
+    let c0len = rd3(list, 0);
+    let leaf = parseCert((list as long + 3) as ptr, c0len);
+    let p = 3 + c0len;
+    let root = parseCert(rootDer, rootLen);
+    if (p + 3 > listLen) {
+        return verifyChain2(leaf, root, host, now);
+    }
+    let c1len = rd3(list, p);
+    let inter = parseCert((list as long + (p + 3) as long) as ptr, c1len);
+    return verifyChain3(leaf, inter, root, host, now);
+}
+
+/// True if the certificate carries a P-256 EC key rather than RSA. Lets callers
+/// pick the right key-usage path after parsing.
+pub fn isEcKey(cert: Cert): bool { return cert.keyType == KEY_EC_P256; }
+
+/// Parses just the leaf (first) certificate out of a TLS certificate_list.
+///
+/// A convenience for callers that need the leaf's fields (key type, SAN, and so
+/// on) without running a full chain verification. Reads the leading 3-byte
+/// length and parses that many bytes at offset 3. For a list too short to hold
+/// even the framing it parses zero bytes, yielding a [`Cert`] with `ok == false`.
+/// The framing is shared by TLS 1.2 and 1.3, so this serves both.
+pub fn leafCert(list: ptr, listLen: int): Cert {
+    if (listLen < 3) { return parseCert(list, 0); }
+    let c0len = rd3(list, 0);
+    return parseCert((list as long + 3) as ptr, c0len);
+}
+/// Parses the intermediate (second) certificate from a TLS 1.3
+/// certificate_list, accounting for the leaf's per-certificate extensions.
+///
+/// Steps past the leaf entry AND its 2-byte-prefixed TLS 1.3 extensions block
+/// before reading the second entry's 3-byte length and parsing it. If there is
+/// no second certificate (the offset runs past the list), it falls back to
+/// parsing zero bytes at the list start, giving a non-`ok` [`Cert`]. Use
+/// [`interCert12`] for the TLS 1.2 framing, which has no extensions block.
+pub fn interCert13(list: ptr, listLen: int): Cert {
+    if (listLen < 3) { return parseCert(list, 0); }
+    let c0len = rd3(list, 0);
+    let p = 3 + c0len;
+    let ext0 = (bytes.read_byte(list, p) << 8) | bytes.read_byte(list, p + 1);
+    p = p + 2 + ext0;
+    if (p + 3 > listLen) { return parseCert(list, 0); }
+    let c1len = rd3(list, p);
+    return parseCert((list as long + (p + 3) as long) as ptr, c1len);
+}
+/// Parses the intermediate (second) certificate from a TLS 1.2
+/// certificate_list.
+///
+/// Same as [`interCert13`] but for the TLS 1.2 framing, so it steps past only
+/// the leaf's 3-byte length and DER, with no extensions block, before reading
+/// the second entry. Returns a non-`ok` [`Cert`] when there is no second
+/// certificate.
+pub fn interCert12(list: ptr, listLen: int): Cert {
+    if (listLen < 3) { return parseCert(list, 0); }
+    let c0len = rd3(list, 0);
+    let p = 3 + c0len;
+    if (p + 3 > listLen) { return parseCert(list, 0); }
+    let c1len = rd3(list, p);
+    return parseCert((list as long + (p + 3) as long) as ptr, c1len);
+}

@@ -10,7 +10,7 @@ is the wall (see `docs/design/driver-gap-plan.md`, section M):
 
 - `query(collection, _)` runs `find` with an EMPTY filter, so there is no way to express a
   server-side filter, projection, sort, skip, or limit. Clients must fetch the whole collection and
-  filter in Nova.
+  filter in Kyte.
 - `exec` has nowhere to carry a document, so writes degrade to a `find` and perform nothing.
 - Results are flattened to a single `Text` column holding each document's JSON, so type fidelity is
   lost.
@@ -31,7 +31,7 @@ setup. The new API is a typed surface on top of `runCommand`.
 4. **Lazy cursors.** `find`/`aggregate` return a `Cursor` that drains `firstBatch` then `getMore`s,
    and `killCursors` on close. No more "read only the first batch" truncation and no `batchSize`
    stopgap.
-5. **Nova constraints are first-class** (see the Constraints section): closures cannot `await`, so
+5. **Kyte constraints are first-class** (see the Constraints section): closures cannot `await`, so
    iteration is method-based; async methods return `T | error`; BSON buffers are `ptr`-backed and
    ARC-owned with care.
 
@@ -180,10 +180,10 @@ pub struct Cursor {
 }
 ```
 
-Iteration is `while (let d = await cur.next()) { ... }` style (method-based) because Nova closures
+Iteration is `while (let d = await cur.next()) { ... }` style (method-based) because Kyte closures
 cannot `await` (so a `forEach(fn)` that awaits inside `fn` is not expressible).
 
-## Wire mapping (command builders to add to `commands.nova`)
+## Wire mapping (command builders to add to `commands.ky`)
 
 All are `runCommand` payloads. The current `findCommand(dbName, coll, filter)` is extended and joined
 by the rest:
@@ -211,7 +211,7 @@ efficient one. Kind-1 support is a `codec.encodeOpMsg` extension (today it write
 
 ## BSON codec work this unblocks (do first)
 
-The document model needs these `bson.nova` gaps closed (from the gap analysis, section I):
+The document model needs these `bson.ky` gaps closed (from the gap analysis, section I):
 
 1. **ObjectId**: add `entryObjectId` + a serialise case for type 7 + generation; today it is
    decode-only, so you cannot query or round-trip by `_id`. This is prerequisite for almost every
@@ -239,7 +239,7 @@ pub fn defaultDatabase(self: MongoConnection): Database    // the DSN's db
 `runCommand` and the one socket + busy guard, so concurrency rules are unchanged (one in-flight op
 per connection; use a pool for parallelism).
 
-## Nova-specific constraints (call out, do not rediscover)
+## Kyte-specific constraints (call out, do not rediscover)
 
 - **Closures cannot `await`.** Cursor iteration and `bulkWrite` must be method/loop driven, not
   `forEach(asyncFn)`. (Same lesson as the web mediator's `next.proceed()`.)
@@ -248,7 +248,7 @@ per connection; use a pool for parallelism).
   `rs.err`.
 - **BSON buffers are `ptr`-backed and ARC-owned.** `serialize` returns a `ptr`; adopt it as a string
   where ARC should free it, and free scratch buffers in `delete`. Follow the existing
-  `nova-ptr-field-arc-ownership` rule and verify with `--asan`.
+  `kyte-ptr-field-arc-ownership` rule and verify with `--asan`.
 - **`getText` on a numeric `DbValue` returns ""** in the SQL seam; the document API sidesteps this by
   having typed getters return `T | undefined` rather than reusing `DbValue`.
 - **One connection = one socket + busy guard.** True concurrency needs a Mongo-aware pool (a later

@@ -1,4 +1,4 @@
-//! The Nova abstract syntax tree: the parser's output and the shape every later
+//! The Kyte abstract syntax tree: the parser's output and the shape every later
 //! compiler pass reads.
 //!
 //! This file is nothing but data definitions. It declares the whole tree of
@@ -35,7 +35,7 @@
 //!     are `union(enum)`s: the tag says which grammar production matched and the
 //!     payload carries its fields. Downstream passes switch on the tag.
 //!
-//! The statement/expression split mirrors the language: Nova is expression-
+//! The statement/expression split mirrors the language: Kyte is expression-
 //! oriented in places (see [`IfExpr`] and `block_expr`), so a handful of
 //! constructs appear both as a [`Statement`] variant and an [`ExprKind`]
 //! variant with slightly different shapes.
@@ -107,12 +107,12 @@ pub const WhereBound = struct {
     traits: []const []const u8,
 };
 
-/// A function definition: its signature, body, and the extras Nova functions
+/// A function definition: its signature, body, and the extras Kyte functions
 /// can carry (generics, async, attributes, extern linkage).
 ///
 /// Used both for free functions ([`Declaration.fn_decl`]) and, wrapped by
 /// [`MethodDecl`], for methods. When `extern_lib` is set the function has no
-/// Nova body and binds to a symbol in that library instead; `body` is then an
+/// Kyte body and binds to a symbol in that library instead; `body` is then an
 /// empty [`Block`].
 pub const FunctionDecl = struct {
     /// The function's name.
@@ -239,7 +239,7 @@ pub const MethodDecl = struct {
 /// An `enum` definition: its variants, any methods, and whether it is an
 /// exception type.
 ///
-/// Nova enums may carry payloads (see [`Variant`]), so this covers both plain
+/// Kyte enums may carry payloads (see [`Variant`]), so this covers both plain
 /// C-style enums and sum types. `is_exception` marks enums that participate in
 /// the `try`/`catch` error model as thrown error values.
 pub const EnumDecl = struct {
@@ -694,7 +694,7 @@ pub const ReturnStmt = struct {
     span: Span,
 };
 
-/// A `break` statement (span only; Nova `break` carries no label or value).
+/// A `break` statement (span only; Kyte `break` carries no label or value).
 pub const BreakStmt = struct {
     /// Span of the statement.
     span: Span,

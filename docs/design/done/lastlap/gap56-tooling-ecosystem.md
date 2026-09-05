@@ -1,6 +1,6 @@
 # Gap 56: Tooling and Ecosystem -- Deep, Honest Analysis
 
-Assessed from the actual code on 2026-08-15. Umbrella root `/Users/kamlesh/nova-lang`.
+Assessed from the actual code on 2026-08-15. Umbrella root `/Users/kamlesh/kyte-lang`.
 
 ## What I actually inspected vs could not access
 
@@ -11,8 +11,8 @@ INSPECTED (all present locally, all read from source, not from README claims):
 - Package manager: `lang/src/packages.zig` (179) + `lang/src/scaffold.zig` (214) + `lang/src/templates.zig` (354).
 - Debugger: searched `lang/`, `nls/`, `extension/` for any DAP/DWARF/debug-info. Confirmed absent (details below).
 - VS Code extension: `extension/` (extension.ts 102 lines, package.json, grammars, snippets).
-- DB drivers: `packages/nova-{postgres,mysql,mssql,mongodb,novadb,btreedb,orchestrator}` -- Nova source, line-counted and structure-sampled.
-- Web framework: `lang/src/lib/std/web/` (24 files, 3747 lines) + DB seam `lang/src/lib/std/data/` (db.nova 677, orm.nova 225, sql/pool.nova 291).
+- DB drivers: `packages/kyte-{postgres,mysql,mssql,mongodb,novadb,btreedb,orchestrator}` -- Kyte source, line-counted and structure-sampled.
+- Web framework: `lang/src/lib/std/web/` (24 files, 3747 lines) + DB seam `lang/src/lib/std/data/` (db.ky 677, orm.ky 225, sql/pool.ky 291).
 - Orchestrator: `packages/nova-orchestrator/` (src 4817 lines + bin/tests/webui = 9364 total).
 - NovaDB: `novadb/` IS present locally as a sibling-style dir inside the umbrella (59,513 Zig lines total, 25,552 in `src/`). It is a separate project/repo but the tree is here, so I could inspect its structure.
 
@@ -21,7 +21,7 @@ COULD NOT fully access / NOT VERIFIED:
 - I did not build or run any of these; all maturity reads are from static inspection and line counts, not from executing test suites. Where behaviour depends on a live DB/runtime I mark it NOT VERIFIED.
 - NovaDB internals were only structurally sampled (file/line breakdown), not audited for correctness. It is a separate project with its own CLAUDE.md and gate; a deep design for it needs its own analysis pass.
 - The orchestrator `webui/` is noted in project memory as untracked and not building; I did not verify its state beyond the file listing.
-- `~/.nova/cache` (the package cache) does not exist on this machine (the `ls` failed), so I could not see resolved/fetched dependency copies; I assessed the fetch logic from `packages.zig` instead.
+- `~/.kyte/cache` (the package cache) does not exist on this machine (the `ls` failed), so I could not see resolved/fetched dependency copies; I assessed the fetch logic from `packages.zig` instead.
 
 ---
 
@@ -64,7 +64,7 @@ LOCATED and read both files.
 WHAT EXISTS:
 
 - `formatter.zig` (1031 lines): a `Formatter` struct that pretty-prints the AST with 4-space indent (`writeIndent`, 24-29). AST-driven, so it fully normalises layout.
-- `format.zig` (244 lines) is the `nova fmt` driver and does two things a naive AST printer does not: (1) `sameTokenStream` (23-33) verifies the formatted output lexes to the IDENTICAL token stream as the input -- a real safety net against the formatter changing meaning; (2) it reinjects comments the AST printer drops (the file header comment says "reinjecting comments the pretty-printer drops"), tracked via `codeTokenSpans`/`TokenSpan`.
+- `format.zig` (244 lines) is the `kyte fmt` driver and does two things a naive AST printer does not: (1) `sameTokenStream` (23-33) verifies the formatted output lexes to the IDENTICAL token stream as the input -- a real safety net against the formatter changing meaning; (2) it reinjects comments the AST printer drops (the file header comment says "reinjecting comments the pretty-printer drops"), tracked via `codeTokenSpans`/`TokenSpan`.
 - Has a self-test: "formatter: every operator round-trips through the lexer" (formatter.zig 1019).
 
 WHAT IS MISSING / WEAKER:
@@ -81,8 +81,8 @@ LOCATED and read fully (179 lines).
 
 WHAT EXISTS:
 
-- `nova get <git-url>` (`cmdGet`, 128): `git clone --depth 1 <url>` into `~/.nova/cache/<repo-name>` (`cloneIntoCache`, 35-65), then appends the raw git URL to `project.json`'s `dependencies` array (166-178).
-- `nova get` with no arg / `nova restore` (`cmdRestore`, 100) and `ensureDependencies` (73) auto-clone any declared dep not already in the cache before build/test.
+- `kyte get <git-url>` (`cmdGet`, 128): `git clone --depth 1 <url>` into `~/.kyte/cache/<repo-name>` (`cloneIntoCache`, 35-65), then appends the raw git URL to `project.json`'s `dependencies` array (166-178).
+- `kyte get` with no arg / `kyte restore` (`cmdRestore`, 100) and `ensureDependencies` (73) auto-clone any declared dep not already in the cache before build/test.
 - Dedup is by exact URL string match (155-160). Repo name is derived by string-munging the URL (`repoNameFromUrl`, 24-33).
 
 WHAT IS MISSING (versus any real package manager -- cargo/npm/go):
@@ -92,37 +92,37 @@ WHAT IS MISSING (versus any real package manager -- cargo/npm/go):
 - NO REGISTRY / no namespacing / no discovery. It is git-URL-only.
 - NO TRANSITIVE DEPENDENCY RESOLUTION. `ensureDependencies` reads the ROOT `project.json` only; a fetched dependency's own `project.json` deps are not walked. No dependency graph, no conflict resolution, no dedup across versions.
 - NO INTEGRITY (no checksum/hash verification), no cache invalidation/update command (a cached repo is never re-pulled -- line 44-47 short-circuits if the dir exists), no uninstall, no `outdated`/`update`.
-- Cache key is the repo NAME, so two different URLs ending in the same repo name collide in `~/.nova/cache`.
+- Cache key is the repo NAME, so two different URLs ending in the same repo name collide in `~/.kyte/cache`.
 
-ROOT CAUSE: it is a git-clone convenience wrapper, not a package manager. It was built to make `git clone <app> && nova build` resolve the driver packages, and stops there. Memory note `nova-db-decimal-and-multidriver-import` also flags "stale repo packages/* shadow ~/.nova/cache", i.e. resolution order between the in-repo `packages/` and the cache is itself a known hazard.
+ROOT CAUSE: it is a git-clone convenience wrapper, not a package manager. It was built to make `git clone <app> && kyte build` resolve the driver packages, and stops there. Memory note `kyte-db-decimal-and-multidriver-import` also flags "stale repo packages/* shadow ~/.kyte/cache", i.e. resolution order between the in-repo `packages/` and the cache is itself a known hazard.
 
 ### A.4 Debugger -- GAP: TOTAL. Does not exist.
 
 CONFIRMED absent:
 
 - No DAP implementation anywhere. `grep -ril debugAdapter|DebugSession|vscode-debugadapter|breakpoint` over `lang/`, `nls/`, `extension/` returns only a design doc filename (`bug-async-owned-struct-uaf.md`) -- no code.
-- No source-level debug info emitted by codegen: `grep -rl DIBuilder|createCompileUnit|LLVMDIBuilder|dwarf` over `lang/src/backend` returns NOTHING. The compiler lowers to LLVM IR and links native binaries but emits no DWARF/line tables, so even attaching `lldb`/`gdb` gives no Nova-source line mapping -- you would be debugging optimised machine code with no symbols back to `.nova`.
-- The VS Code extension declares no `debuggers` contribution (package.json has languages, grammars, snippets, one command `nova.runFile`; no debug config).
+- No source-level debug info emitted by codegen: `grep -rl DIBuilder|createCompileUnit|LLVMDIBuilder|dwarf` over `lang/src/backend` returns NOTHING. The compiler lowers to LLVM IR and links native binaries but emits no DWARF/line tables, so even attaching `lldb`/`gdb` gives no Kyte-source line mapping -- you would be debugging optimised machine code with no symbols back to `.ky`.
+- The VS Code extension declares no `debuggers` contribution (package.json has languages, grammars, snippets, one command `kyte.runFile`; no debug config).
 
-IMPLICATION: there is no way to set a breakpoint, step, or inspect a Nova variable at runtime. Debugging today is print-statements + the runtime's opt-in facilities (`NOVA_CRASH_TRACE`, `NOVA_IO_WATCHDOG`, `NOVA_ARC_AUDIT`) which are for compiler/runtime authors, not app developers.
+IMPLICATION: there is no way to set a breakpoint, step, or inspect a Kyte variable at runtime. Debugging today is print-statements + the runtime's opt-in facilities (`KYTE_CRASH_TRACE`, `KYTE_IO_WATCHDOG`, `KYTE_ARC_AUDIT`) which are for compiler/runtime authors, not app developers.
 
 ### A.5 VS Code extension (`extension/`) -- GAP: moderate. Syntax + launch only.
 
-LOCATED. `extension.ts` is 102 lines. Contributes: language registration, a TextMate grammar (syntax highlighting), snippets (`snippets/nova.json`), and exactly ONE command `nova.runFile` ("Nova: Run Current File"). Packaged as `nova-vscode-0.2.0.vsix`.
+LOCATED. `extension.ts` is 102 lines. Contributes: language registration, a TextMate grammar (syntax highlighting), snippets (`snippets/kyte.json`), and exactly ONE command `kyte.runFile` ("Kyte: Run Current File"). Packaged as `kyte-vscode-0.2.0.vsix`.
 
-It presumably launches `~/.nova/bin/nls` for LSP features (per nls CLAUDE), so IDE intelligence rides on the LSP above. No debug integration, no build tasks, no test explorer, no `.nsx` rich support beyond grammar. This is a "basic syntax highlighter + LSP client + run button", which matches the CLAUDE.md self-description.
+It presumably launches `~/.kyte/bin/nls` for LSP features (per nls CLAUDE), so IDE intelligence rides on the LSP above. No debug integration, no build tasks, no test explorer, no `.nsx` rich support beyond grammar. This is a "basic syntax highlighter + LSP client + run button", which matches the CLAUDE.md self-description.
 
 ---
 
 ## PART B -- ECOSYSTEM
 
-### B.1 DB drivers (`packages/nova-*`) -- GAP: moderate. Substantial code, single-request-proven.
+### B.1 DB drivers (`packages/kyte-*`) -- GAP: moderate. Substantial code, single-request-proven.
 
-LOCATED in `packages/` at the umbrella root (NOT `lang/packages/`, which does not exist). Line counts (Nova source):
+LOCATED in `packages/` at the umbrella root (NOT `lang/packages/`, which does not exist). Line counts (Kyte source):
 
-- nova-postgres 1739, nova-mysql 2017, nova-mssql 2138, nova-mongodb 2767, nova-novadb 1105. (nova-btreedb present but 0 counted `.nova` -- likely a thin shim/rename of novadb.)
+- nova-postgres 1739, nova-mysql 2017, nova-mssql 2138, nova-mongodb 2767, nova-novadb 1105. (nova-btreedb present but 0 counted `.ky` -- likely a thin shim/rename of novadb.)
 
-The abstraction seam lives in std (`lang/src/lib/std/data/db.nova`, 677 lines): `DbValue` tagged union with typed accessors (`asInt/asLong/asDecimal/asText/asUuid/asJson/asArray`, null-coalescing `asXxxOr`), plus `orm.nova` (225, `queryAs<T>`) and `sql/pool.nova` (291, connection pool). Per project memory the drivers are "prod-ready single-request", the pool + streaming cursor (X4/X5) exist, and the four SQL drivers + mongo are feature-complete for the common path.
+The abstraction seam lives in std (`lang/src/lib/std/data/db.ky`, 677 lines): `DbValue` tagged union with typed accessors (`asInt/asLong/asDecimal/asText/asUuid/asJson/asArray`, null-coalescing `asXxxOr`), plus `orm.ky` (225, `queryAs<T>`) and `sql/pool.ky` (291, connection pool). Per project memory the drivers are "prod-ready single-request", the pool + streaming cursor (X4/X5) exist, and the four SQL drivers + mongo are feature-complete for the common path.
 
 WHAT IS MISSING / ROUGH (from memory notes cross-checked against structure, several NOT VERIFIED without a live DB):
 
@@ -132,7 +132,7 @@ WHAT IS MISSING / ROUGH (from memory notes cross-checked against structure, seve
 
 ### B.2 Web framework (`lang/src/lib/std/web/`) -- GAP: moderate. Surprisingly broad for its age.
 
-LOCATED: 24 files, 3747 lines, flat (no subdirectories). Highlights by size: app.nova (547), request.nova (480), client.nova (435, an HTTP client), response.nova (370), routing.nova (223), mediator.nova (213, MediatR-style), di.nova (160), httpparser.nova (160), multipart.nova (128). Middleware present as discrete files: cors, csrf, session, cookie, rate_limit, circuit_breaker, body_limit, request_id, logger, redact, static_content, mime, methods.
+LOCATED: 24 files, 3747 lines, flat (no subdirectories). Highlights by size: app.ky (547), request.ky (480), client.ky (435, an HTTP client), response.ky (370), routing.ky (223), mediator.ky (213, MediatR-style), di.ky (160), httpparser.ky (160), multipart.ky (128). Middleware present as discrete files: cors, csrf, session, cookie, rate_limit, circuit_breaker, body_limit, request_id, logger, redact, static_content, mime, methods.
 
 This is a real, ASP.NET-flavoured framework: routing + DI + mediator + a middleware pipeline + an HTTP client + multipart + sessions + common security middleware. For a language this young it is broad.
 
@@ -144,7 +144,7 @@ WHAT IS MISSING / ROUGH:
 
 ### B.3 Orchestrator (`packages/nova-orchestrator/`) -- GAP: moderate-to-large, in active flux.
 
-LOCATED: 9364 Nova lines total (src 4817, plus bin/, tests/, webui/, examples/). Structure: `bin/{orchd,orchctl,service}.nova`; `src/orch/{supervisor(392),nativelet(513),manifest(381),spec,lease(194),asynclease,autoscaler,rollout,health,alerts,controlplane,isolation}`; `src/net/{proxy(977),service,netns,autoscale}`; `src/store/{config,sqlconfig}`. ~28 test files (178-201 series) + live tests.
+LOCATED: 9364 Kyte lines total (src 4817, plus bin/, tests/, webui/, examples/). Structure: `bin/{orchd,orchctl,service}.ky`; `src/orch/{supervisor(392),nativelet(513),manifest(381),spec,lease(194),asynclease,autoscaler,rollout,health,alerts,controlplane,isolation}`; `src/net/{proxy(977),service,netns,autoscale}`; `src/store/{config,sqlconfig}`. ~28 test files (178-201 series) + live tests.
 
 This is a genuine control-plane attempt: proxy/load-balancer, supervisor, manifest reconciliation, leader lease, autoscaler, rollout, health checks, YAML declarative manifest, SQL-backed config store. Real breadth.
 
@@ -160,9 +160,9 @@ LOCATED locally (though a separate project with its own CLAUDE.md/gate). 59,513 
 
 I did NOT audit correctness. From memory + the CLAUDE binary-protocol note, the honest reads:
 
-- The binary wire protocol is self-described as "naive"; the driver on the Nova side (`nova-novadb`, 1105 lines) is likewise "too naive" per project notes.
+- The binary wire protocol is self-described as "naive"; the driver on the Kyte side (`nova-novadb`, 1105 lines) is likewise "too naive" per project notes.
 - SQL92 coverage has known defects (PLATFORM-PLAN Workstream B: SQL92 defects + expression engine); e.g. no SQL `IN` historically (memory `btree-d-rows-progress`).
-- End-to-end Nova-app-on-NovaDB-relational is the whole point of the PLATFORM-PLAN slice and was not yet certified.
+- End-to-end Kyte-app-on-NovaDB-relational is the whole point of the PLATFORM-PLAN slice and was not yet certified.
 
 DEEP DESIGN FOR NOVADB NEEDS ITS OWN REPO/PASS. I only structurally surveyed it.
 
@@ -175,7 +175,7 @@ DEEP DESIGN FOR NOVADB NEEDS ITS OWN REPO/PASS. I only structurally surveyed it.
 LSP (confidence: HIGH for the additive features, MEDIUM for precision):
 
 1. Add the cheap missing capabilities first -- `documentHighlight`, `foldingRange`, `selectionRange`, `semanticTokens/range` -- these are pure AST walks, low risk, high perceived polish.
-2. Build a workspace/project index: on init, scan the project's `.nova` files (respecting `project.json` + resolved imports from `~/.nova/cache`), parse once, keep a symbol table keyed by module. This unlocks cross-file go-to-def/references/rename and turns diagnostics import-aware. MEDIUM effort; the main unknown is running import resolution without pulling codegen in.
+2. Build a workspace/project index: on init, scan the project's `.ky` files (respecting `project.json` + resolved imports from `~/.kyte/cache`), parse once, keep a symbol table keyed by module. This unlocks cross-file go-to-def/references/rename and turns diagnostics import-aware. MEDIUM effort; the main unknown is running import resolution without pulling codegen in.
 3. Incremental sync + reparse caching to stop re-typechecking the whole file per keystroke.
 4. Precision: reuse more of `sema/` (infer only, not mono/codegen) inside completion to replace the lightweight env. HIGHEST risk (that is exactly what nls avoided); gate behind a flag.
 
@@ -186,7 +186,7 @@ Package manager (confidence: MEDIUM -- this is real design work):
 1. Add version pinning: allow `{url, ref}` (tag/branch/commit) in `dependencies`, clone that ref (drop blind `--depth 1` HEAD).
 2. Write a lockfile (`project.lock.json`) recording the resolved commit SHA + a content hash per dependency; `restore` honours the lock, `update` re-resolves.
 3. Walk transitive deps (read each fetched dep's `project.json`), build a dependency graph, detect conflicts. UNKNOWN: conflict policy without semver (git URLs alone can't express "compatible range") -- may need to introduce version tags as the constraint language.
-4. Fix the cache key (hash the full URL, not the repo name) to remove collisions, and reconcile the `packages/` vs `~/.nova/cache` shadowing (memory-flagged).
+4. Fix the cache key (hash the full URL, not the repo name) to remove collisions, and reconcile the `packages/` vs `~/.kyte/cache` shadowing (memory-flagged).
    This is genuinely multi-day and is the single highest-leverage tooling investment for "beta-adequate".
 
 Debugger (confidence: MEDIUM-LOW, LARGE effort): the pragmatic path is DWARF, not a bespoke DAP. Step 1: emit debug info from codegen via LLVM's DIBuilder (compile units, subprograms, line tables, local variable locations). That alone makes `lldb`/`gdb` work at source level. Step 2: a thin DAP shim (or lean on VS Code's C/C++/CodeLLDB adapter over the emitted DWARF). UNKNOWN: ARC and coroutine-split frames make variable/lifetime mapping hard -- stepping through `async` will be confusing without extra work. A "beta-adequate" first cut is line-level stepping + backtraces via DWARF; full variable inspection is a follow-on.
@@ -222,10 +222,10 @@ All effort figures are single-developer guesses from code size and known-defect 
 
 Tooling:
 
-- LSP: go-to-def and find-references work ACROSS files (not just open buffers), on a real multi-module project; diagnostics match `nova build` errors including import errors; completion offers correct members after `.` on a typed receiver. Measure by scripting LSP stdio requests over the flagship app and diffing against compiler output.
-- Formatter: `nova fmt` is idempotent on the whole conformance corpus (`fmt(fmt(x)) == fmt(x)`), never changes the token stream, and preserves every comment. Measure by a corpus gate.
-- Package manager: a lockfile makes two clean machines resolve byte-identical dependency trees from the same manifest; transitive deps resolve; `nova get` pins a version. Measure by a reproducibility test (clone → build → compare SHAs) in CI.
-- Debugger: a breakpoint in a `.nova` file is hit, the call stack shows Nova frames with source lines, and a local variable can be inspected. Measure by a scripted lldb/DAP session on a sample app.
+- LSP: go-to-def and find-references work ACROSS files (not just open buffers), on a real multi-module project; diagnostics match `kyte build` errors including import errors; completion offers correct members after `.` on a typed receiver. Measure by scripting LSP stdio requests over the flagship app and diffing against compiler output.
+- Formatter: `kyte fmt` is idempotent on the whole conformance corpus (`fmt(fmt(x)) == fmt(x)`), never changes the token stream, and preserves every comment. Measure by a corpus gate.
+- Package manager: a lockfile makes two clean machines resolve byte-identical dependency trees from the same manifest; transitive deps resolve; `kyte get` pins a version. Measure by a reproducibility test (clone → build → compare SHAs) in CI.
+- Debugger: a breakpoint in a `.ky` file is hit, the call stack shows Kyte frames with source lines, and a local variable can be inspected. Measure by a scripted lldb/DAP session on a sample app.
 
 Ecosystem:
 

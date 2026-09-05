@@ -1,4 +1,4 @@
-# Nova Beta checklist (the scoreboard)
+# Kyte Beta checklist (the scoreboard)
 
 Adopted from `remaining-gaps-design.md` Gap 7. Nothing ships "beta" until items 1-5 are green **by
 command** (item 6 is a scoping note, not a task). This file is the living scoreboard: update the Status +
@@ -24,14 +24,14 @@ The full gate (version-sync, corpus, dogfood, fuzz, shadow, string-lint, corpus-
 each supported host. Locally green on macOS arm64; the other five hosts run in CI (release matrix), which
 also builds the bundles.
 
-**Verify (per host):** `cd lang && ./gate.sh` → `GATE PASS  nova (lang)`.
+**Verify (per host):** `cd lang && ./gate.sh` → `GATE PASS  kyte (lang)`.
 **Open:** confirm green on mac x86_64, linux (x86_64 + arm64), Windows (x86_64 + arm64) via CI. This is the
 Gap 2 CI-matrix dependency; the release workflow (`.github/workflows/release.yml`) exercises the build on
 all six.
 
 ## 2 — Ownership verifier enforced corpus-wide  ✅
 
-The OSSA-lite release-balance verifier (sound: never falsely accuses) runs under `NOVA_OSSA=hard` over the
+The OSSA-lite release-balance verifier (sound: never falsely accuses) runs under `KYTE_OSSA=hard` over the
 WHOLE positive corpus, not the old 6-case spot-check.
 
 **Verify:** `cd lang && ./conformance/run.sh --ossa -j` → `Passed: 381  Failed: 0`.
@@ -46,8 +46,8 @@ genuinely-uncertain residuals are now resolved and RE-VERIFIED, not taken from r
 
 - **Value-optional PARAM present-0-as-absent** — RE-RUN and gated. A present `0`/`false`/`0.0` passed as a
   value-optional argument reads PRESENT (was a suspected variant of the value-level zero bug, orthogonal to
-  the local/Map paths). Now a permanent regression guard: `conformance/cases/127_value_optional_zero.nova`
-  `test_param_widths`. **Verify:** `nova test conformance/cases/127_value_optional_zero.nova` → `0 failed`.
+  the local/Map paths). Now a permanent regression guard: `conformance/cases/127_value_optional_zero.ky`
+  `test_param_widths`. **Verify:** `kyte test conformance/cases/127_value_optional_zero.ky` → `0 failed`.
 - **mongo async-handler HANG at concurrency > 1** — FIXED via the reactor-aware `AsyncLock` guarding
   `runCommand` (nova-mongodb `2e4b6f8`): concurrent `runCommand` on the shared cached connection was
   interleaving frames on the socket. Bench evidence: c=50 crash → 100% success, bench4 green. A live re-run
@@ -56,7 +56,7 @@ genuinely-uncertain residuals are now resolved and RE-VERIFIED, not taken from r
 ## 4 — Package manager  ✅
 
 Implemented to `pkg-manager.md`: `project.json` deps as `url[#ref]`, a flat `project.lock.json` over the
-whole tree (declared name + resolved git SHA per dep), version-keyed cache `~/.nova/cache/<name>-<sha8>`,
+whole tree (declared name + resolved git SHA per dep), version-keyed cache `~/.kyte/cache/<name>-<sha8>`,
 transitive cache-deduped resolution, build-honors-lock (never moves a pin; offline once restored),
 `get`/`restore`/`update`/`publish`, and version-aware per-owner import resolution (multi-version
 coexistence + name-collision guard).

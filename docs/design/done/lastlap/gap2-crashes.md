@@ -1,7 +1,7 @@
 # Gap 2 -- Compiler crash surface (STABILITY): an empirical hunt
 
-Date: 2026-08-15. Compiler under test: `/Users/kamlesh/.nova/bin/nova` (installed build).
-All programs compiled and run with `NOVA_ASAN=1` so a latent memory bug surfaces as an
+Date: 2026-08-15. Compiler under test: `/Users/kamlesh/.kyte/bin/kyte` (installed build).
+All programs compiled and run with `KYTE_ASAN=1` so a latent memory bug surfaces as an
 ASAN SEGV rather than passing silently.
 
 This is the gap that decides alpha vs beta: **can you still hit compiler bugs (crashes /
@@ -14,7 +14,7 @@ known-open limitation, not a fresh regression, but it is a real SIGSEGV.
 
 ## 1. Method
 
-I wrote 49 small but realistic Nova programs and, for each, recorded: does it compile? does it
+I wrote 49 small but realistic Kyte programs and, for each, recorded: does it compile? does it
 run? does it crash (exit >= 132 / ASAN SEGV)? is the output correct?
 
 Design of the corpus:
@@ -38,7 +38,7 @@ Design of the corpus:
   crash and prove what does *not* trigger it.
 
 **Syntax was validated first** against passing sources so a parse error is never miscounted as
-a bug: I read `docs/guide/examples/{05,08,09,10,11,13,14,15,16,17,21}.nova` and conformance
+a bug: I read `docs/guide/examples/{05,08,09,10,11,13,14,15,16,17,21}.ky` and conformance
 cases `278`, `299`, `306` before writing anything, and confirmed a baseline (`t00`) compiles and
 runs. Import style follows the conformance corpus (`import list; List<int>()`).
 
@@ -58,7 +58,7 @@ method uses its `T`-typed field concretely (string interpolation), SEGVs.**
 
 Minimal repro:
 
-```nova
+```kyte
 trait Render { fn render(self: Render): string; }
 struct Cell<T> impl Render {
   pub v: T,
@@ -106,7 +106,7 @@ First-look root cause (backend codegen, high confidence -- I read the code):
   string path in `StringBuilder_append` and dereferenced as a pointer → SEGV.
 
 This is **a known-open limitation, not a new regression**: conformance case 299
-(`299_generic_struct_typed_field_value.nova`) explicitly documents it -- *"Still open (tracked
+(`299_generic_struct_typed_field_value.ky`) explicitly documents it -- *"Still open (tracked
 separately): dispatch of such a method through a TRAIT OBJECT vtable, where the vtable points to
 the erased shared method body rather than the per-instantiation monomorphisation."* This hunt
 confirms it empirically and pins the crashing site.
@@ -132,7 +132,7 @@ structs from a `List` (`a03`), three-level nested generics (`a04`), multi-payloa
 
 One thing worth a footnote (not a crash, not counted as a bug): in `t30`, a key stored with an
 explicit `undefined` value reports `!= undefined` as **true** (present), which is the intended
-present-vs-absent double-box semantics from the `nova-a-nested-double-box-arc` note. It ran
+present-vs-absent double-box semantics from the `kyte-a-nested-double-box-arc` note. It ran
 cleanly; flagging only so a future reviewer does not mistake it for a miscompute.
 
 ---
@@ -150,9 +150,9 @@ structs are fine).
 But it is a **real, memorable crash a real app can reach**: "put my generic wrapper behind an
 interface and print it" is an ordinary thing to do, and it SIGSEGVs with no diagnostic. For a
 *beta* stability claim, an un-diagnosed SEGV on a plausible pattern is a genuine blocker, even
-if narrow. The honest read: **Nova's compiler is close to beta-stable on stability grounds  -- 
+if narrow. The honest read: **Kyte's compiler is close to beta-stable on stability grounds  -- 
 one well-understood defect stands between this corpus and 100% green.** That matches the
-`nova-final-beta-readiness` note's framing (alpha, not beta), and this hunt narrows *why* on the
+`kyte-final-beta-readiness` note's framing (alpha, not beta), and this hunt narrows *why* on the
 stability axis to essentially one class.
 
 Caveat on scope: 49 hand-written programs is a spot-check, not a proof of absence. It samples
@@ -197,8 +197,8 @@ The gap is a **realistic-combination dogfood corpus run under ASAN in CI**, dist
 type-directed codegen fuzzer:
 
 1. Land this 49-program corpus (trimmed to the ~40 signal programs) as
-   `tests/dogfood/*.nova`, each a self-checking program (assert or known stdout), run under
-   `NOVA_ASAN=1` by `gate.sh`. Bar: **100% green** (after Track 1).
+   `tests/dogfood/*.ky`, each a self-checking program (assert or known stdout), run under
+   `KYTE_ASAN=1` by `gate.sh`. Bar: **100% green** (after Track 1).
 2. Prioritise categories by observed and historical risk, in order:
    (a) generic struct × {trait dispatch, field-of-generic, method-returns-`T`} -- the live class;
    (b) optional/error-union boxing across generic and async boundaries (double-box, value-opt as
@@ -225,7 +225,7 @@ Stability is "done enough for beta" when all of the following hold:
 1. **The `a02` repro is fixed** and landed as a conformance case that asserts correct output
    (not just "does not crash").
 2. **A curated dogfood corpus of ~40 realistic feature-combination programs is 100% green under
-   `NOVA_ASAN=1`** and is wired into `gate.sh` so a regression fails CI. (This hunt's corpus is
+   `KYTE_ASAN=1`** and is wired into `gate.sh` so a regression fails CI. (This hunt's corpus is
    the seed; it is 47/48 today, one fix from 48/48.)
 3. **A generative feature-combination fuzzer runs >= N (e.g. 5,000) random depth<=3 programs per
    CI run with zero compiler crashes and zero ASAN SEGVs** over at least one sustained green
@@ -238,10 +238,10 @@ the surface at zero rather than proving it once; it is the part that is genuinel
 
 ### Appendix -- reproduction
 
-Programs live in `…/scratchpad/lastlap/progs/*.nova`; the runner is
+Programs live in `…/scratchpad/lastlap/progs/*.ky`; the runner is
 `…/scratchpad/lastlap/run.sh` (compiles + runs each under ASAN, classifies
 `OK` / `COMPILE_FAIL` / `COMPILE_CRASH` / `RUN_CRASH`). The one crash reproduces with:
 
 ```
-NOVA_ASAN=1 /Users/kamlesh/.nova/bin/nova progs/a02_gen_via_trait.nova -o /tmp/a02 && /tmp/a02
+KYTE_ASAN=1 /Users/kamlesh/.kyte/bin/kyte progs/a02_gen_via_trait.ky -o /tmp/a02 && /tmp/a02
 ```

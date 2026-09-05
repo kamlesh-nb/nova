@@ -1,0 +1,63 @@
+import assert;
+import bytes;
+import net.poller;
+
+@test
+fn test_self_wake(): void {
+    let r = poller.Reactor(16, 1024, 4);
+    r.registerWake(5);
+    poller.post(5, 42);
+
+    let got = 0;
+    let n = r.poll(1000);
+    let i = 0;
+    while (i < n) {
+        if (r.readyFilter(i) == poller.evfiltUser()) {
+            let h = poller.drainWake(5);
+            while (h != 0) { got = h as int; h = poller.drainWake(5); }
+        }
+        i = i + 1;
+    }
+    assert.equalInt(got, 42);
+    r.destroy();
+}
+
+struct WakeCtx {
+    pub result: long,
+    init(result: long) { self.result = result; }
+}
+
+fn wakeWorker(ctx: WakeCtx, idx: int): void {
+    if (idx == 0) {
+        let r = poller.Reactor(16, 1024, 4);
+        r.registerWake(0);
+        let n = r.poll(5000);
+        let i = 0;
+        while (i < n) {
+            if (r.readyFilter(i) == poller.evfiltUser()) {
+                let h = poller.drainWake(0);
+                while (h != 0) { bytes.write_i32(ctx.result, 0, h); h = poller.drainWake(0); }
+            }
+            i = i + 1;
+        }
+        r.destroy();
+    } else {
+        let start = kyte_mono_ms();
+        while (kyte_mono_ms() - start < (300 as long)) { let _ = start; }
+        poller.post(0, 777);
+    }
+}
+
+@test
+fn test_cross_reactor_wakeup(): void {
+    let cell = bytes.alloc(4);
+    bytes.write_i32(cell, 0, 0);
+    let ctx = WakeCtx(cell);
+
+    poller.runReactors(2, (idx) => {
+        wakeWorker(ctx, idx);
+    });
+
+    assert.equalInt(bytes.read_i32(cell, 0) as int, 777);
+    bytes.free(cell);
+}

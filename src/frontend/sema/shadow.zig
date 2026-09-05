@@ -5,7 +5,7 @@
 //!
 //! ## Why this file exists
 //!
-//! Nova's compiler grew a first generation of resolution that decided almost
+//! Kyte's compiler grew a first generation of resolution that decided almost
 //! everything from mangled name STRINGS: which function a call names, what a
 //! type is, and, most dangerously, whether a value is heap-owned (and so must
 //! be ARC-released) by matching its type NAME. Deciding ownership from a string
@@ -1113,7 +1113,7 @@ var diff_examples: [12][3][]const u8 = undefined;
 /// Number of valid entries in [`diff_examples`].
 var diff_example_n: usize = 0;
 
-/// Rewrites a rendered type string so the LLVM-style primitive names and Nova's
+/// Rewrites a rendered type string so the LLVM-style primitive names and Kyte's
 /// surface aliases become ONE canonical spelling, so the two engines are compared
 /// on the type they mean, not on how each spells it.
 ///
@@ -1154,7 +1154,7 @@ fn canonicalTypeStr(allocator: std.mem.Allocator, s: []const u8) []const u8 {
     return buf.toOwnedSlice(allocator) catch s;
 }
 
-/// True if `c` can appear inside a Nova identifier (alphanumeric or `_`).
+/// True if `c` can appear inside a Kyte identifier (alphanumeric or `_`).
 ///
 /// Used by [`canonicalTypeStr`] to decide whether an alias match sits at a real
 /// token boundary rather than in the middle of a longer name.
@@ -1562,7 +1562,7 @@ pub fn reportDiff() void {
 const testing = std.testing;
 
 // Verifies [`canonicalTypeStr`] folds each LLVM-style primitive spelling onto its
-// Nova alias (`i32`→`int`, `f64`→`double`, ...), including nested inside generic
+// Kyte alias (`i32`→`int`, `f64`→`double`, ...), including nested inside generic
 // arguments (`Map<string, i32>`→`Map<string, int>`), so two engines naming the
 // same type never read as a disagreement.
 test "canonicalTypeStr: i32 and int are ONE type, so they must render as one word" {

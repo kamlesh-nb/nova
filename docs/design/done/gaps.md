@@ -1,10 +1,10 @@
-# Nova language soundness baseline (specification vs. implementation)
+# Kyte language soundness baseline (specification vs. implementation)
 
 This is the LIVING status record for the language: what is specified, what is implemented, and where the
 implementation is unsound. It is the single source of truth for tracking soundness. The three docs have
 distinct jobs and must not be merged:
 
-- `language-specification.md` is NORMATIVE: what Nova is. It carries no status and no bugs.
+- `language-specification.md` is NORMATIVE: what Kyte is. It carries no status and no bugs.
 - This file (`gaps.md`) is STATUS: implemented vs missing vs unsound, measured against the spec.
 - `design/further-refinement.md` is the PLAN: how to close these gaps.
 
@@ -94,7 +94,7 @@ hard error).
 ## Codegen soundness (crashes / miscompiles a valid program)
 
 Root: ARC ownership, destructor dispatch, and field/payload layout were historically chosen from rendered
-type-name STRINGS with a fail-OPEN default. STATUS (2026-08-13, measured with the `NOVA_SEMA_SHADOW` gate):
+type-name STRINGS with a fail-OPEN default. STATUS (2026-08-13, measured with the `KYTE_SEMA_SHADOW` gate):
 the ownership/dtor/layout DECISIONS now run on the resolved-TypeId engine (`isOwnedTypeId`,
 `getOrCreateDestructorPreferId`, `buildStorageDestructorByTypeId`); across 232 corpus cases the gate reports
 `ownership td_disagree = 0` and `keystone_disagree = 0` (the TypeId engine and the string baseline agree on
@@ -146,7 +146,7 @@ identical answers to the TypeId engine and are a cleanup, not active miscompiles
 
 Two takeaways: flip the fallbacks to FAIL CLOSED (unknown type -> borrowed / hard error), and add
 crash-regression cases. Progress: C7/C8/C10 are fail-closed; the ownership/dtor/layout decisions are on the
-TypeId engine with the `NOVA_SEMA_SHADOW` gate at 0 disagreements. Regression cases DO exist for several
+TypeId engine with the `KYTE_SEMA_SHADOW` gate at 0 disagreements. Regression cases DO exist for several
 (`expect_fail/atomic_unsupported_type` C8, `constructor_arg_count`, `array_string_element`,
 `array_struct_element`); the earlier "none exist" was stale. C8 is also fail-closed for float atomics.
 
@@ -172,10 +172,10 @@ TypeId engine with the `NOVA_SEMA_SHADOW` gate at 0 disagreements. Regression ca
 
 Unbounded per-connection leaks sink a long-running server.
 
-- **M1 `TlsStream.scratch` leaks 16 KB on EVERY TLS connection** (`asynctls.nova:34`; no `delete()`,
+- **M1 `TlsStream.scratch` leaks 16 KB on EVERY TLS connection** (`asynctls.ky:34`; no `delete()`,
   `close()` frees bio+base but not scratch). Blast radius: every driver over TLS, HTTPS client, web TLS
   accept.
-- **M2 Postgres `PgReader.buf` leaks 64 KB on EVERY pg connection** (`proto.nova:19`, no `delete()`). Clear
+- **M2 Postgres `PgReader.buf` leaks 64 KB on EVERY pg connection** (`proto.ky:19`, no `delete()`). Clear
   asymmetry: mysql/mssql/novadb all free their reader buffer.
 - **M3 Postgres prepared-statement cache is unbounded** (no cap, no Close/DEALLOCATE); mysql caps at 256 with
   COM_STMT_CLOSE.
@@ -183,57 +183,57 @@ Unbounded per-connection leaks sink a long-running server.
   the 24-byte StringBuilder header box leaks on every JSX element.
 - **M5 Streaming cursor poisons the pooled connection**: `queryStream` sets `conn.busy`, cleared only in
   `finish()`/`cur.close()`; an early break leaves `busy` true and `Pool.release` re-pools it unchecked, so
-  the next borrower gets "connection busy" for the connection's life (`postgres.nova:385/446`,
-  `pool.nova:156`; same on mysql).
-- **M6 `reactorConnect` leaks the socket fd on submit failure** (`eventedio.nova:293`).
+  the next borrower gets "connection busy" for the connection's life (`postgres.ky:385/446`,
+  `pool.ky:156`; same on mysql).
+- **M6 `reactorConnect` leaks the socket fd on submit failure** (`eventedio.ky:293`).
 
 ## X. Concurrency and async
 
-- **X1 Blocking `Channel<T>` from a reactor coroutine deadlocks the reactor** (`channel.nova` over
+- **X1 Blocking `Channel<T>` from a reactor coroutine deadlocks the reactor** (`channel.ky` over
   `concurrency.cpp:466`): parks the whole OS thread on a condvar; same-reactor producer -> permanent
   self-deadlock. REACHABLE.
-- **X2 `nova_chan_send` / `AsyncLock.release` resume a waiter via the thread-local run queue**
-  (`nova_sched_schedule`) instead of the owning reactor (`nova_reactor_post`): UAF + lost wakeup once channels
+- **X2 `kyte_chan_send` / `AsyncLock.release` resume a waiter via the thread-local run queue**
+  (`kyte_sched_schedule`) instead of the owning reactor (`kyte_reactor_post`): UAF + lost wakeup once channels
   or actors are wired cross-reactor. LATENT.
 - **X3 `AsyncLock`** additionally has a stale-waiter-on-cancel UAF and no error-path release.
-- **X4 Pool acquire-to-release and driver `busy` have no try/finally**, so IF a Nova `await` propagates an
+- **X4 Pool acquire-to-release and driver `busy` have no try/finally**, so IF a Kyte `await` propagates an
   unwind, a leaked borrow wedges the pool at its hard cap and a stuck `busy` poisons the connection. OPEN
   QUESTION: does `await` unwind? Decides the severity of X4 and M5.
 
 ## E. Stdlib correctness (silent wrong results and stubs)
 
-- **E-parse `string.parseFloat` has no exponent/Infinity/NaN grammar** (`string.nova:498`): `"1e3"` -> 13,
+- **E-parse `string.parseFloat` has no exponent/Infinity/NaN grammar** (`string.ky:498`): `"1e3"` -> 13,
   on the float-decode path of postgres/mysql/novadb. `parseI64` returns 0 on garbage and truncates at the
   first non-digit. FIX: the `parseInt`/`parseLong`/`parseDouble` failure-surfacing family (see
   further-refinement.md).
-- **E1 ORM to BSON truncates every `long` to 32 bits** (§10, `orm.nova:214` uses `entryInt(key, val as int)`;
+- **E1 ORM to BSON truncates every `long` to 32 bits** (§10, `orm.ky:214` uses `entryInt(key, val as int)`;
   `entryInt64Val` is unused).
-- **E7 JSON parser returns a partial node and NO error on malformed input** (`serde/json.nova`
+- **E7 JSON parser returns a partial node and NO error on malformed input** (`serde/json.ky`
   parseArray/parseObject/parseValue): `"[1,2,"` -> `[1,2]`, no success/failure signal.
 - **E2 `fs.Watcher` is an unconditional runtime stub** (`io.cpp:403`): delivers no events on any platform.
-- **E3 `net.aio.sleep(ms)` is a no-op** (`aio.nova:144`, `return 0`).
-- **E4 ORM cannot bind array/nested/child columns** (`orm.nova:61`): binds empty.
-- **E5 "Streaming" is not lazy** (`db.nova:467`): iterates an already-materialised ResultSet.
+- **E3 `net.aio.sleep(ms)` is a no-op** (`aio.ky:144`, `return 0`).
+- **E4 ORM cannot bind array/nested/child columns** (`orm.ky:61`): binds empty.
+- **E5 "Streaming" is not lazy** (`db.ky:467`): iterates an already-materialised ResultSet.
 - **E6 `hexNibble` returns 0 for invalid hex** (pg typemap): corrupt bytea decodes wrong-but-plausible.
-- **E8 GridFS metadata defaults missing length/chunkSize to 0** (mongo `gridfs.nova:163`).
-- **E9 MongoDB DocSource accessors conflate absent/wrong-type with the zero value** (`document.nova:127`).
-- **E10 TLS 1.3 supports only SHA-256 transcripts** (`handshake.nova:50`): AES-256-GCM-SHA384-only servers
+- **E8 GridFS metadata defaults missing length/chunkSize to 0** (mongo `gridfs.ky:163`).
+- **E9 MongoDB DocSource accessors conflate absent/wrong-type with the zero value** (`document.ky:127`).
+- **E10 TLS 1.3 supports only SHA-256 transcripts** (`handshake.ky:50`): AES-256-GCM-SHA384-only servers
   fail.
 
 ## Sec. Security (drivers, exploitable under default settings)
 
-- **Sec1 CRITICAL MSSQL sends the password with NO encryption by default** (`connection.nova:42`, `encrypt`
+- **Sec1 CRITICAL MSSQL sends the password with NO encryption by default** (`connection.ky:42`, `encrypt`
   defaults false): LOGIN7 over plaintext, only a reversible obfuscation. Fix: default `encrypt` true.
-- **Sec2 CRITICAL MSSQL `trustServerCertificate` defaults TRUE** (`connection.nova:45`): MITM even with
+- **Sec2 CRITICAL MSSQL `trustServerCertificate` defaults TRUE** (`connection.ky:45`): MITM even with
   `encrypt=true`. Fix: default false.
 - **Sec3 HIGH MySQL caching_sha2 full-auth trusts the server-supplied RSA public key over plaintext**
-  (`mysql.nova:711`): key-substitution recovers the password. Fix: RSA key-exchange only over verified TLS,
+  (`mysql.ky:711`): key-substitution recovers the password. Fix: RSA key-exchange only over verified TLS,
   or a pinned key.
-- **Sec4 MEDIUM NovaDB primary `query`/`exec` uses client-side string interpolation** (`novadb.nova:63,85`):
+- **Sec4 MEDIUM NovaDB primary `query`/`exec` uses client-side string interpolation** (`novadb.ky:63,85`):
   the only SQL driver whose main path is not server-bound; `escapeText` misses backslash, Decimal text is
   raw-unquoted (`1 OR 1=1` injects). Fix: route through the server-bound Parse/Bind path.
-- **Sec5 MEDIUM SCRAM ServerSignature never verified and combined nonce not checked** (pg `auth.nova` ignores
-  SASLFinal kind 12; mongo returns success without checking `v=`; `scram.nova:102`): a rogue server can claim
+- **Sec5 MEDIUM SCRAM ServerSignature never verified and combined nonce not checked** (pg `auth.ky` ignores
+  SASLFinal kind 12; mongo returns success without checking `v=`; `scram.ky:102`): a rogue server can claim
   success. Password not disclosed (one-way proof).
 - **Sec6 LOW** plaintext-by-default transport (pg/mysql/novadb); `tls=true` without cert verify on
   mongo/novadb; MySQL multi-packet reassembly has no aggregate cap (OOM); x509 accepts a bare-TLD wildcard;
@@ -250,7 +250,7 @@ length fields capped before alloc.
   one-line `wireRowsFromResultSet` fallback each. Root cause: trait has no default methods (T3) and nothing
   gates a lang trait change against the out-of-repo drivers (T2).
 - **T2 Two-copy driver trap + unpinned deps** (`main.zig:530-555`): the resolver prefers a sibling
-  `packages/` copy over the `~/.nova/cache` copy apps use; dependencies are raw GitHub URLs with no lockfile
+  `packages/` copy over the `~/.kyte/cache` copy apps use; dependencies are raw GitHub URLs with no lockfile
   or ref. Fix: a lockfile with pinned commit SHAs.
 - **T3 Trait default methods unsupported** (§3.8): every impl must define every method, which is what makes a
   trait change a breaking change. This is a LANGUAGE gap, not just tooling.
@@ -264,7 +264,7 @@ length fields capped before alloc.
   says "fails on trivial programs", the archived execution-plan claims 104/104). Reconcile and wire the
   product path.
 - **T7 Windows** run-verified but readiness cases 192/194/195 fail (IOCP has no armRead/armWrite analogue,
-  `ev/iocp.nova:201`), and `--asan`/`--arc` gates are not wired there.
+  `ev/iocp.ky:201`), and `--asan`/`--arc` gates are not wired there.
 
 ---
 

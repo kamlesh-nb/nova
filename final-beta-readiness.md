@@ -1,4 +1,4 @@
-# Nova: Final Beta-Readiness Report
+# Kyte: Final Beta-Readiness Report
 
 Date: 2026-08-08. Method: ten independent, evidence-based audits in two waves over the actual compiler,
 runtime, and standard library. Every defect below was reproduced by compiling and running a minimal program
@@ -58,19 +58,19 @@ gating case (273–305) and stays corpus + ASAN green.**
 | A1 | A value-opt | S-crit | ✅ | `62ca289` await of value-optional = box ptr (the mongo cursor root), case 281 |
 | A2 | A value-opt | crash | ✅ | `7a90915` `List<int\|undefined>` insert-box, case 280 |
 | A3 | A value-opt | wrong | ✅ | `7a90915` (same fix — single read/narrow unboxes correctly) |
-| A3-read | A value-opt | crash | ✅ | value-optional monomorphisation collision. A `List<int \| undefined>` mangled to the SAME symbol as a plain `List<int>` (the legacy type-name path rendered `int \| undefined` as just `int`), so a program using BOTH (directly, or via the stdlib's own `List<int>`) shared one body and mixed a boxed value-optional layout with a raw i32 layout → any read of a ≥2-element value-optional list dereferenced a mis-typed slot (UAF/SEGV in `nova_retain`). Found by the codegen fuzzer. Fix: render value-optionals distinctly in `renderLegacy` (`int \| undefined`, not `int`) + mangle `\|`, so the two instantiations get distinct names and layouts. Cases 286 + fuzzer multi-element valopt; corpus + ASAN green. (The suspected "borrow over-release" was a red herring — string-model `set`/`get` retain is correct and `grow()` relies on it.) |
+| A3-read | A value-opt | crash | ✅ | value-optional monomorphisation collision. A `List<int \| undefined>` mangled to the SAME symbol as a plain `List<int>` (the legacy type-name path rendered `int \| undefined` as just `int`), so a program using BOTH (directly, or via the stdlib's own `List<int>`) shared one body and mixed a boxed value-optional layout with a raw i32 layout → any read of a ≥2-element value-optional list dereferenced a mis-typed slot (UAF/SEGV in `kyte_retain`). Found by the codegen fuzzer. Fix: render value-optionals distinctly in `renderLegacy` (`int \| undefined`, not `int`) + mangle `\|`, so the two instantiations get distinct names and layouts. Cases 286 + fuzzer multi-element valopt; corpus + ASAN green. (The suspected "borrow over-release" was a red herring — string-model `set`/`get` retain is correct and `grow()` relies on it.) |
 | C1 | C module-scope | S-crit | ✅ | `6e1b977` colliding-struct field access — was a SEMA return-type-scope bug, case 282 |
 | C2 | C module-scope | S-crit | ✅ | enums `bfb341f`+`87379e6` (plain+payload), cases 283/284 |
 | C2 | C module-scope (traits) | S-crit | 🔵 | `58257f9` traits already coexist (per-impl vtable); false alarm; case 285. Unions: not a functional construct |
 | E1 | E async | hang | 🔵 | did not reproduce in isolation; ASAN-clean — likely subsumed by C/B fixes |
-| E2/S7 | E async | S-crit | ✅ | owned-struct-across-await no longer reproduces (fixed as part of the async-lowering owned-across-await/reap-mark work). Now GATED: case 308 exercises an owned struct with a heap `string` field read AFTER an await on the Nova reactor (`coroStart`) across five shapes -- single spawn+await, between two awaits, method-receiver after await, await inside a loop, and read-then-return. Corpus + ASAN + ARC all clean |
+| E2/S7 | E async | S-crit | ✅ | owned-struct-across-await no longer reproduces (fixed as part of the async-lowering owned-across-await/reap-mark work). Now GATED: case 308 exercises an owned struct with a heap `string` field read AFTER an await on the Kyte reactor (`coroStart`) across five shapes -- single spawn+await, between two awaits, method-receiver after await, await inside a loop, and read-then-return. Corpus + ASAN + ARC all clean |
 | G4 | G stdlib | wrong | 🔵 (partial) | `parseI64` i64-MIN actually works (double wrap); non-digit/overflow parts still open |
 | A4 | A value-opt | wrong | ✅ | interpolating a non-narrowed optional printed the box ptr; now renders the inner value when present and `undefined` when absent (value-optional + heap-optional string). Case 291 |
 | A-nested | A value-opt | wrong | ✅ | `Map<K, V\|undefined>.get()` returns `(V\|undefined)\|undefined`. Root cause pinned: an outer optional over a value-optional inner reuses 0 as its `none` sentinel, so *present-holding-undefined* (inner == 0) collides with *absent* (0) -> `m.set(k, undefined); m.get(k)` reads as a miss (silent wrong value, not a crash). Fix requires the OUTER optional to be boxed so `box(0)` != `0`. Blocked like B4 by monomorphisation: the producer is a generic method whose return TypeRef is `.optional(.ident("V"))` -- the nested optionality is hidden behind an unsubstituted type-param and string substitution collapses it (F1-class), so the producer can't tell it must add a box level. Needs mono-aware optional-depth resolution + ARC handling of the double-box. NB: surface syntax cannot express this (`(int\|undefined)` parses as a TUPLE; `int\|undefined\|undefined` flattens), so it only arises through generics. STATUS (2026-08-09): assessed and deliberately DEFERRED as the single remaining defect. It is niche (a map of nullable values distinguishing present-null from absent), SILENT (wrong value, not a crash), and generics-only. A "reject it loudly" fix is NOT viable because a value-optional container element is an INTENTIONALLY SUPPORTED feature (`List<int\|undefined>`, cases 280/286), so rejecting `Map<K, V\|undefined>` would be inconsistent. The only correct fix is to SUPPORT depth-aware value-optionals. FOCUSED PROJECT (2026-08-09) — attempted end to end, then REVERTED to known-good. Corrected diagnosis (supersedes the earlier "checker collapses it" note, which was WRONG): (1) the CHECKER is CORRECT — a probe confirmed `Map<string,int\|undefined>.get()` infers `optional(optional(int))` (depth 2); lowerInMethodScope + subst + structural interning all preserve nesting. No checker change needed. (2) PRODUCE + CONSUME-FUNCTIONAL are a small (~4-line) CODEGEN change: make `valueOptionalInner` recognise a nested value-optional (recurse), box the OUTER level when a fn returns `optional(X)` with X itself a value-optional, and add `.nullish_coalesce` to the `exprYieldsValoptBox` whitelist (else the `let inner = g ?? undefined` double-boxes). With these, present-vs-absent AND reading the value both work at runtime. (3) THE BLOCKER IS DOUBLE-BOX ARC. The inner value-optional box is owned by the map's `Storage`; wrapping it in the outer box and later releasing it produces a MULTI-OWNER refcount tangle. Adding a nested-outer destructor (unbox + release inner) fixes the leak but FREES the map's still-referenced box -> USE-AFTER-FREE; a null dtor LEAKS the inner box (Storage does not release value-optional-box elements); a retain-on-extract shifts the imbalance again. All three failure modes (leak / double-free / UAF) were reproduced. Getting the ownership provably correct needs a dedicated ARC design pass (define ownership of value-optional boxes inside containers first) with exhaustive nested-valopt ASAN/ARC/fuzz coverage — NOT a safe incremental change, since a UAF is worse than the silent bug. Deferred. WORKAROUND: use `Map<K, int>` plus a separate presence `Set<K>`, or wrap the value in a one-field struct (`struct Cell { v: int \| undefined }`) so the container element is a struct (not a nested value-optional). **✅ FIXED 2026-08-09** (supersedes the deferral above): the foundation was the container-element-ownership fix (f6e7b86 -- the container now OWNS and frees its value-optional element boxes), which resolves the earlier leak/UAF fork. With that, the ownership model is: the outer box BORROWS the inner (the container is the sole owner), so 5 small codegen changes make it correct: (1) `valueOptionalInner` recurses (a value-optional-of-value-optional IS a value-optional); (2) the return-boxing guard in `statements.zig` boxes the OUTER level on the key-found return EVEN THOUGH the returned expr already yields the inner box (the `return undefined` arm stays 0 = absent, via the isUndefinedLiteral guard) -- this was the missing piece that made prior attempts collapse to a single box; (3) `.nullish_coalesce` joins the `exprYieldsValoptBox` whitelist so a nested peel unboxes one level; (4) the `??` peel routes the PRESENT arm through its own block and RETAINS the container-owned inner box there (present-only, so a non-pointer default like `999` is never retained), balancing the bound local's scope-end release against the container's own release; (5) the `??` RHS default is boxed to the inner value-optional representation (unless it is `undefined`, which stays 0) so both phi arms share the boxed shape. Verified: case `312_nested_value_optional` (present-value / present-holding-undefined / absent all distinguished, on both `Map` and `List`), full corpus 314/315 (only the by-design off-Linux `189`), `--asan` clean, `--arc` audit clean (outer + inner boxes both freed exactly once) |
 | B4 | B generics | blk | ✅ | FIXED. `Set<T>` (over `Map<T, bool>`) failed. Root cause (as pinned): `Set<int>` monomorphised its OWN methods (`Set_i32_*`) but the nested generic `Map<int, bool>` was never instantiated, so `self.map.get(...)` fell to the ERASED `Map_*` — causing both (1) `_Map_keysEqual` undefined at link (order-dependent DCE of the private helper) and (2) a SEGV in `Set_i32_has` (the erased `Map.get` returns a different `V\|undefined` representation, so `get() != undefined` released a non-heap value-optional). Fix: the monomorphisation worklist (`sema/mono.zig`, `Worklist.note`) now recurses into a struct's FIELD types (substituted with the instantiation's args), not just its type-args and method-return types, so `Set<int>`'s field `Map<T,bool>` → `Map<int,bool>` is instantiated and calls route to `Map_i32_bool_*`. Both symptoms vanish; ARC audit clean. Case 306 |
 | B5 | B generics | crash | ✅ | DIRECT case fixed earlier (case 299): struct-init inference recovers the instantiation from field values. TRAIT-OBJECT case now fixed too: widening a generic instantiation (`Cell<int>`) to a trait slot (`let s: Shape = c`, or a trait-typed arg) did NOT build the fat pointer because the widening guard tested `structs.contains("Cell<int>")` and `structs` is keyed by BASE name -> the raw struct ptr was stored, and the first vtable dispatch read past the 8-byte struct -> SEGV. Fix: test the BASE name at every struct->trait widen site (statements.zig let-init + the ~11 arg/return widen sites), and look the shared vtable up by base name in `constructTraitObject` (generic trait objects erase the type arg: one `_vtable_Cell_Shape`, methods `Cell_area`). Case 307 (let-widen, arg-widen, owned `Cell<string>` type-param, two instantiations sharing the vtable); ARC clean |
 | B6 | B generics | blk | ✅ | FIXED. A generic `async fn` calling `serde.bind<T>` failed in three ways, all from the generic async fn keeping its ERASED body alongside the mono specs: (1) the erased body's `serde.bind<T>` could not resolve `T__bind` -> hard compile error; (2) a generic async CALL in sync context was not driven+extracted, so the caller read the raw coroutine ramp handle as the result (garbage); (3) `await gen<T>(...)` resolved the erased base name (also in async_fns) instead of the spec, so the awaited body was the erased one (which now traps). Fixes (expressions.zig): `serde.bind<T>` emits a runtime TRAP when `T` is an unresolved type-param (the erased body is a never-run fallback; the mono spec carries the real binder); drive+extract a generic async call; and resolve `await gen<T>(...)` to the spec name BEFORE the base. Case 309 (bind from sync, present-0 field, await-generic-async). Corpus + ASAN + ARC clean. (The related return-owned-type-param-argument double-free surfaced here is now FIXED separately as B3, case 310.) |
-| D1/D2/D3 | D erased carriers | S-crit | ✅ fixed | ✅ D3 fixed: a trait→concrete downcast (`traitObj as Square`) was UNCHECKED and silently reinterpreted memory when the actual type differed (`Circle as Square` handed back a bogus Square). Now the downcast loads the trait object's vtable (which uniquely identifies the concrete type for that trait) and traps via `nova_panic_cstr` on mismatch. Case 305 (positives; the wrong-downcast trap aborts, verified manually like 277). ✅ D1/D2 fixed (owning `any`): `any` is now an OWNED carrier, not an opaque unowned `.ptr`. A new owned `.any_` TypeStore variant (lowers there, `isOwned=true`, renders "any"); widening a value into `any` boxes it into a refcounted `{payload, dtor}` box (`nova_any_box`, dtor `nova_any_box_dtor`) that records the payload's destructor; reading `x as T` unboxes (`nova_any_unbox`) and retains for a heap target. So a heap struct/string stored into `any` is retained and survives after its original binding drops (D1 UAF gone), and is released exactly once on drop (D2 double-free gone, no leak). Three widen seams: the let-init widen (statements.zig, local takes ownership → consumes the temp), the value-optional/`any` call-arg seam (`coerceValoptArg`), and the method-call arg loop -- all keyed on the callee's INSTANTIATION-substituted param type so a generic `Map<K, any>.set(k, v)` (whose param renders the bare type-param `V` but substitutes to `any`) boxes too; the container then only ever stores real heap boxes and its element retain/release (`Storage_any` dtor releases each with `nova_any_box_dtor`) is uniform. The box is registered as a temporary so a storing call that retains it has its extra caller ref released at statement end. Gate: case 123 extended to 13 tests (value in container, heap struct/string surviving the original binding drop, DI cache) -- corpus 307/308 (only the off-Linux `189`), ASAN clean, ARC audit clean. KEY subtlety recorded: `getFunctionParamType` must render the param under the callee's angle-form instantiation (`current_instantiation = owner`), else the type-param reads back as its bare name at the call site and boxing never fires |
+| D1/D2/D3 | D erased carriers | S-crit | ✅ fixed | ✅ D3 fixed: a trait→concrete downcast (`traitObj as Square`) was UNCHECKED and silently reinterpreted memory when the actual type differed (`Circle as Square` handed back a bogus Square). Now the downcast loads the trait object's vtable (which uniquely identifies the concrete type for that trait) and traps via `kyte_panic_cstr` on mismatch. Case 305 (positives; the wrong-downcast trap aborts, verified manually like 277). ✅ D1/D2 fixed (owning `any`): `any` is now an OWNED carrier, not an opaque unowned `.ptr`. A new owned `.any_` TypeStore variant (lowers there, `isOwned=true`, renders "any"); widening a value into `any` boxes it into a refcounted `{payload, dtor}` box (`kyte_any_box`, dtor `kyte_any_box_dtor`) that records the payload's destructor; reading `x as T` unboxes (`kyte_any_unbox`) and retains for a heap target. So a heap struct/string stored into `any` is retained and survives after its original binding drops (D1 UAF gone), and is released exactly once on drop (D2 double-free gone, no leak). Three widen seams: the let-init widen (statements.zig, local takes ownership → consumes the temp), the value-optional/`any` call-arg seam (`coerceValoptArg`), and the method-call arg loop -- all keyed on the callee's INSTANTIATION-substituted param type so a generic `Map<K, any>.set(k, v)` (whose param renders the bare type-param `V` but substitutes to `any`) boxes too; the container then only ever stores real heap boxes and its element retain/release (`Storage_any` dtor releases each with `kyte_any_box_dtor`) is uniform. The box is registered as a temporary so a storing call that retains it has its extra caller ref released at statement end. Gate: case 123 extended to 13 tests (value in container, heap struct/string surviving the original binding drop, DI cache) -- corpus 307/308 (only the off-Linux `189`), ASAN clean, ARC audit clean. KEY subtlety recorded: `getFunctionParamType` must render the param under the callee's angle-form instantiation (`current_instantiation = owner`), else the type-param reads back as its bare name at the call site and boxing never fires |
 | E3 | E async | crash | ⬜ | reap-mark not cleared for awaited children (latent) |
 | F1 | F enum/union | crash | ✅ | `T\|E\|undefined` value-arm SEGV: `typeRefToString` dropped the `.optional`, so the error-union ok arm collapsed from `int\|undefined` to `int`. Producer stored a raw int; every consumer unboxed a value-optional → SEGV. Fixed across the seam: render value-optionals distinctly, box the ok value on return, treat `try`/`catch` as value-optional boxes, box the catch handler. Case 293 |
 | F2 | F enum/union | wrong | ✅ | payload-enum `==` now compares by VALUE (word-by-word over the same-size zero-padded box), not heap identity. Value payloads compare by value; string/heap payload fields stay identity (documented). Case 290 |
@@ -87,8 +87,8 @@ gating case (273–305) and stays corpus + ASAN green.**
 
 ## 0. Honest verdict
 
-Nova is a **broad, genuinely capable alpha**, not a beta. The breadth is real: a self-hosted async runtime on
-native reactors, TLS 1.3 in pure Nova against OpenSSL, four working database drivers, ARC, an LLVM backend, a
+Kyte is a **broad, genuinely capable alpha**, not a beta. The breadth is real: a self-hosted async runtime on
+native reactors, TLS 1.3 in pure Kyte against OpenSSL, four working database drivers, ARC, an LLVM backend, a
 web framework serving tens of thousands of requests per second. That is not a toy.
 
 But the two audit waves reproduced **about thirty distinct defects**, of which roughly a dozen produce
@@ -221,7 +221,7 @@ generic). These two incomplete representations account for the two largest clust
 
 **1d. Two structural errors in the async model, confirmed against Go and Swift.** We studied the two proven
 implementations that solved these problems: Go's goroutine scheduler (`runtime/proc.go`, `netpoll.go`,
-`chan.go`) and Swift's async/await (which, like Nova, lowers async to stackless LLVM coroutines: SE-0296,
+`chan.go`) and Swift's async/await (which, like Kyte, lowers async to stackless LLVM coroutines: SE-0296,
 SE-0300, the AsyncContext ABI). They independently point at the same two root errors, and each error is the
 common cause of a pair of our confirmed async defects.
 
@@ -231,7 +231,7 @@ common cause of a pair of our confirmed async defects.
   as one atomic step guarded by `casgstatus`, so a stale or duplicate wake is a thrown error, not a silent
   drop; identity is a stable `g` struct with an authoritative status field, not a bare address. Swift does
   the mirror: an atomic `Pending -> Awaited` / `Pending -> Resumed` handshake where the loser of the race
-  performs the single enqueue, and identity is a refcounted Task/Job object, never the frame pointer. Nova
+  performs the single enqueue, and identity is a refcounted Task/Job object, never the frame pointer. Kyte
   violates both: our register-then-schedule split is exactly the E1 lost-wakeup hang (the unresolved-call
   path registers a waiter and never schedules), and keying wakeup bookkeeping on the malloc'd frame address
   is exactly the E3 recycled-identity lost-wakeup. The fix for E1 and E3 is one fix: **make suspend-and-arm
@@ -245,7 +245,7 @@ common cause of a pair of our confirmed async defects.
   ownership form before CoroSplit: `await` is a barrier, anything live across it is pinned in the AsyncContext
   at +1 and released only at its true last use on the resume side, and the result flows back through a
   result slot typed as the declared return type (so `Optional<Int>` keeps its payload-plus-discriminator, not
-  a box). Nova does neither: our drop placement releases an owned value before its post-await use (E2/S7,
+  a box). Kyte does neither: our drop placement releases an owned value before its post-await use (E2/S7,
   the owned-struct-across-await UAF), and the awaited result is materialised as an erased box carrier so a
   value-type optional comes back as box-pointer bits (A1). The fix for E2/S7 and A1 is one fix: **run
   drop-placement on a CFG where `await` is a real barrier so releases anchor to the post-resume last use, and
@@ -267,13 +267,13 @@ slot, or a container.
   Silent corruption on every async optional API (cursors, `queryOne`, `next()`). Very likely the real mongo
   cursor root cause that `findList` only dodged.
 - **A2** a value-optional stored as a **generic container element** (`List<int|undefined>`,
-  `Map<_, int|undefined>`) SEGVs on read (`nova_valopt_unbox` / `nova_retain`).
+  `Map<_, int|undefined>`) SEGVs on read (`kyte_valopt_unbox` / `kyte_retain`).
 - **A3** a **single** read/narrow of such a container element is now correct (unboxes to the value, `7a90915`).
 - **A3-read** (fixed, fuzzer-found) a `List<int | undefined>` monomorphised to the SAME symbol as a plain
   `List<int>`, because the legacy type-name path (`renderLegacy`) rendered `int | undefined` as just `int`.
   A program that used both (directly, or via the stdlib's own `List<int>`, which is why it only reproduced
-  under `nova test`) shared one body, mixing a boxed value-optional layout with a raw i32 layout, so a read
-  of a ≥2-element value-optional list dereferenced a mis-typed slot (UAF/SEGV in `nova_retain`). Fixed by
+  under `kyte test`) shared one body, mixing a boxed value-optional layout with a raw i32 layout, so a read
+  of a ≥2-element value-optional list dereferenced a mis-typed slot (UAF/SEGV in `kyte_retain`). Fixed by
   rendering value-optionals distinctly (`int | undefined`, not `int`) plus mangling `|`, so the two
   instantiations get distinct names and layouts (cases 286 + the fuzzer's multi-element valopt template; corpus
   + ASAN green). Root cause is squarely the F2-6/W9 "string path drops `.optional`" class, fixed reactively.
@@ -379,7 +379,7 @@ Root: 1b.
   follow-on is to have the checker reject a `switch` over `T | E` outright rather than silently fall through.
 
 ### Cluster G: standard library and checker correctness  [wrong + crash]
-- **G1** `Map` with an integer or enum key of value **0** is silently unretrievable: `map.nova` uses `key==0`
+- **G1** `Map` with an integer or enum key of value **0** is silently unretrievable: `map.ky` uses `key==0`
   as the empty-slot sentinel with no occupied bit, so `set(0,x)` stores it but `get(0)` reports absent. Broad
   silent data loss; hidden because real usage is string-keyed.
 - **G2** `switch` on a **non-enum** discriminant (int, string) silently miscompiles: every case label lowers
@@ -388,7 +388,7 @@ Root: 1b.
 - **G3** (fixed) JSON `\uXXXX\uDXXX` **surrogate pairs corrupted astral characters** (emoji became mojibake):
   the decoder UTF-8-encoded each surrogate independently (two invalid 3-byte sequences) with no 4-byte branch.
   Data corruption in the shared JSON parser, so every HTTP and DB path that received JS-escaped emoji was
-  affected. Fixed in `appendUnicode` (`src/std/serde/json.nova`): combine a high surrogate (D800..DBFF) with a
+  affected. Fixed in `appendUnicode` (`src/std/serde/json.ky`): combine a high surrogate (D800..DBFF) with a
   following low surrogate (DC00..DFFF) into one code point and add the 4-byte UTF-8 branch; a lone/invalid
   surrogate is left as-is and does not consume following text. Case 287 (surrogate pair, both range ends,
   BMP/2-byte/ASCII unaffected, lone high surrogate, pair surrounded by ASCII).
@@ -404,7 +404,7 @@ Root: 1b.
   signature. `try g()` re-raises the callee's error UNCHANGED into the enclosing function, so that error must
   match the function's declared error type; propagating a foreign error (`fn f(): T | E1 { return try g() }`
   where g fails with E2) let an E2 escape a function whose contract says E1. The checker now flags it in the
-  `.try_expr` inference against `current_ret` (`src/sema/infer.zig`, `errorTypesCompatible`); Nova has no
+  `.try_expr` inference against `current_ret` (`src/sema/infer.zig`, `errorTypesCompatible`); Kyte has no
   error subtyping, so only an exact match of the declared error type passes (an unresolved side is never
   flagged). Case 292 + expect_fail/try_error_type_mismatch.
 
@@ -459,7 +459,7 @@ Trait` constraints, and trait **default method** bodies are all unsupported at t
 
 The specification says the runtime is Boost.Asio (retired) and "55 cases" (actual 230), and says WASM fails
 for trivial programs (it works). It does not document closure-by-value capture, the coloring rules, or the
-native reactor model. CLAUDE.md lists "Linux still aborts in nova_run_root" (false, epoll is wired).
+native reactor model. CLAUDE.md lists "Linux still aborts in kyte_run_root" (false, epoll is wired).
 
 ## 5. Fix plan (ordered by blast radius, grouped so shared roots are fixed once)
 
@@ -516,7 +516,7 @@ first; they make whole classes impossible rather than patching instances.
     fragility, and is a prerequisite to safely deleting the legacy string engine.
 
 ### Phase F5: primitives, hardening, and docs
-11. Add an async semaphore, a WaitGroup, and a bounded async channel; quarantine the stubbed `atomic.nova` and
+11. Add an async semaphore, a WaitGroup, and a bounded async channel; quarantine the stubbed `atomic.ky` and
     the thread-blocking `Channel<T>`; harden `AsyncLock` (reentrancy guard, removable waiter token,
     single-reactor guard). Convert compiler internal errors into located diagnostics.
 12. Close the parser gaps in Cluster I as scope allows (scientific literals, underscores, trait default
@@ -524,7 +524,7 @@ first; they make whole classes impossible rather than patching instances.
 
 ## 6. Beta exit criteria (measurable)
 
-Nova is beta when all of these hold, each checkable:
+Kyte is beta when all of these hold, each checkable:
 
 1. **Zero known miscompilation or memory-unsafety classes.** Every repro in Clusters A to H runs clean under
    AddressSanitizer, each promoted to a gating conformance or `expect_fail` case.
@@ -545,9 +545,9 @@ so the work is bounded and the order is clear.
 
 ## Appendix A: what Go and Swift teach (design study)
 
-We studied the two proven implementations of exactly Nova's problems: Go's goroutine runtime and Swift's
-async/await (which lowers to stackless LLVM coroutines like Nova). Beyond section 1d's async fixes, three
-design conclusions came out, each with a concrete decision for Nova.
+We studied the two proven implementations of exactly Kyte's problems: Go's goroutine runtime and Swift's
+async/await (which lowers to stackless LLVM coroutines like Kyte). Beyond section 1d's async fixes, three
+design conclusions came out, each with a concrete decision for Kyte.
 
 ### A.1 Ownership conventions (fixes B3, the torn copy, and points F2-6 at a proof)
 Swift lowers every value to SIL with an explicit ownership kind and statically proves, in OSSA, that every
@@ -556,13 +556,13 @@ owned (+1) value has exactly one lifetime-ending use on every path.
   release or escape it), and `consuming` is `+1` (the callee consumes exactly once). The two sides never both
   release.
 - **Result contract:** a function result is always `+1`. Returning a borrowed (`+0`) value requires an
-  explicit copy (`copy_value`, a retain) to promote it. **This is precisely Nova's B3:** we return a borrowed
+  explicit copy (`copy_value`, a retain) to promote it. **This is precisely Kyte's B3:** we return a borrowed
   value as if it were `+1` without the retain, so caller and original owner both release. The fix is a
-  one-line rule: at any `return` of a `+0` value, insert one `nova_retain`; a function result is always `+1`.
+  one-line rule: at any `return` of a `+0` value, insert one `kyte_retain`; a function result is always `+1`.
   It applies uniformly to a generic `T` return (Swift drives it off the convention via value witnesses, not
   the concrete layout, which is why `id<T>` never double-frees there).
 - **Value versus reference, the torn copy:** Swift keeps two disjoint categories, `struct` (value, copy all
-  fields, copy-on-write) and `class` (reference, share all fields via one `+0/+1` reference). Nova's "struct"
+  fields, copy-on-write) and `class` (reference, share all fields via one `+0/+1` reference). Kyte's "struct"
   is a heap object passed by value by copying fields, so a scalar field (the connection `busy` bool) is
   copied while heap-pointer fields (the fd, an `AsyncLock`) are shared. That is a **torn copy**, and it is the
   exact root of the by-value connection bug. Decision: **pick one discipline per type.** Anything holding an
@@ -581,7 +581,7 @@ owned (+1) value has exactly one lifetime-ending use on every path.
   We should not adopt the P layer. This is the one big architectural decision, and our current choice is
   right.
 - **Consequence for primitives:** because we are share-nothing, the async primitives should be single-reactor
-  (no atomics, no cross-thread locks). The `NOVA_WEB_WORKERS` cross-thread issues (stdout flush, a shared
+  (no atomics, no cross-thread locks). The `KYTE_WEB_WORKERS` cross-thread issues (stdout flush, a shared
   `AsyncLock`) are a tiny set of process-globals to make explicitly safe, not to expand; cross-reactor work
   should be message-passing (the SCM_RIGHTS fd-handoff at accept time), never shared state.
 - **Adopt from Go:** a small blocking-syscall offload pool so the reactor thread never blocks on a synchronous
@@ -602,7 +602,7 @@ there is nothing to hold, forget, or leak.
 Our `AsyncLock`, held across `await` to serialise a multi-round-trip `runCommand`, reproduces the exact
 pattern Swift forbids while omitting the safety machinery Go requires (it is not reentrant, a cancelled waiter
 dangles a handle in the queue, and it is unguarded cross-thread). Decision, in order of preference:
-1. **Primary: make the shared connection an actor / serial request-queue** (Nova already has actors over the
+1. **Primary: make the shared connection an actor / serial request-queue** (Kyte already has actors over the
    async channel). `runCommand` becomes a message processed to completion as one indivisible job (one full
    request-response per job, no mid-frame executor yield, so a second command cannot interleave and corrupt
    the wire framing). This removes the crash and the cancellation-UAF by construction, with no manual lock
@@ -616,5 +616,5 @@ dangles a handle in the queue, and it is unguarded cross-thread). Decision, in o
 
 Cancellation safety is the common thread: both Go (dequeue-under-lock, select's one-winner handshake) and
 Swift (a cancellation handler resumes the continuation exactly once) guarantee a cancelled waiter is removed
-and resumed once, never orphaned. Any Nova wait primitive (the async semaphore and WaitGroup in Phase F5
+and resumed once, never orphaned. Any Kyte wait primitive (the async semaphore and WaitGroup in Phase F5
 included) must have this or it is memory-unsafe under cancellation.

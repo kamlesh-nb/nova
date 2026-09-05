@@ -1,6 +1,6 @@
-# Nova conformance corpus (roadmap workstream E2)
+# Kyte conformance corpus (roadmap workstream E2)
 
-The **safety net** for the production-readiness work. Each `cases/*.nova` file is a
+The **safety net** for the production-readiness work. Each `cases/*.ky` file is a
 set of `@test` functions that pins current, known-good compiler/runtime/stdlib
 behavior. Run it before and after every change so refactors (the C++20 runtime, the
 type-checker work, the stdlib hardening) can't silently regress.
@@ -8,7 +8,7 @@ type-checker work, the stdlib hardening) can't silently regress.
 ## Run
 
 ```sh
-cd lang && zig build          # (re)build the compiler → ~/.nova/bin/nova
+cd lang && zig build          # (re)build the compiler → ~/.kyte/bin/kyte
 ./conformance/run.sh          # run all cases
 ./conformance/run.sh 02       # run cases matching "02"
 ```
@@ -17,7 +17,7 @@ Exit code is non-zero if any case fails to compile/link or any test fails.
 
 ## Negative cases (`expect_fail/`)
 
-Programs in `expect_fail/*.nova` **must fail to compile** — the runner reports PASS
+Programs in `expect_fail/*.ky` **must fail to compile** — the runner reports PASS
 when they're rejected and FAIL if one unexpectedly compiles (a check regressed).
 This is the harness for verifying type-checker checks that *reject* code (A2
 increment 2 / A3). Seeded with `undefined_variable` and `undefined_function`.
@@ -28,9 +28,9 @@ move each into `expect_fail/` as a real case once its check lands.
 
 ## Adding cases
 
-Add a `cases/NN_topic.nova` with `@test fn` functions (see existing cases). Prefer
+Add a `cases/NN_topic.ky` with `@test fn` functions (see existing cases). Prefer
 one concept per file. When you fix a bug, add a case that would have caught it — e.g.
-`02_generics_destructor.nova` guards the duplicate-function link bug (a user struct
+`02_generics_destructor.ky` guards the duplicate-function link bug (a user struct
 owning a `List<T>` failed to link with `undefined symbol _List_delete`).
 
 ## Coverage today (seed)

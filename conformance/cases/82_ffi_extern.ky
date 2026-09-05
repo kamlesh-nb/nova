@@ -1,0 +1,51 @@
+import assert;
+
+extern("c") fn abs(x: int): int;
+extern("c") fn llabs(x: long): long;
+extern("c") fn malloc(n: long): ptr;
+extern("c") fn memset(p: ptr, c: int, n: long): ptr;
+extern("c") fn free(p: ptr): void;
+extern("c") fn strlen(s: string): long;
+extern("c") fn getenv(name: string): string;
+extern("c") fn memcmp(a: ptr, b: ptr, n: long): int;
+
+struct FfiPoint {
+    x: int,
+    y: int,
+    init(px: int, py: int) { self.x = px; self.y = py; }
+}
+
+@test
+fn test_ffi_scalar(): void {
+    assert.equalInt(abs(-5), 5);
+    assert.equalInt(abs(123), 123);
+    assert.isTrue(llabs(-9000000000) == 9000000000);
+}
+
+@test
+fn test_ffi_pointer(): void {
+    let p = malloc(64);
+    assert.isTrue(p != 0);
+    let q = memset(p, 0, 64);
+    assert.isTrue(q == p);
+    free(p);
+}
+
+@test
+fn test_ffi_string(): void {
+    assert.isTrue(strlen("hello world") == 11);
+    assert.isTrue(strlen("") == 0);
+    let path = getenv("PATH");
+    assert.isTrue(strlen(path) > 0);
+    let missing = getenv("KYTE_FFI_DEFINITELY_UNSET_VAR");
+    assert.isTrue(strlen(missing) == 0);
+}
+
+@test
+fn test_ffi_struct_by_ptr(): void {
+    let a = FfiPoint(3, 7);
+    let b = FfiPoint(3, 7);
+    let c = FfiPoint(3, 9);
+    assert.isTrue(memcmp(a, b, 8) == 0);
+    assert.isTrue(memcmp(a, c, 8) != 0);
+}

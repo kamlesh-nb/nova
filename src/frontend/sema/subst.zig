@@ -1,7 +1,7 @@
 //! Type-parameter substitution over interned types: the substrate the
 //! monomorphizer stands on.
 //!
-//! Nova generics are NOT type-erased. `List<int>` is a genuinely distinct type
+//! Kyte generics are NOT type-erased. `List<int>` is a genuinely distinct type
 //! from `List<string>`, instantiated by textually replacing each type parameter
 //! with a concrete argument. That replacement is what this file does, operating
 //! on [`TypeId`]s in a [`types.TypeStore`] rather than on syntax: every type is

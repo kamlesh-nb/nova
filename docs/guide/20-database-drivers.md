@@ -1,8 +1,8 @@
 # 20. Database drivers
 
-Nova talks to a database through one interface and many drivers. The interface is the `Connection` seam
+Kyte talks to a database through one interface and many drivers. The interface is the `Connection` seam
 in the standard library (`data.db`); each concrete database ships as its own package that implements the
-seam. You add the driver you need with `nova get`, import it, and write your queries against the shared
+seam. You add the driver you need with `kyte get`, import it, and write your queries against the shared
 seam. Because every SQL driver speaks the same `Connection` vocabulary, the query and exec code you write
 is identical whichever engine you point it at. MongoDB is the one exception: it is not relational, so it
 carries a native document API alongside the seam.
@@ -26,7 +26,7 @@ The core types live in the standard library and never change from driver to driv
 
 A driver is a git-backed package under its own repository. You do not vendor it or copy files: you add its
 URL to your project and import the module. Package management is covered in its own chapter; the short
-version is that `nova get <url>` appends the dependency to `project.json` and resolves it, and then
+version is that `kyte get <url>` appends the dependency to `project.json` and resolves it, and then
 `import <name>;` makes the driver types available.
 
 ### Bind values, never concatenate
@@ -35,7 +35,7 @@ The single rule that applies to every SQL driver: pass values as `DbValue` param
 `...` placeholders, and never build SQL by joining strings. String concatenation is how injection bugs
 get in; bound parameters close that door by construction.
 
-```nova
+```kyte
 import list;
 import data.db;
 
@@ -52,7 +52,7 @@ rewrites it to its own engine's placeholder syntax internally.
 
 `query` returns a `ResultSet` you can read positionally:
 
-```nova
+```kyte
 let r = rs.row(0);
 let id   = r.getInt(0);
 let name = r.getText(1);
@@ -67,7 +67,7 @@ A single connection serves one query at a time, so a server that handles concurr
 pool. The standard library ships one driver-agnostic pool, `pool.Pool`, that works with every driver: you
 give it a `Driver`, a DSN, and an idle size, and it hands out connections and takes them back.
 
-```nova
+```kyte
 import pool;
 import postgres;
 
@@ -89,13 +89,13 @@ Now the drivers, one at a time.
 
 ## PostgreSQL
 
-PostgreSQL is the widely deployed open-source relational database. The Nova driver speaks the v3 wire
+PostgreSQL is the widely deployed open-source relational database. The Kyte driver speaks the v3 wire
 protocol with SCRAM-SHA-256 authentication and server-side prepared statements.
 
 ### Add it to your project
 
 ```sh
-nova get https://github.com/kamlesh-nb/nova-postgres
+kyte get https://github.com/kamlesh-nb/nova-postgres
 ```
 
 ```json
@@ -106,7 +106,7 @@ nova get https://github.com/kamlesh-nb/nova-postgres
 }
 ```
 
-```nova
+```kyte
 import postgres;
 import db;
 ```
@@ -115,7 +115,7 @@ The driver type is `PgDriver` and the connection type is `PgConnection`.
 
 ### Connect and query
 
-```nova
+```kyte
 let drv  = PgDriver();
 let conn = await drv.connect("postgresql://user:pass@127.0.0.1:5432/mydb");
 
@@ -144,7 +144,7 @@ The driver uses server-side prepared statements with a per-connection statement 
 large to hold in memory, `PgConnection.queryStream(sql, params, batchSize)` returns an async `Cursor`
 that pages rows from the server so the full set never materialises:
 
-```nova
+```kyte
 import postgres;
 
 let conn = await postgres.open("postgresql://user@127.0.0.1:5432/db");
@@ -161,14 +161,14 @@ stack, and the driver also supports LISTEN/NOTIFY and COPY.
 
 ## MySQL
 
-MySQL (and MariaDB) is another widely deployed open-source relational database. The Nova driver handles
+MySQL (and MariaDB) is another widely deployed open-source relational database. The Kyte driver handles
 the native, sha2, caching_sha2, and RSA authentication methods and uses server-side prepared statements
 over the binary protocol.
 
 ### Add it to your project
 
 ```sh
-nova get https://github.com/kamlesh-nb/nova-mysql
+kyte get https://github.com/kamlesh-nb/nova-mysql
 ```
 
 ```json
@@ -179,7 +179,7 @@ nova get https://github.com/kamlesh-nb/nova-mysql
 }
 ```
 
-```nova
+```kyte
 import mysql;
 import db;
 ```
@@ -188,7 +188,7 @@ The driver type is `MyDriver` and the connection type is `MyConnection`.
 
 ### Connect and query
 
-```nova
+```kyte
 let conn = await MyDriver().connect("mysql://root:pass@127.0.0.1:3306/mydb");
 
 let params = List<DbValue>();
@@ -217,13 +217,13 @@ the same streaming shape as PostgreSQL. `mysql.open(dsn)` returns the concrete `
 
 ## SQL Server
 
-Microsoft SQL Server is the enterprise relational database. The Nova driver speaks TDS 7.4 with the
+Microsoft SQL Server is the enterprise relational database. The Kyte driver speaks TDS 7.4 with the
 PRELOGIN and LOGIN7 handshake, over TLS, with server-side prepared statements.
 
 ### Add it to your project
 
 ```sh
-nova get https://github.com/kamlesh-nb/nova-mssql
+kyte get https://github.com/kamlesh-nb/nova-mssql
 ```
 
 ```json
@@ -234,7 +234,7 @@ nova get https://github.com/kamlesh-nb/nova-mssql
 }
 ```
 
-```nova
+```kyte
 import mssql;
 import db;
 ```
@@ -243,7 +243,7 @@ The driver type is `MssqlDriver` and the connection type is `MssqlConnection`.
 
 ### Connect and query
 
-```nova
+```kyte
 let conn = await MssqlDriver().connect("mssql://sa:pass@127.0.0.1:1433/mydb");
 
 let params = List<DbValue>();
@@ -284,7 +284,7 @@ update builder, lazy cursors, and a typed ORM over your `@serializable` structs.
 ### Add it to your project
 
 ```sh
-nova get https://github.com/kamlesh-nb/nova-mongodb
+kyte get https://github.com/kamlesh-nb/nova-mongodb
 ```
 
 ```json
@@ -295,7 +295,7 @@ nova get https://github.com/kamlesh-nb/nova-mongodb
 }
 ```
 
-```nova
+```kyte
 import mongodb;
 ```
 
@@ -305,7 +305,7 @@ returns the `Connection` trait, but the document API hangs off the concrete type
 
 ### Connect
 
-```nova
+```kyte
 // A single server.
 let conn = await mongodb.open("mongodb://user:pass@127.0.0.1:27017/shop");
 
@@ -332,7 +332,7 @@ mongodb://[user:pass@]host:port[,host2:port2...][/db][?replicaSet=NAME&readPrefe
 `conn.database(name).collection(name)` gives you a `Collection`, the handle for reads and writes. Build a
 filter with `mongodb.filter()`, an update with `mongodb.update()`, and a document with `mongodb.doc()`:
 
-```nova
+```kyte
 let coll = conn.database("shop").collection("products");
 
 // Read.
@@ -363,7 +363,7 @@ Rather than hand-building a `Doc` per field, mark a struct `@serializable` and l
 it. The bridge functions are `docOf<T>` (struct to `Doc`), `bindOne<T>` (`Doc` to struct), and
 `bindAll<T>` (list of docs to list of structs):
 
-```nova
+```kyte
 @serializable pub struct Product {
     pub name: string,
     pub price: int,
@@ -388,7 +388,7 @@ never see SQL. This layer is shared across all three SQL drivers, since it is wr
 
 Mark the target struct `@serializable` so the compiler generates the binder, then bind a result set:
 
-```nova
+```kyte
 import data.orm;
 
 @serializable pub struct Product {

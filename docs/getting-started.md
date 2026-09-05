@@ -1,26 +1,26 @@
-# Getting Started with Nova
+# Getting Started with Kyte
 
-This guide takes you from an empty machine to a running Nova program, a scaffolded project, and a
-dependency pulled from git. Nova is in Beta (0.1.0); expect rough edges and pin an exact version if you
+This guide takes you from an empty machine to a running Kyte program, a scaffolded project, and a
+dependency pulled from git. Kyte is in Beta (0.1.0); expect rough edges and pin an exact version if you
 need reproducibility.
 
 ## 1. Install the toolchain
 
-Nova compiles through LLVM, so you need the Nova compiler plus an LLVM install. The Nova compiler is
+Kyte compiles through LLVM, so you need the Kyte compiler plus an LLVM install. The Kyte compiler is
 built from this repository with a pinned Zig.
 
 ```bash
 cd lang
 export PATH="$(scripts/bootstrap-zig.sh | tail -1):$PATH"        # download + checksum-verify Zig 0.16.0, add to PATH
-export NOVA_LLVM_PREFIX=/path/to/llvm      # macOS: $(brew --prefix llvm@21); Linux: /usr/lib/llvm-21
-zig build                                  # builds `nova`, installs to ~/.nova/bin/nova
+export KYTE_LLVM_PREFIX=/path/to/llvm      # macOS: $(brew --prefix llvm@21); Linux: /usr/lib/llvm-21
+zig build                                  # builds `kyte`, installs to ~/.kyte/bin/kyte
 ```
 
-Put `~/.nova/bin` on your PATH, then confirm:
+Put `~/.kyte/bin` on your PATH, then confirm:
 
 ```bash
-nova version
-# nova 0.1.0
+kyte version
+# kyte 0.1.0
 #   abi:    1    (extern-C runtime ABI contract; ...)
 #   zig:    0.16.0    (pinned; see .zig-version)
 #   host:   aarch64-macos
@@ -28,8 +28,8 @@ nova version
 
 ## 2. Your first program
 
-```nova
-// hello.nova
+```kyte
+// hello.ky
 fn main(): void {
     let name = "world";
     console.log(`hello, ${name}`);
@@ -43,7 +43,7 @@ fn main(): void {
 Compile it to a native binary and run:
 
 ```bash
-nova hello.nova -o hello
+kyte hello.ky -o hello
 ./hello
 # hello, world
 # sum 1..10 = 55
@@ -63,21 +63,21 @@ conformance case.
 ## 3. Scaffold a project
 
 ```bash
-nova init web --name myapp        # templates: console | web | desktop  (`app` is an alias for web)
+kyte init web --name myapp        # templates: console | web | desktop  (`app` is an alias for web)
 cd myapp
 ```
 
 This creates a `project.json`, a `src/` with an entry point, and a `tests/` directory. Build and test:
 
 ```bash
-nova build                        # -> build/<profile>/{obj,bin}; reads project.json
-nova build --release              # optimized build
-nova test                         # runs @test functions in the import graph
+kyte build                        # -> build/<profile>/{obj,bin}; reads project.json
+kyte build --release              # optimized build
+kyte test                         # runs @test functions in the import graph
 ```
 
 A test is any `fn` annotated `@test`:
 
-```nova
+```kyte
 import assert;
 
 @test
@@ -86,26 +86,26 @@ fn adds(): void {
 }
 ```
 
-Note that `nova test` runs the `@test` functions reachable through imports (including a library's own
+Note that `kyte test` runs the `@test` functions reachable through imports (including a library's own
 tests), and it does not run `main()`.
 
 ## 4. Formatting
 
 ```bash
-nova fmt path/to/file.nova        # canonical formatting
+kyte fmt path/to/file.ky        # canonical formatting
 ```
 
 ## 5. Add a dependency
 
-Nova packages are git repositories. Add one to the current project:
+Kyte packages are git repositories. Add one to the current project:
 
 ```bash
-nova get https://github.com/<owner>/<repo>     # clones into the cache, records it in project.json
-nova get                                       # with no URL: restore all recorded dependencies
+kyte get https://github.com/<owner>/<repo>     # clones into the cache, records it in project.json
+kyte get                                       # with no URL: restore all recorded dependencies
 ```
 
-Then `import` the package's modules from your Nova source. The dependency is recorded in
-`project.json` under `dependencies`, so a fresh checkout can restore it with a bare `nova get`. See
+Then `import` the package's modules from your Kyte source. The dependency is recorded in
+`project.json` under `dependencies`, so a fresh checkout can restore it with a bare `kyte get`. See
 [packages.md](packages.md) for the full model, including how to publish your own package.
 
 ## 6. Cross-compiling
@@ -113,8 +113,8 @@ Then `import` the package's modules from your Nova source. The dependency is rec
 From a macOS or Linux host you can produce binaries for other targets with the bundled toolchain:
 
 ```bash
-nova app.nova --target linux-x86_64   -o app-linux
-nova app.nova --target windows-x86_64 -o app.exe
+kyte app.ky --target linux-x86_64   -o app-linux
+kyte app.ky --target windows-x86_64 -o app.exe
 ```
 
 Linux and Windows binaries are produced this way today; the Windows runtime is run-verified, and Linux
@@ -123,6 +123,6 @@ is the standard native path.
 ## Where to go next
 
 - [packages.md](packages.md) -- publish and consume packages.
-- [architecture/](architecture/) -- how Nova is built (for contributors).
+- [architecture/](architecture/) -- how Kyte is built (for contributors).
 - [../CONTRIBUTING.md](../CONTRIBUTING.md) -- the gate suite and how to land a change.
 - [STABILITY.md](STABILITY.md) -- what "Beta" guarantees and what it does not.

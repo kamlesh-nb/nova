@@ -69,7 +69,7 @@ const TypedIr = infer.TypedIr;
 /// Global switch that turns the one-line `[escape] ...` summary print on.
 ///
 /// Off by default so the pass is silent in normal builds. A driver flips this
-/// (for example a `NOVA_ESCAPE_REPORT`-style opt-in) when it wants the aggregate
+/// (for example a `KYTE_ESCAPE_REPORT`-style opt-in) when it wants the aggregate
 /// numbers from [`analyze`] echoed to stderr.
 pub var report_enabled: bool = false;
 

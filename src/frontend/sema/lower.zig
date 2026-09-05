@@ -182,7 +182,7 @@ pub const Lowerer = struct {
 
     /// Interns a built-in primitive type by name, or `null` if `name` is not one.
     ///
-    /// Maps Nova's primitive spellings, including the C#/TS-style aliases
+    /// Maps Kyte's primitive spellings, including the C#/TS-style aliases
     /// (`byte`/`u8`, `int`/`i32`, `long`/`i64`, `float`/`f32`, `double`/`f64`,
     /// and so on), to a `prim` type carrying the TARGET bit width and signedness.
     /// Note the width encoded is the language's fixed width, not the host's: `int`
@@ -564,7 +564,7 @@ test "join: a named type resolves to a struct decl, not unresolved" {
             .attributes = &.{},
             .impls = &.{},
             .is_public = true,
-            .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "m.nova" },
+            .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "m.ky" },
         } },
         .{ .struct_decl = .{
             .name = "List",
@@ -573,10 +573,10 @@ test "join: a named type resolves to a struct decl, not unresolved" {
             .attributes = &.{},
             .impls = &.{},
             .is_public = true,
-            .span = .{ .start = 0, .end = 0, .line = 2, .col = 1, .file = "m.nova" },
+            .span = .{ .start = 0, .end = 0, .line = 2, .col = 1, .file = "m.ky" },
         } },
     };
-    try tab.build(.{ .declarations = &decls, .span = .{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "root.nova" } });
+    try tab.build(.{ .declarations = &decls, .span = .{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "root.ky" } });
 
     var l = Lowerer.init(a, &store);
     defer l.deinit();
@@ -607,9 +607,9 @@ test "join: F4's precondition holds on real decls, List<string> != List<int>" {
         .attributes = &.{},
         .impls = &.{},
         .is_public = true,
-        .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "m.nova" },
+        .span = .{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "m.ky" },
     } }};
-    try tab.build(.{ .declarations = &decls, .span = .{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "root.nova" } });
+    try tab.build(.{ .declarations = &decls, .span = .{ .start = 0, .end = 0, .line = 0, .col = 0, .file = "root.ky" } });
 
     var l = Lowerer.init(a, &store);
     defer l.deinit();

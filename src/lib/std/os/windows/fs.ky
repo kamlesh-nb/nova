@@ -1,0 +1,152 @@
+//! Win32 FFI bindings for filesystem, directory, virtual memory, and UTF-8/UTF-16
+//! conversion primitives, used to implement the Windows variant of the `os`
+//! filesystem seam (paired with `os/windows/sys`).
+//!
+//! Windows file APIs are wide-character (UTF-16) only, so every path or string
+//! that crosses into a `*W` function must first be converted with `widen`, and
+//! any wide string coming back must be converted with `narrowInto`. The
+//! constants here mirror the Win32 headers (`winnt.h`, `fileapi.h`, `memoryapi.h`)
+//! exactly, using their documented numeric values rather than symbolic imports,
+//! because Kyte FFI binds to the raw `kernel32`/`ucrt` ABI, not to C headers.
+//! Callers outside this module should generally go through the higher-level
+//! `dir`/`file` abstractions rather than calling these externs directly.
+
+import bytes;
+
+/// Requests read access when opening a file with `CreateFileW`.
+pub const GENERIC_READ: int = 1 << 31;
+/// Requests write access when opening a file with `CreateFileW`.
+pub const GENERIC_WRITE: int = 1 << 30;
+/// File disposition flag: writes always land at end-of-file (append mode).
+pub const FILE_APPEND_DATA: int = 4;
+
+/// Allows other handles to open the file for reading while this one is open.
+pub const FILE_SHARE_READ: int = 1;
+/// Allows other handles to open the file for writing while this one is open.
+pub const FILE_SHARE_WRITE: int = 2;
+/// Allows other handles to delete (or rename) the file while this one is open.
+pub const FILE_SHARE_DELETE: int = 4;
+
+/// `CreateFileW` disposition: fail if the file already exists, else create it.
+pub const CREATE_NEW: int = 1;
+/// `CreateFileW` disposition: always create the file, overwriting any existing one.
+pub const CREATE_ALWAYS: int = 2;
+/// `CreateFileW` disposition: fail unless the file already exists.
+pub const OPEN_EXISTING: int = 3;
+/// `CreateFileW` disposition: open the file, creating it if it does not exist.
+pub const OPEN_ALWAYS: int = 4;
+/// `CreateFileW` disposition: open an existing file and truncate it to zero length.
+pub const TRUNCATE_EXISTING: int = 5;
+
+/// A file with no other notable attributes set.
+pub const FILE_ATTRIBUTE_NORMAL: int = 128;
+/// The `GetFileAttributesW`/find-data bit marking an entry as a directory.
+pub const FILE_ATTRIBUTE_DIRECTORY: int = 16;
+/// The `GetFileAttributesW`/find-data bit marking an entry as a reparse point (symlink or junction).
+pub const FILE_ATTRIBUTE_REPARSE_POINT: int = 1024;
+/// Sentinel returned by `GetFileAttributesW` when the path does not exist or cannot be queried.
+pub const INVALID_FILE_ATTRIBUTES: int = -1;
+
+/// `SetFilePointerEx` seek origin: offset from the start of the file.
+pub const FILE_BEGIN: int = 0;
+/// `SetFilePointerEx` seek origin: offset from the current file position.
+pub const FILE_CURRENT: int = 1;
+/// `SetFilePointerEx` seek origin: offset from the end of the file.
+pub const FILE_END: int = 2;
+
+/// `MoveFileExW` flag: overwrite the destination if it already exists.
+pub const MOVEFILE_REPLACE_EXISTING: int = 1;
+
+/// Windows code page identifier for UTF-8, passed to `MultiByteToWideChar`/`WideCharToMultiByte`.
+pub const CP_UTF8: int = 65001;
+
+/// `VirtualAlloc` flag: commit the pages, backing them with physical storage.
+pub const MEM_COMMIT: int = 4096;
+/// `VirtualAlloc` flag: reserve an address range without committing it.
+pub const MEM_RESERVE: int = 8192;
+/// `VirtualFree` flag: release a reserved/committed region back to the system.
+pub const MEM_RELEASE: int = 32768;
+/// Page protection: readable and writable memory.
+pub const PAGE_READWRITE: int = 4;
+
+/// Sentinel `HANDLE` value used by Win32 to signal a failed handle-creating call.
+pub const INVALID_HANDLE: long = -1;
+
+/// Size, in bytes, of the Win32 `WIN32_FIND_DATAW` structure used by `FindFirstFileW`/`FindNextFileW`.
+pub const FIND_DATA_SIZE: int = 592;
+/// Byte offset of the `cFileName` (wide string) field within `WIN32_FIND_DATAW`.
+pub const FIND_DATA_NAME_OFF: int = 44;
+/// Byte offset of the `dwFileAttributes` field within `WIN32_FIND_DATAW`.
+pub const FIND_DATA_ATTR_OFF: int = 0;
+
+/// Converts a UTF-8 (or other code-page) byte string to UTF-16; `srcLen: -1` means the source is NUL-terminated.
+/// Returns the number of wide characters written (including the terminator), or 0 on failure.
+pub extern("c") fn MultiByteToWideChar(codePage: int, flags: int, src: ptr, srcLen: int, dst: ptr, dstLen: int): int;
+/// Converts a UTF-16 string back to a byte string in the given code page.
+/// Returns the number of bytes written, or 0 on failure.
+pub extern("c") fn WideCharToMultiByte(codePage: int, flags: int, src: ptr, srcLen: int, dst: ptr, dstLen: int, defaultChar: ptr, usedDefault: ptr): int;
+
+/// Opens or creates a file and returns a Win32 `HANDLE`, or `INVALID_HANDLE` on failure. `path` must be a wide (UTF-16) string.
+pub extern("c") fn CreateFileW(path: ptr, access: int, share: int, sa: ptr, disposition: int, flags: int, template_: long): long;
+/// Reads up to `toRead` bytes from a file handle into `buf`; the actual count is written to `got`. Returns nonzero on success.
+pub extern("c") fn ReadFile(h: long, buf: ptr, toRead: int, got: ptr, ov: ptr): int;
+/// Writes up to `toWrite` bytes from `buf` to a file handle; the actual count is written to `wrote`. Returns nonzero on success.
+pub extern("c") fn WriteFile(h: long, buf: ptr, toWrite: int, wrote: ptr, ov: ptr): int;
+/// Moves the file pointer of a handle by `distance` bytes relative to `method` (one of `FILE_BEGIN`/`FILE_CURRENT`/`FILE_END`).
+pub extern("c") fn SetFilePointerEx(h: long, distance: long, newPos: ptr, method: int): int;
+/// Flushes any buffered writes for a file handle to disk.
+pub extern("c") fn FlushFileBuffers(h: long): int;
+/// Closes a Win32 handle (file, find, or otherwise) obtained from this module's functions.
+pub extern("c") fn CloseHandle(h: long): int;
+/// Returns the attribute bitmask for a path, or `INVALID_FILE_ATTRIBUTES` if the path cannot be queried.
+pub extern("c") fn GetFileAttributesW(path: ptr): int;
+/// Deletes a file by wide-string path. Returns nonzero on success.
+pub extern("c") fn DeleteFileW(path: ptr): int;
+/// Moves or renames a file, optionally replacing an existing destination (see `MOVEFILE_REPLACE_EXISTING`).
+pub extern("c") fn MoveFileExW(from: ptr, to: ptr, flags: int): int;
+
+/// Creates a new directory by wide-string path. Returns nonzero on success.
+pub extern("c") fn CreateDirectoryW(path: ptr, sa: ptr): int;
+/// Removes an empty directory by wide-string path. Returns nonzero on success.
+pub extern("c") fn RemoveDirectoryW(path: ptr): int;
+/// Fills `buf` with the current working directory as a wide string; returns the length written (excluding the NUL), or 0 on failure.
+pub extern("c") fn GetCurrentDirectoryW(bufLen: int, buf: ptr): int;
+/// Sets the process's current working directory by wide-string path.
+pub extern("c") fn SetCurrentDirectoryW(path: ptr): int;
+/// Begins a directory listing matching a wildcard pattern, filling the first `WIN32_FIND_DATAW` and returning a search handle.
+pub extern("c") fn FindFirstFileW(pattern: ptr, data: ptr): long;
+/// Advances a directory listing started by `FindFirstFileW`, filling the next `WIN32_FIND_DATAW`. Returns 0 when there are no more entries.
+pub extern("c") fn FindNextFileW(h: long, data: ptr): int;
+/// Closes a search handle obtained from `FindFirstFileW`.
+pub extern("c") fn FindClose(h: long): int;
+
+/// Reserves and/or commits a region of virtual memory; returns the base address, or a null pointer on failure.
+pub extern("c") fn VirtualAlloc(addr: ptr, size: long, allocType: int, protect: int): ptr;
+/// Releases or decommits a region of virtual memory previously obtained from `VirtualAlloc`.
+pub extern("c") fn VirtualFree(addr: ptr, size: long, freeType: int): int;
+
+/// Sets a process environment variable (the UCRT equivalent of POSIX `setenv`, which is absent on Windows).
+pub extern("c") fn _putenv_s(name: ptr, value: ptr): int;
+
+/// Returns the calling thread's last Win32 error code, for diagnosing a failed call above.
+pub extern("c") fn GetLastError(): int;
+
+/// Converts a NUL-terminated UTF-8 string to a freshly allocated UTF-16 buffer.
+/// Returns a null pointer (`0 as ptr`) if either conversion pass fails; the caller owns and must free the returned buffer.
+pub fn widen(utf8: ptr): ptr {
+    let n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, 0 as ptr, 0);
+    if (n <= 0) { return 0 as ptr; }
+    let w = bytes.alloc(n * 2);
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, n) <= 0) {
+        bytes.free(w);
+        return 0 as ptr;
+    }
+    return w;
+}
+
+/// Converts a NUL-terminated UTF-16 string into an existing UTF-8 buffer `dst` of capacity `dstLen`.
+/// Returns the number of bytes written, or 0 on failure (including insufficient capacity).
+pub fn narrowInto(utf16: ptr, dst: ptr, dstLen: int): int {
+    let n = WideCharToMultiByte(CP_UTF8, 0, utf16, -1, dst, dstLen, 0 as ptr, 0 as ptr);
+    return if (n > 0) n else 0;
+}

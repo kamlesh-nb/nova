@@ -1,0 +1,153 @@
+//! Twelve-factor style application configuration.
+//!
+//! This module gives a Kyte service a single, small place to read its settings
+//! from two sources with a fixed precedence: an environment variable wins, and a
+//! compiled-in default fills the gap when the environment is silent. That is the
+//! whole model. There is deliberately no config file parsing, no live reload,
+//! and no watching here; a service reads its config once at start-up and keeps
+//! the resolved values.
+//!
+//! The one idea worth understanding is the key mapping. Callers ask for keys in
+//! a friendly, dotted, lower-case form (for example `db.host` or
+//! `server.max-conns`), because that reads well in code and matches how defaults
+//! are usually written. Environment variables, by convention, are SHOUTING_SNAKE
+//! (for example `APP_DB_HOST`). [`envKeyOf`] is the bridge between the two: it
+//! upper-cases the key and turns every dot and dash into an underscore, then
+//! prepends an optional prefix. So a single lookup key such as `db.host` resolves
+//! against the env var `<PREFIX>DB_HOST`, while the same key still finds its
+//! default under the original dotted spelling in the [`Config.defaults`] map.
+//!
+//! The prefix ([`Config.prefix`]) lets several services, or several instances,
+//! share one environment without clashing: give each a prefix like `APP_` or
+//! `ORCH_` and their variables live in separate namespaces. The prefix is applied
+//! verbatim, so include the trailing separator yourself (`"APP_"`, not `"APP"`).
+//!
+//! The typed getters ([`Config.getInt`], [`Config.getBool`]) are thin wrappers
+//! over [`Config.getString`]: they resolve the raw string first, then parse it,
+//! and fall back to the supplied default when the string is empty. Booleans are
+//! read leniently, treating `true`, `1`, `yes`, and `on` (any case) as true and
+//! everything else as false. This sits in the standard library alongside `env`,
+//! `string`, and `map`, and is the intended front door for reading settings in a
+//! Kyte application rather than calling `env.get` directly at each site.
+
+import string;
+import map;
+import env;
+
+/// Translates a friendly lookup key into its environment-variable name.
+///
+/// The key is upper-cased, then every dot (`.`, byte 46) and dash (`-`, byte 45)
+/// is replaced with an underscore, and finally `prefix` is prepended unchanged.
+/// So with `prefix = "APP_"` the key `db.host` becomes `APP_DB_HOST` and
+/// `server.max-conns` becomes `APP_SERVER_MAX_CONNS`. This is the single point
+/// that reconciles the dotted, lower-case keys used in code with the
+/// SHOUTING_SNAKE convention used for environment variables. Only `.` and `-` are
+/// remapped; any other punctuation in the key is upper-cased and passed through
+/// as-is. Private, since callers only ever go through [`Config`].
+fn envKeyOf(prefix: string, key: string): string {
+    let up = string.toUpperCase(key);
+    let out = "";
+    let i = 0;
+    while (i < up.length) {
+        let c = up[i];
+        if (c == 46 || c == 45) { out = out + "_"; } else { out = out + string.slice(up, i, i + 1); }
+        i = i + 1;
+    }
+    return prefix + out;
+}
+
+/// A resolver for application settings, holding the compiled-in defaults and the
+/// environment prefix.
+///
+/// A `Config` is the front door for reading settings: every getter first consults
+/// the environment (via [`envKeyOf`] applied to [`Config.prefix`]) and only falls
+/// back to [`Config.defaults`] when the environment is silent. Build one with
+/// [`newConfig`], register fallbacks with [`Config.setDefault`], optionally set a
+/// namespace with [`Config.withPrefix`], then read through [`Config.getString`],
+/// [`Config.getInt`], or [`Config.getBool`].
+pub struct Config {
+    /// Compiled-in fallback values, keyed by the friendly dotted key (for example
+    /// `db.host`), used whenever the corresponding environment variable is unset
+    /// or empty. Populated through [`Config.setDefault`].
+    pub defaults: Map<string, string>,
+    /// Namespace prepended, unchanged, to every derived environment-variable name
+    /// (see [`envKeyOf`]). Empty means no namespace. Include the trailing
+    /// separator yourself, for example `"APP_"`.
+    pub prefix: string,
+
+    /// Creates an empty config: no defaults registered and no prefix. The
+    /// defaults map is sized for 16 entries up front and keyed by `string.hash`.
+    init() {
+        self.defaults = Map<string, string>(16, string.hash);
+        self.prefix = "";
+    }
+
+    /// Sets the environment-variable [`Config.prefix`] and returns `self` so calls
+    /// can be chained onto [`newConfig`]. The prefix is applied verbatim, so
+    /// include any trailing separator (`"APP_"`, not `"APP"`).
+    pub fn withPrefix(self: Config, p: string): Config { self.prefix = p; return self; }
+    /// Registers a fallback value for `key`, used when the environment does not
+    /// supply it. The key is the friendly dotted form (for example `db.host`),
+    /// stored as given in [`Config.defaults`].
+    pub fn setDefault(self: Config, key: string, val: string): void { self.defaults.set(key, val); }
+
+    /// Resolves `key` to a string, preferring the environment over the default.
+    ///
+    /// The environment variable named by [`envKeyOf`] is checked first; a
+    /// non-empty value there wins. Otherwise the registered default for `key` is
+    /// returned if one exists, and failing that the caller's `dflt`. Note that an
+    /// environment variable set to the empty string counts as absent here, so it
+    /// does not override a registered default. This is the base resolver that
+    /// [`Config.getInt`] and [`Config.getBool`] build on.
+    pub fn getString(self: Config, key: string, dflt: string): string {
+        let envVal = env.get(envKeyOf(self.prefix, key));
+        if (envVal != "") { return envVal; }
+        let d = self.defaults.get(key);
+        if (d != undefined) { return d ?? dflt; }
+        return dflt;
+    }
+
+    /// Resolves `key` and parses it as a signed integer, falling back to `dflt`.
+    ///
+    /// The value is fetched with [`Config.getString`] using an empty resolver
+    /// default; an empty result (no env var and no registered default) yields
+    /// `dflt` without parsing. A present value is parsed with `string.parseI64`
+    /// and narrowed to `int`, so a value outside the 32-bit range, or one that is
+    /// not a valid integer, is truncated or parsed by the underlying routine
+    /// rather than reported as an error here.
+    pub fn getInt(self: Config, key: string, dflt: int): int {
+        let s = self.getString(key, "");
+        if (s == "") { return dflt; }
+        return string.parseI64(s) as int;
+    }
+
+    /// Resolves `key` and interprets it as a boolean, falling back to `dflt`.
+    ///
+    /// The value is fetched with [`Config.getString`] and lower-cased; an empty
+    /// result yields `dflt`. Otherwise the reading is lenient: `true`, `1`, `yes`,
+    /// and `on` are treated as true and anything else (including `false`, `0`,
+    /// `no`, `off`, or any unrecognised text) is false. Because the string is
+    /// lower-cased first, the match is case-insensitive.
+    pub fn getBool(self: Config, key: string, dflt: bool): bool {
+        let s = string.toLowerCase(self.getString(key, ""));
+        if (s == "") { return dflt; }
+        return string.eql(s, "true") || string.eql(s, "1") || string.eql(s, "yes") || string.eql(s, "on");
+    }
+
+    /// Reports whether `key` is resolvable, from either source.
+    ///
+    /// Returns true if the derived environment variable (see [`envKeyOf`]) is set
+    /// to a non-empty value, or if a default has been registered for `key`. Like
+    /// [`Config.getString`], an environment variable set to the empty string is
+    /// treated as absent, so it does not on its own make `has` true.
+    pub fn has(self: Config, key: string): bool {
+        if (env.get(envKeyOf(self.prefix, key)) != "") { return true; }
+        return self.defaults.get(key) != undefined;
+    }
+}
+
+/// Constructs a fresh, empty [`Config`] with no defaults and no prefix.
+///
+/// The conventional entry point for this module: build one, then chain
+/// [`Config.withPrefix`] and [`Config.setDefault`] onto it before reading values.
+pub fn newConfig(): Config { return Config(); }

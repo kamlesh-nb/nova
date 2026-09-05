@@ -1,0 +1,388 @@
+//! X.509 Certificate Revocation List (CRL) parsing, lookup, and ECDSA verification.
+//!
+//! A CRL is the classic revocation mechanism from RFC 5280: the issuing CA
+//! periodically publishes a signed list of the serial numbers it has revoked,
+//! and a relying party consults that list before trusting a certificate. This
+//! module gives Kyte the three operations a TLS client actually needs: locate
+//! the structural parts of a DER-encoded CRL ([`parseCrl`]), test whether a
+//! given serial appears in the revoked set ([`isRevoked`]), and confirm the
+//! whole list was genuinely signed by the issuer ([`verifyCrlSignatureEc`]).
+//!
+//! Everything here works directly over a raw DER buffer (`ptr` + `len`) rather
+//! than a decoded object tree. It never copies the certificate list or builds
+//! intermediate structures: parsing records byte OFFSETS into the caller's
+//! buffer, and both lookup and verification re-walk the buffer from those
+//! offsets. The DER decoding leans on the shared TLV reader in `crypto.x509`
+//! (`x509.readTlv`), which returns a tag plus the `start` of a value, its `len`,
+//! and the `next` offset just past the whole tag-length-value triple. The
+//! caller owns the buffer and must keep it alive for as long as any [`CrlView`]
+//! derived from it is used, because the view holds only offsets, not bytes.
+//!
+//! Signature support is deliberately narrow. Only the ECDSA-with-P-256 profile
+//! is implemented: hashing with `crypto.hash.sha256` and verifying with
+//! `crypto.ecc.p256`. RSA-signed CRLs are out of scope for this module. The
+//! DER-to-fixed-width conversion of the `r` and `s` signature integers is done
+//! by hand here rather than in the ECC layer, because the ECC primitive wants
+//! two bare 32-byte big-endian scalars while DER stores them as minimally
+//! encoded INTEGERs (variable length, sometimes carrying a leading 0x00 sign
+//! byte). See [`crlDecodeSig`] and [`crlIntTo`] for the strip-and-right-align
+//! logic, and [`crlEncInt`] for the inverse used when constructing a CRL.
+//!
+//! The builder ([`buildTestCrl`]) exists so the parser and verifier can be
+//! exercised end to end against a known-good, self-signed CRL: it hand-assembles
+//! the DER, signs the tbsCertList with P-256, and writes the finished
+//! CertificateList into the caller's buffer. As the name says, it is a test
+//! and fixture helper, not a general CRL authoring API. The `crl*` free
+//! functions ([`crlWlen`], [`crlWrap`], [`crlCat`], [`crlEncodeSig`]) are the
+//! small DER-emission primitives it is built from.
+
+import bytes;
+import crypto.x509;
+import crypto.hash.sha256;
+import crypto.ecc.p256;
+
+/// A set of byte offsets that locate the interesting parts of a DER CRL.
+///
+/// [`parseCrl`] fills this in by walking the outer `CertificateList` and its
+/// `tbsCertList`. Nothing is copied: every field is an offset (or length) into
+/// the ORIGINAL DER buffer, so the buffer must outlive the view. When `ok` is
+/// false the view is empty and the numeric fields are meaningless; callers must
+/// check `ok` before trusting the rest. The `tbsStart`/`tbsLen` span is exactly
+/// the tbsCertList tag-length-value that gets hashed for signature checking, and
+/// `revokedOff`/`revokedLen` bound the content of the `revokedCertificates`
+/// SEQUENCE that [`isRevoked`] iterates.
+pub struct CrlView {
+    /// True once [`parseCrl`] has recognised a well-formed CertificateList and
+    /// filled in the offsets. False means parsing bailed out early and every
+    /// other field should be ignored.
+    pub ok: bool,
+    /// Byte offset of the tbsCertList tag within the DER buffer, and the length
+    /// of the whole tbsCertList tag-length-value from that offset. This exact
+    /// span is what gets SHA-256 hashed in [`verifyCrlSignatureEc`], so it must
+    /// cover the tag and length header, not just the content.
+    pub tbsStart: int, pub tbsLen: int,
+    /// Byte offset of the CONTENT of the `revokedCertificates` SEQUENCE, and its
+    /// content length. Both are zero when the CRL lists no revoked certificates
+    /// (the field is OPTIONAL in RFC 5280); [`isRevoked`] treats a zero length
+    /// as "nothing revoked".
+    pub revokedOff: int, pub revokedLen: int,
+    /// Byte offset and length of the raw ECDSA signature value, with the BIT
+    /// STRING's leading unused-bits byte (0x00) already skipped. This points at
+    /// the DER `SEQUENCE { INTEGER r, INTEGER s }` that [`crlDecodeSig`] parses.
+    pub sigOff: int, pub sigLen: int,
+
+    /// Constructs an empty, not-yet-parsed view: `ok` is false and every offset
+    /// is zero. [`parseCrl`] starts from this and overwrites the fields once it
+    /// has validated the structure.
+    init() { self.ok = false; self.tbsStart = 0; self.tbsLen = 0; self.revokedOff = 0; self.revokedLen = 0; self.sigOff = 0; self.sigLen = 0; }
+}
+
+/// True if a DER tag denotes an X.509 `Time`, i.e. UTCTime (0x17) or
+/// GeneralizedTime (0x18).
+///
+/// Used by [`parseCrl`] to step over the OPTIONAL `thisUpdate` and `nextUpdate`
+/// fields without knowing in advance which of the two ASN.1 time encodings the
+/// issuer chose.
+fn isTime(tag: int): bool { return tag == 0x17 || tag == 0x18; }
+
+/// Parses a DER-encoded CRL and returns a [`CrlView`] of byte offsets into it.
+///
+/// Walks the outer `CertificateList` SEQUENCE to find the tbsCertList (recorded
+/// as `tbsStart`/`tbsLen`), the signatureAlgorithm, and the signatureValue BIT
+/// STRING (recorded as `sigOff`/`sigLen`, with the unused-bits byte skipped).
+/// It then descends into the tbsCertList and steps field by field to locate the
+/// OPTIONAL `revokedCertificates` SEQUENCE.
+///
+/// The field walk mirrors the RFC 5280 tbsCertList layout and treats the
+/// variable-presence fields structurally: an INTEGER (tag 0x02) at the front is
+/// the OPTIONAL `version` and is skipped, then `signature` and `issuer` are
+/// stepped over unconditionally, and up to two [`isTime`] fields
+/// (`thisUpdate`, then the OPTIONAL `nextUpdate`) are consumed. Whatever
+/// remains, if it is a SEQUENCE (0x30) that starts before the end of the
+/// tbsCertList, is taken as `revokedCertificates`.
+///
+/// Returns a view with `ok` false, and all offsets zero, if either the outer or
+/// the tbsCertList tag is not a SEQUENCE. This is a structural parser only: it
+/// does NOT verify the signature (call [`verifyCrlSignatureEc`] for that) and
+/// does not validate dates. `len` is currently unused because the offsets are
+/// derived from the TLV lengths inside the buffer.
+pub fn parseCrl(der: ptr, len: int): CrlView {
+    let v = CrlView();
+    let top = x509.readTlv(der, 0);
+    if (top.tag != 0x30) { return v; }
+    let tbs = x509.readTlv(der, top.start);
+    if (tbs.tag != 0x30) { return v; }
+    v.tbsStart = top.start;
+    v.tbsLen = tbs.next - top.start;
+
+    let sigAlg = x509.readTlv(der, tbs.next);
+    let sigBit = x509.readTlv(der, sigAlg.next);
+    v.sigOff = sigBit.start + 1;
+    v.sigLen = sigBit.len - 1;
+
+    let p = tbs.start;
+    let e = x509.readTlv(der, p);
+    if (e.tag == 0x02) { p = e.next; e = x509.readTlv(der, p); }
+    p = e.next; e = x509.readTlv(der, p);
+    p = e.next; e = x509.readTlv(der, p);
+    if (isTime(e.tag)) { p = e.next; e = x509.readTlv(der, p); }
+    if (isTime(e.tag)) { p = e.next; e = x509.readTlv(der, p); }
+    if (p < v.tbsStart + v.tbsLen && e.tag == 0x30) {
+        v.revokedOff = e.start;
+        v.revokedLen = e.len;
+    }
+    v.ok = true;
+    return v;
+}
+
+/// Tests whether a certificate serial number appears in the CRL's revoked set.
+///
+/// Iterates the entries of the `revokedCertificates` SEQUENCE bounded by
+/// `v.revokedOff` and `v.revokedLen`. Each entry is itself a SEQUENCE whose
+/// first field is the `userCertificate` serial INTEGER; the raw serial bytes of
+/// that field are compared against `serial`/`serialLen` via [`crlSerialEq`].
+/// Returns true on the first match.
+///
+/// Returns false immediately, treating the certificate as not revoked, when the
+/// view never parsed (`!v.ok`) or the CRL lists nothing (`revokedLen == 0`).
+/// The comparison is byte-exact on the DER INTEGER content, so the caller must
+/// pass the serial in the SAME encoding the CRL uses (a raw big-endian INTEGER
+/// value, including any leading 0x00 sign byte the issuer emitted).
+pub fn isRevoked(der: ptr, v: CrlView, serial: ptr, serialLen: int): bool {
+    if (!v.ok || v.revokedLen == 0) { return false; }
+    let p = v.revokedOff;
+    let end = v.revokedOff + v.revokedLen;
+    while (p < end) {
+        let entry = x509.readTlv(der, p);
+        let ser = x509.readTlv(der, entry.start);
+        if (crlSerialEq(der, ser.start, ser.len, serial, serialLen)) { return true; }
+        p = entry.next;
+    }
+    return false;
+}
+
+/// Compares `n` bytes at `off` in the CRL buffer against `serialLen` bytes at
+/// `serial`, returning true only if the lengths match and every byte is equal.
+///
+/// A plain constant-length equality check used by [`isRevoked`] to match a
+/// candidate serial against a revoked-entry serial. Differing lengths short
+/// circuit to false, so serials that would be equal only after zero-padding are
+/// treated as distinct: both sides must already be in the same minimal DER
+/// INTEGER encoding.
+fn crlSerialEq(der: ptr, off: int, n: int, serial: ptr, serialLen: int): bool {
+    if (n != serialLen) { return false; }
+    let i = 0;
+    while (i < n) { if (bytes.read_byte(der, off + i) != bytes.read_byte(serial, i)) { return false; } i = i + 1; }
+    return true;
+}
+
+/// Verifies the CRL's ECDSA-P-256 signature against the issuer's public key.
+///
+/// Hashes the tbsCertList span (`v.tbsStart`, `v.tbsLen`) with SHA-256, decodes
+/// the DER `SEQUENCE { INTEGER r, INTEGER s }` at `v.sigOff` into two 32-byte
+/// scalars via [`crlDecodeSig`], and checks them with `p256.ecdsaVerify`.
+/// `issuerPub65` is the issuer's public key as a 65-byte uncompressed P-256
+/// point (0x04 prefix followed by the 32-byte X and Y coordinates).
+///
+/// Returns false if the view never parsed (`!v.ok`); otherwise returns the
+/// verifier's verdict. This function assumes the ECDSA-with-SHA-256 profile and
+/// does not inspect the signatureAlgorithm OID, so the caller is responsible for
+/// only invoking it on CRLs known to use that algorithm. The three scratch
+/// buffers (digest, `r`, `s`) are freed before returning.
+pub fn verifyCrlSignatureEc(der: ptr, v: CrlView, issuerPub65: ptr): bool {
+    if (!v.ok) { return false; }
+    let digest = bytes.alloc(32);
+    sha256.hashInto((der as long + v.tbsStart) as ptr, v.tbsLen, digest);
+    let sigPtr = (der as long + v.sigOff) as ptr;
+    let r = bytes.alloc(32); let s = bytes.alloc(32);
+    crlDecodeSig(sigPtr, r, s);
+    let ok = p256.ecdsaVerify(digest, issuerPub65, r, s);
+    bytes.free(digest); bytes.free(r); bytes.free(s);
+    return ok;
+}
+
+/// Splits a DER ECDSA signature into two fixed 32-byte big-endian scalars.
+///
+/// The input `sig` points at a `SEQUENCE { INTEGER r, INTEGER s }`. The layout
+/// is decoded positionally: byte 0 is the SEQUENCE tag, byte 1 its length, byte
+/// 2 the tag of `r`, byte 3 the length of `r`, and byte 4 onwards the value of
+/// `r`. From there `sValHdr = 4 + rLen` lands on `s`'s INTEGER tag, so `s`'s
+/// length is at `sValHdr + 1` and its value at `sValHdr + 2`. Each integer is
+/// then left-stripped and right-aligned into a 32-byte output by [`crlIntTo`].
+///
+/// This positional decode assumes both length fields use the DER short form
+/// (a single length byte, always true for P-256 where each integer is at most
+/// 33 bytes) and does not check the tags, so it must only be fed a
+/// well-formed P-256 ECDSA signature such as the one located by [`parseCrl`].
+fn crlDecodeSig(sig: ptr, rOut: ptr, sOut: ptr): void {
+    let rTag = 4;
+    let rLen = bytes.read_byte(sig, 3);
+    let sValHdr = rTag + rLen;
+    let sTag = sValHdr + 2;
+    let sLen = bytes.read_byte(sig, sValHdr + 1);
+    crlIntTo(sig, rTag, rLen, rOut);
+    crlIntTo(sig, sTag, sLen, sOut);
+}
+/// Copies a variable-length DER INTEGER value into a fixed 32-byte, zero-padded,
+/// right-aligned big-endian buffer.
+///
+/// P-256's `r` and `s` are 256-bit scalars, but DER stores them minimally: any
+/// leading zero bytes are dropped, and a single 0x00 is prepended only when the
+/// top bit would otherwise make the value look negative. `p256.ecdsaVerify`
+/// wants a bare 32-byte scalar instead, so this strips the leading zero bytes
+/// (advancing `s` and shrinking `l`), clears the whole 32-byte `out`, and then
+/// writes the remaining `l` bytes starting at `pad = 32 - l` so the value is
+/// right-aligned. The inverse encoding lives in [`crlEncInt`].
+fn crlIntTo(buf: ptr, start: int, len: int, out: ptr): void {
+    let s = start; let l = len;
+    while (l > 0 && bytes.read_byte(buf, s) == 0) { s = s + 1; l = l - 1; }
+    let i = 0; while (i < 32) { bytes.write_byte(out, i, 0); i = i + 1; }
+    let pad = 32 - l;
+    i = 0; while (i < l) { bytes.write_byte(out, pad + i, bytes.read_byte(buf, s + i)); i = i + 1; }
+}
+
+/// Writes a DER length field for `n` at `off` and returns how many bytes it took.
+///
+/// Implements the DER definite-length encoding used by the CRL builder: the
+/// short form (a single byte) for `n < 0x80`, the `0x81` + one-byte long form
+/// for `n < 0x100`, and the `0x82` + two-byte big-endian long form otherwise.
+/// One, two, or three bytes are written respectively. Lengths of 0x10000 or
+/// more are not handled, which is fine for the small test CRLs [`buildTestCrl`]
+/// produces. Paired with [`crlWrap`], which calls it to emit a tag-length-value.
+fn crlWlen(out: ptr, off: int, n: int): int {
+    if (n < 0x80) { bytes.write_byte(out, off, n); return 1; }
+    if (n < 0x100) { bytes.write_byte(out, off, 0x81); bytes.write_byte(out, off + 1, n); return 2; }
+    bytes.write_byte(out, off, 0x82); bytes.write_byte(out, off + 1, (n >> 8) & 0xff); bytes.write_byte(out, off + 2, n & 0xff);
+    return 3;
+}
+/// Emits one DER tag-length-value at `off`: the `tag` byte, the encoded length
+/// of `childLen` (via [`crlWlen`]), then a copy of `childLen` bytes from `child`.
+///
+/// Returns the total number of bytes written (`1 + length-bytes + childLen`).
+/// This is the workhorse of [`buildTestCrl`], used to wrap each already-built
+/// child buffer inside its ASN.1 tag: SEQUENCEs (0x30), INTEGERs (0x02), BIT
+/// STRINGs (0x03), and GeneralizedTimes (0x18).
+fn crlWrap(out: ptr, off: int, tag: int, child: ptr, childLen: int): int {
+    bytes.write_byte(out, off, tag);
+    let ln = crlWlen(out, off + 1, childLen);
+    let p = off + 1 + ln;
+    let i = 0; while (i < childLen) { bytes.write_byte(out, p + i, bytes.read_byte(child, i)); i = i + 1; }
+    return 1 + ln + childLen;
+}
+/// Appends `n` raw bytes from `src` into `out` at `off`, returning `n`.
+///
+/// A plain byte copy with no ASN.1 framing, used by [`buildTestCrl`] to
+/// concatenate already-encoded pieces into a larger body. Returning the count
+/// lets callers advance their write cursor with `off = off + crlCat(...)`.
+fn crlCat(out: ptr, off: int, src: ptr, n: int): int {
+    let i = 0; while (i < n) { bytes.write_byte(out, off + i, bytes.read_byte(src, i)); i = i + 1; }
+    return n;
+}
+
+/// Builds a complete, self-signed ECDSA-P-256 CRL into `out` and returns its
+/// length, as a fixture for exercising the parser and verifier.
+///
+/// `serials` is a flat array of `count` serial numbers, each exactly `serialLen`
+/// bytes, laid out back to back (entry `k` starts at `serials + k * serialLen`).
+/// `key32` is the 32-byte P-256 private scalar used to sign, and `time15` is a
+/// 15-byte GeneralizedTime string reused for both the CRL's `thisUpdate` and
+/// every entry's `revocationDate`.
+///
+/// The DER is assembled bottom up. For each serial it wraps the INTEGER and a
+/// GeneralizedTime revocationDate inside a per-entry SEQUENCE, concatenating the
+/// entries into the `revokedCertificates` SEQUENCE. It then builds the
+/// tbsCertList (the hardcoded ecdsa-with-SHA-256 AlgorithmIdentifier, an empty
+/// issuer Name, `thisUpdate`, and the revoked list), SHA-256 hashes it, signs
+/// with `p256.ecdsaSign`, DER-encodes the signature via [`crlEncodeSig`], wraps
+/// it in a BIT STRING with a 0x00 unused-bits prefix, and finally wraps the
+/// tbsCertList, the repeated AlgorithmIdentifier, and the signature BIT STRING
+/// in the outer CertificateList SEQUENCE written to `out`.
+///
+/// The many `bytes.alloc` scratch buffers here are intentionally NOT freed: this
+/// is a test helper whose leaks are acceptable, so do not model production CRL
+/// construction on it. It emits no OPTIONAL version and no `nextUpdate`, so the
+/// output stays on the simple path [`parseCrl`] handles.
+pub fn buildTestCrl(serials: ptr, serialLen: int, count: int, key32: ptr, time15: ptr, out: ptr): int {
+    let entries = bytes.alloc(64 + count * (serialLen + 24));
+    let ep = 0;
+    let k = 0;
+    while (k < count) {
+        let one = bytes.alloc(serialLen + 32);
+        let op = 0;
+        let ser = bytes.alloc(serialLen + 4);
+        let serLen = crlWrap(ser, 0, 0x02, (serials as long + k * serialLen) as ptr, serialLen);
+        op = op + crlCat(one, op, ser, serLen);
+        let rd = bytes.alloc(20); let rdLen = crlWrap(rd, 0, 0x18, time15, 15);
+        op = op + crlCat(one, op, rd, rdLen);
+        let entry = bytes.alloc(serialLen + 40); let entryLen = crlWrap(entry, 0, 0x30, one, op);
+        ep = ep + crlCat(entries, ep, entry, entryLen);
+        k = k + 1;
+    }
+    let revoked = bytes.alloc(80 + count * (serialLen + 40)); let revokedLen = crlWrap(revoked, 0, 0x30, entries, ep);
+
+    let sigAlg = bytes.alloc(12);
+    bytes.write_byte(sigAlg, 0, 0x30); bytes.write_byte(sigAlg, 1, 0x0a);
+    bytes.write_byte(sigAlg, 2, 0x06); bytes.write_byte(sigAlg, 3, 0x08);
+    bytes.write_byte(sigAlg, 4, 0x2a); bytes.write_byte(sigAlg, 5, 0x86); bytes.write_byte(sigAlg, 6, 0x48);
+    bytes.write_byte(sigAlg, 7, 0xce); bytes.write_byte(sigAlg, 8, 0x3d); bytes.write_byte(sigAlg, 9, 0x04);
+    bytes.write_byte(sigAlg, 10, 0x03); bytes.write_byte(sigAlg, 11, 0x02);
+    let issuer = bytes.alloc(4); bytes.write_byte(issuer, 0, 0x30); bytes.write_byte(issuer, 1, 0x00);
+    let tu = bytes.alloc(20); let tuLen = crlWrap(tu, 0, 0x18, time15, 15);
+
+    let tbsBody = bytes.alloc(200 + revokedLen); let tp = 0;
+    tp = tp + crlCat(tbsBody, tp, sigAlg, 12);
+    tp = tp + crlCat(tbsBody, tp, issuer, 2);
+    tp = tp + crlCat(tbsBody, tp, tu, tuLen);
+    tp = tp + crlCat(tbsBody, tp, revoked, revokedLen);
+    let tbs = bytes.alloc(240 + revokedLen); let tbsLen = crlWrap(tbs, 0, 0x30, tbsBody, tp);
+
+    let digest = bytes.alloc(32); sha256.hashInto(tbs, tbsLen, digest);
+    let r = bytes.alloc(32); let s = bytes.alloc(32); p256.ecdsaSign(digest, key32, r, s);
+    let sigVal = bytes.alloc(80); let sigValLen = crlEncodeSig(r, s, sigVal);
+    let bitBody = bytes.alloc(84); bytes.write_byte(bitBody, 0, 0x00); let bb = 1 + crlCat(bitBody, 1, sigVal, sigValLen);
+    let sigBit = bytes.alloc(88); let sigBitLen = crlWrap(sigBit, 0, 0x03, bitBody, bb);
+
+    let body = bytes.alloc(400 + revokedLen); let bp = 0;
+    bp = bp + crlCat(body, bp, tbs, tbsLen);
+    bp = bp + crlCat(body, bp, sigAlg, 12);
+    bp = bp + crlCat(body, bp, sigBit, sigBitLen);
+    return crlWrap(out, 0, 0x30, body, bp);
+}
+
+/// Encodes two 32-byte scalars `r` and `s` as a DER `SEQUENCE { INTEGER r,
+/// INTEGER s }` in `out`, returning the total bytes written.
+///
+/// Writes the two INTEGERs first (via [`crlEncInt`], starting at offset 2 to
+/// leave room for the SEQUENCE header), then backfills the SEQUENCE tag (0x30)
+/// and its length at offsets 0 and 1. The length uses the short form, which is
+/// always sufficient because a P-256 signature SEQUENCE is well under 128 bytes.
+/// This is the inverse of [`crlDecodeSig`] and is used by [`buildTestCrl`].
+fn crlEncodeSig(r: ptr, s: ptr, out: ptr): int {
+    let rlen = crlEncInt(r, out, 2);
+    let slen = crlEncInt(s, out, 2 + rlen);
+    let total = rlen + slen;
+    bytes.write_byte(out, 0, 0x30); bytes.write_byte(out, 1, total);
+    return 2 + total;
+}
+/// Encodes a 32-byte big-endian scalar at `src` as a minimal DER INTEGER at
+/// `off` in `out`, returning how many bytes it wrote.
+///
+/// Reverses what [`crlIntTo`] does. It drops leading zero bytes (scanning up to
+/// index 31, so an all-zero input still keeps one byte), then adds a single
+/// 0x00 pad byte when the first significant byte has its top bit set, because
+/// DER INTEGERs are signed and that byte would otherwise be read as negative.
+/// It writes the INTEGER tag (0x02), the computed length, the optional pad, and
+/// the value bytes. Used by [`crlEncodeSig`] for each of `r` and `s`.
+fn crlEncInt(src: ptr, out: ptr, off: int): int {
+    let s = 0;
+    while (s < 31 && bytes.read_byte(src, s) == 0) { s = s + 1; }
+    let pad = 0;
+    if ((bytes.read_byte(src, s) & 0x80) != 0) { pad = 1; }
+    let vlen = 32 - s + pad;
+    bytes.write_byte(out, off, 0x02); bytes.write_byte(out, off + 1, vlen);
+    let p = off + 2;
+    if (pad == 1) { bytes.write_byte(out, p, 0); p = p + 1; }
+    let i = s;
+    while (i < 32) { bytes.write_byte(out, p, bytes.read_byte(src, i)); p = p + 1; i = i + 1; }
+    return p - off;
+}

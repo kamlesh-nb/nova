@@ -5,11 +5,11 @@
 //! ownership-only representation, modelled on Swift's OSSA, whose sole job is
 //! to make lifetimes explicit enough that a checker can prove every owned
 //! value is consumed exactly once along every path (no leak, no double-free,
-//! no use-after-consume). The codegen ARC pass lowers a Nova function into a
+//! no use-after-consume). The codegen ARC pass lowers a Kyte function into a
 //! [`Func`] of basic blocks whose instructions are ownership events, then a
 //! separate verifier walks it. Because the only things represented here are
 //! creation, copy, borrow, and consumption of SSA values, the checker never
-//! has to understand actual Nova semantics: it only tracks the [`Ownership`]
+//! has to understand actual Kyte semantics: it only tracks the [`Ownership`]
 //! discipline.
 //!
 //! The value model is classic SSA. Each [`Value`] is produced exactly once (by
@@ -39,7 +39,7 @@ const std = @import("std");
 const types = @import("../../types.zig");
 
 /// Re-export of the compiler's canonical type identifier so OSSA values can
-/// optionally carry the Nova type they represent without depending on the full
+/// optionally carry the Kyte type they represent without depending on the full
 /// types module at every use site. Ownership checking does not need the type;
 /// it is threaded through purely for diagnostics and downstream lowering.
 pub const TypeId = types.TypeId;
@@ -207,7 +207,7 @@ const ValueInfo = struct {
     /// The value's [`Ownership`] class, the fact the verifier reads via
     /// [`Func.ownershipOf`].
     own: Ownership,
-    /// The Nova type this value represents, if tracked. Optional because
+    /// The Kyte type this value represents, if tracked. Optional because
     /// ownership checking does not require it.
     ty: ?TypeId = null,
 };

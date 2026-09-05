@@ -1,0 +1,24 @@
+//! Generic object mapping built on the `...from` struct-literal spread.
+//!
+//! `map<To, From>(src)` is the callable form of `To{ ...from(src) }`: it fills
+//! every `To` field from a same-named (`_`/case-insensitive) field of `src`,
+//! including nested-struct fields and one level of flattening. A `To` field that
+//! no `From` field can supply is a COMPILE ERROR at the instantiation, so the map
+//! is only ever generated when it is total. Renames and derived fields belong on
+//! the DTO as `@from`/`@derive` attributes, or in a hand-written mapper.
+//!
+//! `To` is written first so the destination is explicit at the call site; both
+//! type arguments are required (`map<Dto, Ent>(e)`), since Kyte does not infer a
+//! trailing type argument from the value. Repository.oneAs/listAs supply both for
+//! you (the entity type from the repository, the DTO type from the method).
+/// Map one `From` value to a `To` by convention. Value fields are copied (owned
+/// strings are shared by retain), so the result is independent of `src`.
+///
+/// List mapping lives on `Repository.listAs` (a method, which can forward its
+/// type parameters into this call). A free-function list wrapper is intentionally
+/// omitted: forwarding a free function's type parameters into another generic
+/// free function is a separate compiler capability, and inlining the spread in a
+/// loop instead leaks the borrowed element.
+pub fn mapTo<To, From>(src: From): To {
+    return To{ ...from(src) };
+}

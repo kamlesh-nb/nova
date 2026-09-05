@@ -1,4 +1,4 @@
-//! Interned, structural type universe for the Nova compiler front-end.
+//! Interned, structural type universe for the Kyte compiler front-end.
 //!
 //! Every type the compiler reasons about is represented here NOT as a string
 //! ("List<int>", "string?", "i64") but as a value in the [`Type`] union that is
@@ -88,7 +88,7 @@ pub const PrimType = struct {
 /// A (possibly generic) named struct type: the declaration plus its type
 /// arguments.
 ///
-/// Because Nova monomorphises rather than erasing, the `args` are part of the
+/// Because Kyte monomorphises rather than erasing, the `args` are part of the
 /// identity: `List<int>` and `List<string>` share `decl` but differ in `args`
 /// and therefore intern to different ids. A non-generic struct has empty `args`.
 pub const StructType = struct {
@@ -143,7 +143,7 @@ pub const TypeParam = struct {
 /// The `T!E` result type: a success payload `ok` or an error payload `err`.
 pub const ErrorUnionType = struct { ok: TypeId, err: TypeId };
 
-/// The tagged union of every kind of type Nova can represent.
+/// The tagged union of every kind of type Kyte can represent.
 ///
 /// Each variant is either payload-free (a singleton shape like `string` or
 /// `unresolved` that interns to exactly one id) or carries the data that makes
@@ -464,8 +464,8 @@ pub const TypeStore = struct {
     pub fn boolT(self: *TypeStore) !TypeId {
         return self.intern(.{ .prim = .{ .kind = .bool, .bits = 1, .signed = false } });
     }
-    /// Interns and returns Nova's default `int`: a SIGNED 32-bit integer.
-    /// (Nova's `int` is 32-bit; 64-bit is `long` via [`TypeStore.longT`].)
+    /// Interns and returns Kyte's default `int`: a SIGNED 32-bit integer.
+    /// (Kyte's `int` is 32-bit; 64-bit is `long` via [`TypeStore.longT`].)
     pub fn intT(self: *TypeStore) !TypeId {
         return self.intern(.{ .prim = .{ .kind = .int, .bits = 32, .signed = true } });
     }
@@ -474,7 +474,7 @@ pub const TypeStore = struct {
     pub fn uintT(self: *TypeStore) !TypeId {
         return self.intern(.{ .prim = .{ .kind = .int, .bits = 32, .signed = false } });
     }
-    /// Interns and returns Nova's `long`: a signed 64-bit integer. Heap addresses
+    /// Interns and returns Kyte's `long`: a signed 64-bit integer. Heap addresses
     /// must use this width, not `int`, to avoid 32-bit truncation.
     pub fn longT(self: *TypeStore) !TypeId {
         return self.intern(.{ .prim = .{ .kind = .int, .bits = 64, .signed = true } });

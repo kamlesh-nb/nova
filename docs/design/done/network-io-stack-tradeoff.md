@@ -12,14 +12,14 @@ pluggable backend behind an executor-agnostic seam — not a from-scratch 3-plat
 `io_context`, `tcp::{socket,acceptor,resolver,endpoint}`, `steady_timer`, `strand`/`make_strand`/
 `bind_executor`, `async_{read,write,connect}`, `thread_pool`, `post`, `buffer`.
 
-Crucially, **everything above the reactor is already Nova-owned**:
+Crucially, **everything above the reactor is already Kyte-owned**:
 
 - **Coroutines** are LLVM-generated; `raw_coro_resume(h)` resumes them by reading the frame's
   resume/destroy pointers directly (the switched-resume ABI). Asio is NOT the coroutine engine — it only
   `post`s resume handlers onto the loop.
-- **Composition** — `spawn`/`await`/`when_all`/`select`/whole-query-deadline — is Nova's own waiter
+- **Composition** — `spawn`/`await`/`when_all`/`select`/whole-query-deadline — is Kyte's own waiter
   registry, not Asio's `awaitable`/`co_spawn`.
-- **Scheduling** — `nova_sched_schedule` posts a coroutine's resume to **its per-coroutine strand**
+- **Scheduling** — `kyte_sched_schedule` posts a coroutine's resume to **its per-coroutine strand**
   (`CoroState.strand = make_strand(g_io)`).
 
 So Asio provides exactly three things: **(1) the reactor** (epoll/kqueue/IOCP abstraction), **(2) socket +
@@ -57,7 +57,7 @@ One `io_context` **per core**, each pinned to its own thread, **no shared state 
 — a connection lives entirely on one core's loop, so its socket is reused freely by any coroutine on that
 core. The pooling limit dissolves *structurally*, not by locking.
 
-- **Cost:** days. Restructure `nova_run` to N independent `io_context`s + per-core accept; drop the
+- **Cost:** days. Restructure `kyte_run` to N independent `io_context`s + per-core accept; drop the
   cross-coroutine strand posting; per-core connection pools (already per-thread lock-free — we built that
   for I1). TLS, timers, sockets, the coroutine seam — **all unchanged**.
 - **Risk:** low. Same battle-tested Asio reactor; the async/TLS/timeout gates (113/114/115) are the guardrail.
@@ -70,7 +70,7 @@ reactor underneath it is a swappable detail. Path A is the prerequisite for Path
 
 ---
 
-## 3. Path B — Nova-owned io_uring/kqueue/IOCP loop, leave Boost
+## 3. Path B — Kyte-owned io_uring/kqueue/IOCP loop, leave Boost
 
 ### 3.1 The genuine case FOR
 - **io_uring is materially faster than epoll** at high connection counts: batched submission (one syscall
@@ -82,7 +82,7 @@ reactor underneath it is a swappable detail. Path A is the prerequisite for Path
 - **Share-nothing is native** — one ring per core.
 - **btree disk I/O could ride io_uring too** — async file I/O for the storage engine, one model for net+disk.
 - Asio's executor/strand model is something we **fight** (it caused the pooling limit); owning the loop
-  lets the design match Nova's coroutine model instead of adapting to Asio's.
+  lets the design match Kyte's coroutine model instead of adapting to Asio's.
 
 ### 3.2 The genuine case AGAINST
 - **We reimplement the 10% that is the hardest 10%.** epoll/kqueue/IOCP edge cases, socket lifetime,
@@ -103,7 +103,7 @@ reactor underneath it is a swappable detail. Path A is the prerequisite for Path
 
 ### 3.3 What Path B is NOT about
 **Senders/Receivers (P2300 / stdexec) is irrelevant here.** It is a *composition* model (structured
-async, `then`/`when_all` as a type-level algebra). Nova already composes async **in-language** via LLVM
+async, `then`/`when_all` as a type-level algebra). Kyte already composes async **in-language** via LLVM
 coroutines + its own waiter registry; the C++ runtime is a thin event-loop + I/O + TLS glue. Adopting
 stdexec buys ~nothing and would mean *more* C++ surface, not less. "Asio is dated / the committee moved to
 S/R" is true but is a different problem than the one we have. Do not let it steer this decision.

@@ -1,0 +1,1198 @@
+
+pub fn sizeOf<T>(): int { return 8; }
+
+pub fn copyElem<T>(dst: long, src: long): void { }
+
+pub fn dropElem<T>(addr: long): void { }
+
+pub fn store<T>(slot: long, value: T): void { }
+
+pub fn storeOver<T>(slot: long, value: T): void { }
+
+pub fn load<T>(slot: long): T { return slot as T; }
+
+pub fn moveElem<T>(dst: long, src: long): void { }
+
+pub fn moveOut<T>(slot: long): T { return slot as T; }
+
+import bytes;
+import mem.witness;
+
+pub class RawBuffer<T> {
+    data: long,
+    cap: int,
+    len: int,
+
+    init(capElems: int) {
+        let c = if (capElems <= 0) 1 else capElems;
+        self.data = bytes.alloc(c * witness.sizeOf<T>());
+        self.cap = c;
+        self.len = 0;
+    }
+
+    pub fn capacity(self: RawBuffer<T>): int { return self.cap; }
+    pub fn count(self: RawBuffer<T>): int { return self.len; }
+    pub fn base(self: RawBuffer<T>): long { return self.data; }
+
+    pub fn fill(self: RawBuffer<T>, n: int): void { self.len = n; }
+
+    fn slot(self: RawBuffer<T>, i: int): long {
+        return self.data + (i as long) * (witness.sizeOf<T>() as long);
+    }
+
+    pub fn push(self: RawBuffer<T>, value: T): void {
+        if (self.len >= self.cap) {
+            let nc = if (self.cap < 1) 1 else self.cap * 2;
+            self.reserveExact(nc);
+        }
+        witness.store<T>(self.slot(self.len), value);
+        self.len = self.len + 1;
+    }
+
+    pub fn at(self: RawBuffer<T>, i: int): T {
+        return witness.load<T>(self.slot(i));
+    }
+
+    pub fn set(self: RawBuffer<T>, i: int, value: T): void {
+        witness.storeOver<T>(self.slot(i), value);
+    }
+
+    pub fn pop(self: RawBuffer<T>): T | undefined {
+        if (self.len == 0) { return undefined; }
+        self.len = self.len - 1;
+        return witness.moveOut<T>(self.slot(self.len));
+    }
+
+    pub fn insertAt(self: RawBuffer<T>, i: int, value: T): void {
+        if (i < 0 || i > self.len) { return; }
+        if (self.len >= self.cap) {
+            let nc = if (self.cap < 1) 1 else self.cap * 2;
+            self.reserveExact(nc);
+        }
+        let j = self.len;
+        while (j > i) {
+            witness.moveElem<T>(self.slot(j), self.slot(j - 1));
+            j = j - 1;
+        }
+        witness.store<T>(self.slot(i), value);
+        self.len = self.len + 1;
+    }
+
+    pub fn removeAt(self: RawBuffer<T>, i: int): void {
+        if (i < 0 || i >= self.len) { return; }
+        witness.dropElem<T>(self.slot(i));
+        let j = i;
+        while (j < self.len - 1) {
+            witness.moveElem<T>(self.slot(j), self.slot(j + 1));
+            j = j + 1;
+        }
+        self.len = self.len - 1;
+    }
+
+    pub fn clear(self: RawBuffer<T>): void {
+        let i = 0;
+        while (i < self.len) {
+            witness.dropElem<T>(self.slot(i));
+            i = i + 1;
+        }
+        self.len = 0;
+    }
+
+    fn reserveExact(self: RawBuffer<T>, nc: int): void {
+        if (nc <= self.cap) { return; }
+        let w = witness.sizeOf<T>() as long;
+        let nd = bytes.alloc(nc * witness.sizeOf<T>());
+        if (self.len > 0) {
+            bytes.copy(nd, self.data, (self.len as long) * w);
+        }
+        bytes.free(self.data);
+        self.data = nd;
+        self.cap = nc;
+    }
+
+    pub fn delete(self: RawBuffer<T>): void {
+        let i = 0;
+        while (i < self.len) {
+            witness.dropElem<T>(self.slot(i));
+            i = i + 1;
+        }
+        if (self.data != 0) {
+            bytes.free(self.data);
+            self.data = 0;
+            self.len = 0;
+        }
+    }
+}
+
+import mem.rawbuffer;
+
+pub class List<T> {
+    pub data: rawbuffer.RawBuffer<T>,
+    pub len: int,
+    pub cap: int,
+
+    init() { self.data = rawbuffer.RawBuffer<T>(4); self.len = 0; self.cap = 4; }
+
+    pub fn push(self: List<T>, value: T): void { self.data.push(value); self.len = self.data.count(); self.cap = self.data.capacity(); }
+    pub fn get(self: List<T>, index: int): T | undefined { if (index < 0 || index >= self.data.count()) { return undefined; } return self.data.at(index); }
+    pub fn at(self: List<T>, index: int): T { if (index < 0 || index >= self.data.count()) { nova_panic("List.at: index out of bounds"); } return self.data.at(index); }
+    pub fn set(self: List<T>, index: int, value: T): void { if (index < 0 || index >= self.data.count()) { return; } self.data.set(index, value); }
+    pub fn insert(self: List<T>, index: int, value: T): void { self.data.insertAt(index, value); self.len = self.data.count(); self.cap = self.data.capacity(); }
+    pub fn remove(self: List<T>, index: int): void { self.data.removeAt(index); self.len = self.data.count(); self.cap = self.data.capacity(); }
+    pub fn size(self: List<T>): int { return self.data.count(); }
+    pub fn forEach(self: List<T>, fn: (T) => void): void { let i = 0; while (i < self.data.count()) { let val = self.data.at(i); fn(val); i = i + 1; } }
+    pub fn map<U>(self: List<T>, fn: (T) => U): List<U> { let result = List<U>(); let i = 0; while (i < self.data.count()) { let val = self.data.at(i); let mapped = fn(val); result.push(mapped); i = i + 1; } return result; }
+    pub fn filter(self: List<T>, pred: (T) => bool): List<T> { let result = List<T>(); let i = 0; while (i < self.data.count()) { let val = self.data.at(i); if (pred(val)) { result.push(val); } i = i + 1; } return result; }
+    pub fn reduce<U>(self: List<T>, acc: U, fn: (U, T) => U): U { let result = acc; let i = 0; while (i < self.data.count()) { let val = self.data.at(i); result = fn(result, val); i = i + 1; } return result; }
+    pub fn reverse(self: List<T>): void { let i = 0; let j = self.data.count() - 1; while (i < j) { let tmp = self.data.at(i); self.data.set(i, self.data.at(j)); self.data.set(j, tmp); i = i + 1; j = j - 1; } }
+    pub fn clear(self: List<T>): void { self.data.clear(); self.len = 0; }
+    pub fn first(self: List<T>): T | undefined { if (self.data.count() == 0) { return undefined; } return self.data.at(0); }
+    pub fn last(self: List<T>): T | undefined { if (self.data.count() == 0) { return undefined; } return self.data.at(self.data.count() - 1); }
+    pub fn pop(self: List<T>): T | undefined { let v = self.data.pop(); self.len = self.data.count(); self.cap = self.data.capacity(); return v; }
+    pub fn findIndex(self: List<T>, pred: (T) => bool): int { let i = 0; while (i < self.data.count()) { if (pred(self.data.at(i))) { return i; } i = i + 1; } return -1; }
+    pub fn any(self: List<T>, pred: (T) => bool): bool { return self.findIndex(pred) != -1; }
+    pub fn all(self: List<T>, pred: (T) => bool): bool { let i = 0; while (i < self.data.count()) { if (!pred(self.data.at(i))) { return false; } i = i + 1; } return true; }
+    pub fn indexOf(self: List<T>, value: T): int { let i = 0; while (i < self.data.count()) { if (self.data.at(i) == value) { return i; } i = i + 1; } return -1; }
+    pub fn contains(self: List<T>, value: T): bool { return self.indexOf(value) != -1; }
+
+    pub fn slice(self: List<T>, start: int, end: int): List<T> {
+        let n = self.data.count();
+        let s = if (start < 0) 0 else if (start > n) n else start;
+        let e = if (end < 0) 0 else if (end > n) n else end;
+        let out = List<T>();
+        let i = s;
+        while (i < e) { out.push(self.data.at(i)); i = i + 1; }
+        return out;
+    }
+
+    pub fn concat(self: List<T>, other: List<T>): List<T> {
+        let out = List<T>();
+        let i = 0;
+        while (i < self.data.count()) { out.push(self.data.at(i)); i = i + 1; }
+        let j = 0;
+        while (j < other.size()) { out.push(other.at(j)); j = j + 1; }
+        return out;
+    }
+
+    pub fn sort(self: List<T>, cmp: (T, T) => int): void {
+        let n = self.data.count();
+        let i = 1;
+        while (i < n) {
+            let key = self.data.at(i);
+            let j = i - 1;
+            while (j >= 0 && cmp(self.data.at(j), key) > 0) {
+                self.data.set(j + 1, self.data.at(j));
+                j = j - 1;
+            }
+            self.data.set(j + 1, key);
+            i = i + 1;
+        }
+    }
+
+    pub fn take(self: List<T>, n: int): List<T> {
+        let out = List<T>();
+        let count = self.data.count();
+        let lim = n; if (lim < 0) { lim = 0; } if (lim > count) { lim = count; }
+        let i = 0;
+        while (i < lim) { out.push(self.data.at(i)); i = i + 1; }
+        return out;
+    }
+
+    pub fn drop(self: List<T>, n: int): List<T> {
+        let out = List<T>();
+        let count = self.data.count();
+        let start = n; if (start < 0) { start = 0; } if (start > count) { start = count; }
+        let i = start;
+        while (i < count) { out.push(self.data.at(i)); i = i + 1; }
+        return out;
+    }
+
+    pub fn count(self: List<T>, pred: (T) => bool): int {
+        let c = 0;
+        let i = 0;
+        while (i < self.data.count()) { if (pred(self.data.at(i))) { c = c + 1; } i = i + 1; }
+        return c;
+    }
+
+    pub fn flatMap<U>(self: List<T>, fn: (T) => List<U>): List<U> {
+        let out = List<U>();
+        let i = 0;
+        while (i < self.data.count()) {
+            let sub = fn(self.data.at(i));
+            let j = 0;
+            while (j < sub.size()) { out.push(sub.at(j)); j = j + 1; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    pub fn chunk(self: List<T>, size: int): List<List<T>> {
+        let out = List<List<T>>();
+        if (size <= 0) { return out; }
+        let count = self.data.count();
+        let i = 0;
+        while (i < count) {
+            let piece = List<T>();
+            let j = 0;
+            while (j < size && (i + j) < count) { piece.push(self.data.at(i + j)); j = j + 1; }
+            out.push(piece);
+            i = i + size;
+        }
+        return out;
+    }
+
+    pub fn zip<U>(self: List<T>, other: List<U>): List<(T, U)> {
+        let out = List<(T, U)>();
+        let n = self.data.count();
+        let m = other.size();
+        let lim = n; if (m < lim) { lim = m; }
+        let i = 0;
+        while (i < lim) { out.push((self.data.at(i), other.at(i))); i = i + 1; }
+        return out;
+    }
+
+    pub fn sortBy(self: List<T>, key: (T) => int): void {
+        let n = self.data.count();
+        let i = 1;
+        while (i < n) {
+            let cur = self.data.at(i);
+            let ck = key(cur);
+            let j = i - 1;
+            while (j >= 0 && key(self.data.at(j)) > ck) {
+                self.data.set(j + 1, self.data.at(j));
+                j = j - 1;
+            }
+            self.data.set(j + 1, cur);
+            i = i + 1;
+        }
+    }
+}
+
+@test
+fn test_list(): void {
+    let list = List<int>();
+    if (list.size() != 0) { nova_test_fail("list.size != 0"); }
+    list.push(10); list.push(20); list.push(30);
+    if (list.size() != 3) { nova_test_fail("list.size != 3"); }
+    if (list.get(0) != 10) { nova_test_fail("list[0] != 10"); }
+}
+
+
+import list;
+import bytes;
+
+pub fn len(s: string): int {
+    return s.length;
+}
+
+fn allocString(len: int): string {
+
+    return bytes.alloc(len) as string;
+}
+
+pub fn concat(a: string, b: string): string {
+    let len_a = a.length;
+    let len_b = b.length;
+    let total_len = len_a + len_b;
+    if (total_len == 0) { return ""; }
+    let ptr = allocString(total_len);
+    if (len_a > 0) { bytes.copy(ptr as long, a as long, len_a); }
+    if (len_b > 0) { bytes.copy((ptr as long) + (len_a as long), b as long, len_b); }
+    return ptr;
+}
+
+pub fn split(s: string, sep: string): List<string> {
+    let result = List<string>();
+    let s_len = s.length;
+    let sep_len = sep.length;
+
+    if (sep_len == 0) {
+
+        let i = 0;
+        while (i < s_len) {
+            let char_len = 1;
+            let char_ptr = allocString(1);
+            bytes.write_byte(char_ptr, 0, s[i]);
+            result.push(char_ptr);
+            i = i + 1;
+        }
+        return result;
+    }
+
+    let start = 0;
+    while (true) {
+        let pos = indexOfFrom(s, sep, start);
+        if (pos == -1) {
+
+            let remaining = slice(s, start, s_len);
+            result.push(remaining);
+            break;
+        }
+
+        let part = slice(s, start, pos);
+        result.push(part);
+        start = pos + sep_len;
+    }
+    return result;
+}
+
+pub fn join(list: List<string>, sep: string): string {
+    if (list.size() == 0) {
+        return "";
+    }
+    let sep_len = sep.length;
+    let list_len = list.size();
+
+    let total_len = 0;
+    let idx = 0;
+    while (idx < list_len) {
+        let s = list.get(idx);
+
+        if (s != undefined) {
+            total_len = total_len + s.length;
+        }
+        idx = idx + 1;
+    }
+    total_len = total_len + sep_len * (list_len - 1);
+
+    let ptr = allocString(total_len);
+    let offset = 0;
+    let i = 0;
+    while (i < list_len) {
+        let s = list.get(i);
+        if (s != undefined) {
+            let len_s = s.length;
+            let j = 0;
+            while (j < len_s) {
+                bytes.write_byte(ptr, offset + j, s[j]);
+                j = j + 1;
+            }
+            offset = offset + len_s;
+        }
+        if (i < list_len - 1) {
+            let k = 0;
+            while (k < sep_len) {
+                bytes.write_byte(ptr, offset + k, sep[k]);
+                k = k + 1;
+            }
+            offset = offset + sep_len;
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+pub fn slice(s: string, start: int, end: int): string {
+    let s_len = s.length;
+    let start_clamped = if (start < 0) 0 else if (start > s_len) s_len else start;
+    let end_clamped = if (end < start_clamped) start_clamped else if (end > s_len) s_len else end;
+    let len = end_clamped - start_clamped;
+    if (len <= 0) {
+        return "";
+    }
+    let ptr = allocString(len);
+    bytes.copy(ptr as long, (s as long) + (start_clamped as long), len);
+    return ptr;
+}
+
+pub fn trim(s: string): string {
+    let len = s.length;
+    let start = 0;
+    while (start < len) {
+        let c = s[start];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            break;
+        }
+        start = start + 1;
+    }
+    let end = len;
+    while (end > start) {
+        let c = s[end - 1];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            break;
+        }
+        end = end - 1;
+    }
+    return slice(s, start, end);
+}
+
+pub fn trimStart(s: string): string {
+    let len = s.length;
+    let start = 0;
+    while (start < len) {
+        let c = s[start];
+        if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+        start = start + 1;
+    }
+    return slice(s, start, len);
+}
+
+pub fn trimEnd(s: string): string {
+    let len = s.length;
+    let end = len;
+    while (end > 0) {
+        let c = s[end - 1];
+        if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+        end = end - 1;
+    }
+    return slice(s, 0, end);
+}
+
+pub fn substring(s: string, start: int, end: int): string {
+    return slice(s, start, end);
+}
+
+pub fn charAt(s: string, i: int): string {
+    if (i < 0 || i >= s.length) { return ""; }
+    return slice(s, i, i + 1);
+}
+
+pub fn repeat(s: string, n: int): string {
+    let out = "";
+    let i = 0;
+    while (i < n) { out = concat(out, s); i = i + 1; }
+    return out;
+}
+
+pub fn padStart(s: string, targetLen: int, pad: string): string {
+    if (pad.length == 0) { return s; }
+    let deficit = targetLen - s.length;
+    if (deficit <= 0) { return s; }
+    let prefix = "";
+    while (prefix.length < deficit) { prefix = concat(prefix, pad); }
+    return concat(slice(prefix, 0, deficit), s);
+}
+
+pub fn padEnd(s: string, targetLen: int, pad: string): string {
+    if (pad.length == 0) { return s; }
+    let deficit = targetLen - s.length;
+    if (deficit <= 0) { return s; }
+    let suffix = "";
+    while (suffix.length < deficit) { suffix = concat(suffix, pad); }
+    return concat(s, slice(suffix, 0, deficit));
+}
+
+pub fn replace(s: string, old: string, new: string): string {
+    let s_len = s.length;
+    let old_len = old.length;
+    let new_len = new.length;
+
+    if (old_len == 0) {
+
+        let result = bytes.alloc(s_len * (new_len + 1) + new_len);
+        let offset = 0;
+        let i = 0;
+        while (i < s_len) {
+
+            let k = 0;
+            while (k < new_len) {
+                bytes.write_byte(result, offset + k, new[k]);
+                k = k + 1;
+            }
+            offset = offset + new_len;
+            bytes.write_byte(result, offset, s[i]);
+            offset = offset + 1;
+            i = i + 1;
+        }
+
+        let k = 0;
+        while (k < new_len) {
+            bytes.write_byte(result, offset + k, new[k]);
+            k = k + 1;
+        }
+        offset = offset + new_len;
+
+        return slice(result, 0, offset);
+    }
+
+    let count = 0;
+    let pos = 0;
+    while (true) {
+        let idx = indexOfFrom(s, old, pos);
+        if (idx == -1) break;
+        count = count + 1;
+        pos = idx + old_len;
+    }
+
+    if (count == 0) {
+        return s;
+    }
+
+    let result_len = s_len + count * (new_len - old_len);
+    let result = allocString(result_len);
+    let offset = 0;
+    let search_start = 0;
+
+    while (true) {
+        let idx = indexOfFrom(s, old, search_start);
+        if (idx == -1) {
+
+            let remaining_len = s_len - search_start;
+            let k = 0;
+            while (k < remaining_len) {
+                bytes.write_byte(result, offset + k, s[search_start + k]);
+                k = k + 1;
+            }
+            break;
+        }
+
+        let before_len = idx - search_start;
+        let k = 0;
+        while (k < before_len) {
+            bytes.write_byte(result, offset + k, s[search_start + k]);
+            k = k + 1;
+        }
+        offset = offset + before_len;
+
+        let k = 0;
+        while (k < new_len) {
+            bytes.write_byte(result, offset + k, new[k]);
+            k = k + 1;
+        }
+        offset = offset + new_len;
+        search_start = idx + old_len;
+    }
+
+    return result;
+}
+
+pub fn toLowerCase(s: string): string {
+    let len = s.length;
+    let ptr = allocString(len);
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c >= 65 && c <= 90) {
+            bytes.write_byte(ptr, i, c + 32);
+        } else {
+            bytes.write_byte(ptr, i, c);
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+pub fn toUpperCase(s: string): string {
+    let len = s.length;
+    let ptr = allocString(len);
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c >= 97 && c <= 122) {
+            bytes.write_byte(ptr, i, c - 32);
+        } else {
+            bytes.write_byte(ptr, i, c);
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+pub fn startsWith(s: string, prefix: string): bool {
+    let s_len = s.length;
+    let p_len = prefix.length;
+    if (s_len < p_len) {
+        return false;
+    }
+    let i = 0;
+    while (i < p_len) {
+        if (s[i] != prefix[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn endsWith(s: string, suffix: string): bool {
+    let s_len = s.length;
+    let suf_len = suffix.length;
+    if (s_len < suf_len) {
+        return false;
+    }
+    let i = 0;
+    while (i < suf_len) {
+        if (s[s_len - suf_len + i] != suffix[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn contains(s: string, substr: string): bool {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len) {
+        return false;
+    }
+    if (sub_len == 0) {
+        return true;
+    }
+    let i = 0;
+    while (i <= s_len - sub_len) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) {
+                is_match = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if (is_match) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+pub fn indexOf(s: string, substr: string): int {
+    return indexOfFrom(s, substr, 0);
+}
+
+pub fn lastIndexOf(s: string, substr: string): int {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len) { return -1; }
+    if (sub_len == 0) { return s_len; }
+    let i = s_len - sub_len;
+    while (i >= 0) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) { is_match = false; break; }
+            j = j + 1;
+        }
+        if (is_match) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+fn indexOfFrom(s: string, substr: string, start: int): int {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len || start >= s_len) {
+        return -1;
+    }
+    if (sub_len == 0) {
+        return start;
+    }
+    let i = start;
+    while (i <= s_len - sub_len) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) {
+                is_match = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if (is_match) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub fn eql(a: string, b: string): bool {
+    if (a == undefined || b == undefined) {
+        return a == undefined && b == undefined;
+    }
+    let len_a = a.length;
+    let len_b = b.length;
+    if (len_a != len_b) {
+        return false;
+    }
+    let i = 0;
+    while (i < len_a) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+pub fn compare(a: string, b: string): int {
+    let len_a = a.length;
+    let len_b = b.length;
+    let min_len = len_a;
+    if (len_b < len_a) {
+        min_len = len_b;
+    }
+    let i = 0;
+    while (i < min_len) {
+        let char_a = a[i];
+        let char_b = b[i];
+        if (char_a < char_b) {
+            return -1;
+        }
+        if (char_a > char_b) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if (len_a < len_b) {
+        return -1;
+    }
+    if (len_a > len_b) {
+        return 1;
+    }
+    return 0;
+}
+
+pub fn hash(s: string): int {
+    let len = s.length;
+    let h = 5381;
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        h = ((h << 5) + h) + c;
+        i = i + 1;
+    }
+    return h;
+}
+
+pub fn parseI64(s: string): long {
+
+    let len = s.length;
+    if (len == 0) {
+        return 0;
+    }
+    let LONG_MIN: long = -9223372036854775807 - 1;
+    let LONG_MAX: long = 9223372036854775807;
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) {
+        neg = true;
+        i = 1;
+    } else if (s[0] == 43) {
+        i = 1;
+    }
+
+    let limit: long = 0 - LONG_MAX;
+    if (neg) {
+        limit = LONG_MIN;
+    }
+    let multmin: long = limit / 10;
+
+    let acc: long = 0;
+    let any = false;
+    while (i < len) {
+        let c = s[i];
+        if (c < 48 || c > 57) {
+            i = len;
+        } else {
+            let d: long = (c - 48) as long;
+            if (acc < multmin) {
+                if (neg) { return LONG_MIN; }
+                return LONG_MAX;
+            }
+            acc = acc * 10;
+            if (acc < limit + d) {
+                if (neg) { return LONG_MIN; }
+                return LONG_MAX;
+            }
+            acc = acc - d;
+            any = true;
+            i = i + 1;
+        }
+    }
+
+    if (!any) {
+        return 0;
+    }
+    if (neg) {
+        return acc;
+    }
+    return 0 - acc;
+}
+
+pub fn parseFloat(s: string): double {
+    let parsed = parseDouble(s);
+    if (parsed != undefined) { return parsed; }
+    let len = s.length;
+    let i = 0;
+    let neg = false;
+    if (len > 0 && s[0] == 45) {
+        neg = true;
+        i = 1;
+    }
+    let intPart = 0.0;
+    while (i < len && s[i] != 46) {
+        if (s[i] >= 48 && s[i] <= 57) {
+            intPart = intPart * 10.0 + ((s[i] - 48) as double);
+        }
+        i = i + 1;
+    }
+    let frac = 0.0;
+    let scale = 1.0;
+    if (i < len && s[i] == 46) {
+        i = i + 1;
+        while (i < len) {
+            if (s[i] >= 48 && s[i] <= 57) {
+                scale = scale / 10.0;
+                frac = frac + ((s[i] - 48) as double) * scale;
+            }
+            i = i + 1;
+        }
+    }
+    let result = intPart + frac;
+    if (neg) {
+        result = 0.0 - result;
+    }
+    return result;
+}
+
+
+pub fn parseLong(s: string): long | undefined {
+    let len = s.length;
+    if (len == 0) { return undefined; }
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) {
+        neg = true;
+        i = 1;
+    } else if (s[0] == 43) {
+        i = 1;
+    }
+    if (i >= len) { return undefined; }
+
+    let LONG_MIN: long = -9223372036854775807 - 1;
+    let LONG_MAX: long = 9223372036854775807;
+    let limit: long = 0 - LONG_MAX;
+    if (neg) { limit = LONG_MIN; }
+    let multmin: long = limit / 10;
+
+    let acc: long = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c < 48 || c > 57) { return undefined; }
+        let d: long = (c - 48) as long;
+        if (acc < multmin) { return undefined; }
+        acc = acc * 10;
+        if (acc < limit + d) { return undefined; }
+        acc = acc - d;
+        i = i + 1;
+    }
+    if (neg) { return acc; }
+    return 0 - acc;
+}
+
+pub fn parseInt(s: string): int | undefined {
+    let v = parseLong(s);
+    if (v == undefined) { return undefined; }
+    let INT_MIN: long = -2147483648;
+    let INT_MAX: long = 2147483647;
+    if (v < INT_MIN || v > INT_MAX) { return undefined; }
+    return v as int;
+}
+
+pub fn parseDouble(s: string): double | undefined {
+    let len = s.length;
+    if (len == 0) { return undefined; }
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) {
+        neg = true;
+        i = 1;
+    } else if (s[0] == 43) {
+        i = 1;
+    }
+
+    let sawDigit = false;
+    let intPart = 0.0;
+    while (i < len && s[i] >= 48 && s[i] <= 57) {
+        intPart = intPart * 10.0 + ((s[i] - 48) as double);
+        sawDigit = true;
+        i = i + 1;
+    }
+
+    let frac = 0.0;
+    let scale = 1.0;
+    if (i < len && s[i] == 46) {
+        i = i + 1;
+        while (i < len && s[i] >= 48 && s[i] <= 57) {
+            scale = scale / 10.0;
+            frac = frac + ((s[i] - 48) as double) * scale;
+            sawDigit = true;
+            i = i + 1;
+        }
+    }
+    if (!sawDigit) { return undefined; }
+    let mant = intPart + frac;
+
+    if (i < len && (s[i] == 101 || s[i] == 69)) {
+        i = i + 1;
+        let expNeg = false;
+        if (i < len && s[i] == 45) { expNeg = true; i = i + 1; }
+        else if (i < len && s[i] == 43) { i = i + 1; }
+        let sawExpDigit = false;
+        let exp = 0;
+        while (i < len && s[i] >= 48 && s[i] <= 57) {
+            exp = exp * 10 + (s[i] - 48);
+            sawExpDigit = true;
+            i = i + 1;
+        }
+        if (!sawExpDigit) { return undefined; }
+        let p = 0;
+        let factor = 1.0;
+        while (p < exp) { factor = factor * 10.0; p = p + 1; }
+        if (expNeg) { mant = mant / factor; } else { mant = mant * factor; }
+    }
+
+    if (i != len) { return undefined; }
+    if (neg) { mant = 0.0 - mant; }
+    return mant;
+}
+
+pub fn delete(self: string): void {
+}
+
+@test
+fn test_string_helpers(): void {
+    if (!startsWith("hello", "he")) { nova_test_fail("startsWith fail"); }
+    if (startsWith("hello", "lo")) { nova_test_fail("startsWith negative fail"); }
+    if (!endsWith("hello", "lo")) { nova_test_fail("endsWith fail"); }
+    if (endsWith("hello", "he")) { nova_test_fail("endsWith negative fail"); }
+    if (!contains("hello", "el")) { nova_test_fail("contains fail"); }
+    if (contains("hello", "world")) { nova_test_fail("contains negative fail"); }
+
+    if (indexOf("hello", "e") != 1) { nova_test_fail("indexOf fail"); }
+    if (indexOf("hello", "z") != -1) { nova_test_fail("indexOf negative fail"); }
+
+    if (!eql("abc", "abc")) { nova_test_fail("eql fail"); }
+    if (eql("abc", "def")) { nova_test_fail("eql negative fail"); }
+
+    if (compare("abc", "def") != -1) { nova_test_fail("compare < fail"); }
+    if (compare("def", "abc") != 1) { nova_test_fail("compare > fail"); }
+    if (compare("abc", "abc") != 0) { nova_test_fail("compare == fail"); }
+
+    if (parseI64("1234") != 1234) { nova_test_fail("parseI64 positive fail"); }
+    if (parseI64("-56") != -56) { nova_test_fail("parseI64 negative fail"); }
+
+    if ((parseLong("1234") ?? -1) != 1234) { nova_test_fail("parseLong ok fail"); }
+    if ((parseLong("-56") ?? 1) != -56) { nova_test_fail("parseLong neg fail"); }
+    if (parseLong("") != undefined) { nova_test_fail("parseLong empty should be undefined"); }
+    if (parseLong("12x") != undefined) { nova_test_fail("parseLong trailing garbage should be undefined"); }
+    if (parseLong("+") != undefined) { nova_test_fail("parseLong lone sign should be undefined"); }
+    if (parseLong("99999999999999999999") != undefined) { nova_test_fail("parseLong overflow should be undefined"); }
+
+    if ((parseInt("42") ?? -1) != 42) { nova_test_fail("parseInt ok fail"); }
+    if (parseInt("3000000000") != undefined) { nova_test_fail("parseInt out-of-i32-range should be undefined"); }
+    if (parseInt("abc") != undefined) { nova_test_fail("parseInt non-numeric should be undefined"); }
+
+    let d1 = (parseDouble("1e3") ?? 0.0) - 1000.0;
+    if (d1 > 0.0001 || d1 < -0.0001) { nova_test_fail("parseDouble exponent fail"); }
+    let d2 = (parseDouble("2.5") ?? 0.0) - 2.5;
+    if (d2 > 0.0001 || d2 < -0.0001) { nova_test_fail("parseDouble frac fail"); }
+    let d3 = (parseDouble("-1.5e2") ?? 0.0) + 150.0;
+    if (d3 > 0.0001 || d3 < -0.0001) { nova_test_fail("parseDouble neg exp fail"); }
+    if (parseDouble("") != undefined) { nova_test_fail("parseDouble empty should be undefined"); }
+    if (parseDouble("1.2.3") != undefined) { nova_test_fail("parseDouble double-dot should be undefined"); }
+    if (parseDouble("1e") != undefined) { nova_test_fail("parseDouble dangling exp should be undefined"); }
+    if (parseDouble("5x") != undefined) { nova_test_fail("parseDouble trailing garbage should be undefined"); }
+}
+
+
+import string;
+import bytes;
+
+pub fn fail(msg: string): void {
+    nova_test_fail(msg);
+}
+
+pub fn isTrue(val: bool): void {
+    if (!val) {
+        nova_test_fail("Expected true, got false");
+    }
+}
+
+pub fn isFalse(val: bool): void {
+    if (val) {
+        nova_test_fail("Expected false, got true");
+    }
+}
+
+pub fn equalInt(actual: int, expected: int): void {
+    if (actual != expected) {
+        let msg = "Expected " + expected + ", got " + actual;
+        nova_test_fail(msg);
+    }
+}
+
+pub fn notEqualInt(actual: int, expected: int): void {
+    if (actual == expected) {
+        let msg = "Expected values to differ, both were " + actual;
+        nova_test_fail(msg);
+    }
+}
+
+pub fn equalStr(actual: string, expected: string): void {
+    if (!string.eql(actual, expected)) {
+        let msg = "Expected \"" + expected + "\", got \"" + actual + "\"";
+        nova_test_fail(msg);
+    }
+}
+
+pub fn notEqualStr(actual: string, expected: string): void {
+    if (string.eql(actual, expected)) {
+        let msg = "Expected strings to differ, both were \"" + actual + "\"";
+        nova_test_fail(msg);
+    }
+}
+
+pub fn contains(haystack: string, needle: string): void {
+    if (string.indexOf(haystack, needle) == -1) {
+        let msg = "Expected \"" + haystack + "\" to contain \"" + needle + "\"";
+        nova_test_fail(msg);
+    }
+}
+
+pub fn notZero(val: int): void {
+    if (val == 0) {
+        nova_test_fail("Expected non-zero value, got 0");
+    }
+}
+
+pub fn zero(val: int): void {
+    if (val != 0) {
+        let msg = "Expected 0, got " + val;
+        nova_test_fail(msg);
+    }
+}
+
+pub fn gt(a: int, b: int): void {
+    if (a <= b) {
+        let msg = "Expected " + a + " > " + b;
+        nova_test_fail(msg);
+    }
+}
+
+pub fn gte(a: int, b: int): void {
+    if (a < b) {
+        let msg = "Expected " + a + " >= " + b;
+        nova_test_fail(msg);
+    }
+}
+
+pub fn lt(a: int, b: int): void {
+    if (a >= b) {
+        let msg = "Expected " + a + " < " + b;
+        nova_test_fail(msg);
+    }
+}
+
+pub fn lte(a: int, b: int): void {
+    if (a > b) {
+        let msg = "Expected " + a + " <= " + b;
+        nova_test_fail(msg);
+    }
+}
+
+@test
+fn test_assert_mechanics(): void {
+    isTrue(true);
+    isFalse(false);
+    equalInt(42, 42);
+    notEqualInt(42, 43);
+    gt(10, 5);
+    gte(10, 10);
+    lt(5, 10);
+    lte(10, 10);
+}
+
+
+import bytes;
+import assert;
+
+pub class StringBuilder {
+    pub buf: ptr,
+    pub len: int,
+    pub cap: int,
+
+    init() {
+        self.cap = 16;
+        self.len = 0;
+        self.buf = bytes.alloc_persistent_nz(16);
+    }
+
+    pub fn append(self: StringBuilder, s: string): void {
+        let slen = s.length;
+        if (slen == 0) return;
+        self.ensureCapacity(self.len + slen);
+        bytes.copy((self.buf as long) + (self.len as long), s as long, slen);
+        self.len = self.len + slen;
+    }
+
+    pub fn appendChar(self: StringBuilder, c: int): void {
+        self.ensureCapacity(self.len + 1);
+        bytes.write_byte(self.buf, self.len, c);
+        self.len = self.len + 1;
+    }
+
+    pub fn appendRange(self: StringBuilder, s: string, start: int, end: int): void {
+        let n = end - start;
+        if (n <= 0) return;
+        self.ensureCapacity(self.len + n);
+        bytes.copy((self.buf as long) + (self.len as long), (s as long) + (start as long), n);
+        self.len = self.len + n;
+    }
+
+    pub fn appendBytes(self: StringBuilder, srcPtr: long, n: int): void {
+        if (n <= 0) return;
+        self.ensureCapacity(self.len + n);
+        bytes.copy((self.buf as long) + (self.len as long), srcPtr, n);
+        self.len = self.len + n;
+    }
+
+    pub fn toString(self: StringBuilder): string {
+        if (self.len == 0) return "";
+
+        let sptr = bytes.alloc_persistent_nz(self.len);
+        bytes.copy(sptr as long, self.buf as long, self.len);
+        return sptr as string;
+    }
+
+    pub fn ensureCapacity(self: StringBuilder, minCap: int): void {
+        if (minCap <= self.cap) return;
+        let newCap = self.cap * 2;
+        if (newCap < minCap) newCap = minCap;
+        let newBuf = bytes.alloc_persistent_nz(newCap);
+        bytes.copy(newBuf as long, self.buf as long, self.len);
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+        }
+        self.buf = newBuf;
+        self.cap = newCap;
+    }
+
+    pub fn delete(self: StringBuilder): void {
+        if (self.buf != 0) {
+            bytes.free(self.buf);
+            self.buf = 0;
+        }
+    }
+}
+
+@test
+fn test_string_builder(): void {
+    let sb = StringBuilder();
+    sb.append("hello");
+    sb.append(" ");
+    sb.append("world");
+    let res = sb.toString();
+    assert.isTrue(res == "hello world");
+}
+
+fn boxit(x: int): int | undefined { return x; }
+fn main(): void { let r = boxit(42) ?? 0; if (r != 42) { return; } }
+

@@ -149,4 +149,4 @@ Phase A ≈ 0.5d (tiny edit, heavy verification — it is the big exerciser). Ph
 Phase D ≈ 1d. Phase E ≈ 0.5d. Coverage-extension ≈ 0.5d. ~3–3.5d total; **Phase A alone** delivers the
 headline win (store-native struct builder actually runs for all locals) and is shippable on its own.
 
-See [[nova-f2-6-stage4-parked]] and docs/design/done/F2-6-typed-ir.md (increment 7, honest-scope note).
+See [[kyte-f2-6-stage4-parked]] and docs/design/done/F2-6-typed-ir.md (increment 7, honest-scope note).

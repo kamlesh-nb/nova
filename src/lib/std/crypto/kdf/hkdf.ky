@@ -1,0 +1,197 @@
+//! HKDF, the HMAC-based key derivation function of RFC 5869, plus the TLS 1.3
+//! HKDF-Expand-Label / Derive-Secret helpers of RFC 8446 section 7.1.
+//!
+//! HKDF turns one input keying material (IKM) that may not be uniformly random,
+//! for example a raw Diffie-Hellman shared secret, into any number of strong,
+//! independent output keys. It works in two stages, and this file exposes both
+//! separately so callers can follow the specification exactly:
+//!
+//!   1. EXTRACT ([`extract`]) concentrates the entropy of the IKM into a
+//!      fixed-length pseudo-random key (the PRK) by taking one HMAC over the IKM
+//!      keyed by an optional salt.
+//!   2. EXPAND ([`expand`]) stretches that PRK into as many output bytes as
+//!      asked for, feeding a caller-supplied `info` context so that the same PRK
+//!      can yield distinct keys for distinct purposes.
+//!
+//! Everything here is a thin, allocation-light shell over HMAC: the security
+//! rests entirely on the underlying `crypto.mac.hmac` primitive, and this module
+//! adds only the counter and buffer bookkeeping the RFC prescribes. All buffers
+//! are caller-owned raw pointers (`ptr`), and the scratch this module needs is
+//! allocated from `bytes` and freed before return, so no HKDF state outlives a
+//! call. Addresses are handled as `ptr`/`long` throughout because a heap address
+//! does not fit in Kyte's 32-bit `int`.
+//!
+//! The hash choice is passed as a small integer tag ([`SHA256`] / [`SHA384`])
+//! rather than a trait object, which keeps these functions leaf-level and lets
+//! the TLS 1.3 record and handshake code call straight in. The upper layers of
+//! the standard library use the [`expandLabel`] and [`deriveSecret`] helpers,
+//! which wrap [`expand`] with the exact `HkdfLabel` structure TLS 1.3 defines.
+
+import bytes;
+import crypto.mac.hmac;
+
+/// Hash tag selecting SHA-256 as the HMAC and HKDF hash: a 32-byte output.
+///
+/// Pass this as the `kind` argument to every function in this module. It is the
+/// default for TLS 1.3 cipher suites built on SHA-256.
+pub const SHA256: int = 0;
+/// Hash tag selecting SHA-384 as the HMAC and HKDF hash: a 48-byte output.
+///
+/// Pass this as the `kind` argument to every function in this module, for cipher
+/// suites such as TLS_AES_256_GCM_SHA384 whose key schedule uses SHA-384.
+pub const SHA384: int = 1;
+
+/// Output length in bytes of the hash selected by `kind`.
+///
+/// Returns 48 for [`SHA384`] and 32 for [`SHA256`] (the default for any other
+/// tag value). This is both the PRK length produced by [`extract`] and the block
+/// step size used by [`expand`], so callers sizing a PRK buffer should allocate
+/// exactly this many bytes.
+pub fn hashLen(kind: int): int {
+    return if (kind == SHA384) 48 else 32;
+}
+
+/// Computes one HMAC over `msg` keyed by `key`, dispatching on the hash tag.
+///
+/// This is the single primitive every other function in the file is built on:
+/// EXTRACT is one call of this, and each EXPAND block is one call of this. It
+/// routes to [`hmac.hmacSha384`] for [`SHA384`] and [`hmac.hmacSha256`] for any
+/// other tag. `out` must have room for [`hashLen`] bytes; the HMAC writes its
+/// full digest there.
+fn mac(kind: int, key: ptr, keyLen: int, msg: ptr, msgLen: int, out: ptr): void {
+    if (kind == SHA384) {
+        hmac.hmacSha384(key, keyLen, msg, msgLen, out);
+    } else {
+        hmac.hmacSha256(key, keyLen, msg, msgLen, out);
+    }
+}
+
+/// HKDF-Extract (RFC 5869 section 2.2): condenses `ikm` into a PRK using `salt`.
+///
+/// This is exactly `PRK = HMAC(salt, IKM)`: the salt is the HMAC key and the IKM
+/// is the message, which is the reverse of the intuitive reading, so watch the
+/// argument order. The salt need not be secret and may be all zeros or empty
+/// when no salt is available; a non-secret salt still improves the extraction.
+/// `prkOut` must have room for [`hashLen`] bytes, and the resulting PRK is what
+/// you then feed to [`expand`].
+pub fn extract(kind: int, salt: ptr, saltLen: int, ikm: ptr, ikmLen: int, prkOut: ptr): void {
+    mac(kind, salt, saltLen, ikm, ikmLen, prkOut);
+}
+
+/// HKDF-Expand (RFC 5869 section 2.3): stretches `prk` into `l` output bytes.
+///
+/// Produces `l` bytes into `out` by iterating the T-block recurrence:
+/// `T(1) = HMAC(PRK, info | 0x01)` and `T(n) = HMAC(PRK, T(n-1) | info | n)`,
+/// concatenating `T(1) | T(2) | ...` and truncating to `l`. Each block is one
+/// hash length ([`hashLen`]) wide, so it runs `ceil(l / hashLen)` HMAC calls.
+///
+/// The one-byte counter is why `l` cannot exceed `255 * hashLen`; this routine
+/// does not check that bound, so the caller must respect it (the counter would
+/// simply wrap past 255 otherwise). `info` is an optional context and label
+/// string that binds the output to a purpose; distinct `info` values give
+/// independent keys from the same PRK.
+///
+/// The subtlety worth noting is the feedback buffer `buf`: on the first
+/// iteration `tlen` is 0, so no previous T block is prepended and `buf` holds
+/// just `info | counter`; from the second iteration on it holds
+/// `T(n-1) | info | counter`. `t` carries `T(n-1)` between iterations while
+/// `tmp` receives the fresh HMAC, then `t` is overwritten from `tmp`. All three
+/// scratch buffers are freed before return, so `expand` allocates nothing that
+/// escapes.
+pub fn expand(kind: int, prk: ptr, prkLen: int, info: ptr, infoLen: int, out: ptr, l: int): void {
+    let hl = hashLen(kind);
+    // T(n-1), the previously emitted block, fed back into the next HMAC.
+    let t = bytes.alloc(hl);
+    // Number of valid bytes currently held in `t`; 0 before the first block.
+    let tlen = 0;
+    // Receives the HMAC output for the current block before it is copied out.
+    let tmp = bytes.alloc(hl);
+    // Message buffer for one HMAC: at most T(n-1) | info | one counter byte.
+    let buf = bytes.alloc(hl + infoLen + 1);
+    // Output bytes emitted so far; the loop stops once this reaches `l`.
+    let done = 0;
+    // RFC 5869 T-block index, the single trailing byte of each HMAC message.
+    let counter = 1;
+    while (done < l) {
+        let p = 0;
+        let i = 0;
+        while (i < tlen) { bytes.write_byte(buf, p, bytes.read_byte(t, i)); p = p + 1; i = i + 1; }
+        i = 0;
+        while (i < infoLen) { bytes.write_byte(buf, p, bytes.read_byte(info, i)); p = p + 1; i = i + 1; }
+        bytes.write_byte(buf, p, counter);
+        p = p + 1;
+        mac(kind, prk, prkLen, buf, p, tmp);
+        i = 0;
+        while (i < hl) { bytes.write_byte(t, i, bytes.read_byte(tmp, i)); i = i + 1; }
+        tlen = hl;
+        // Emit a full block, or only the remaining tail on the last iteration.
+        let n = if (l - done < hl) (l - done) else hl;
+        i = 0;
+        while (i < n) { bytes.write_byte(out, done + i, bytes.read_byte(tmp, i)); i = i + 1; }
+        done = done + n;
+        counter = counter + 1;
+    }
+    bytes.free(t);
+    bytes.free(tmp);
+    bytes.free(buf);
+}
+
+/// TLS 1.3 HKDF-Expand-Label (RFC 8446 section 7.1) over an HKDF PRK/secret.
+///
+/// Builds the `HkdfLabel` structure the TLS 1.3 key schedule mandates and then
+/// calls [`expand`] with it as the `info`. The structure serialised into `info`
+/// is, in order: the 2-byte output length `l` (big-endian), a 1-byte length
+/// prefix for the label, the label bytes themselves prefixed with the fixed
+/// ASCII string "tls13 " (that is bytes 116, 108, 115, 49, 51, 32), a 1-byte
+/// length prefix for the context, and the context bytes.
+///
+/// `fullLabelLen` is `6 + labelLen` because the six "tls13 " prefix bytes count
+/// towards the label length byte the wire format carries. `label` should
+/// therefore be the bare label such as "key" or "iv", without the prefix, which
+/// this function adds. `context` is usually a transcript hash and may be empty.
+/// `out` receives exactly `l` bytes. The `info` scratch buffer is freed before
+/// return.
+pub fn expandLabel(kind: int, secret: ptr, secretLen: int, label: ptr, labelLen: int,
+                   context: ptr, contextLen: int, out: ptr, l: int): void {
+    // Label length on the wire: the six "tls13 " prefix bytes plus the label.
+    let fullLabelLen = 6 + labelLen;
+    // HkdfLabel: 2-byte length, 1-byte label-len, label, 1-byte ctx-len, ctx.
+    let info = bytes.alloc(2 + 1 + fullLabelLen + 1 + contextLen);
+    let p = 0;
+    bytes.write_byte(info, p, (l >> 8) & 0xff);
+    p = p + 1;
+    bytes.write_byte(info, p, l & 0xff);
+    p = p + 1;
+    bytes.write_byte(info, p, fullLabelLen);
+    p = p + 1;
+    bytes.write_byte(info, p, 116); p = p + 1;
+    bytes.write_byte(info, p, 108); p = p + 1;
+    bytes.write_byte(info, p, 115); p = p + 1;
+    bytes.write_byte(info, p, 49); p = p + 1;
+    bytes.write_byte(info, p, 51); p = p + 1;
+    bytes.write_byte(info, p, 32); p = p + 1;
+    let i = 0;
+    while (i < labelLen) { bytes.write_byte(info, p, bytes.read_byte(label, i)); p = p + 1; i = i + 1; }
+    bytes.write_byte(info, p, contextLen);
+    p = p + 1;
+    i = 0;
+    while (i < contextLen) { bytes.write_byte(info, p, bytes.read_byte(context, i)); p = p + 1; i = i + 1; }
+
+    expand(kind, secret, secretLen, info, p, out, l);
+    bytes.free(info);
+}
+
+/// TLS 1.3 Derive-Secret (RFC 8446 section 7.1): the fixed-length special case.
+///
+/// A convenience over [`expandLabel`] for the very common case where the context
+/// is a transcript hash and the desired output length equals the hash length.
+/// It sets both the context length and the output length `l` to [`hashLen`], so
+/// `out` receives exactly one hash length of key material and `transcriptHash`
+/// is passed straight through as the context. Used to walk the TLS 1.3 key
+/// schedule between stages (for example deriving the handshake and master
+/// secrets from the early secret).
+pub fn deriveSecret(kind: int, secret: ptr, secretLen: int, label: ptr, labelLen: int,
+                    transcriptHash: ptr, out: ptr): void {
+    let hl = hashLen(kind);
+    expandLabel(kind, secret, secretLen, label, labelLen, transcriptHash, hl, out, hl);
+}

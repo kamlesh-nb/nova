@@ -1,0 +1,91 @@
+import assert;
+import bytes;
+import os.sys;
+import net.poller;
+import net.eventedio;
+
+const SO_REUSEADDR: int = 4;
+
+fn bump(cell: long): void {
+    bytes.write_i32(cell, 0, (bytes.read_i32(cell, 0) as int) + 1);
+}
+fn count(cell: long): int {
+    return bytes.read_i32(cell, 0) as int;
+}
+
+async fn serverConn(listenFd: int, kq: int, done: long): void {
+    let s = await eventedio.reactorAccept(listenFd, kq);
+    if (s.isOpen()) {
+        let buf = bytes.alloc(64);
+        let n = await s.recvInto(buf, 64);
+        if (n > 0) { await s.sendBuf(buf, n); }
+        bytes.free(buf);
+        s.close();
+    }
+    bump(done);
+}
+
+async fn clientConn(kq: int, port: int, done: long, result: long, gotLen: long): void {
+    let s = await eventedio.reactorConnect("127.0.0.1", port, kq);
+    if (s.isOpen()) {
+        let msg = bytes.alloc(4);
+        bytes.write_byte(msg, 0, 80); bytes.write_byte(msg, 1, 73);
+        bytes.write_byte(msg, 2, 78); bytes.write_byte(msg, 3, 71);
+        await s.sendBuf(msg, 4);
+        bytes.free(msg);
+        let n = await s.recvInto(result, 64);
+        bytes.write_i32(gotLen, 0, n as long);
+        s.close();
+    }
+    bump(done);
+}
+
+@test
+fn test_reactor_tcp_connect_accept(): void {
+    let lfd = sys.socket(sys.AF_INET, sys.SOCK_STREAM, 0);
+    assert.isTrue(lfd >= 0);
+    let one = bytes.alloc(4);
+    bytes.write_i32(one, 0, 1);
+    sys.setsockopt(lfd, sys.SOL_SOCKET, SO_REUSEADDR, one, 4);
+    bytes.free(one);
+
+    let sa = sys.makeSockaddrIn(0, eventedio.parseIPv4("127.0.0.1"));
+    let br = sys.bind(lfd, sa, 16);
+    bytes.free(sa);
+    assert.equalInt(br, 0);
+    sys.listen(lfd, 16);
+    sys.setNonBlocking(lfd);
+    let port = sys.boundPort(lfd);
+    assert.isTrue(port > 0);
+
+    let r = poller.Reactor(64, 4096, 16);
+    let done = bytes.alloc(4); bytes.write_i32(done, 0, 0);
+    let result = bytes.alloc(64);
+    let gotLen = bytes.alloc(4); bytes.write_i32(gotLen, 0, 0);
+
+    coroStart(serverConn(lfd, r.kq, done));
+    coroStart(clientConn(r.kq, port, done, result, gotLen));
+
+    let guard = 0;
+    while (count(done) < 2 && guard < 1000) {
+        let nev = r.pollComplete(500);
+        poller.batchBegin();
+        let i = 0;
+        while (i < nev) {
+            kyte_reactor_resume(r.completedToken(i));
+            i = i + 1;
+        }
+        guard = guard + 1;
+    }
+
+    assert.equalInt(count(done), 2);
+    assert.equalInt(bytes.read_i32(gotLen, 0) as int, 4);
+    assert.equalInt(bytes.read_byte(result, 0) as int, 80);
+    assert.equalInt(bytes.read_byte(result, 3) as int, 71);
+
+    bytes.free(done);
+    bytes.free(result);
+    bytes.free(gotLen);
+    r.destroy();
+    sys.close(lfd);
+}

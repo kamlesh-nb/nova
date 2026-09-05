@@ -1,6 +1,6 @@
-# Value-type optionals — boxing (Nova's `Nullable<T>`), the fix for V1
+# Value-type optionals — boxing (Kyte's `Nullable<T>`), the fix for V1
 
-**The bug (V1, `nova-value-optional-zero-bug`):** a value-type optional (`int | undefined`, `long?`, `float?`,
+**The bug (V1, `kyte-value-optional-zero-bug`):** a value-type optional (`int | undefined`, `long?`, `float?`,
 `bool?`, `double?`) has NO distinct runtime representation for `undefined` — `codegen/types.zig:392` shows an
 optional's machine type IS its inner type, and `undefined` is the literal `0` (`expressions.zig:1214`). For pointer
 types (string/struct/trait/`Service`/`decimal` — all heap objects) `0` = null is correct. For value types the value
@@ -17,13 +17,13 @@ It would leave "optionals of some value types work, of others silently corrupt" 
 
 ## The design — borrow C#'s two-tier model
 
-C# splits nullability and Nova already gets tier 1 right:
-- **Reference types** — `null` is a null *reference* (`0`); zero runtime cost. **Nova already does this** for
+C# splits nullability and Kyte already gets tier 1 right:
+- **Reference types** — `null` is a null *reference* (`0`); zero runtime cost. **Kyte already does this** for
   string/struct/trait/`Service`/`decimal`. UNCHANGED.
 - **Value types** — `int?` is `Nullable<T> = { bool HasValue; T Value; }` — an EXPLICIT presence indicator, never a
-  magic value. This is the tier Nova lacks.
+  magic value. This is the tier Kyte lacks.
 
-C# carries presence in **two fields** (no alloc, but a value-optional is two words). Nova's Storage/Map/List assume a
+C# carries presence in **two fields** (no alloc, but a value-optional is two words). Kyte's Storage/Map/List assume a
 uniform **one-word (8-byte) slot**, so two-word value-optionals would ripple through every container. The one-word,
 container-compatible expression of "explicit presence" is **boxing**: a value-type optional is a **pointer to a
 heap-boxed value, or null for `undefined`** — exactly what C# does when it boxes a `Nullable<T>` to `object`.
@@ -39,7 +39,7 @@ Then, uniformly for ALL value types:
 - `at()` / trapping access → deref (trap if null).
 - `decimal`/reference optionals: already pointers → **no change**.
 
-**Reuse:** the `nova_any_box` runtime primitives (`src/runtime/alloc.cpp`, built for the deferred boxed-`any`, see
+**Reuse:** the `kyte_any_box` runtime primitives (`src/runtime/alloc.cpp`, built for the deferred boxed-`any`, see
 `docs/design/boxed-any.md`) are the boxing foundation — a value-optional box is simpler (no dtor: value types aren't
 ARC-owned; the box is just a value cell freed with its owner). **One boxing foundation serves BOTH value-optionals
 and dynamic `any`.**
@@ -49,7 +49,7 @@ and dynamic `any`.**
 **V1 IS DONE.** Value-type optionals are boxed end-to-end; a stored/present `0`/`0.0`/`false` is a
 non-null pointer, distinct from `undefined` (null). **Corpus 153/153, ASAN 280/280, no ARC-leak
 regression** (the value-optional gate `127_value_optional_zero` audits clean; the pre-existing
-`nova_random_hex`/async-runtime baseline drift is unrelated, proven by a revert-and-re-audit). No flag.
+`kyte_random_hex`/async-runtime baseline drift is unrelated, proven by a revert-and-re-audit). No flag.
 
 **The invariant that makes it consistent:** since `val_type` is i64 everywhere, a boxed `int?` and a
 raw `int` are the SAME machine type — so V1 is a *semantic* invariant, not an LLVM-type change: a value
@@ -62,10 +62,10 @@ arithmetic — `int? % int = int?` — even though the VALUE is already raw):
   (`m.get(k)` call, an `int?` ident/field/index). A COMPOUND (`x % 2`, `a ?? b`, cast) or a
   `.generic_call` (erased free fns don't box) yields a RAW value → NOT a box. Drives CONSUME, the
   "already-a-box?" PRODUCE guard, AND `isOwnedExpr` (a value-optional is an owned heap box only if it
-  yields one — else `nova_release` would free a raw int as a pointer).
+  yields one — else `kyte_release` would free a raw int as a pointer).
 
 **Where it landed (all in one change):**
-- Foundation: runtime `nova_valopt_box`/`nova_valopt_unbox` (`alloc.cpp`, 8-byte ARC cell) + codegen
+- Foundation: runtime `kyte_valopt_box`/`kyte_valopt_unbox` (`alloc.cpp`, 8-byte ARC cell) + codegen
   `buildValoptBox`/`buildValoptUnbox`/`valueOptionalInner`.
 - PRODUCE (box a bare value into a value-optional slot): `return` (via `FunctionInfo.ret_type_ref`, the
   un-erased TypeRef) · `let x: int? = …` · call-argument to a value-optional param (`coerceValoptArg`).
@@ -75,7 +75,7 @@ arithmetic — `int? % int = int?` — even though the VALUE is already raw):
   param-independent consume site).
 - SLOT sizing: a value-optional local is an i64 alloca even for `float?`/`double?` (`slotTypeForLocalId`)
   — the slot holds a pointer, not the FP value.
-- ARC: `isOwnedTypeId(.optional value)` = owned; a free-only destructor (`nova_release(box, null)`);
+- ARC: `isOwnedTypeId(.optional value)` = owned; a free-only destructor (`kyte_release(box, null)`);
   boxes are retained/released by the existing machinery, freed once — no leak (audited).
 - NULL-CHECK (`!= undefined`/`== undefined`) is unchanged: present box is non-null, absent is 0.
 
@@ -94,7 +94,7 @@ spec. Now the spec body boxes (`T | undefined` renders `int | undefined` under t
 ### Historical foundation note (superseded by the Status above)
 
 ✅ **FOUNDATION BUILT + verified compiling** (corpus 152/152, unused until wired):
-- Runtime: `nova_valopt_box(value)` / `nova_valopt_unbox(box)` in `src/runtime/alloc.cpp` (+ `nova_abi.h`) — an
+- Runtime: `kyte_valopt_box(value)` / `kyte_valopt_unbox(box)` in `src/runtime/alloc.cpp` (+ `kyte_abi.h`) — an
   8-byte ARC cell; present = non-null box, `undefined` = null.
 - Codegen: `buildValoptBox` / `buildValoptUnbox` emit helpers + **`valueOptionalInner(tid)`** — the typed-IR detector
   that returns the inner TypeId iff `tid` is `.optional(.prim)` (int/long/float/double/bool), else null (pointer/
@@ -109,7 +109,7 @@ landable.** The moment produce boxes an `int?`, EVERY consume site that isn't wi
 arithmetic, arg-passing) reads the box pointer as garbage → corpus reds. So "produce + `??`" alone is unsafe; the
 real unit is **produce + ALL consume + ARC, corpus-green in ONE coherent atomic change.**
 
-**Approach = one ATOMIC change on a branch (NO dev flag).** A trial env flag (`NOVA_VALOPT_BOX`) was wired then
+**Approach = one ATOMIC change on a branch (NO dev flag).** A trial env flag (`KYTE_VALOPT_BOX`) was wired then
 REMOVED — no shipped language exposes such a switch, and gating a representation change incrementally is exactly what
 the all-or-nothing constraint forbids. The conventional path: do the whole wiring on a branch; the corpus is RED
 mid-way (a half-changed representation is invalid), GREEN when complete; then merge. Present values are untouched, so
@@ -125,11 +125,11 @@ the diff is confined to the produce/consume BOUNDARY sites below.
 ### WIRING STATUS (2026-07-24 — flag + partial wiring REVERTED; foundation KEPT, flag-free)
 
 Corpus 152/152, ASAN 276/276 — clean with NO flag. What survives in-tree is the **foundation only**:
-✅ Runtime `nova_valopt_box`/`nova_valopt_unbox` (`alloc.cpp` + `nova_abi.h`).
+✅ Runtime `kyte_valopt_box`/`kyte_valopt_unbox` (`alloc.cpp` + `kyte_abi.h`).
 ✅ Codegen `buildValoptBox`/`buildValoptUnbox`/`valueOptionalInner` (`llvm_codegen.zig`) — unused until the pass.
 
 REVERTED (were incomplete; unconditional they red the corpus, and a flag is not the right vehicle):
-- The `NOVA_VALOPT_BOX` flag (module var + `compiler` field + `main.zig` wiring).
+- The `KYTE_VALOPT_BOX` flag (module var + `compiler` field + `main.zig` wiring).
 - `FunctionInfo.ret_type_ref` + its population sites.
 - Produce-box at `return` (`statements.zig`) and consume-unbox at `??` (`expressions.zig`).
 
@@ -165,8 +165,8 @@ Gate target: `value_optional_zero` — `Map<string,int>` / `long?` / `float?` / 
 
 ## Implementation plan (incremental, gated — same discipline as boxed-`any`)
 
-1. **Runtime:** a value-cell box (or reuse `nova_any_box` with a 0 dtor). `nova_valopt_box(value)` → ptr;
-   `nova_valopt_unbox(ptr)` → value; box freed by its owner (no ARC).
+1. **Runtime:** a value-cell box (or reuse `kyte_any_box` with a 0 dtor). `kyte_valopt_box(value)` → ptr;
+   `kyte_valopt_unbox(ptr)` → value; box freed by its owner (no ARC).
 2. **Type system:** mark `.optional(valuetype)` as a distinct codegen representation (a pointer). `.optional(ptr
    type)` stays as-is (already a pointer).
 3. **Box on PRODUCE** (T → value-optional): the coercion sites — a `return v` where the return type is a
@@ -187,4 +187,4 @@ destabilizes.** `long`/`double`/`float` and `int` all fixed by one uniform rule.
 
 - `?:` ternary — **DONE** (already parsed → `if`-expression; gate `126_ternary`).
 - `??=` null-coalescing assignment — a small parser desugar (`x = x ?? d`).
-- `if (x is T v)` pattern narrowing — Nova has H2 narrowing + `??`/`?.`; `is`-pattern is a future ergonomic.
+- `if (x is T v)` pattern narrowing — Kyte has H2 narrowing + `??`/`?.`; `is`-pattern is a future ergonomic.

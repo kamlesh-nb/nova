@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nova foundation probe harness  (deterministic, local, no LLM)
+Kyte foundation probe harness  (deterministic, local, no LLM)
 
 Systematically stress-tests the danger zones that have produced foundation bugs
 (erasure x ARC seam: container-of-trait/struct, `?? default` on owned values,
@@ -11,13 +11,13 @@ It does NOT reason about the spec or invent new gaps — it CONFIRMS a fixed mat
 adversarial patterns. Add probes to PROBES to widen coverage.
 
 Run from the `lang/` dir:   python3 foundation_probe.py
-Requires: zig at ~/zig/zig (edit ZIG below), a buildable nova.
+Requires: zig at ~/zig/zig (edit ZIG below), a buildable kyte.
 
 Modes per probe:
-  FUNC   -> `nova test`                  : does it compile+run and pass?
-  ASAN   -> NOVA_ASAN=1 build + run      : heap-use-after-free / double-free?
-  SHADOW -> NOVA_SEMA_SHADOW=1 run       : static-vs-dynamic ownership DISAGREE?
-  ARC    -> NOVA_ARC_AUDIT=1 run         : leak (live objects at exit)?
+  FUNC   -> `kyte test`                  : does it compile+run and pass?
+  ASAN   -> KYTE_ASAN=1 build + run      : heap-use-after-free / double-free?
+  SHADOW -> KYTE_SEMA_SHADOW=1 run       : static-vs-dynamic ownership DISAGREE?
+  ARC    -> KYTE_ARC_AUDIT=1 run         : leak (live objects at exit)?
 
 Each probe declares `expect`: "ok" (should be clean) or "known-bad" (documents a
 known-open gap). The report flags OK-probes that fail (regressions / new gaps) and
@@ -27,11 +27,11 @@ import os, subprocess, tempfile, sys, textwrap, shutil
 
 ZIG   = os.path.expanduser("~/zig/zig")
 LANG  = os.getcwd()                      # run from lang/
-NOVA  = os.path.join(LANG, "zig-out", "bin", "nova")
-TMP   = tempfile.mkdtemp(prefix="novaprobe_")
+KYTE  = os.path.join(LANG, "zig-out", "bin", "kyte")
+TMP   = tempfile.mkdtemp(prefix="kyteprobe_")
 
 # ---------------------------------------------------------------- probe matrix
-# code: a full .nova @test file.   expect: "ok" | "known-bad"
+# code: a full .ky @test file.   expect: "ok" | "known-bad"
 PROBES = [
  # ---- container-of-trait / struct (the Map<K,Trait>.get family) ----
  dict(name="map_trait_narrow", cat="container", expect="ok", code=r'''
@@ -178,12 +178,12 @@ def sh(cmd, env=None, timeout=90):
         return 124, "(timeout)"
 
 def build(asan):
-    env = {"NOVA_ASAN": "1"} if asan else {}
+    env = {"KYTE_ASAN": "1"} if asan else {}
     rc, out = sh(f"{ZIG} build", env=env, timeout=600)
     return rc == 0, out
 
 def write_probe(p):
-    path = os.path.join(TMP, p["name"] + ".nova")
+    path = os.path.join(TMP, p["name"] + ".ky")
     with open(path, "w") as f: f.write(p["code"])
     return path
 
@@ -223,25 +223,25 @@ def main():
     results = {p["name"]: {} for p in PROBES}
 
     # phase 1: non-ASAN binary -> FUNC / SHADOW / ARC
-    print("building non-ASAN nova ...", flush=True)
+    print("building non-ASAN kyte ...", flush=True)
     ok, out = build(False)
     if not ok: print("BUILD FAILED (non-asan):\n" + out[-2000:]); sys.exit(1)
     for p in PROBES:
         path = write_probe(p)
-        _, o = sh(f"{NOVA} test {path}");                    results[p["name"]]["FUNC"]   = classify_func(o)
-        _, o = sh(f"{NOVA} test {path}", {"NOVA_SEMA_SHADOW":"1"}); results[p["name"]]["SHADOW"] = classify_shadow(o)
-        _, o = sh(f"{NOVA} test {path}", {"NOVA_ARC_AUDIT":"1"});   results[p["name"]]["ARC"]    = classify_arc(o)
+        _, o = sh(f"{KYTE} test {path}");                    results[p["name"]]["FUNC"]   = classify_func(o)
+        _, o = sh(f"{KYTE} test {path}", {"KYTE_SEMA_SHADOW":"1"}); results[p["name"]]["SHADOW"] = classify_shadow(o)
+        _, o = sh(f"{KYTE} test {path}", {"KYTE_ARC_AUDIT":"1"});   results[p["name"]]["ARC"]    = classify_arc(o)
         print(f"  {p['name']:<30} FUNC={results[p['name']]['FUNC']:<12} SHADOW={results[p['name']]['SHADOW']:<10} ARC={results[p['name']]['ARC']}", flush=True)
 
     # phase 2: ASAN binary -> ASAN
-    print("\nbuilding ASAN nova ...", flush=True)
+    print("\nbuilding ASAN kyte ...", flush=True)
     ok, out = build(True)
     if not ok:
         print("BUILD FAILED (asan):\n" + out[-2000:])
     else:
         for p in PROBES:
-            path = os.path.join(TMP, p["name"] + ".nova")
-            _, o = sh(f"{NOVA} test {path}", {"NOVA_ASAN":"1"})
+            path = os.path.join(TMP, p["name"] + ".ky")
+            _, o = sh(f"{KYTE} test {path}", {"KYTE_ASAN":"1"})
             results[p["name"]]["ASAN"] = classify_asan(o)
             print(f"  {p['name']:<30} ASAN={results[p['name']]['ASAN']}", flush=True)
 

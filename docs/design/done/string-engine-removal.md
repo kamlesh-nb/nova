@@ -36,7 +36,7 @@ TypeId-native for every route so codegen never renders a param-ful type for a de
 - **B3 value-optional-of-type-param is decided on the TypeRef, not the expr.** `valoptTypeRefIsValue`
   (`llvm_codegen.zig:792`), `slotTypeForLocal`, `argIsValoptLocal` read the declared TypeRef; `tidForTypeRef`
   (`types.zig:1107-1112`) lowers with NO instantiation context -> `.optional{.type_param}` -> `valueOptionalInner`
-  null -> not boxed. Gating case: `119_generic_return.nova` (`maybe<int>(0,true)` must box or present-0 collapses).
+  null -> not boxed. Gating case: `119_generic_return.ky` (`maybe<int>(0,true)` must box or present-0 collapses).
 
 Ruled out as separate roots (confirmed): generic enums (no type_params), lambdas (inherit parent instantiation),
 struct field dtor/owned (already TypeId-native via `subst.substitute`, `arc.zig:856-862`), `getTypeSize`
@@ -82,8 +82,8 @@ feeding both `typeOfExprConcrete` (exprs) and an instantiation-aware `tidForType
 
 ## The gate (once, at the end)
 
-`NOVA_ASAN=1 zig build && conformance/run.sh --asan`. ASAN is REQUIRED, not optional: the failure class is
-UAF/double-free that a plain `nova test` masks. Green ASAN corpus is the only go signal. Guard cases the
+`KYTE_ASAN=1 zig build && conformance/run.sh --asan`. ASAN is REQUIRED, not optional: the failure class is
+UAF/double-free that a plain `kyte test` masks. Green ASAN corpus is the only go signal. Guard cases the
 adversaries named: 119, 279, 310, 40_map_refcounted_closure, 123, 02_generics_destructor, 39_declared_type_ownership.
 
 ## Honest effort and risk
@@ -119,7 +119,7 @@ substitution for dispatch/mangling, not any decision.
   `189_epoll_event_layout`, off-platform). [ASAN gate result pending in this same run.]
 
 **The precise residual (what still calls the string substitution, and why):** measured with
-`NOVA_TID_CENSUS=1` across the whole corpus.
+`KYTE_TID_CENSUS=1` across the whole corpus.
 - Null-branch of `resolveExpressionTypeName`: **exactly ONE** expr in the entire corpus differs if
   `substMethodParams` is dropped -- a lambda reifying its parent generic method's `<T>`
   (`68_generic_method_mono`, `(s) => serde.bind<T>(s)...`). The lifted `__lambda_*` is compiled with a
@@ -177,7 +177,7 @@ the overlay previously could not reach; closure keys discriminate by `inst_key` 
 receiver struct-T and the method `<U>`) instead of the `method_subst` signature, with registration and
 lookup deriving the id identically; the two serde-reify sites use `concreteTidForTypeRef` + `symbolName`.
 
-**Proof, not a guess:** a full-corpus `NOVA_TID_CENSUS` sweep showed the legacy string bindings were
+**Proof, not a guess:** a full-corpus `KYTE_TID_CENSUS` sweep showed the legacy string bindings were
 never the sole resolver and never diverged from the overlay (`legacy_only=0`, `diverge=0`) on every
 case, including `68`. Then **deleted**: `current_method_subst`, `MethodParamBinding`, the `method_subst`
 FunctionInfo field, `current_collecting_method_subst`, all spec-loop `subst` allocations, and the
@@ -186,7 +186,7 @@ off-platform `189`), zero ASAN errors.
 
 **What remains (NOT a decision, so not the hazard):** the struct-T path, `substTypeParams` ->
 `substituteFieldType` (string) -> `substMethodParams` (now TypeId-native). It is used ONLY for NAME
-rendering, the dev-only `NOVA_SEMA_SHADOW` report (`tdShadowDiff`/`isOwnedRenderedFallback`/
+rendering, the dev-only `KYTE_SEMA_SHADOW` report (`tdShadowDiff`/`isOwnedRenderedFallback`/
 `legacyStringOwnership`), and a `live_sema`-null fallback destructor -- no live type DECISION rides on
 it. A measured attempt to fold `substituteFieldType` into the overlay diverged on 292/341 cases: the
 overlay cannot resolve struct-T wherever `current_instantiation` (string) is set but

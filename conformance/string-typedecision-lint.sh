@@ -13,7 +13,7 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 # NOTE ON THE METRIC: this raw grep also counts the sanctioned canonical-name checks ("any", "void",
 # "string", primitive names) which have fixed identity and are NOT the generic-type hazard. The genuine
 # hazard (deciding ownership/layout/dtor for a USER/GENERIC type from its rendered name) is a subset; the
-# gap-1 work drives the raw count down while the shadow gate (NOVA_SEMA_SHADOW, td_disagree=0) proves no
+# gap-1 work drives the raw count down while the shadow gate (KYTE_SEMA_SHADOW, td_disagree=0) proves no
 # live disagreement remains. Keep both.
 BASELINE=51
 count=$(grep -rcE 'std\.mem\.eql\(u8, [a-z_]+, "(int|long|string|bool|byte|short|double|float|void|any|char|f32|f64|decimal|i32|i64|u32|u64)"\)' src/backend/codegen/*.zig | awk -F: '{s+=$2} END {print s+0}')

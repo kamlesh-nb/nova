@@ -2,22 +2,22 @@
 
 - Chapter: [13-ownership.md](../13-ownership.md)
 - Estimated length: ~10 minutes
-- You will need: the `nova` compiler installed, a terminal, and the guide's `examples/` folder open
+- You will need: the `kyte` compiler installed, a terminal, and the guide's `examples/` folder open
 
 ## Hook (0:00)
 
-**Say:** In this video we will look at how Nova manages memory. The headline is simple: there is no garbage collector, and you never write a `free` call yourself. By the end you will understand the four rules that govern who owns what, and you will watch a program build a struct that owns a list of strings, hand it back from a function, use it, and clean itself up, all with zero manual management.
+**Say:** In this video we will look at how Kyte manages memory. The headline is simple: there is no garbage collector, and you never write a `free` call yourself. By the end you will understand the four rules that govern who owns what, and you will watch a program build a struct that owns a list of strings, hand it back from a function, use it, and clean itself up, all with zero manual management.
 
 ## What we will cover (0:25)
 
-- Why Nova uses deterministic ARC instead of a garbage collector
+- Why Kyte uses deterministic ARC instead of a garbage collector
 - The four ownership rules: primitives, heap objects, borrowed arguments, and aggregates
 - A worked example that owns, transfers, and drops heap data
 - Why the cleanup is predictable and safe
 
 ## Segment: what ARC gives you (0:50)
 
-**Say:** Nova has no garbage collector and no manual `free`. Memory is managed by deterministic ARC, which stands for automatic reference counting. Every heap object carries a reference count, and it is freed the instant its last owner goes away. The important word there is deterministic. Cleanup happens at a known point in the program, not whenever a collector decides to run, and you never write the free yourself. So you get the memory safety of a managed language with the determinism of manual management, and none of the ceremony of either.
+**Say:** Kyte has no garbage collector and no manual `free`. Memory is managed by deterministic ARC, which stands for automatic reference counting. Every heap object carries a reference count, and it is freed the instant its last owner goes away. The important word there is deterministic. Cleanup happens at a known point in the program, not whenever a collector decides to run, and you never write the free yourself. So you get the memory safety of a managed language with the determinism of manual management, and none of the ceremony of either.
 
 ## Segment: the four rules (2:00)
 
@@ -36,9 +36,9 @@
 **Say:** Let us make this concrete. Here is a `Team` struct. It owns two heap things: a `string` name, and a `List<string>` of members. Watch how ownership is set up in the constructor and the `add` method.
 
 **On screen:**
-```nova
-// examples/19_ownership.nova
-// Nova manages memory with deterministic ARC (automatic reference counting):
+```kyte
+// examples/19_ownership.ky
+// Kyte manages memory with deterministic ARC (automatic reference counting):
 // no garbage collector, no manual free. You never call `free`.
 //
 //   * Primitives (int, long, float, bool) are VALUE types: copied, never owned.
@@ -81,7 +81,7 @@ struct Team {
 **Say:** Now the two free functions. `greet` shows borrowing, and `buildTeam` shows ownership transfer.
 
 **On screen:**
-```nova
+```kyte
 // `who` is BORROWED: this function reads it and returns a NEW string built from
 // it. It never frees `who`; the caller still owns it after the call.
 fn greet(who: string): string {
@@ -105,7 +105,7 @@ fn buildTeam(): Team {
 **Say:** Finally, `main` ties the two ideas together. It borrows a name, then takes ownership of a team, and at the end everything drops on its own.
 
 **On screen:**
-```nova
+```kyte
 fn main(): void {
     // `name` is a heap string owned by this scope.
     let name = "Ada";
@@ -128,7 +128,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/19_ownership.nova -o out && ./out
+kyte examples/19_ownership.ky -o out && ./out
 ```
 
 ```
@@ -152,4 +152,4 @@ size = 3
 
 ## Outro (9:40)
 
-**Say:** So you wrote no `free`, no destructor, and no reference-count bookkeeping, yet every string and list was released exactly once, at a point you can predict from the code. Next up we will look at modules and visibility, how Nova organises code across files. If this helped, a like or subscribe keeps the series going.
+**Say:** So you wrote no `free`, no destructor, and no reference-count bookkeeping, yet every string and list was released exactly once, at a point you can predict from the code. Next up we will look at modules and visibility, how Kyte organises code across files. If this helped, a like or subscribe keeps the series going.

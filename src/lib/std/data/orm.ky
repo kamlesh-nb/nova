@@ -1,0 +1,368 @@
+//! Object-relational mapping: the bridge between `serde` and the `db` seam.
+//!
+//! This module is the thin, generic glue that lets a plain Kyte `struct` travel
+//! to and from a SQL database (or a BSON document) without hand-writing any
+//! decode or bind code. It owns none of the machinery itself. Instead it adapts
+//! two general-purpose serde interfaces onto the concrete database types:
+//!
+//!   - `ValueSource` is serde's "read a field by name" interface. [`RowSource`]
+//!     implements it over a single database [`Row`] plus its column list, so
+//!     `serde.bindRow<T>` can populate a `T` straight out of a result set.
+//!   - `ValueSink` is serde's "write a field by name" interface. [`ParamSink`]
+//!     and [`BsonSink`] implement it, turning a `T`'s fields into a parameter
+//!     list for a prepared statement or into a BSON document respectively.
+//!
+//! Everything else here (`bindAll`, `queryAs`, `insert`, `update`) is a small
+//! convenience built on those three adapters plus the `serde.dump` /
+//! `serde.bindRow` code that the compiler generates per type. The generated
+//! `planFor<T>` decides once, from the result columns, how each field maps to a
+//! column; reusing one plan across every row of a result set is what keeps the
+//! bind loop cheap.
+//!
+//! Design points worth keeping in mind:
+//!
+//!   - Column matching is CASE-INSENSITIVE. [`RowSource`] lower-cases every
+//!     column name into an index map at construction, and looks a field up by
+//!     the field name first, then by its lower-cased form. This tolerates the
+//!     usual `UserId` field versus `user_id`/`USERID` column mismatch.
+//!   - Parameter placeholders are emitted in PostgreSQL `$1`, `$2` ... style,
+//!     numbered in the order the fields are dumped. The order the sink receives
+//!     fields therefore has to match the order the placeholders are written,
+//!     which is why [`insert`] and [`update`] build the SQL and the value list
+//!     from the SAME single dump pass.
+//!   - There are async and blocking variants of the query helpers. The async
+//!     ones (`queryAs`, `queryOne`) prepare then execute over a `Connection`
+//!     coroutine; the `...Blocking` variants take the synchronous `query` path
+//!     for callers that are not on the reactor.
+//!
+//! This file is data-only: it never opens a connection or manages a pool. The
+//! caller supplies an already-connected `Connection`; see `data.db` for the
+//! seam types and `data.pool` for pooling.
+
+import serde.source;
+import serde.bson;
+import data.db;
+import map;
+import list;
+import string;
+import str;
+import assert;
+
+/// A read-only [`ValueSource`] view over one database [`Row`] and its columns.
+///
+/// This adapts a result-set row onto serde's by-name field reader, so that
+/// `serde.bindRow<T>` can fill a struct straight from a row. Construction builds
+/// a case-insensitive name-to-position [`index`] once; every later `getX` call
+/// resolves a field name to a column position through it and reads the cell.
+///
+/// It is scalar-only. A relational row has no nested objects or arrays, so the
+/// child and array methods are stubs (see [`RowSource.getChild`] and the
+/// `item*` family below) that exist purely to satisfy the `ValueSource`
+/// interface.
+pub struct RowSource impl ValueSource {
+    /// The underlying row whose cells are read on demand by column position.
+    pub row: Row,
+    /// Case-insensitive column-name to column-index map, built once at
+    /// construction. Keys are the lower-cased column names; the value is the
+    /// 0-based position of that column in the row.
+    pub index: Map<string, int>,
+
+    /// Builds the source from a row and its column metadata.
+    ///
+    /// Every column name is lower-cased and inserted into [`index`] against its
+    /// position, giving O(1) case-insensitive lookup later. A null or unnamed
+    /// column defaults to an empty name of `DbType.Null`, so a missing column
+    /// simply never matches a field.
+    init(row: Row, columns: List<Column>) {
+        self.row = row;
+        self.index = Map<string, int>(16, string.hash);
+        let i = 0;
+        while (i < columns.size()) {
+            let c = columns.get(i) ?? Column("", DbType.Null);
+            self.index.set(string.toLowerCase(c.name), i);
+            i = i + 1;
+        }
+    }
+
+    /// Resolves a field name to its 0-based column position, or -1 if absent.
+    ///
+    /// Tries the key as given first, then its lower-cased form, so a field named
+    /// exactly as a column matches immediately while a mixed-case field still
+    /// matches a differently-cased column. The map itself is keyed by lower-case
+    /// names, so the first (verbatim) probe succeeds only when the field name is
+    /// already lower-case; the second probe is the general path.
+    fn colIndex(self: RowSource, key: string): int {
+        let i = self.index.get(key);
+        if (i == undefined) { i = self.index.get(string.toLowerCase(key)); }
+        return i ?? -1;
+    }
+
+    /// Fetches the raw [`DbValue`] cell for a field name.
+    ///
+    /// Returns a SQL null value (`db.dbNull()`) when the name matches no column,
+    /// so callers of the typed `getX` accessors get the type's zero rather than
+    /// a crash when a field is not present in the result set.
+    fn cell(self: RowSource, key: string): DbValue {
+        let i = self.colIndex(key);
+        if (i < 0) { return db.dbNull(); }
+        return self.row.get(i);
+    }
+
+    /// Reads the named column as an owned text `string` (empty if absent).
+    pub fn getString(self: RowSource, key: string): string { return self.cell(key).asText(); }
+    /// Reads the named column as a borrowed [`str.Str`] view over the row buffer.
+    ///
+    /// Zero-copy: the returned view points into the row's own storage, so it is
+    /// only valid while this `RowSource` (and its `Row`) is alive. Use this on
+    /// the hot bind path to avoid minting an owned string per field; call
+    /// `str.Str.toOwned` if the value must outlive the row.
+    pub fn getStr(self: RowSource, key: string): str.Str { return self.cell(key).asView(); }
+    /// Reads the named column as a 64-bit integer (0 if absent).
+    pub fn getInt(self: RowSource, key: string): long { return self.cell(key).asLong(); }
+    /// Reads the named column as a boolean (false if absent).
+    pub fn getBool(self: RowSource, key: string): bool { return self.cell(key).asBool(); }
+    /// Reads the named column as a double (0.0 if absent).
+    pub fn getFloat(self: RowSource, key: string): double { return self.cell(key).asDouble(); }
+    /// Reads the named column as an exact [`decimal`] (0 if absent).
+    pub fn getDecimal(self: RowSource, key: string): decimal { return self.cell(key).asDecimal(); }
+
+    /// Nested-object accessor, required by `ValueSource` but not meaningful for
+    /// a flat SQL row.
+    ///
+    /// A relational row has no sub-documents, so this returns the same source
+    /// unchanged rather than descending. `serde` only calls it for struct-typed
+    /// fields, which a plain row cannot supply.
+    pub fn getChild(self: RowSource, key: string): ValueSource { return self; }
+    /// Whether a column with this field name exists in the row.
+    pub fn has(self: RowSource, key: string): bool {
+        return self.colIndex(key) >= 0;
+    }
+    /// Array-length accessor, always 0: a SQL row has no array-valued cells here.
+    pub fn arrayLen(self: RowSource, key: string): int { return 0; }
+    /// Array-element string accessor; a stub returning empty, no arrays in a row.
+    pub fn itemString(self: RowSource, key: string, i: int): string { return ""; }
+    /// Array-element int accessor; a stub returning 0, no arrays in a row.
+    pub fn itemInt(self: RowSource, key: string, i: int): long { return 0; }
+    /// Array-element decimal accessor; a stub returning 0, no arrays in a row.
+    pub fn itemDecimal(self: RowSource, key: string, i: int): decimal { return 0m; }
+    /// Array-element child accessor; a stub returning self, no arrays in a row.
+    pub fn itemChild(self: RowSource, key: string, i: int): ValueSource { return self; }
+}
+
+/// Materialises every row of an already-fetched result set as a `List<T>`.
+///
+/// A thin pass-through to `serde.bindAll<T>`, which builds one bind plan from
+/// the columns and applies it to each row. Use this when you already hold a
+/// `ResultSet` (from a raw query) and just want the typed list; the `queryAs`
+/// helpers combine the fetch and the bind in one call.
+pub fn bindAll<T>(rs: ResultSet): List<T> {
+    return serde.bindAll<T>(rs);
+}
+
+/// Materialises the first row of a result set as a `T`, or `undefined` if empty.
+///
+/// Computes the bind plan from the columns and binds only row 0. Returns
+/// `undefined` (not a zero-valued `T`) when the result set has no rows, so the
+/// caller can distinguish "no match" from a real row.
+pub fn bindOne<T>(rs: ResultSet): T | undefined {
+    if (rs.rows.size() == 0) { return undefined; }
+    let plan = serde.planFor<T>(rs.columns);
+    return serde.bindRow<T>(rs.rows.get(0) ?? Row(), plan);
+}
+
+/// Prepares and runs `sql` with `params`, binding every result row to `T`.
+///
+/// The async, reactor-side path: it prepares the statement, executes it with
+/// bound parameters (so values are never string-interpolated into the SQL), and
+/// binds the whole result set. Use `queryAsBlocking` off the reactor. See
+/// [`queryOne`] for the single-row variant.
+pub async fn queryAs<T>(conn: Connection, sql: string, params: List<DbValue>): List<T> {
+    let stmt = await conn.prepare(sql);
+    let rs = await conn.queryPrepared(stmt, params);
+    return serde.bindAll<T>(rs);
+}
+
+/// Prepares and runs `sql`, binding every row to `T`, keeping the wire buffer.
+///
+/// The buffer-safe async read: it returns a [`db.Rows`], which OWNS the wire
+/// result and therefore keeps any zero-copy `str.Str` fields valid for as long as
+/// the caller holds the `Rows`. Prefer this over [`queryAs`] whenever `T` binds
+/// text columns as `str.Str` (the common case): `queryAs` returns a bare
+/// `List<T>` and drops the result set, which dangles those views. Use `queryAs`
+/// only when every text field of `T` is an owned `string`. Thin pass-through to
+/// [`data.db.query`], surfaced here so repository/ORM callers reach one seam.
+pub async fn queryRows<T>(conn: Connection, sql: string, params: List<DbValue>): db.Rows<T> {
+    return await db.query<T>(conn, sql, params);
+}
+
+/// Prepares and runs `sql`, binding the first row to `T`, or `undefined` if none.
+///
+/// Like [`queryAs`] but stops at row 0 and returns `undefined` on an empty
+/// result. Intended for lookups by primary key or any query expected to yield at
+/// most one row.
+pub async fn queryOne<T>(conn: Connection, sql: string, params: List<DbValue>): T | undefined {
+    let stmt = await conn.prepare(sql);
+    let rs = await conn.queryPrepared(stmt, params);
+    if (rs.rows.size() == 0) { return undefined; }
+    let plan = serde.planFor<T>(rs.columns);
+    return serde.bindRow<T>(rs.rows.get(0) ?? Row(), plan);
+}
+
+/// Synchronous [`queryAs`]: runs `sql` and binds every row to `T`, blocking.
+///
+/// For callers not running on the reactor. It uses the connection's blocking
+/// `query` path and binds each row through one shared plan. Returns an empty
+/// list (not an error) when there are no rows.
+pub fn queryAsBlocking<T>(conn: Connection, sql: string, params: List<DbValue>): List<T> {
+    let rs = conn.query(sql, params);
+    let out = List<T>();
+    if (rs.rows.size() == 0) { return out; }
+    let plan = serde.planFor<T>(rs.columns);
+    let i = 0;
+    while (i < rs.rows.size()) {
+        out.push(serde.bindRow<T>(rs.rows.get(i) ?? Row(), plan));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Synchronous [`queryOne`]: runs `sql`, binds the first row, blocking.
+///
+/// For callers not on the reactor. Returns `undefined` when the result is empty,
+/// otherwise binds row 0 through the computed plan.
+pub fn queryOneBlocking<T>(conn: Connection, sql: string, params: List<DbValue>): T | undefined {
+    let rs = conn.query(sql, params);
+    if (rs.rows.size() == 0) { return undefined; }
+    let plan = serde.planFor<T>(rs.columns);
+    return serde.bindRow<T>(rs.rows.get(0) ?? Row(), plan);
+}
+
+/// A [`ValueSink`] that collects a struct's fields into parallel column-name and
+/// [`DbValue`] lists for use as SQL statement parameters.
+///
+/// `serde.dump<T>` calls one `putX` per field in field order, and each call
+/// appends the name to [`cols`] and the boxed value to [`vals`] at the same
+/// index. The two lists therefore stay positionally aligned, which is what
+/// [`insert`] and [`update`] rely on when they emit `$1`, `$2` placeholders.
+pub struct ParamSink impl ValueSink {
+    /// Column names in dump order, index-aligned with [`vals`].
+    pub cols: List<string>,
+    /// Boxed cell values in dump order, index-aligned with [`cols`].
+    pub vals: List<DbValue>,
+
+    /// Creates an empty sink ready to receive a `serde.dump` pass.
+    init() {
+        self.cols = List<string>();
+        self.vals = List<DbValue>();
+    }
+
+    /// Appends a text field, boxing the value as a SQL text `DbValue`.
+    fn putString(self: ParamSink, key: string, val: string): void { self.cols.push(key); self.vals.push(db.dbText(val)); }
+    /// Appends an integer field, boxing the value as a 64-bit SQL integer.
+    fn putInt(self: ParamSink, key: string, val: long): void { self.cols.push(key); self.vals.push(db.dbLong(val)); }
+    /// Appends a boolean field, boxing the value as a SQL boolean.
+    fn putBool(self: ParamSink, key: string, val: bool): void { self.cols.push(key); self.vals.push(db.dbBool(val)); }
+    /// Appends a floating-point field, boxing the value as a SQL double.
+    fn putFloat(self: ParamSink, key: string, val: double): void { self.cols.push(key); self.vals.push(db.dbDouble(val)); }
+    /// Appends an exact-decimal field, boxing the value as a SQL decimal.
+    fn putDecimal(self: ParamSink, key: string, val: decimal): void { self.cols.push(key); self.vals.push(db.dbDecimal(val)); }
+}
+
+/// Flattens a struct into a [`ParamSink`] of column names and boxed values.
+///
+/// A one-shot `serde.dump<T>` into a fresh sink. Handy when you want the
+/// name/value lists yourself to build a custom statement, rather than the ready
+/// SQL that [`insert`] or [`update`] produce.
+pub fn toParams<T>(obj: T): ParamSink {
+    let sink = ParamSink();
+    serde.dump<T>(obj, sink);
+    return sink;
+}
+
+/// Builds and runs an `INSERT` for `obj` into `table`, returning the exec result.
+///
+/// Dumps the struct once, then walks the collected columns to write the
+/// `(col, col, ...)` list and a matching `VALUES ($1, $2, ...)` list, so every
+/// value is bound as a parameter rather than interpolated. The two loops iterate
+/// the SAME sink in the same order, which keeps each `$n` aligned with the value
+/// at index `n-1`. See [`ParamSink`] for why the lists stay positional.
+pub fn insert<T>(conn: Connection, table: string, obj: T): ExecResult {
+
+    let p = ParamSink();
+    serde.dump<T>(obj, p);
+    let sql = "INSERT INTO " + table + " (";
+    let i = 0;
+    while (i < p.cols.size()) {
+        if (i > 0) { sql = sql + ", "; }
+        sql = sql + (p.cols.get(i) ?? "");
+        i = i + 1;
+    }
+    sql = sql + ") VALUES (";
+    i = 0;
+    while (i < p.vals.size()) {
+        if (i > 0) { sql = sql + ", "; }
+        sql = sql + "$" + (i + 1);
+        i = i + 1;
+    }
+    sql = sql + ")";
+    return conn.exec(sql, p.vals);
+}
+
+pub fn update<T>(conn: Connection, table: string, obj: T, keyCol: string): ExecResult {
+    let p = ParamSink();
+    serde.dump<T>(obj, p);
+    let sql = "UPDATE " + table + " SET ";
+    let params = List<DbValue>();
+    let keyVal = db.dbNull();
+    let first = true;
+    let i = 0;
+    while (i < p.cols.size()) {
+        let col = p.cols.get(i) ?? "";
+        let v = p.vals.get(i) ?? db.dbNull();
+        if (string.eql(col, keyCol)) {
+            keyVal = v;
+        } else {
+            if (!first) { sql = sql + ", "; }
+            params.push(v);
+            sql = sql + col + " = $" + (params.size());
+            first = false;
+        }
+        i = i + 1;
+    }
+    params.push(keyVal);
+    sql = sql + " WHERE " + keyCol + " = $" + (params.size());
+    return conn.exec(sql, params);
+}
+
+pub fn deleteBy(conn: Connection, table: string, keyCol: string, keyVal: DbValue): ExecResult {
+    let params = List<DbValue>();
+    params.push(keyVal);
+    return conn.exec("DELETE FROM " + table + " WHERE " + keyCol + " = $1", params);
+}
+
+pub struct BsonSink impl ValueSink {
+    pub doc: bson.BsonDocument,
+
+    init() { self.doc = bson.BsonDocument{ entries: List<bson.BsonEntry>() }; }
+
+    fn putString(self: BsonSink, key: string, val: string): void { self.doc.entries.push(bson.entryString(key, val)); }
+
+    fn putInt(self: BsonSink, key: string, val: long): void {
+        let narrowed = (val as int) as long;
+        if (narrowed == val) {
+            self.doc.entries.push(bson.entryInt(key, val as int));
+        } else {
+            self.doc.entries.push(bson.entryInt64Val(key, val));
+        }
+    }
+    fn putBool(self: BsonSink, key: string, val: bool): void { self.doc.entries.push(bson.entryBool(key, val ? 1 : 0)); }
+    fn putFloat(self: BsonSink, key: string, val: double): void { self.doc.entries.push(bson.entryDoubleVal(key, val)); }
+    fn putDecimal(self: BsonSink, key: string, val: decimal): void { self.doc.entries.push(bson.entryDecimal(key, val)); }
+}
+
+pub fn toBson<T>(obj: T): bson.BsonDocument {
+    let sink = BsonSink();
+    serde.dump<T>(obj, sink);
+    return sink.doc;
+}
+

@@ -1,0 +1,810 @@
+//! Owned `string` manipulation utilities.
+//!
+//! Where `str.ky` defines `Str`, a borrowed zero-copy view, this module works
+//! on owned `string` values: each function that produces new text (`concat`,
+//! `slice`, `trim`, case conversion, `replace`, and so on) allocates a fresh
+//! heap string and returns it, leaving the input untouched. It also carries
+//! the numeric parsers (`parseInt`, `parseLong`, `parseDouble`, ...) and the
+//! byte-wise comparison helpers (`eql`, `compare`, `hash`) used throughout the
+//! standard library wherever text needs to be split, joined, searched, or
+//! converted to and from numbers.
+
+import list;
+import bytes;
+
+extern("c") fn kyte_str_alloc(len: int): long;
+
+/// Returns the number of bytes in `s`.
+pub fn len(s: string): int {
+    return s.length;
+}
+
+// Allocates an uninitialised owned string buffer of the given byte length.
+fn allocString(len: int): string {
+    return kyte_str_alloc(len) as string;
+}
+
+/// Concatenates `a` and `b` into a newly allocated string.
+pub fn concat(a: string, b: string): string {
+    let len_a = a.length;
+    let len_b = b.length;
+    let total_len = len_a + len_b;
+    if (total_len == 0) { return ""; }
+    let ptr = allocString(total_len);
+    if (len_a > 0) { bytes.copy(ptr as long, a as long, len_a); }
+    if (len_b > 0) { bytes.copy((ptr as long) + (len_a as long), b as long, len_b); }
+    return ptr;
+}
+
+/// Splits `s` on every occurrence of `sep`, returning the parts in order.
+///
+/// An empty `sep` splits into individual one-byte strings rather than
+/// returning `s` unchanged.
+pub fn split(s: string, sep: string): List<string> {
+    let result = List<string>();
+    let s_len = s.length;
+    let sep_len = sep.length;
+
+    if (sep_len == 0) {
+
+        let i = 0;
+        while (i < s_len) {
+            let char_len = 1;
+            let char_ptr = allocString(1);
+            bytes.write_byte(char_ptr, 0, s[i]);
+            result.push(char_ptr);
+            i = i + 1;
+        }
+        return result;
+    }
+
+    let start = 0;
+    while (true) {
+        let pos = indexOfFrom(s, sep, start);
+        if (pos == -1) {
+
+            let remaining = slice(s, start, s_len);
+            result.push(remaining);
+            break;
+        }
+
+        let part = slice(s, start, pos);
+        result.push(part);
+        start = pos + sep_len;
+    }
+    return result;
+}
+
+/// Joins the strings in `list` into one string, inserting `sep` between
+/// consecutive elements. Returns `""` for an empty list. `undefined` entries
+/// contribute no bytes but still get a separator on either side.
+pub fn join(list: List<string>, sep: string): string {
+    if (list.size() == 0) {
+        return "";
+    }
+    let sep_len = sep.length;
+    let list_len = list.size();
+
+    let total_len = 0;
+    let idx = 0;
+    while (idx < list_len) {
+        let s = list.get(idx);
+
+        if (s != undefined) {
+            total_len = total_len + s.length;
+        }
+        idx = idx + 1;
+    }
+    total_len = total_len + sep_len * (list_len - 1);
+
+    let ptr = allocString(total_len);
+    let offset = 0;
+    let i = 0;
+    while (i < list_len) {
+        let s = list.get(i);
+        if (s != undefined) {
+            let len_s = s.length;
+            let j = 0;
+            while (j < len_s) {
+                bytes.write_byte(ptr, offset + j, s[j]);
+                j = j + 1;
+            }
+            offset = offset + len_s;
+        }
+        if (i < list_len - 1) {
+            let k = 0;
+            while (k < sep_len) {
+                bytes.write_byte(ptr, offset + k, sep[k]);
+                k = k + 1;
+            }
+            offset = offset + sep_len;
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+/// Returns the substring from `start` (inclusive) to `end` (exclusive).
+///
+/// Both bounds are clamped into `[0, s.length]`, and a range that ends up
+/// empty or inverted yields `""` rather than erroring.
+pub fn slice(s: string, start: int, end: int): string {
+    let s_len = s.length;
+    let start_clamped = if (start < 0) 0 else if (start > s_len) s_len else start;
+    let end_clamped = if (end < start_clamped) start_clamped else if (end > s_len) s_len else end;
+    let len = end_clamped - start_clamped;
+    if (len <= 0) {
+        return "";
+    }
+    let ptr = allocString(len);
+    bytes.copy(ptr as long, (s as long) + (start_clamped as long), len);
+    return ptr;
+}
+
+/// Removes leading and trailing ASCII whitespace (space, tab, LF, CR).
+pub fn trim(s: string): string {
+    let len = s.length;
+    let start = 0;
+    while (start < len) {
+        let c = s[start];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            break;
+        }
+        start = start + 1;
+    }
+    let end = len;
+    while (end > start) {
+        let c = s[end - 1];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            break;
+        }
+        end = end - 1;
+    }
+    return slice(s, start, end);
+}
+
+/// Removes leading ASCII whitespace only.
+pub fn trimStart(s: string): string {
+    let len = s.length;
+    let start = 0;
+    while (start < len) {
+        let c = s[start];
+        if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+        start = start + 1;
+    }
+    return slice(s, start, len);
+}
+
+/// Removes trailing ASCII whitespace only.
+pub fn trimEnd(s: string): string {
+    let len = s.length;
+    let end = len;
+    while (end > 0) {
+        let c = s[end - 1];
+        if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+        end = end - 1;
+    }
+    return slice(s, 0, end);
+}
+
+/// Alias for `slice`: returns the substring from `start` to `end`.
+pub fn substring(s: string, start: int, end: int): string {
+    return slice(s, start, end);
+}
+
+/// Returns the single-byte string at index `i`, or `""` if `i` is out of range.
+pub fn charAt(s: string, i: int): string {
+    if (i < 0 || i >= s.length) { return ""; }
+    return slice(s, i, i + 1);
+}
+
+/// Returns `s` repeated `n` times, concatenated with no separator.
+pub fn repeat(s: string, n: int): string {
+    let out = "";
+    let i = 0;
+    while (i < n) { out = concat(out, s); i = i + 1; }
+    return out;
+}
+
+/// Pads `s` on the left with repetitions of `pad` until it reaches `targetLen`
+/// bytes. Returns `s` unchanged if `pad` is empty or `s` is already long enough.
+pub fn padStart(s: string, targetLen: int, pad: string): string {
+    if (pad.length == 0) { return s; }
+    let deficit = targetLen - s.length;
+    if (deficit <= 0) { return s; }
+    let prefix = "";
+    while (prefix.length < deficit) { prefix = concat(prefix, pad); }
+    return concat(slice(prefix, 0, deficit), s);
+}
+
+/// Pads `s` on the right with repetitions of `pad` until it reaches
+/// `targetLen` bytes. Returns `s` unchanged if `pad` is empty or `s` is
+/// already long enough.
+pub fn padEnd(s: string, targetLen: int, pad: string): string {
+    if (pad.length == 0) { return s; }
+    let deficit = targetLen - s.length;
+    if (deficit <= 0) { return s; }
+    let suffix = "";
+    while (suffix.length < deficit) { suffix = concat(suffix, pad); }
+    return concat(s, slice(suffix, 0, deficit));
+}
+
+/// Replaces every non-overlapping occurrence of `old` in `s` with `new`.
+///
+/// When `old` is `""`, `new` is inserted between every byte of `s`, including
+/// before the first byte and after the last. Returns `s` unchanged (no new
+/// allocation) when there are no matches.
+pub fn replace(s: string, old: string, new: string): string {
+    let s_len = s.length;
+    let old_len = old.length;
+    let new_len = new.length;
+
+    if (old_len == 0) {
+
+        let result = bytes.alloc(s_len * (new_len + 1) + new_len);
+        let offset = 0;
+        let i = 0;
+        while (i < s_len) {
+
+            let k = 0;
+            while (k < new_len) {
+                bytes.write_byte(result, offset + k, new[k]);
+                k = k + 1;
+            }
+            offset = offset + new_len;
+            bytes.write_byte(result, offset, s[i]);
+            offset = offset + 1;
+            i = i + 1;
+        }
+
+        let k = 0;
+        while (k < new_len) {
+            bytes.write_byte(result, offset + k, new[k]);
+            k = k + 1;
+        }
+        offset = offset + new_len;
+
+        return slice(result, 0, offset);
+    }
+
+    let count = 0;
+    let pos = 0;
+    while (true) {
+        let idx = indexOfFrom(s, old, pos);
+        if (idx == -1) break;
+        count = count + 1;
+        pos = idx + old_len;
+    }
+
+    if (count == 0) {
+        return s;
+    }
+
+    let result_len = s_len + count * (new_len - old_len);
+    let result = allocString(result_len);
+    let offset = 0;
+    let search_start = 0;
+
+    while (true) {
+        let idx = indexOfFrom(s, old, search_start);
+        if (idx == -1) {
+
+            let remaining_len = s_len - search_start;
+            let k = 0;
+            while (k < remaining_len) {
+                bytes.write_byte(result, offset + k, s[search_start + k]);
+                k = k + 1;
+            }
+            break;
+        }
+
+        let before_len = idx - search_start;
+        let k = 0;
+        while (k < before_len) {
+            bytes.write_byte(result, offset + k, s[search_start + k]);
+            k = k + 1;
+        }
+        offset = offset + before_len;
+
+        let k = 0;
+        while (k < new_len) {
+            bytes.write_byte(result, offset + k, new[k]);
+            k = k + 1;
+        }
+        offset = offset + new_len;
+        search_start = idx + old_len;
+    }
+
+    return result;
+}
+
+/// Returns a copy of `s` with ASCII uppercase letters lowercased. Non-ASCII
+/// bytes pass through unchanged.
+pub fn toLowerCase(s: string): string {
+    let len = s.length;
+    let ptr = allocString(len);
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c >= 65 && c <= 90) {
+            bytes.write_byte(ptr, i, c + 32);
+        } else {
+            bytes.write_byte(ptr, i, c);
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+/// Returns a copy of `s` with ASCII lowercase letters uppercased. Non-ASCII
+/// bytes pass through unchanged.
+pub fn toUpperCase(s: string): string {
+    let len = s.length;
+    let ptr = allocString(len);
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c >= 97 && c <= 122) {
+            bytes.write_byte(ptr, i, c - 32);
+        } else {
+            bytes.write_byte(ptr, i, c);
+        }
+        i = i + 1;
+    }
+    return ptr;
+}
+
+/// Reports whether `s` begins with `prefix`.
+pub fn startsWith(s: string, prefix: string): bool {
+    let s_len = s.length;
+    let p_len = prefix.length;
+    if (s_len < p_len) {
+        return false;
+    }
+    let i = 0;
+    while (i < p_len) {
+        if (s[i] != prefix[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Reports whether `s` ends with `suffix`.
+pub fn endsWith(s: string, suffix: string): bool {
+    let s_len = s.length;
+    let suf_len = suffix.length;
+    if (s_len < suf_len) {
+        return false;
+    }
+    let i = 0;
+    while (i < suf_len) {
+        if (s[s_len - suf_len + i] != suffix[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Reports whether `substr` occurs anywhere in `s`. An empty `substr` always
+/// matches.
+pub fn contains(s: string, substr: string): bool {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len) {
+        return false;
+    }
+    if (sub_len == 0) {
+        return true;
+    }
+    let i = 0;
+    while (i <= s_len - sub_len) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) {
+                is_match = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if (is_match) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Returns the byte index of the first occurrence of `substr` in `s`, or -1
+/// if it does not occur.
+pub fn indexOf(s: string, substr: string): int {
+    return indexOfFrom(s, substr, 0);
+}
+
+/// Returns the byte index of the last occurrence of `substr` in `s`, or -1 if
+/// it does not occur. An empty `substr` matches at `s.length`.
+pub fn lastIndexOf(s: string, substr: string): int {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len) { return -1; }
+    if (sub_len == 0) { return s_len; }
+    let i = s_len - sub_len;
+    while (i >= 0) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) { is_match = false; break; }
+            j = j + 1;
+        }
+        if (is_match) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// Finds the first occurrence of substr at or after byte index start, or -1.
+fn indexOfFrom(s: string, substr: string, start: int): int {
+    let s_len = s.length;
+    let sub_len = substr.length;
+    if (s_len < sub_len || start >= s_len) {
+        return -1;
+    }
+    if (sub_len == 0) {
+        return start;
+    }
+    let i = start;
+    while (i <= s_len - sub_len) {
+        let j = 0;
+        let is_match = true;
+        while (j < sub_len) {
+            if (s[i + j] != substr[j]) {
+                is_match = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if (is_match) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Reports whether `a` and `b` have identical bytes. Two `undefined` strings
+/// are considered equal; `undefined` never equals a defined string.
+pub fn eql(a: string, b: string): bool {
+    if (a == undefined || b == undefined) {
+        return a == undefined && b == undefined;
+    }
+    let len_a = a.length;
+    let len_b = b.length;
+    if (len_a != len_b) {
+        return false;
+    }
+    let i = 0;
+    while (i < len_a) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Lexicographically compares `a` and `b` byte by byte, returning -1, 0, or 1
+/// (a shorter string that is a prefix of the other compares as smaller).
+pub fn compare(a: string, b: string): int {
+    let len_a = a.length;
+    let len_b = b.length;
+    let min_len = len_a;
+    if (len_b < len_a) {
+        min_len = len_b;
+    }
+    let i = 0;
+    while (i < min_len) {
+        let char_a = a[i];
+        let char_b = b[i];
+        if (char_a < char_b) {
+            return -1;
+        }
+        if (char_a > char_b) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if (len_a < len_b) {
+        return -1;
+    }
+    if (len_a > len_b) {
+        return 1;
+    }
+    return 0;
+}
+
+/// Computes a djb2-style hash of `s`, suitable for use as a map/set key hash.
+pub fn hash(s: string): int {
+    let len = s.length;
+    let h = 5381;
+    let i = 0;
+    while (i < len) {
+        let c = s[i];
+        h = ((h << 5) + h) + c;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// Parses a signed decimal integer from `s`, saturating to `long`'s min/max on
+/// overflow and stopping at the first non-digit rather than failing.
+///
+/// Unlike `parseLong`, this never returns `undefined`: an empty string or a
+/// string with no leading digits parses as `0`.
+pub fn parseI64(s: string): long {
+
+    let len = s.length;
+    if (len == 0) {
+        return 0;
+    }
+    let LONG_MIN: long = -9223372036854775807 - 1;
+    let LONG_MAX: long = 9223372036854775807;
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) {
+        neg = true;
+        i = 1;
+    } else if (s[0] == 43) {
+        i = 1;
+    }
+
+    let limit: long = 0 - LONG_MAX;
+    if (neg) {
+        limit = LONG_MIN;
+    }
+    let multmin: long = limit / 10;
+
+    let acc: long = 0;
+    let any = false;
+    while (i < len) {
+        let c = s[i];
+        if (c < 48 || c > 57) {
+            i = len;
+        } else {
+            let d: long = (c - 48) as long;
+            if (acc < multmin) {
+                if (neg) { return LONG_MIN; }
+                return LONG_MAX;
+            }
+            acc = acc * 10;
+            if (acc < limit + d) {
+                if (neg) { return LONG_MIN; }
+                return LONG_MAX;
+            }
+            acc = acc - d;
+            any = true;
+            i = i + 1;
+        }
+    }
+
+    if (!any) {
+        return 0;
+    }
+    if (neg) {
+        return acc;
+    }
+    return 0 - acc;
+}
+
+/// Parses a decimal (optionally exponent-bearing) number from `s`.
+///
+/// Delegates to `parseDouble` first and only falls back to a lenient
+/// digit-by-digit scan (which never fails and simply ignores invalid
+/// characters) when `parseDouble` reports `undefined`.
+pub fn parseFloat(s: string): double {
+    let parsed = parseDouble(s);
+    if (parsed != undefined) { return parsed; }
+    let len = s.length;
+    let i = 0;
+    let neg = false;
+    if (len > 0 && s[0] == 45) {
+        neg = true;
+        i = 1;
+    }
+    let intPart = 0.0;
+    while (i < len && s[i] != 46) {
+        if (s[i] >= 48 && s[i] <= 57) {
+            intPart = intPart * 10.0 + ((s[i] - 48) as double);
+        }
+        i = i + 1;
+    }
+    let frac = 0.0;
+    let scale = 1.0;
+    if (i < len && s[i] == 46) {
+        i = i + 1;
+        while (i < len) {
+            if (s[i] >= 48 && s[i] <= 57) {
+                scale = scale / 10.0;
+                frac = frac + ((s[i] - 48) as double) * scale;
+            }
+            i = i + 1;
+        }
+    }
+    let result = intPart + frac;
+    if (neg) {
+        result = 0.0 - result;
+    }
+    return result;
+}
+
+
+/// Strictly parses a signed decimal integer from `s` into a `long`.
+///
+/// Returns `undefined` for an empty string, a lone sign, trailing
+/// non-numeric characters, or overflow of `long`'s range: the whole string
+/// must be a valid integer.
+pub fn parseLong(s: string): long | undefined {
+    let len = s.length;
+    if (len == 0) { return undefined; }
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) {
+        neg = true;
+        i = 1;
+    } else if (s[0] == 43) {
+        i = 1;
+    }
+    if (i >= len) { return undefined; }
+
+    let LONG_MIN: long = -9223372036854775807 - 1;
+    let LONG_MAX: long = 9223372036854775807;
+    let limit: long = 0 - LONG_MAX;
+    if (neg) { limit = LONG_MIN; }
+    let multmin: long = limit / 10;
+
+    let acc: long = 0;
+    while (i < len) {
+        let c = s[i];
+        if (c < 48 || c > 57) { return undefined; }
+        let d: long = (c - 48) as long;
+        if (acc < multmin) { return undefined; }
+        acc = acc * 10;
+        if (acc < limit + d) { return undefined; }
+        acc = acc - d;
+        i = i + 1;
+    }
+    if (neg) { return acc; }
+    return 0 - acc;
+}
+
+/// Strictly parses a signed decimal integer from `s` into an `int`.
+///
+/// Uses `parseLong` and returns `undefined` if parsing fails or the value
+/// falls outside `int`'s 32-bit range.
+pub fn parseInt(s: string): int | undefined {
+    let v = parseLong(s);
+    if (v == undefined) { return undefined; }
+    let INT_MIN: long = -2147483648;
+    let INT_MAX: long = 2147483647;
+    if (v < INT_MIN || v > INT_MAX) { return undefined; }
+    return v as int;
+}
+
+/// Strictly parses a decimal number from `s` into a `double`, with optional
+/// sign, fractional part, and `e`/`E` exponent (e.g. `-1.5e2`).
+///
+/// Returns `undefined` unless the entire string is consumed as a valid
+/// number: no digits, a dangling exponent marker, or trailing garbage all
+/// fail rather than returning a partial result.
+pub fn parseDouble(s: string): double | undefined {
+    let len = s.length;
+    if (len == 0) { return undefined; }
+
+    let i = 0;
+    let neg = false;
+    if (s[0] == 45) {
+        neg = true;
+        i = 1;
+    } else if (s[0] == 43) {
+        i = 1;
+    }
+
+    let sawDigit = false;
+    let intPart = 0.0;
+    while (i < len && s[i] >= 48 && s[i] <= 57) {
+        intPart = intPart * 10.0 + ((s[i] - 48) as double);
+        sawDigit = true;
+        i = i + 1;
+    }
+
+    let frac = 0.0;
+    let scale = 1.0;
+    if (i < len && s[i] == 46) {
+        i = i + 1;
+        while (i < len && s[i] >= 48 && s[i] <= 57) {
+            scale = scale / 10.0;
+            frac = frac + ((s[i] - 48) as double) * scale;
+            sawDigit = true;
+            i = i + 1;
+        }
+    }
+    if (!sawDigit) { return undefined; }
+    let mant = intPart + frac;
+
+    if (i < len && (s[i] == 101 || s[i] == 69)) {
+        i = i + 1;
+        let expNeg = false;
+        if (i < len && s[i] == 45) { expNeg = true; i = i + 1; }
+        else if (i < len && s[i] == 43) { i = i + 1; }
+        let sawExpDigit = false;
+        let exp = 0;
+        while (i < len && s[i] >= 48 && s[i] <= 57) {
+            exp = exp * 10 + (s[i] - 48);
+            sawExpDigit = true;
+            i = i + 1;
+        }
+        if (!sawExpDigit) { return undefined; }
+        let p = 0;
+        let factor = 1.0;
+        while (p < exp) { factor = factor * 10.0; p = p + 1; }
+        if (expNeg) { mant = mant / factor; } else { mant = mant * factor; }
+    }
+
+    if (i != len) { return undefined; }
+    if (neg) { mant = 0.0 - mant; }
+    return mant;
+}
+
+/// Destructor hook for `string`. Owned strings are plain heap buffers with no
+/// nested owned fields, so there is nothing extra to release here.
+pub fn delete(self: string): void {
+}
+
+@test
+fn test_string_helpers(): void {
+    if (!startsWith("hello", "he")) { kyte_test_fail("startsWith fail"); }
+    if (startsWith("hello", "lo")) { kyte_test_fail("startsWith negative fail"); }
+    if (!endsWith("hello", "lo")) { kyte_test_fail("endsWith fail"); }
+    if (endsWith("hello", "he")) { kyte_test_fail("endsWith negative fail"); }
+    if (!contains("hello", "el")) { kyte_test_fail("contains fail"); }
+    if (contains("hello", "world")) { kyte_test_fail("contains negative fail"); }
+
+    if (indexOf("hello", "e") != 1) { kyte_test_fail("indexOf fail"); }
+    if (indexOf("hello", "z") != -1) { kyte_test_fail("indexOf negative fail"); }
+
+    if (!eql("abc", "abc")) { kyte_test_fail("eql fail"); }
+    if (eql("abc", "def")) { kyte_test_fail("eql negative fail"); }
+
+    if (compare("abc", "def") != -1) { kyte_test_fail("compare < fail"); }
+    if (compare("def", "abc") != 1) { kyte_test_fail("compare > fail"); }
+    if (compare("abc", "abc") != 0) { kyte_test_fail("compare == fail"); }
+
+    if (parseI64("1234") != 1234) { kyte_test_fail("parseI64 positive fail"); }
+    if (parseI64("-56") != -56) { kyte_test_fail("parseI64 negative fail"); }
+
+    if ((parseLong("1234") ?? -1) != 1234) { kyte_test_fail("parseLong ok fail"); }
+    if ((parseLong("-56") ?? 1) != -56) { kyte_test_fail("parseLong neg fail"); }
+    if (parseLong("") != undefined) { kyte_test_fail("parseLong empty should be undefined"); }
+    if (parseLong("12x") != undefined) { kyte_test_fail("parseLong trailing garbage should be undefined"); }
+    if (parseLong("+") != undefined) { kyte_test_fail("parseLong lone sign should be undefined"); }
+    if (parseLong("99999999999999999999") != undefined) { kyte_test_fail("parseLong overflow should be undefined"); }
+
+    if ((parseInt("42") ?? -1) != 42) { kyte_test_fail("parseInt ok fail"); }
+    if (parseInt("3000000000") != undefined) { kyte_test_fail("parseInt out-of-i32-range should be undefined"); }
+    if (parseInt("abc") != undefined) { kyte_test_fail("parseInt non-numeric should be undefined"); }
+
+    let d1 = (parseDouble("1e3") ?? 0.0) - 1000.0;
+    if (d1 > 0.0001 || d1 < -0.0001) { kyte_test_fail("parseDouble exponent fail"); }
+    let d2 = (parseDouble("2.5") ?? 0.0) - 2.5;
+    if (d2 > 0.0001 || d2 < -0.0001) { kyte_test_fail("parseDouble frac fail"); }
+    let d3 = (parseDouble("-1.5e2") ?? 0.0) + 150.0;
+    if (d3 > 0.0001 || d3 < -0.0001) { kyte_test_fail("parseDouble neg exp fail"); }
+    if (parseDouble("") != undefined) { kyte_test_fail("parseDouble empty should be undefined"); }
+    if (parseDouble("1.2.3") != undefined) { kyte_test_fail("parseDouble double-dot should be undefined"); }
+    if (parseDouble("1e") != undefined) { kyte_test_fail("parseDouble dangling exp should be undefined"); }
+    if (parseDouble("5x") != undefined) { kyte_test_fail("parseDouble trailing garbage should be undefined"); }
+}

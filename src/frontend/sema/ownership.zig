@@ -1,6 +1,6 @@
 //! Ownership analysis and use-after-move verifier for the typed IR.
 //!
-//! Nova is an ARC language: every heap value carries a refcount and is dropped
+//! Kyte is an ARC language: every heap value carries a refcount and is dropped
 //! (released) exactly once when its owner goes out of scope. This pass runs over
 //! the already-typed IR ([`TypedIr`], produced by `infer.zig`) and has two jobs
 //! that share the same tree walk:
@@ -36,7 +36,7 @@
 //!
 //! [`analyze`] returns just the [`Stats`] (fire-and-forget accounting used by the
 //! normal compile). [`verify`] additionally collects a [`Diagnostic`] per
-//! violation. [`runVerify`] is the `NOVA_OWN_VERIFY` developer gate: it prints a
+//! violation. [`runVerify`] is the `KYTE_OWN_VERIFY` developer gate: it prints a
 //! coverage report and, when `hard_fail` is set, exits the process non-zero on
 //! any violation so CI can gate on it. See `arc.zig` (the OSSA ARC-balance
 //! self-verifier) for the complementary codegen-side check.
@@ -147,7 +147,7 @@ pub fn verify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *TypedI
     return .{ .stats = st, .diagnostics = try list.toOwnedSlice(allocator) };
 }
 
-/// The `NOVA_OWN_VERIFY` developer gate: run [`verify`], print a coverage report
+/// The `KYTE_OWN_VERIFY` developer gate: run [`verify`], print a coverage report
 /// to stderr, and optionally fail the build.
 ///
 /// Prints functions walked, owned locals, the proved/deferred split, coverage
@@ -163,7 +163,7 @@ pub fn runVerify(allocator: std.mem.Allocator, store: *const TypeStore, ir: *Typ
     const deferred = s.deferred_cfg + s.deferred_untyped;
     const cov: usize = if (total == 0) 100 else (proved * 100) / total;
     std.debug.print(
-        "=== ownership verifier (NOVA_OWN_VERIFY) ===\n" ++
+        "=== ownership verifier (KYTE_OWN_VERIFY) ===\n" ++
         "  functions walked        : {d}\n" ++
         "  owned let-locals        : {d}\n" ++
         "    proved (balance held) : {d}\n" ++

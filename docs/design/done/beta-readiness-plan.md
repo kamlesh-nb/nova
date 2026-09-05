@@ -1,11 +1,11 @@
-# Nova → Beta: The Final Plan
+# Kyte → Beta: The Final Plan
 
 > **👉 For F1–F5 status, read `design/FOUNDATION-STATUS.md` — that is the board (scorecard +
 > per-stage evidence + remaining-work task IDs). This file is the append-only progress log; scan the
 > board first, dig here for the narrative.**
 
 **Status:** Plan of record. Written 2026-07-17.
-**Supersedes** the sequencing in `nova-readiness-roadmap.md` and `nova-language-evolution-plan.md` (both
+**Supersedes** the sequencing in `kyte-readiness-roadmap.md` and `kyte-language-evolution-plan.md` (both
 substantially stale — see §5). **Does not supersede** `design/F1–F5` (the current foundation program) or
 `runtime-cpp20-plan.md` (the current runtime program); this document *sequences* them and adds what
 neither covers.
@@ -77,7 +77,7 @@ NEXT: **cut over** `isOwnedTypeId`'s `.type_param` branch to `subst.substitute` 
 
 ## ⏱ Progress log — 2026-07-18b (Lane A: shadow-diff harness LANDED — migration de-risked to ONE keystone)
 
-Built the **string→TypeId shadow-diff harness** (report-only under NOVA_SEMA_SHADOW; all 5 gates green):
+Built the **string→TypeId shadow-diff harness** (report-only under KYTE_SEMA_SHADOW; all 5 gates green):
 at every ownership decision (`isOwnedTypeId`) it computes BOTH the typed `store.isOwned(t)` and the
 legacy `isRefCountedType(renderLegacy(t))` and classifies CONCRETE(agree/disagree) vs BLOCKED
 (`.type_param`/`.unresolved`/`.enum_`). This is THE safety net — it turns "did I break an unexercised
@@ -92,7 +92,7 @@ path?" into a measured number before any cutover.
 ⟹ **The whole ARC-ownership migration collapses to ONE keystone**: per-instantiation typing to
 eliminate `.type_param` at codegen. F2-5 (unresolved) and enum-awareness are NOT blockers at the
 ownership-decision level. Drive `td_blocked→0` via the keystone, keep `td_disagree=0`, delete
-`isRefCountedType`. Gate/verify: `NOVA_SEMA_SHADOW=1 nova test <case>` → the
+`isRefCountedType`. Gate/verify: `KYTE_SEMA_SHADOW=1 kyte test <case>` → the
 `string→TypeId shadow-diff` block. NEXT: build the keystone (per-instantiation re-typing via
 `subst.substitute`, behind this shadow-diff — the blocked count must fall and disagree must stay 0).
 
@@ -150,7 +150,7 @@ now done:
   `8472` (an i32-truncated string pointer); no unwinding, coroutine-UB (`715fb20`).
 - **P2-13** `T | Error` WORKS — union type, `try` (propagate) / `catch` (default) as value operators,
   boxed `[tag,payload]` representation, payload enum carries the reason. Errors reach the caller with the
-  message intact (`ee50e18`, `c2a6eb3`). Gated by `33_error_union.nova`.
+  message intact (`ee50e18`, `c2a6eb3`). Gated by `33_error_union.ky`.
 - **P2-14** optional member-deref: the live SEGV is now an honest **located abort** (runtime guard on an
   optional-typed receiver). See-through ergonomics kept (`eea2139`). Gated by `38_optional_deref_guard`.
 - **P2-16** the enum discriminant/payload bugs — payload binding stringifying a pointer (`c2a6eb3`), and
@@ -166,7 +166,7 @@ all three misdiagnosed as one "module-qualified type in closure" bug — none ac
 - a method on a payload-less enum value (`b9872a9`)
 
 **✅ §6 keeper split (route-handling-via-mediator.md):** `isNamespaceReceiver` (`476311a`) and
-`CompositeSource` (`54e6666`) committed with gates. `callBinder` + `app.nova` stay in the working tree —
+`CompositeSource` (`54e6666`) committed with gates. `callBinder` + `app.ky` stay in the working tree —
 they are genuinely coupled to the framework REWRITE (P5-31), not more KEEP work.
 
 **Recurring finding, worth stating once:** nearly every bug above was the same root cause — *something
@@ -191,8 +191,8 @@ are judged on exit code alone, and a crash also exits non-zero. Measured: of 16 
 
 **Nothing in this plan can be verified until that is fixed.** It is task **P0-1** and it is first, ahead
 of every user-visible feature, because every "done" below is otherwise an opinion. This is the same
-failure family as `nova test` silently skipping `main()` ([[nova-arc-measurement-traps]]) and the
-compiler test-list running 0 tests while reporting 101/101 ([[nova-test-discovery-guard]]). **Third
+failure family as `kyte test` silently skipping `main()` ([[kyte-arc-measurement-traps]]) and the
+compiler test-list running 0 tests while reporting 101/101 ([[kyte-test-discovery-guard]]). **Third
 occurrence. The pattern is the finding, not the instance.**
 
 ---
@@ -207,8 +207,8 @@ Much better than the docs say in some places, much worse in others.
 | **C++20 runtime, Asio, multi-core** | `concurrency.cpp` includes `boost/asio.hpp`; `g_io.run()` on an N-thread pool. The "runtime is C / fragile" grade is **stale**. |
 | **async/await, LLVM coroutines** | Runtime plan M0 gate PASSED; B (surface) + C (lowering) + D (Asio) landed. |
 | **TLS via wolfSSL** | Verified against the real network; **fail-closed proven** (self-signed + wrong-host both rejected). |
-| **Crypto is real** | `crypto.sha256("abc")` = `ba7816bf…f20015ad` — the correct KAT. wolfCrypt, with an honest `nova_crypto_unavailable` fallback (never a silent stub). |
-| **Crypto input is binary-safe** | `nova_crypto_slen` reads the length header at `s-4`, not `strlen`. |
+| **Crypto is real** | `crypto.sha256("abc")` = `ba7816bf…f20015ad` — the correct KAT. wolfCrypt, with an honest `kyte_crypto_unavailable` fallback (never a silent stub). |
+| **Crypto input is binary-safe** | `kyte_crypto_slen` reads the length header at `s-4`, not `strlen`. |
 | **Map growth** | 5000 keys from a presize of 8, many resizes → clean. |
 | **`${long}` / `${double}` interpolation** | Both fine. |
 | **`let f = self.hashFn; (f)(k)`** | Fine. |
@@ -223,8 +223,8 @@ Much better than the docs say in some places, much worse in others.
 | ~~Optional enforcement: none~~ | ✅ **The SEGV is fixed (P2-14, `eea2139`)** — a member deref on an absent optional now traps with file:line instead of reading through address 0. ⏳ Assign/pass/return still not *statically* rejected (compile-time enforcement pending; they don't crash — no deref). |
 | ~~Tuples: silent corruption~~ | ✅ **The corruption is fixed (P2-18, `fb77f0e`)** — box owns its elements, leak 68→3, `return t` UAF gone. ⏳ The *type-checker* half is still open: `v + e` (int+string) still compiles, arity unchecked. |
 | ~~`throw` is an i32 longjmp~~ | ✅ **REMOVED (P2-12, `715fb20`).** Replaced by `T | Error` (P2-13). |
-| **Stack traces don't exist** | Unchanged. `nova_get_stacktrace()` returns an empty buffer. (`throw` never provided one either, so nothing was lost.) |
-| **Bounded channels don't exist** | Unchanged. `nova_chan_new`: `(void)capacity;` — gates R3 (P3-20). |
+| **Stack traces don't exist** | Unchanged. `kyte_get_stacktrace()` returns an empty buffer. (`throw` never provided one either, so nothing was lost.) |
+| **Bounded channels don't exist** | Unchanged. `kyte_chan_new`: `(void)capacity;` — gates R3 (P3-20). |
 | **Build is macOS-hardcoded** | Unchanged. Runtime plan workstream **E is OPEN**. Blocks "production ready" on any other OS and B-gate 3. |
 | ~~Negative-test harness~~ | ✅ **Fixed (P0, `92e51df`)** — asserts the failure reason; `--arc` + `--asan` gates added. |
 
@@ -266,7 +266,7 @@ The audit found the gap is wider than that.
 - **M7. Actors** — CLAUDE.md promises the actor model. **No design in any doc.**
 - **M8. Bounded channels** — the SSE bus's core property; unimplemented.
 - **M9. Reference cycles** — F5 Q1: ARC cannot collect them; a parent↔child graph leaks today and will
-  still leak after F5. **Undocumented in specs.** "Nova has ARC" implies a cycle story to anyone from Swift.
+  still leak after F5. **Undocumented in specs.** "Kyte has ARC" implies a cycle story to anyone from Swift.
 - **M10. Cross-platform CI** — build is macOS-hardcoded; roadmap's own 1.0 list names portability.
 - **M11. Package manager / registry, LSP hardening, diagnostics** (E3/E4) — open, unowned.
 - **M12. `collections.array` segfaults on mere import** — a pre-existing codegen bug; array is never gated
@@ -279,15 +279,15 @@ The audit found the gap is wider than that.
 
 ### R1. Webview desktop apps (`webview/webview`)
 **Feasible, but blocked on a real architectural decision.**
-- ⚠️ **Event-loop conflict.** `main()` → `__nova_main()` → `nova_run()` → `g_io.run()` **on the main
+- ⚠️ **Event-loop conflict.** `main()` → `__kyte_main()` → `kyte_run()` → `g_io.run()` **on the main
   thread**. macOS AppKit *requires* the UI loop on the main thread. Two loops, one thread.
-- **Design:** main thread runs `webview_run()`; Asio `io_context` runs on worker threads only; Nova async
+- **Design:** main thread runs `webview_run()`; Asio `io_context` runs on worker threads only; Kyte async
   code runs on workers; UI updates marshalled via `webview_dispatch`. Needs a new entry mode
-  (`nova_webview_run()`) that inverts who owns `main`.
+  (`kyte_webview_run()`) that inverts who owns `main`.
 - **Blocked on:** cross-platform build (runtime **E**, open) — webview needs WebKitGTK (Linux) /
   WebView2 (Windows) / WKWebView (macOS). **Native only; never WASM.**
 - Note `studio/` in the tree is currently a **Node.js** app (`server.js`, `node_modules`) — the Data
-  Studio prototype is not Nova today.
+  Studio prototype is not Kyte today.
 
 ### R2. DB drivers — MySQL / Postgres / MSSQL / MongoDB
 **`db-drivers.md` is ~5% of a spec and cannot be built from.** It contains the easy, re-derivable part
@@ -316,9 +316,9 @@ by runtime primitives, not logic.
 **🔑 DECISION (user, 2026-07-17) — no WatchClient, no change-stream, no separate service.**
 ssehub's WatchClient existed to fan a **change stream** out across **micro-services**. Neither applies here:
 a change stream is implementable on NovaDB but **not** on Postgres/MySQL/MSSQL/Mongo, so it cannot be a
-portable framework primitive; and Nova targets a **monolith**, not micro-services. Therefore:
+portable framework primitive; and Kyte targets a **monolith**, not micro-services. Therefore:
 - **The bus is a library inside the web framework**, not a standalone service. It lives in-process with the
-  app — `std/web/sse.nova` — and the app publishes to it directly.
+  app — `std/web/sse.ky` — and the app publishes to it directly.
 - **There is no upstream-watch concept at all.** The "source" is ordinary application code calling
   `publish(topic, event)`. If NovaDB change-streams ever land, they become *one caller* of `publish`, not
   a component of the bus.
@@ -327,7 +327,7 @@ portable framework primitive; and Nova targets a **monolith**, not micro-service
 **The cut is exceptionally clean** and this decision makes it cleaner. `event_bus.zig` does **not** import
 `watch_client.zig` — the coupling is entirely one-way through a user hook that calls `bus.publish`. Drop
 the file, its 3 re-exports, and the planck/bson/tls deps. **Nothing else changes.** The only residual
-dependency is `utils.Now` (one function) → Nova's monotonic clock.
+dependency is `utils.Now` (one function) → Kyte's monotonic clock.
 
 **Also transport-agnostic:** the bus never opens, reads, or closes a socket. It receives a *writer* from
 the HTTP layer; SSE framing is isolated in `wire.zig`. **Preserve that** — it is the best part of the
@@ -336,7 +336,7 @@ design.
 ⚠️ **The blocking prerequisite — M8, and it is sharper than "bounded".** The design's whole load-bearing
 line is a **non-blocking try-send**: `queue.putUncancelable(io, &{owned}, 0)` with `min = 0`, meaning
 "enqueue only if it won't block". Full queue → drop or disconnect; **the publish path never blocks on a
-slow subscriber.** Nova needs a bounded MPSC channel with `try_send` semantics. `nova_chan_new` today
+slow subscriber.** Kyte needs a bounded MPSC channel with `try_send` semantics. `kyte_chan_new` today
 ignores capacity *and* offers no try-send. **Without try-send this design is not merely slower — it is
 impossible.**
 
@@ -359,13 +359,13 @@ an NTP step — use monotonic); **replay gaps are silent** (`oldestId()` exists 
 cheapest high-value correctness win); heartbeat is the magic string `"heartbeat"` (leaks a duped name;
 make it a variant); `\r` unhandled and `event_name` unvalidated in `writeEvent` (frame-injection vector);
 `Config.subscriber_queue_size` is dead; the `event_bus`↔`subscriber` circular import must become a leaf
-types module in Nova regardless. Consider a **refcounted shared payload** instead of the N-way
+types module in Kyte regardless. Consider a **refcounted shared payload** instead of the N-way
 per-subscriber dupe — the main scalability win, and a port is when to take it.
 
-### R4. Full crypto (`sha.nova`, `md5.nova`, `base64.nova`, `random.nova`)
-`src/std/crypto/` is **an empty directory**; `src/std/crypto.nova` is a thin 4-function file.
+### R4. Full crypto (`sha.ky`, `md5.ky`, `base64.ky`, `random.ky`)
+`src/std/crypto/` is **an empty directory**; `src/std/crypto.ky` is a thin 4-function file.
 - Have (real, KAT-correct, binary-safe **input**): `sha256`, `sha512`, `md5`, `hmac_sha256`, `random_hex`.
-- ⚠️ **The gap is output: hex-only.** `nova_hex(...)` means digests **cannot chain**. PBKDF2 is
+- ⚠️ **The gap is output: hex-only.** `kyte_hex(...)` means digests **cannot chain**. PBKDF2 is
   `HMAC(pw, salt‖i)` fed back round after round — that needs **raw bytes**. L4 designed `hash.sha256Bytes`;
   it never landed. Without it SCRAM is possible only via hex-decode between rounds — wasteful and silly.
 - **Absent entirely:** base64, SHA-1, SHA-384, SHA-3, PBKDF2, HKDF, AEAD (AES-GCM / ChaCha20-Poly1305),
@@ -376,7 +376,7 @@ per-subscriber dupe — the main scalability win, and a port is when to take it.
 
 ## 4. Beta criteria (the bar we are aiming at)
 
-From `nova-readiness-roadmap.md:358-370`, kept because it is good and still correct:
+From `kyte-readiness-roadmap.md:358-370`, kept because it is good and still correct:
 
 > Prototype → Alpha *(today)* → **Beta** → 1.0/Production.
 > - **Sound-enough core**: real type checking, real generics, no closure/concurrency data-race landmines.
@@ -387,7 +387,7 @@ From `nova-readiness-roadmap.md:358-370`, kept because it is good and still corr
 
 **This plan adds three Beta gates the roadmap lacks**, all earned by this audit:
 - **B-gate 1 — the harness proves things.** Negative cases assert a *reason*; the corpus runs under
-  `NOVA_ARC_AUDIT`. *A green corpus must be evidence about the compiler, not about the harness.*
+  `KYTE_ARC_AUDIT`. *A green corpus must be evidence about the compiler, not about the harness.*
 - **B-gate 2 — no silent memory unsoundness in a documented feature.** Optionals, tuples, and errors
   either enforce or are documented as unenforced. **No feature ships whose spec claims a guarantee the
   compiler does not make.**
@@ -439,7 +439,7 @@ something below it.
 
 > **P1 progress 2026-07-17.** Four of the six items I planned here **did not exist**. Measured, not
 > assumed — and the measuring is what produced the two real bugs found instead:
-> - ✅ **P1-6 (Map → `Storage<T>`) was ALREADY DONE.** `map.nova` holds `Storage<K>`/`Storage<V>`;
+> - ✅ **P1-6 (Map → `Storage<T>`) was ALREADY DONE.** `map.ky` holds `Storage<K>`/`Storage<V>`;
 >   `retainIfGenericStore` is deleted; `12_traits_dispatch`/`13_serde`/`14_collections_map` all pass.
 >   **F4/F5's "Map is excluded — that is the next task" was stale, and my first doc-truth pass
 >   REPEATED the stale claim** because I corrected the header from a summary instead of from the
@@ -450,18 +450,18 @@ something below it.
 >   fixing it is the substance of this session's P1 — see below.
 
 **Landed in P1:**
-- ✅ **`nova_atomic_cas_i32` returned the expected value, not the success flag.** Codegen truncates
+- ✅ **`kyte_atomic_cas_i32` returned the expected value, not the success flag.** Codegen truncates
   to i1, so callers got **the low bit of the expected value**: `compareAndSwap(22, 30)` succeeded and
   reported `false`; the *failing* CAS also reported `false`, so `assert.isFalse` passed by accident
   and only success looked broken. Correct iff the expected value was odd. **Every atomic CAS in the
   language was wrong**, and nothing in the corpus imported `concurrency.atomic`.
-- ✅ **`nova_atomic_cas_i64` declared `int32_t desired`** while codegen passes i64 — silently
+- ✅ **`kyte_atomic_cas_i64` declared `int32_t desired`** while codegen passes i64 — silently
   truncating any desired value above 2^31. ABI mismatch, fixed in header + impl.
-- ✅ **The test harness could not name a failing test.** `nova_test_fail` `_Exit(1)`s, so the
+- ✅ **The test harness could not name a failing test.** `kyte_test_fail` `_Exit(1)`s, so the
   generated `FAIL <name>` branch and the whole `Results: N passed, M failed` path are **dead code**.
   A failure printed only `Assertion failed: <msg>` — no name, no summary. Since the merged stdlib
   runs every imported module's `@test`s, **an unrelated module's failing test was indistinguishable
-  from your own**. Added `nova_test_begin(name)`; a failure now prints `FAIL <test>` + the message +
+  from your own**. Added `kyte_test_begin(name)`; a failure now prints `FAIL <test>` + the message +
   a note that the suite aborts at the first failure.
 - ✅ **`test_fiber_execution` was never broken — it was NEVER RUNNING.** `test_atomic_i32` aborted
   the process first, so it (and `test_atomic_i64`, `test_atomic_bool`) never executed. The abort was
@@ -469,7 +469,7 @@ something below it.
   "atomic/closure-capture defect". `spawn`, closure capture and the arena were all innocent.
   **Same shape as "string heap corruption" (a `func_map` suffix-scan bug misfiled for months): an
   instrument that cannot name a failure will misname it, and the wrong name sticks.**
-- ✅ **`conformance/cases/31_atomics.nova`** gates all of it — int/long/bool load/store/add/sub/CAS,
+- ✅ **`conformance/cases/31_atomics.ky`** gates all of it — int/long/bool load/store/add/sub/CAS,
   including an **even-expected-value** case (the shape the old code got wrong) and an
   **odd-expected-value** case (the shape it got right, so a half-fix cannot pass). **Shown to fail
   before the change**, per `design/README.md` §3 non-negotiable #4.
@@ -488,7 +488,7 @@ something below it.
     caught `8472`. Spec §5.5 rewritten.
 13. ✅ **`T | Error` implemented** (spec §3.4b written first) — `ee50e18`, `c2a6eb3`. `try` propagates,
     `catch`/`catch (e)` defaults, error side is a payload enum consumed by `switch`, message intact.
-    Gated `33_error_union.nova`. **Decisions taken with the user:** union not tuple (a tuple lets you
+    Gated `33_error_union.ky`. **Decisions taken with the user:** union not tuple (a tuple lets you
     drop the error); one error enum per signature; `T | E | undefined` for 404-vs-500; `exception`
     keyword rejected in favour of `error`/plain enums.
 14. ✅ **P2-14 RESOLVED (runtime half)** — `eea2139`. The see-through segfault is now a located
@@ -522,7 +522,7 @@ something below it.
 23. Generic channel element types (i32-only today).
 
 ### P4 — The new requirements, in dependency order
-24. **R4 crypto** — `crypto/sha.nova`, `md5.nova`, `base64.nova`, `random.nova` (CSPRNG **and** seeded
+24. **R4 crypto** — `crypto/sha.ky`, `md5.ky`, `base64.ky`, `random.ky` (CSPRNG **and** seeded
     PRNG), **raw-byte digest variants first**, then PBKDF2/HKDF, constant-time compare, NIST KATs.
     *Unblocks R2 auth.*
 25. **R3 SSE event bus** — after P3-20. Cheapest of the four; highest ratio.
@@ -531,7 +531,7 @@ something below it.
     with a type union + NULL; add `params`; then **spec ONE database end-to-end (Postgres — best-documented,
     and its framing already matches btree's) including auth and type mapping, ship it, and only then
     generalize.** Price FFI honestly as v1.
-27. **R1 webview** — after P3-19. Resolve the main-thread/Asio inversion; `nova_webview_run()`.
+27. **R1 webview** — after P3-19. Resolve the main-thread/Asio inversion; `kyte_webview_run()`.
 28. **Rewrite `data-studio.md`** against what then exists.
 
 ### P5 — Stdlib & web (roadmap C/D, unchanged and still open)
@@ -596,7 +596,7 @@ command, not a feeling.
 
 ### The one root cause (design/README, confirmed by every bug this session)
 
-> Nova decides semantics by pattern-matching the *spelling* of a rendered type NAME at codegen time,
+> Kyte decides semantics by pattern-matching the *spelling* of a rendered type NAME at codegen time,
 > and **guesses when it can't parse the name**. `isRefCountedType`'s catch-all returned `true` — "free
 > it" — for anything unrecognised. Every corruption this session (tuple `(unresolved,unresolved)` freed
 > as if owned, untyped `E.A`, closure-return-`void`) was that one mechanism in a different costume. Not
@@ -756,5 +756,5 @@ watch for it. It has not happened: every bug this session mapped to a row above.
 (harness, optionals, error model, tuples, enum payloads) that P0/P2 draw from.
 `docs/design/README.md` + F1–F5 — the foundation program (headers stale; stage tables true).
 `docs/runtime-cpp20-plan.md` §6 — the live runtime backlog.
-Memories: [[nova-conformance-harness-trap]], [[nova-arc-measurement-traps]], [[nova-spec-first-workflow]],
-[[nova-app-generic-mediator]], [[nova-deferred-backlog]].
+Memories: [[kyte-conformance-harness-trap]], [[kyte-arc-measurement-traps]], [[kyte-spec-first-workflow]],
+[[kyte-app-generic-mediator]], [[kyte-deferred-backlog]].

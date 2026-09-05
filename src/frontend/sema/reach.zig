@@ -1,6 +1,6 @@
 //! Whole-program reachability analysis for demand-driven monomorphisation.
 //!
-//! Nova monomorphises generics: `List<int>` becomes a concrete `List_int_*`,
+//! Kyte monomorphises generics: `List<int>` becomes a concrete `List_int_*`,
 //! not a type-erased body. Left unchecked, the type-driven monomorphiser emits
 //! the ENTIRE method surface of every generic instantiation, and measurements
 //! showed roughly 93% of the ~28,750 emitted functions were never actually
@@ -94,7 +94,7 @@ pub const Result = struct {
 /// Global switch for the by-name reachability gate. When false (the default),
 /// [`methodIsReachable`] answers true for everything, so pruning is a no-op and
 /// the build behaves as if this pass did not run. Codegen turns it on (driven by
-/// `NOVA_REACH_ON`) once the reachable set has been [`publish`]ed.
+/// `KYTE_REACH_ON`) once the reachable set has been [`publish`]ed.
 pub var gate_on: bool = false;
 /// Module-global set of reachable methods keyed by the string `"owner|method"`,
 /// populated by [`publish`] and read by [`methodIsReachable`].

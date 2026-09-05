@@ -15,45 +15,45 @@ LLVM" and recommended bring-your-own. That was WRONG, from stale recall. Verifie
 `build.zig.zon`, `deps/llvm-zig/README-static-llvm.md`, and `.github/workflows/release.yml`:
 
 **Self-contained delivery already exists and ships.** **[verified]**
-- `zig build -Dstatic-llvm=true` static-links LLVM's component archives into `nova` → a **~132 MB
-  self-contained binary** (only system dylibs; no `libLLVM.dylib`), gates green. "Users deploy only `nova`".
+- `zig build -Dstatic-llvm=true` static-links LLVM's component archives into `kyte` → a **~132 MB
+  self-contained binary** (only system dylibs; no `libLLVM.dylib`), gates green. "Users deploy only `kyte`".
 - The LLVM.org LTO-bitcode blocker (Zig's linker can't consume bitcode) is **RESOLVED** by
   `convert-drop-to-native.sh` (runs each archive member through `llc -filetype=obj`, re-archives native).
 - `release.yml` builds **6 bundles** and publishes them: macOS {arm64, x86_64} and Linux {arm64, x86_64}
   are **statically linked** (`-Dstatic-llvm=true`, globbing the OS package-manager's `libLLVM*.a`);
-  Windows {x86_64, arm64} ships `nova.exe` + a **bundled `LLVM-C.dll`** in the zip (dynamic, still one
+  Windows {x86_64, arm64} ships `kyte.exe` + a **bundled `LLVM-C.dll`** in the zip (dynamic, still one
   self-contained archive). In every case the end user downloads an archive and never installs LLVM.
 - The old fetched `llvm-dist` mirror was **removed on purpose** — CI uses the OS package manager's static
   archives instead, which is reproducible without hosting ~GB tarballs. So "finish the mirror" is NOT a task.
 
 **Actual remaining items (all narrow):**
-1. **Windows single-file static.** Windows currently bundles `LLVM-C.dll` beside `nova.exe` rather than
+1. **Windows single-file static.** Windows currently bundles `LLVM-C.dll` beside `kyte.exe` rather than
    static-linking (needs static LLVM `.lib` + `link.exe` static link). Arguably unnecessary — the bundle
    is still "download the zip and run" — so this is polish, not a blocker.
 2. **Un-hardcode the local static default.** `build.zig`'s `static_llvm_prefix` is a hardcoded dev-machine
-   path; it only affects a `-Dstatic-llvm` build run locally off that box without `NOVA_LLVM_PREFIX`. CI
-   overrides it, so this is cosmetic — make it a sensible per-OS default or require `NOVA_LLVM_PREFIX`.
+   path; it only affects a `-Dstatic-llvm` build run locally off that box without `KYTE_LLVM_PREFIX`. CI
+   overrides it, so this is cosmetic — make it a sensible per-OS default or require `KYTE_LLVM_PREFIX`.
 3. **Ship `nls` in the bundles (user request: "make nls same as language").** `nls` is a SEPARATE project
-   (`/nova-lang/nls`, own `build.zig`) currently SKIPPED in release.yml (`NOVA_ARCHIVE_SKIP_NLS=1`). Good
+   (`/kyte-lang/nls`, own `build.zig`) currently SKIPPED in release.yml (`KYTE_ARCHIVE_SKIP_NLS=1`). Good
    news: `nls` is a **pure-Zig binary with NO LLVM link** (the LSP uses only the frontend re-exports via
-   `-Dnova-src=…/lang/src/root.zig`; codegen/`llvm` is not reachable), ~5.8 MB, and "cross-compiles
+   `-Dkyte-src=…/lang/src/root.zig`; codegen/`llvm` is not reachable), ~5.8 MB, and "cross-compiles
    unchanged". **[verified]** So "same as language" is straightforward and actually EASIER than the
    compiler:
    - Build `nls` for all 6 targets — and because it is pure Zig, it can be **cross-compiled from a single
      runner** (no per-host LLVM), unlike the compiler.
-   - Pin it to the SAME lang source revision (`-Dnova-src`) so `nls` and `nova` never drift, and stamp the
+   - Pin it to the SAME lang source revision (`-Dkyte-src`) so `nls` and `kyte` never drift, and stamp the
      SAME version (extend `check-version-sync.sh` to cover nls).
-   - Include the `nls` binary in each release archive (drop `NOVA_ARCHIVE_SKIP_NLS`, or a companion
+   - Include the `nls` binary in each release archive (drop `KYTE_ARCHIVE_SKIP_NLS`, or a companion
      `nls-<triple>` artifact) so an install carries the compiler + LSP together.
 4. **Contributor dev builds** use dynamic system LLVM (fast) — fine; only release needs static.
 
 **Recommendation:** delivery is DONE for the web-developer story. #3 (ship `nls`) is the one the user
-explicitly wants and is small — a cross-compiled pure-Zig binary bundled alongside `nova`, version-locked to
+explicitly wants and is small — a cross-compiled pure-Zig binary bundled alongside `kyte`, version-locked to
 the same lang source. Do #2 (un-hardcode) opportunistically; #1 (Windows single-file static) only if it
 matters.
 
 **Decision to lock:** (1) agree delivery is solved (no mirror work). (2) ship `nls` in the SAME archive as
-`nova` vs a companion artifact? (3) version-lock `nls` to lang via `check-version-sync.sh`?
+`kyte` vs a companion artifact? (3) version-lock `nls` to lang via `check-version-sync.sh`?
 
 **Effort:** #3 (nls) = ~1 day (add an nls build+bundle leg, cross-compiled; extend version-sync). #2 = hours.
 #1 (Windows static) = days, optional.
@@ -61,15 +61,15 @@ matters.
 ---
 
 ## Gap 3 — Ownership verifier: gate-default + completeness
-**Problem.** The OSSA verifier is opt-in (`NOVA_OSSA=hard`), 100% coverage, 0 false positives on a 329-case
+**Problem.** The OSSA verifier is opt-in (`KYTE_OSSA=hard`), 100% coverage, 0 false positives on a 329-case
 sweep, wired as a 6-case `ossa-gate.sh` leg in `gate.sh`. **[verified]** Two open points: (a) it is not
 enforced on the whole corpus, only 6 cases; (b) it has a false-NEGATIVE hole — destructured bindings are
 untracked, so a leak *through* a destructuring pattern is not caught. **[verified]**
 
 **Options.**
-- (a) Enforcement: **A** keep the 6-case gate leg only; **B** additionally run `NOVA_OSSA=hard` across the
+- (a) Enforcement: **A** keep the 6-case gate leg only; **B** additionally run `KYTE_OSSA=hard` across the
   WHOLE conformance corpus (cheap — it runs during sema, before the test binary) so every case is checked;
-  **C** make it default in every `nova build` (dev friction + per-build sema cost).
+  **C** make it default in every `kyte build` (dev friction + per-build sema cost).
 - (b) Completeness: **A** close the destructuring hole (track per-binding ownership; needs per-binding
   type info from sema — moderate); **B** accept sound-but-incomplete and document it (it is a false
   negative, never blocks correct code).
@@ -80,7 +80,7 @@ now; it cannot break a build; close later only if destructuring-heavy code appea
 **Decision to lock:** corpus-wide gate (enforcement-B) + accept destructuring hole (completeness-B)?
 
 **DONE 2026-08-18 — enforcement-B landed.** `conformance/run.sh --ossa [-j]` compiles every positive case
-under `NOVA_OSSA=hard` (the verifier fires during sema, so it is a pure front-end pass with a per-case
+under `KYTE_OSSA=hard` (the verifier fires during sema, so it is a pure front-end pass with a per-case
 timeout for hanging reactor cases); `gate.sh` now runs it in place of the 6-case `ossa-gate.sh` (kept as a
 seconds-long local smoke). Baseline sweep before wiring: **329/329 positive cases, 0 proven imbalances**;
 wired gate: **381/381, 0 failed**. Completeness-B accepted: the destructuring-binding hole is a false
@@ -98,17 +98,17 @@ requirement (per user): a web developer debugs **in the editor** — breakpoints
 VS Code** — and NEVER touches `lldb` on the command line.
 
 **These are two layers, both required — not alternatives:**
-- **DWARF** = the debug info emitted into the binary (line tables → variables → types). Nova must emit it.
+- **DWARF** = the debug info emitted into the binary (line tables → variables → types). Kyte must emit it.
 - **DAP** (Debug Adapter Protocol) = what the editor speaks to a debug adapter. The adapter drives an actual
   debug engine over the DWARF.
 
 **Architecture — DWARF (DIBuilder) + `lldb-dap`.** `lldb-dap` (shipped by LLVM; formerly `lldb-vscode`)
-already implements DAP and drives lldb underneath. So: Nova emits DWARF; the VS Code **extension** (already
-in the repo) provides a launch config that starts `lldb-dap` against the built `nova` binary; the developer
-presses F5 and debugs in-editor. This reuses LLVM's mature debug engine AND its DAP frontend — Nova writes
+already implements DAP and drives lldb underneath. So: Kyte emits DWARF; the VS Code **extension** (already
+in the repo) provides a launch config that starts `lldb-dap` against the built `kyte` binary; the developer
+presses F5 and debugs in-editor. This reuses LLVM's mature debug engine AND its DAP frontend — Kyte writes
 neither a debugger nor a DAP server.
-- Rejected alternative: a NATIVE Nova DAP server. Far more work, less robust, and STILL needs a debug engine
-  + DWARF underneath. Only worth it if lldb-dap ever proves inadequate for Nova's semantics.
+- Rejected alternative: a NATIVE Kyte DAP server. Far more work, less robust, and STILL needs a debug engine
+  + DWARF underneath. Only worth it if lldb-dap ever proves inadequate for Kyte's semantics.
 
 **HARD REQUIREMENT: show VALUES, not addresses — C#-quality.** A debugger that shows `0x6000000…` instead
 of `"hello"` / `[1,2,3]` / `{name:"x", age:3}` "does not add much value" (the user's words; this is exactly
@@ -117,14 +117,14 @@ the Zig-in-DAP experience). So value display is not phase-2 polish — it is the
 Why native languages hit the addresses-not-values trap, and how to avoid it:
 - **Primitives** (int/bool/float) show values from standard DWARF base types — free.
 - **Plain structs/enums** render IF the DWARF carries complete `DIType` + member info (lldb walks fields).
-- **Heap/generic types** — Nova `string` (ptr → `{refcount@-8, len@-4, bytes}`), `List`/`Map`/`Set`,
+- **Heap/generic types** — Kyte `string` (ptr → `{refcount@-8, len@-4, bytes}`), `List`/`Map`/`Set`,
   optionals, ARC boxes — show only a POINTER from DWARF alone. To print their CONTENTS you must ship **lldb
   data formatters** (Python summaries + synthetic children) that deref the pointer, read the length from the
   ARC header, and format the payload. This is precisely how Rust (`rust-lldb`), Swift, and C++ (libc++
   pretty-printers) get C#-grade display on native binaries. C# gets it from a managed-runtime debugger; the
   native-AOT equivalent is **rich DWARF + formatters** — there is no free lunch.
 - **Build mode matters:** locals are only reliable in a DEBUG (`-O0`) build; `--release` (`default<O3>`)
-  clobbers them. `nova build` defaults to debug, so debugging is a debug-build activity (state this to users).
+  clobbers them. `kyte build` defaults to debug, so debugging is a debug-build activity (state this to users).
 
 **Deliverable (MVP = all of this together; less is the addresses-only trap):**
 1. **Line-table DWARF** → breakpoints, step, call stack via `lldb-dap` + a VS Code launch config.
@@ -134,13 +134,13 @@ Why native languages hit the addresses-not-values trap, and how to avoid it:
    the heap/generic types show their CONTENTS, not pointers. Shipped with the toolchain, defensive against
    released objects.
 
-**Later (post-MVP):** async/coroutine stepping — Nova async is LLVM coroutines (split frames), so stepping
+**Later (post-MVP):** async/coroutine stepping — Kyte async is LLVM coroutines (split frames), so stepping
 across `await` is inherently confusing; polish last. Full expression evaluation in the debug console (typing
 `xs.len()`) needs more than formatters (a language plugin, Swift-style) — out of scope for value display.
 
 **Recommendation: DWARF + lldb-dap, and treat items 1-3 as ONE deliverable** (do not ship lines-only).
 **Spike first**: confirm (a) the LLVM-zig bindings expose DIBuilder, (b) `lldb-dap` is bundleable on
-mac/Linux/Windows, and (c) an lldb Python data-formatter can read Nova's ARC header layout. Post-beta, but
+mac/Linux/Windows, and (c) an lldb Python data-formatter can read Kyte's ARC header layout. Post-beta, but
 when built it must clear the C#-quality value-display bar or it is not worth shipping.
 
 **Decision to lock:** (1) DWARF + lldb-dap + formatters as one MVP (vs a native DAP server)? (2) bundle
@@ -152,7 +152,7 @@ for generics/enums and the data formatters are the real work). Async stepping = 
 ---
 
 ## Gap 5 — Perf: allocation count — CLOSED as ACCEPTED (2026-08-16, see `done/gap5-closed.md`)
-**Closed.** Nova already beats Rust axum (~2.7x) and Go (~8.6x) per core despite the high alloc count; the
+**Closed.** Kyte already beats Rust axum (~2.7x) and Go (~8.6x) per core despite the high alloc count; the
 SOUND escape-arena lever is low-headroom (measured: only 4% of alloc sites are LOCAL on 13_serde); the
 high-headroom blanket arena regressed 28% (P7). Accepted current perf as the baseline; `escape.zig` kept as
 a seed; standing rule = no perf rework without a specific failing target + a measured delta. Original
@@ -191,8 +191,8 @@ not the open item. **[user-asserted]**
 **The actual remaining networking item: fd-handoff through the orchestrator.** The SCM_RIGHTS fd-passing
 primitive is built and the STANDALONE handoff demo works (`lang/docs/guide/examples/fd-handoff/` — a
 service binds a TCP front port + an AF_UNIX rendezvous and hands each accepted client SOCKET to a backend
-app; the app writes the response directly, proxy out of the data path). Runtime shims `nova_send_fd` /
-`nova_recv_fd` + `os.socket.sendFd`/`recvFd`/AF_UNIX helpers exist. **[verified: demo + primitive]** Per the
+app; the app writes the response directly, proxy out of the data path). Runtime shims `kyte_send_fd` /
+`kyte_recv_fd` + `os.socket.sendFd`/`recvFd`/AF_UNIX helpers exist. **[verified: demo + primitive]** Per the
 fd-passing note, it was **not yet wired into `proxyd`** and not exercised end-to-end through `orchd`/`proxyd`
 — that (wire if needed + TEST the orchestrator handoff path) is the open work. **[recall — reverify current
 proxyd state]**
@@ -217,7 +217,7 @@ data path.** The key systems fact: netns isolation and fd-handoff are ORTHOGONAL
   in the client data path — it carries the app's OTHER traffic (egress to the DB, health/metrics). macOS/
   Windows have no netns; they get handoff without the pod fence (or Job Objects / sandbox if wanted later).
 
-**Mechanism (Nova already has the primitives).** To hand fds across BOTH a netns and a mount namespace,
+**Mechanism (Kyte already has the primitives).** To hand fds across BOTH a netns and a mount namespace,
 don't depend on a shared AF_UNIX path: `orchd` creates a socketpair (`os.socket.unixPair`), spawns the
 replica with one end as an inherited fd, THEN the replica enters its netns/pod. `proxyd` sends each client
 fd over that pre-established socketpair (`sendFd`/`recvFd`, already built). No shared filesystem; clean
@@ -245,7 +245,7 @@ piece — ~1-2 weeks, needs a Linux host to verify. Ship handoff first; add the 
 
 ## Gap 7 — Beta bar (release checklist)
 **Problem.** Version drift is already guarded (`check-version-sync.sh`: `build.zig` == `build.zig.zon`
-version, `build.zig` == `nova_abi.h` ABI). **[verified]** The real gap is the absence of an explicit,
+version, `build.zig` == `kyte_abi.h` ABI). **[verified]** The real gap is the absence of an explicit,
 agreed **beta checklist** (there is a history of declaring beta then walking it back).
 
 **Proposal — the beta gate is met when ALL of:**
@@ -270,11 +270,11 @@ agreed **beta checklist** (there is a history of declaring beta then walking it 
 **Problem.** The package manager's recursive fetch trusts each package's declared dep list (recorded
 out-of-scope in `pkg-manager.md` §5/§9). Fine now; a real concern once an ecosystem exists.
 
-**Proposal.** First cheap defence when needed: **`nova vendor`** — copy the resolved dependency tree into
+**Proposal.** First cheap defence when needed: **`kyte vendor`** — copy the resolved dependency tree into
 `./vendor/` and build offline from it (Go-style), so a build depends only on reviewed, checked-in code.
 Signing / allow-lists / a registry come later and only if the ecosystem grows.
 
-**Decision to lock:** nothing now — record `nova vendor` as the first future step; revisit after Gap 1 ships.
+**Decision to lock:** nothing now — record `kyte vendor` as the first future step; revisit after Gap 1 ships.
 
 ---
 

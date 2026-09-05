@@ -1,7 +1,7 @@
-//! Canonical source formatter for Nova (`nova fmt`).
+//! Canonical source formatter for Kyte (`kyte fmt`).
 //!
 //! This module walks a parsed [`ast.Program`] and re-emits it as normalised
-//! Nova source text: fixed four-space indentation, one canonical spelling for
+//! Kyte source text: fixed four-space indentation, one canonical spelling for
 //! every construct, and consistent spacing around operators. It is a pure
 //! AST-to-text pretty-printer, so it deliberately does NOT preserve the exact
 //! bytes of the input. Comments and blank-line layout that the parser drops are
@@ -29,7 +29,7 @@
 //! when dropping the parentheses would change how it re-parses (a lower-precedence
 //! child, or an equal-precedence child on the right of a left-associative
 //! operator). Second, the operator spellings emitted by [`Formatter.binOpToStr`]
-//! must all be real Nova tokens; the module's tests assert that `&`/`|`/`&&`/`||`
+//! must all be real Kyte tokens; the module's tests assert that `&`/`|`/`&&`/`||`
 //! and every other operator round-trip through the lexer rather than leaking an
 //! internal tag name.
 //!
@@ -46,7 +46,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 
-/// Stateful pretty-printer that renders a parsed Nova program back to canonical
+/// Stateful pretty-printer that renders a parsed Kyte program back to canonical
 /// source text.
 ///
 /// A `Formatter` owns a growable output buffer and threads the current
@@ -904,7 +904,7 @@ pub const Formatter = struct {
 
     /// Returns the canonical source spelling of a binary operator.
     ///
-    /// Every returned string must be a real Nova operator token so the output
+    /// Every returned string must be a real Kyte operator token so the output
     /// re-lexes correctly; the module's tests assert exactly this (including that
     /// the bitwise `&`/`|` and logical `&&`/`||` map to distinct symbols and not
     /// to leftover keyword forms). Referenced by [`Formatter.formatExpression`]
@@ -1219,10 +1219,10 @@ pub const Formatter = struct {
         }
     }
 
-    /// Formats a type reference in its canonical Nova spelling.
+    /// Formats a type reference in its canonical Kyte spelling.
     ///
     /// Covers each [`ast.TypeRef`] shape: a bare identifier; an error union
-    /// `Ok | Err`; an optional, which prints as `T | undefined` (Nova spells
+    /// `Ok | Err`; an optional, which prints as `T | undefined` (Kyte spells
     /// nullability that way rather than with a `?` suffix); a fixed-size array
     /// `T[N]`; a generic instantiation `Name<...>`; a function type
     /// `(params) -> ret`; and a tuple `(a, b, ...)`. Declared `anyerror` for the

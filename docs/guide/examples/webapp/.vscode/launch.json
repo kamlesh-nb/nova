@@ -4,12 +4,12 @@
     {
       "type": "lldb-dap",
       "request": "launch",
-      "name": "Debug Nova (debug build)",
+      "name": "Debug Kyte (debug build)",
       "program": "${workspaceFolder}/build/debug/bin/${workspaceFolderBasename}",
       "cwd": "${workspaceFolder}",
-      "preLaunchTask": "nova: build (debug)",
+      "preLaunchTask": "kyte: build (debug)",
       "initCommands": [
-        "command script import ~/.nova/std/debug/nova_formatters.py"
+        "command script import ~/.kyte/std/debug/kyte_formatters.py"
       ]
     }
   ]

@@ -1,7 +1,7 @@
 //! Semantic-analysis facade: the object that owns the compiler's typed view of
 //! a program and hands its sub-passes a single place to live.
 //!
-//! Nova's frontend runs several distinct passes over a program: symbol
+//! Kyte's frontend runs several distinct passes over a program: symbol
 //! resolution ([`symbols`]), lowering AST to a typed IR ([`lower`]), and type
 //! inference ([`infer`]). Every one of them needs the same three long-lived
 //! stores: an arena/allocator, the interned [`types.TypeStore`] that gives every

@@ -1,9 +1,9 @@
-# Nova soundness scope — VERIFIED (2026-08-14)
+# Kyte soundness scope — VERIFIED (2026-08-14)
 
 This is the empirically re-verified soundness/correctness surface of the language, replacing the stale
 status in `docs/gaps.md` (whose matrix was dated 2026-08-13 and predates the SE-A/B/C string-engine
 cutover and much else). Every entry below was checked by compiling and running a minimal repro through
-`~/.nova/bin/nova` under `NOVA_ASAN=1` (and `NOVA_ARC_AUDIT=1` for leaks) on 2026-08-14. Repros live in
+`~/.kyte/bin/kyte` under `KYTE_ASAN=1` (and `KYTE_ARC_AUDIT=1` for leaks) on 2026-08-14. Repros live in
 the session scratchpad `verifyC/`, `verifyK/`, `verifyChk/`.
 
 Headline: the crash / UAF / miscompile class that `gaps.md` still lists as open is **almost entirely
@@ -35,7 +35,7 @@ The original analysis is preserved below.
 | **L1 (K6)** | codegen + checker | crash / S-crit | Indexing a non-indexable type (`p[0]` where `p` is a struct/int) is not type-checked; it lowers to raw pointer arithmetic — silently reads the first field, and segfaults (ASAN BUS) on a large index. |
 | **L2 (C-chk-6)** | checker fail-open | crash | An optional `T \| undefined` is accepted where a plain `T` is expected in **let-binding** and **argument** positions (the RETURN position IS checked), and a narrowing is not invalidated on reassignment. Runtime crash. |
 | **L3 (C-chk-7)** | checker fail-open | wrong / S-crit | A wrong-arity tuple destructure (`let (a,b,c) = pair` where `pair` is a 2-tuple) is accepted; the extra name binds garbage. |
-| **L4 (E7)** | stdlib correctness | wrong | The JSON parser silently accepts malformed input: `json.parse("[1,2,")` returns `[1,2,null]` (size 3) with no error channel (`std/serde/json.nova` `parse` has no failure signal). |
+| **L4 (E7)** | stdlib correctness | wrong | The JSON parser silently accepts malformed input: `json.parse("[1,2,")` returns `[1,2,null]` (size 3) with no error channel (`std/serde/json.ky` `parse` has no failure signal). |
 | **L5 (K8 dot)** | unsupported syntax | low | Tuple positional dot-access `pair.0` is a parse error (unsupported). The index form `pair[0]` works and is correct, so this is a missing-feature, not a miscompile. |
 
 ### Detail
@@ -51,7 +51,7 @@ The original analysis is preserved below.
   sites; invalidate a narrowing when the variable is reassigned.
 - **L3 / C-chk-7** — tuple destructuring binds by position without an arity check against the tuple's
   element count. Fix: require the pattern arity to equal the tuple arity (fail-closed). Guard.
-- **L4 / E7** — `std/serde/json.nova` `parse` returns a `JsonValue` with no error path;
+- **L4 / E7** — `std/serde/json.ky` `parse` returns a `JsonValue` with no error path;
   `parseArray`/`parseObject` break silently at end-of-input and a spurious `parseValue()` pushes a
   default. Fix: surface a parse error (a result/optional) on malformed input. Stdlib change, larger.
 - **L5 / K8** — the parser rejects `.<integer>` as a field access. Fix (optional): parse `tuple.N` as a

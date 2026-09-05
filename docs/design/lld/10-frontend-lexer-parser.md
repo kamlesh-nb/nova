@@ -1,6 +1,6 @@
 # Low-Level Design: Frontend Lexer and Parser
 
-This document is a function-by-function reference for the two files that turn Nova source text into an
+This document is a function-by-function reference for the two files that turn Kyte source text into an
 abstract syntax tree (AST): `src/frontend/lexer.zig` and `src/frontend/parser.zig`. It is written for a
 new maintainer who needs to be productive quickly, so it names every real function (public and private),
 every type, and every piece of module-level state.
@@ -314,7 +314,7 @@ helper `intLiteralOf` (below). No `pub var`/`pub const` globals; all state lives
   with `is_exported = false` and a span spanning the declaration.
 
 - **`fn skipWhereClause(self) ParserError!void`** (private, method) -- parses and discards an optional
-  `where T: Bound + Bound2, U: ...` clause. Generic dispatch in Nova is structural, so the bounds are
+  `where T: Bound + Bound2, U: ...` clause. Generic dispatch in Kyte is structural, so the bounds are
   advisory and thrown away here; the function only exists so the grammar accepts them.
 
 - **`fn parseFunctionDecl(self, is_exported) ParserError!ast.FunctionDecl`** (private, method) -- parses a
@@ -387,7 +387,7 @@ helper `intLiteralOf` (below). No `pub var`/`pub const` globals; all state lives
   stray `;`. Returns an owned statement slice wrapped in a `Block`.
 
 - **`fn parseStatement(self) ParserError!ast.Statement`** (private, method) -- the statement dispatcher.
-  `let` and `const` go to `parseLetStmt`; `var` is a hard error with a helpful message (Nova has no `var`);
+  `let` and `const` go to `parseLetStmt`; `var` is a hard error with a helpful message (Kyte has no `var`);
   `if`/`while`/`for`/`switch`/`return` to their parsers; `throw`/`catch` are rejected via
   `rejectExceptions`; `try` is rejected only when it is followed by `{` (the exception-block form), else it
   is an expression statement (prefix `try`); `defer`/`errdefer` to `parseDeferStmt`; `break`/`continue`
@@ -534,7 +534,7 @@ helper `intLiteralOf` (below). No `pub var`/`pub const` globals; all state lives
   This ordering is what makes chained trailers like `a.b(c)[d].e<T>(f)` parse.
 
 - **`fn parseJsxAttrName(self) ParserError![]const u8`** (private, method) -- reconstructs an NSX/JSX
-  attribute name that spans several lexer tokens. Nova's lexer splits `data-on-click`, `:class`, `@click`,
+  attribute name that spans several lexer tokens. Kyte's lexer splits `data-on-click`, `:class`, `@click`,
   and Datastar modifiers like `data-on-interval__duration.2s` into separate tokens, so this walks the run
   of ADJACENT tokens (same line, each starting exactly where the previous ended, of the allowed kinds:
   identifier, `-`, `:`, `.`, `@`, `_`) and concatenates their lexemes into a fresh allocator buffer. It

@@ -1,0 +1,74 @@
+import io.file;
+import io.dir;
+import assert;
+import bytes;
+
+@test
+fn text_roundtrip(): void {
+    let path = dir.Dir.tempDir() + "/kyte_c211_text.txt";
+    file.File.writeText(path, "hello kyte m5");
+    assert.isTrue(file.File.exists(path));
+    assert.equalStr(file.File.readText(path), "hello kyte m5");
+
+    file.File.appendText(path, "!!!");
+    assert.equalStr(file.File.readText(path), "hello kyte m5!!!");
+}
+
+@test
+fn fd_handle_api(): void {
+    let path = dir.Dir.tempDir() + "/kyte_c211_handle.txt";
+    let f = file.File.open(path, "w");
+    assert.equalInt(f.writeString("abcdef"), 6);
+    f.close();
+
+    let r = file.File.open(path, "r");
+    let buf = bytes.alloc(16);
+    assert.equalInt(r.readAll(buf, 6), 6);
+    assert.equalInt(bytes.read_byte(buf, 0), 97);
+    assert.equalInt(bytes.read_byte(buf, 5), 102);
+    r.close();
+    bytes.free(buf);
+}
+
+@test
+fn seek_and_tell(): void {
+    let path = dir.Dir.tempDir() + "/kyte_c211_seek.txt";
+    let f = file.File.open(path, "w");
+    f.writeString("0123456789");
+    f.close();
+
+    let r = file.File.open(path, "r");
+    r.seek(4, 0);
+    assert.equalInt(r.tell() as int, 4);
+    let buf = bytes.alloc(4);
+    r.readAll(buf, 3);
+    assert.equalInt(bytes.read_byte(buf, 0), 52);
+    r.close();
+    bytes.free(buf);
+}
+
+@test
+fn dir_create_list_rename(): void {
+    let base = dir.Dir.tempDir() + "/kyte_c211_dir";
+    dir.Dir.create(base, 493);
+    assert.isTrue(dir.Dir.exists(base));
+    assert.isTrue(dir.Dir.isDir(base));
+    assert.isFalse(dir.Dir.isDir(base + "/nope"));
+
+    file.File.writeText(base + "/a.txt", "a");
+    file.File.writeText(base + "/b.txt", "b");
+
+    let d = dir.Dir.open(base);
+    let entries = d.entries();
+    d.close();
+    assert.gte(entries.size(), 2);
+
+    dir.Dir.rename(base + "/a.txt", base + "/c.txt");
+    assert.isTrue(file.File.exists(base + "/c.txt"));
+    assert.isFalse(file.File.exists(base + "/a.txt"));
+}
+
+@test
+fn cwd_nonempty(): void {
+    assert.gt(dir.Dir.getCwd().length, 0);
+}

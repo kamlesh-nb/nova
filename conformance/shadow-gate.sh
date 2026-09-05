@@ -5,14 +5,14 @@
 # drifted spelling cannot silently fail open into a miscompile (the class the `any`-box leak belonged to).
 set -uo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
-export PATH="$HOME/.nova/bin:$PATH"
+export PATH="$HOME/.kyte/bin:$PATH"
 
 # Type-heavy cases exercising ownership/dtor/layout across generics, value-optionals, collections and any.
-CASES="conformance/cases/123_any_container.nova conformance/cases/334_valopt_call_arg.nova conformance/cases/53_for_loops.nova conformance/cases/332_collections_breadth.nova"
+CASES="conformance/cases/123_any_container.ky conformance/cases/334_valopt_call_arg.ky conformance/cases/53_for_loops.ky conformance/cases/332_collections_breadth.ky"
 bad=0
 for c in $CASES; do
   [ -f "$c" ] || continue
-  out=$(NOVA_SEMA_SHADOW=1 nova test "$c" 2>&1 || true)
+  out=$(KYTE_SEMA_SHADOW=1 kyte test "$c" 2>&1 || true)
   td=$(printf '%s' "$out" | grep -oE "DISAGREE : [0-9]+   \(MUST be 0 before cutover\)" | grep -oE "[0-9]+" | head -1)
   ks=$(printf '%s' "$out" | grep -oE "keystone-DISAGREE : [0-9]+" | grep -oE "[0-9]+" | head -1)
   if [ -n "$td" ] && [ "$td" -ne 0 ]; then echo "SHADOW FAIL: $(basename "$c") ownership td_disagree=$td"; bad=1; fi

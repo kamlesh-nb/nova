@@ -24,7 +24,7 @@ bug.
      method-erased BASE (`List_int_map`), tracked by `sema_mono.baseIsNeeded` (`mono.zig:81-94`). `skip_base`
      (`llvm_codegen.zig:2555-2562`) already suppresses the erased body for generic METHODS reached only by
      explicit-arg calls — this is the pattern to generalize.
-  2. **`Map` is EXCLUDED from monomorphization by name** (`codegen/types.zig:119-139`) because `map.nova`
+  2. **`Map` is EXCLUDED from monomorphization by name** (`codegen/types.zig:119-139`) because `map.ky`
      stores keys/values through raw `bytes.write_ptr` (no ARC), not `Storage<K>`/`Storage<V>` — so a
      monomorphized `Map_string_i32_set` has `retain=0` and use-after-frees (`Expected 100, got 4367861072`
      on 12_traits_dispatch). Map therefore runs ENTIRELY on its erased body + the call-site
@@ -40,14 +40,14 @@ bug.
 ## Phases (each independently landable, ASAN-gated; a wrong dtor is a UAF)
 
 ### M1 — Migrate `Map` to `Storage<K>`/`Storage<V>` (the load-bearing blocker) — LARGE, highest risk
-`map.nova` currently stores through `bytes.write_ptr` into `allocZero` memory that carries no ARC. Rewrite
+`map.ky` currently stores through `bytes.write_ptr` into `allocZero` memory that carries no ARC. Rewrite
 its key/value storage to `Storage<K>`/`Storage<V>` (the same typed-slot model `List` uses), so a
 monomorphized `Map_string_Box_set` RETAINS an owned key/value via the store-native path. Then:
 - delete the `retainIfGenericStore` call-site compensation (a mono callee stands it down);
 - delete the `Map`-by-name exclusion (`codegen/types.zig:137`).
 - **Gate:** the two cases the exclusion was protecting (12_traits_dispatch, 13_serde) pass; full corpus
   FUNC/SHADOW/ARC green; **full-corpus ASAN 0** (this is where a botched retain re-introduces the UAF the
-  exclusion documents — do NOT rush); `f45_erased_fallback` stays 0. This is the [[nova-f4b-monomorphization]]
+  exclusion documents — do NOT rush); `f45_erased_fallback` stays 0. This is the [[kyte-f4b-monomorphization]]
   "migrate Map to Storage<T>" task and the single riskiest step — treat it as its own focused sub-effort.
 
 ### M2 — Retire the `keystoneSubst` side-channel via `inst_disp` — MEDIUM
@@ -173,8 +173,8 @@ effort. Rough effort: M1 ≈ 3-5d (risky, its own sub-effort), M2 ≈ 2-3d, M3 �
   now resolves to a deleted erased symbol.
 - `a2_irct_calls` (added this session) — the `isRefCountedType` volume; the M4/M5 progress meter.
 - Per-phase: full-corpus ASAN (a wrong destructor is a UAF, not a leak — ASAN is the authority), plus the
-  existing `NOVA_SEMA_SHADOW` store-vs-string diffs (struct-field/tuple/erru/storage all DISAGREE=0) as
+  existing `KYTE_SEMA_SHADOW` store-vs-string diffs (struct-field/tuple/erru/storage all DISAGREE=0) as
   regression guards.
 
-See [[nova-f4b-monomorphization]] [[nova-f1-f5-memory-safety-closed]] [[nova-f2-6-stage4-parked]] and
+See [[kyte-f4b-monomorphization]] [[kyte-f1-f5-memory-safety-closed]] [[kyte-f2-6-stage4-parked]] and
 `docs/design/F2-6-stage5-release-site-migration.md` (Phase E is M4 here).

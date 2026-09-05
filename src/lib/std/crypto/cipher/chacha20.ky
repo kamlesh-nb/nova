@@ -1,0 +1,283 @@
+//! ChaCha20 stream cipher (RFC 8439).
+//!
+//! This file is the pure-Kyte reference implementation of Bernstein's ChaCha20
+//! stream cipher, using the IETF parameter set from RFC 8439: a 256-bit key, a
+//! 96-bit (12-byte) nonce, and a 32-bit block counter. It is one of the two
+//! symmetric primitives the self-hosted crypto stack is built on (the other
+//! being AES-GCM), and it feeds the ChaCha20-Poly1305 AEAD used by the TLS 1.3
+//! record layer when a peer negotiates that cipher suite.
+//!
+//! ChaCha20 is a stream cipher, so encryption and decryption are the SAME
+//! operation: it turns the key, nonce and counter into a pseudo-random
+//! keystream and XORs that keystream with the data. Running the cipher a second
+//! time with the same key, nonce and counter recovers the plaintext. This is
+//! why there is one entry point, [`applyKeystream`], and no separate encrypt or
+//! decrypt function. The security contract that the CALLER must uphold is that a
+//! given (key, nonce) pair is never reused for two different messages: because
+//! the keystream is deterministic, reuse leaks the XOR of the two plaintexts.
+//!
+//! The state is the standard 4x4 matrix of sixteen 32-bit words: four constant
+//! words ("expand 32-byte k"), eight key words, one counter word, and three
+//! nonce words. The core permutation is twenty rounds, applied as ten
+//! double-rounds, where each double-round is four column quarter-rounds
+//! followed by four diagonal quarter-rounds. See [`keystreamBlock`] for the
+//! word layout and [`qr`] for the quarter-round itself.
+//!
+//! Design notes and invariants specific to this Kyte port:
+//!
+//!   1. Every word is held in a `ulong` (64-bit) but kept logically 32-bit by
+//!      masking with [`MASK32`] after each add and inside [`rotl`]. Kyte's
+//!      `int` is 32-bit and would trap or wrap in ways that are awkward to
+//!      reason about, so the arithmetic is done wide and narrowed explicitly.
+//!   2. All word reads and writes are little-endian, done byte by byte through
+//!      [`leWord`] and [`putLe`], so the result is identical on any host
+//!      regardless of the machine's native byte order.
+//!   3. There is an optional fast path. If the runtime reports a hand-written
+//!      assembly implementation is available (`kyte_has_asm_crypto`), the bulk
+//!      of the buffer is XORed by [`kyte_chacha20_xor`] in 256-byte units and
+//!      only the tail is finished in Kyte. The counter is advanced past the
+//!      fused region so the two paths agree byte for byte. See [`applyKeystream`].
+//!
+//! The pointer-based API (`ptr`/`long` buffers rather than Kyte strings) exists
+//! so this sits directly under the byte-oriented crypto and TLS code without
+//! minting owned intermediates on the hot path.
+
+import bytes;
+
+/// Runtime probe: returns `1` when the C runtime carries a hand-written
+/// assembly ChaCha20 implementation for this CPU, `0` otherwise.
+///
+/// [`applyKeystream`] consults this once per call to decide whether to take the
+/// fused [`kyte_chacha20_xor`] fast path or run entirely in Kyte.
+extern("c") fn kyte_has_asm_crypto(): int;
+
+/// Assembly fast path: XORs `len` bytes of `dataIn` into `out` using ChaCha20
+/// with the given `key`, starting block `counter` and `nonce`.
+///
+/// Only ever called with `len` a multiple of 256 (four blocks), which is the
+/// unit the assembly kernel processes; the Kyte loop in [`applyKeystream`]
+/// finishes any trailing bytes. `counter` is passed as an `int` here because
+/// the RFC 8439 block counter is 32-bit; callers pass the low 32 bits of the
+/// starting counter.
+extern("c") fn kyte_chacha20_xor(key: ptr, counter: int, nonce: ptr, dataIn: ptr, len: int, out: ptr): void;
+
+/// Low 32-bit mask used to keep the wide `ulong` word arithmetic inside 32 bits.
+///
+/// Applied after every modular add and inside [`rotl`] so that each state word
+/// behaves as an unsigned 32-bit value even though it is stored in a 64-bit
+/// `ulong`.
+const MASK32: ulong = 0xffffffff;
+
+/// ChaCha20 key length in bytes (256-bit key), per RFC 8439.
+pub const CHACHA_KEY_LEN: int = 32;
+/// ChaCha20 nonce length in bytes (96-bit IETF nonce), per RFC 8439.
+pub const CHACHA_NONCE_LEN: int = 12;
+/// ChaCha20 keystream block length in bytes (sixteen 32-bit words).
+///
+/// [`applyKeystream`] generates the keystream one 64-byte block at a time and
+/// advances the counter by one per block.
+pub const CHACHA_BLOCK_LEN: int = 64;
+
+/// Rotates the low 32 bits of `x` left by `n` bits.
+///
+/// The word is masked back to 32 bits with [`MASK32`] on the way out, so the
+/// bits shifted off the top of the 32-bit value are the ones that reappear at
+/// the bottom, exactly as a genuine 32-bit rotate would produce. `n` is assumed
+/// to be in `1..31`, which is all the ChaCha quarter-round ever uses (16, 12, 8,
+/// 7).
+fn rotl(x: ulong, n: int): ulong {
+    return ((x << n) | (x >> (32 - n))) & MASK32;
+}
+
+/// Reads four bytes from `buf` at offset `off` as a little-endian 32-bit word.
+///
+/// Byte `off` is the least significant and byte `off + 3` the most significant,
+/// so the same value is produced on any host irrespective of native endianness.
+/// The result is returned in a `ulong` with only the low 32 bits set. The offset
+/// is not bounds-checked; the caller guarantees `buf` has at least `off + 4`
+/// valid bytes.
+fn leWord(buf: ptr, off: int): ulong {
+    return (bytes.read_byte(buf, off) as ulong)
+        | ((bytes.read_byte(buf, off + 1) as ulong) << 8)
+        | ((bytes.read_byte(buf, off + 2) as ulong) << 16)
+        | ((bytes.read_byte(buf, off + 3) as ulong) << 24);
+}
+
+/// Writes the low 32 bits of `w` into `buf` at offset `off` in little-endian
+/// order.
+///
+/// The inverse of [`leWord`]: byte `off` receives the least significant octet
+/// and byte `off + 3` the most significant. Any bits of `w` above bit 31 are
+/// discarded by the per-byte masking. The offset is not bounds-checked; the
+/// caller guarantees `buf` has room for four bytes at `off`.
+fn putLe(buf: ptr, off: int, w: ulong): void {
+    bytes.write_byte(buf, off, (w & 0xff) as int);
+    bytes.write_byte(buf, off + 1, ((w >> 8) & 0xff) as int);
+    bytes.write_byte(buf, off + 2, ((w >> 16) & 0xff) as int);
+    bytes.write_byte(buf, off + 3, ((w >> 24) & 0xff) as int);
+}
+
+/// Applies one ChaCha quarter-round in place to the four state words at
+/// matrix indices `a`, `b`, `c`, `d`.
+///
+/// The state `s` is treated as sixteen little-endian 32-bit words laid out
+/// back to back, so word `k` lives at byte offset `k * 4`. The quarter-round is
+/// the four-step ARX sequence (add, rotate, xor) from RFC 8439 section 2.1,
+/// with the fixed rotation constants 16, 12, 8 and 7. Each intermediate add is
+/// masked with [`MASK32`] to stay 32-bit.
+///
+/// This operates on the SERIALIZED, in-memory state (reading and writing
+/// through [`leWord`] / [`putLe`]). [`keystreamBlock`] does not call it: for
+/// speed that function keeps all sixteen words in locals and inlines the
+/// equivalent steps. This helper is the readable, register-free formulation of
+/// the same round.
+fn qr(s: ptr, a: int, b: int, c: int, d: int): void {
+    let wa = leWord(s, a * 4);
+    let wb = leWord(s, b * 4);
+    let wc = leWord(s, c * 4);
+    let wd = leWord(s, d * 4);
+    wa = (wa + wb) & MASK32; wd = rotl(wd ^ wa, 16);
+    wc = (wc + wd) & MASK32; wb = rotl(wb ^ wc, 12);
+    wa = (wa + wb) & MASK32; wd = rotl(wd ^ wa, 8);
+    wc = (wc + wd) & MASK32; wb = rotl(wb ^ wc, 7);
+    putLe(s, a * 4, wa);
+    putLe(s, b * 4, wb);
+    putLe(s, c * 4, wc);
+    putLe(s, d * 4, wd);
+}
+
+/// Produces one 64-byte ChaCha20 keystream block into `out`.
+///
+/// Builds the initial state matrix from the four constants `j0..j3`
+/// ("expand 32-byte k"), the eight key words read from `key`, the low 32 bits
+/// of `counter` as the block-counter word, and the three nonce words read from
+/// `nonce`. It then runs twenty rounds as ten double-rounds: each loop
+/// iteration performs the four column quarter-rounds followed by the four
+/// diagonal quarter-rounds, all inlined on locals `x0..x15` rather than through
+/// [`qr`] to avoid per-word memory traffic. Finally each working word is added
+/// back to its original input word (feed-forward), masked to 32 bits, and
+/// written out little-endian by [`putLe`].
+///
+/// `key` must point at [`CHACHA_KEY_LEN`] bytes, `nonce` at
+/// [`CHACHA_NONCE_LEN`] bytes, and `out` must have room for
+/// [`CHACHA_BLOCK_LEN`] bytes; none of this is bounds-checked. To encrypt a
+/// message the caller advances `counter` by one for each successive block, which
+/// is what [`applyKeystream`] does.
+pub fn keystreamBlock(key: ptr, counter: ulong, nonce: ptr, out: ptr): void {
+    let j0: ulong = 0x61707865; let j1: ulong = 0x3320646e; let j2: ulong = 0x79622d32; let j3: ulong = 0x6b206574;
+    let j4 = leWord(key, 0);    let j5 = leWord(key, 4);    let j6 = leWord(key, 8);    let j7 = leWord(key, 12);
+    let j8 = leWord(key, 16);   let j9 = leWord(key, 20);   let j10 = leWord(key, 24);  let j11 = leWord(key, 28);
+    let j12: ulong = counter & MASK32;
+    let j13 = leWord(nonce, 0); let j14 = leWord(nonce, 4); let j15 = leWord(nonce, 8);
+
+    let x0 = j0;   let x1 = j1;   let x2 = j2;   let x3 = j3;
+    let x4 = j4;   let x5 = j5;   let x6 = j6;   let x7 = j7;
+    let x8 = j8;   let x9 = j9;   let x10 = j10; let x11 = j11;
+    let x12 = j12; let x13 = j13; let x14 = j14; let x15 = j15;
+
+    let r = 0;
+    while (r < 10) {
+        x0 = (x0 + x4) & MASK32;   x12 = rotl(x12 ^ x0, 16);
+        x8 = (x8 + x12) & MASK32;  x4 = rotl(x4 ^ x8, 12);
+        x0 = (x0 + x4) & MASK32;   x12 = rotl(x12 ^ x0, 8);
+        x8 = (x8 + x12) & MASK32;  x4 = rotl(x4 ^ x8, 7);
+
+        x1 = (x1 + x5) & MASK32;   x13 = rotl(x13 ^ x1, 16);
+        x9 = (x9 + x13) & MASK32;  x5 = rotl(x5 ^ x9, 12);
+        x1 = (x1 + x5) & MASK32;   x13 = rotl(x13 ^ x1, 8);
+        x9 = (x9 + x13) & MASK32;  x5 = rotl(x5 ^ x9, 7);
+
+        x2 = (x2 + x6) & MASK32;   x14 = rotl(x14 ^ x2, 16);
+        x10 = (x10 + x14) & MASK32; x6 = rotl(x6 ^ x10, 12);
+        x2 = (x2 + x6) & MASK32;   x14 = rotl(x14 ^ x2, 8);
+        x10 = (x10 + x14) & MASK32; x6 = rotl(x6 ^ x10, 7);
+
+        x3 = (x3 + x7) & MASK32;   x15 = rotl(x15 ^ x3, 16);
+        x11 = (x11 + x15) & MASK32; x7 = rotl(x7 ^ x11, 12);
+        x3 = (x3 + x7) & MASK32;   x15 = rotl(x15 ^ x3, 8);
+        x11 = (x11 + x15) & MASK32; x7 = rotl(x7 ^ x11, 7);
+
+        x0 = (x0 + x5) & MASK32;   x15 = rotl(x15 ^ x0, 16);
+        x10 = (x10 + x15) & MASK32; x5 = rotl(x5 ^ x10, 12);
+        x0 = (x0 + x5) & MASK32;   x15 = rotl(x15 ^ x0, 8);
+        x10 = (x10 + x15) & MASK32; x5 = rotl(x5 ^ x10, 7);
+
+        x1 = (x1 + x6) & MASK32;   x12 = rotl(x12 ^ x1, 16);
+        x11 = (x11 + x12) & MASK32; x6 = rotl(x6 ^ x11, 12);
+        x1 = (x1 + x6) & MASK32;   x12 = rotl(x12 ^ x1, 8);
+        x11 = (x11 + x12) & MASK32; x6 = rotl(x6 ^ x11, 7);
+
+        x2 = (x2 + x7) & MASK32;   x13 = rotl(x13 ^ x2, 16);
+        x8 = (x8 + x13) & MASK32;  x7 = rotl(x7 ^ x8, 12);
+        x2 = (x2 + x7) & MASK32;   x13 = rotl(x13 ^ x2, 8);
+        x8 = (x8 + x13) & MASK32;  x7 = rotl(x7 ^ x8, 7);
+
+        x3 = (x3 + x4) & MASK32;   x14 = rotl(x14 ^ x3, 16);
+        x9 = (x9 + x14) & MASK32;  x4 = rotl(x4 ^ x9, 12);
+        x3 = (x3 + x4) & MASK32;   x14 = rotl(x14 ^ x3, 8);
+        x9 = (x9 + x14) & MASK32;  x4 = rotl(x4 ^ x9, 7);
+
+        r = r + 1;
+    }
+
+    putLe(out, 0,  (x0 + j0) & MASK32);   putLe(out, 4,  (x1 + j1) & MASK32);
+    putLe(out, 8,  (x2 + j2) & MASK32);   putLe(out, 12, (x3 + j3) & MASK32);
+    putLe(out, 16, (x4 + j4) & MASK32);   putLe(out, 20, (x5 + j5) & MASK32);
+    putLe(out, 24, (x6 + j6) & MASK32);   putLe(out, 28, (x7 + j7) & MASK32);
+    putLe(out, 32, (x8 + j8) & MASK32);   putLe(out, 36, (x9 + j9) & MASK32);
+    putLe(out, 40, (x10 + j10) & MASK32); putLe(out, 44, (x11 + j11) & MASK32);
+    putLe(out, 48, (x12 + j12) & MASK32); putLe(out, 52, (x13 + j13) & MASK32);
+    putLe(out, 56, (x14 + j14) & MASK32); putLe(out, 60, (x15 + j15) & MASK32);
+}
+
+/// Encrypts or decrypts `len` bytes: XORs the ChaCha20 keystream over `dataIn`
+/// and writes the result to `out`.
+///
+/// This is the single public entry point. Because ChaCha20 is a stream cipher,
+/// the same call both encrypts and decrypts: feed it plaintext to get
+/// ciphertext, feed that ciphertext back with the identical `key`, `counter0`
+/// and `nonce` to recover the plaintext. `out` may alias `dataIn` for in-place
+/// operation. `counter0` is the block counter for the first 64-byte block and is
+/// incremented once per block internally.
+///
+/// SECURITY CONTRACT: a (`key`, `nonce`) pair must never be reused for two
+/// different messages. The keystream is a deterministic function of those
+/// inputs, so reuse XORs two plaintexts together and destroys confidentiality.
+///
+/// The function has two paths. If [`kyte_has_asm_crypto`] reports the assembly
+/// kernel is available, the largest 256-byte-aligned prefix (`fused`) is XORed
+/// by [`kyte_chacha20_xor`] in one call, `done` is set past it, and the counter
+/// `ctr` is advanced by `fused / 64` blocks so it lines up exactly where the
+/// fused region ended. The remaining tail (and the whole buffer when there is no
+/// assembly path) is finished in Kyte: a 64-byte scratch block is filled by
+/// [`keystreamBlock`], up to 64 bytes are XORed from it, and the counter steps
+/// on. The final short block XORs only `n = len - done` bytes so the output is
+/// never padded past `len`. The scratch buffer is freed before returning.
+///
+/// `key`, `nonce`, `dataIn` and `out` must all be valid for their respective
+/// lengths; nothing here is bounds-checked.
+pub fn applyKeystream(key: ptr, counter0: ulong, nonce: ptr, dataIn: ptr, len: int, out: ptr): void {
+    let done = 0;
+    let ctr = counter0;
+    if (kyte_has_asm_crypto() == 1) {
+        let fused = len - (len % 256);
+        if (fused > 0) {
+            kyte_chacha20_xor(key, counter0 as int, nonce, dataIn, fused, out);
+            done = fused;
+            ctr = counter0 + (fused / 64) as ulong;
+        }
+    }
+    let ks = bytes.alloc(64);
+    while (done < len) {
+        keystreamBlock(key, ctr, nonce, ks);
+        let n = if (len - done < 64) (len - done) else 64;
+        let i = 0;
+        while (i < n) {
+            bytes.write_byte(out, done + i, bytes.read_byte(dataIn, done + i) ^ bytes.read_byte(ks, i));
+            i = i + 1;
+        }
+        done = done + n;
+        ctr = ctr + 1;
+    }
+    bytes.free(ks);
+}

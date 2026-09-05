@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# emit-differential.sh — regression gate for the optimiser LIR->LLVM emit path (NOVA_OPT_EMIT).
+# emit-differential.sh — regression gate for the optimiser LIR->LLVM emit path (KYTE_OPT_EMIT).
 #
 # The emit path emits the optimised MIR for a small airtight subset (paramless, straight-line, signed
 # int/bool) and falls back to the AST for everything else. This gate compiles a set of integer programs
@@ -8,16 +8,16 @@
 # overflow (width-honest constfold), comparisons, and bitops -- the cases that a naive i64 fold or a missing
 # canonicalize would silently miscompile. Off by default in the corpus; run this explicitly.
 #
-# Usage: conformance/emit-differential.sh   (expects `nova` on PATH)
+# Usage: conformance/emit-differential.sh   (expects `kyte` on PATH)
 set -u
 
-NOVA="${NOVA:-nova}"
+KYTE="${KYTE:-kyte}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 fail=0
 
 emit_case() { # name  body
-    printf '%s\n' "$2" > "$TMP/$1.nova"
+    printf '%s\n' "$2" > "$TMP/$1.ky"
 }
 
 # Each case: a set of paramless int/bool functions printed via main(), so the emit path takes them.
@@ -79,12 +79,12 @@ fn shift(p: Point, dx: int): Point { p.x = p.x + dx; return p; }
 fn main(): void { let p = mk(3, 4); console.log(`${getx(p)} ${dist2(p)} ${getx(shift(p, 10))}`); }
 '
 
-for f in "$TMP"/*.nova; do
-    name="$(basename "$f" .nova)"
-    if ! "$NOVA" "$f" -o "$TMP/${name}_ast" >/dev/null 2>&1; then
+for f in "$TMP"/*.ky; do
+    name="$(basename "$f" .ky)"
+    if ! "$KYTE" "$f" -o "$TMP/${name}_ast" >/dev/null 2>&1; then
         echo "FAIL  $name: AST-path compile failed"; fail=1; continue
     fi
-    if ! NOVA_OPT_EMIT=1 "$NOVA" "$f" -o "$TMP/${name}_emit" >/dev/null 2>&1; then
+    if ! KYTE_OPT_EMIT=1 "$KYTE" "$f" -o "$TMP/${name}_emit" >/dev/null 2>&1; then
         echo "FAIL  $name: emit-path compile failed"; fail=1; continue
     fi
     a_out="$("$TMP/${name}_ast")"

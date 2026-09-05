@@ -1,7 +1,7 @@
 # Value-semantics completion (escape-channel elimination)
 
 Status: SCOPE (2026-08-20). Owner: language core. Prereq reading: `arc.zig`, `types.zig`
-`computeValueEscapeSet`, memory notes `nova-struct-value-semantics-fix`, `nova-nested-value-struct-dtor-leak`.
+`computeValueEscapeSet`, memory notes `kyte-struct-value-semantics-fix`, `kyte-nested-value-struct-dtor-leak`.
 
 ## Goal
 
@@ -47,7 +47,7 @@ From `computeValueEscapeSet`:
 - **P1 — deep owned-field-nested retain-on-copy. ✅ DONE (2026-08-20). Was a real UAF, not just a leak.**
   `retainValueStructOwnedFields` (expressions.zig) retained only DIRECT owned fields, so copying
   `Outer{inner:S{data:string}}` shared `S.data` without a reference and dropping both the original and the
-  copy double-freed it (heap-use-after-free, `nova_release`). Fixed: made retain transitive
+  copy double-freed it (heap-use-after-free, `kyte_release`). Fixed: made retain transitive
   (`retainValueStructOwnedFieldsDepth` recurses into nested value-struct fields at their INLINE address,
   depth-guarded), mirroring the destructor's inline recursion. Gate: corpus 387/390 + ASAN 387/390 (3
   pre-existing), case `381` extended with heap-string copy tests at 1 and 2 nesting levels (ARC/ASAN clean).
@@ -123,7 +123,7 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
    `List.copy()`/`Map.copy()` need adding, retaining owned elements); (b) making the struct copy path
    FIELD-AWARE for container fields -- after the memcpy, replace each shared container field with a fresh
    deep-copy, which means invoking the per-element-type monomorphized container copy from
-   `retainValueStructOwnedFields`/`buildHeapStructDeepCopy` (calling a monomorphized generic Nova method from
+   `retainValueStructOwnedFields`/`buildHeapStructDeepCopy` (calling a monomorphized generic Kyte method from
    codegen is the intricate part); (c) then let such structs into `isPureValueStructName`. High risk (this is
    the exact shape that crashed the blanket experiment; touches List/Map/Set). Memory-safe today (reference-
    semantic). Recommended: a focused session, List first, gated. The deeper alternative is the class-migration
@@ -166,7 +166,7 @@ Each channel is an independent, gated increment. Over-exclusion stays the safe f
 
 Every channel lands with: full corpus green + `--asan` + `--arc`, plus a NEW positive case asserting value
 semantics for that shape (`let b = a; mutate b; assert a unchanged`) AND its destructor is ASAN/ARC clean,
-plus an `expect_fail` where relevant. The `NOVA_VALUE_STRUCTS_OFF=1` escape hatch stays as the bisection
+plus an `expect_fail` where relevant. The `KYTE_VALUE_STRUCTS_OFF=1` escape hatch stays as the bisection
 tool (it flipped 192 to passing and localised the reactor regression last time).
 
 ## Effort

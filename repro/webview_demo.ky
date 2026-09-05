@@ -1,0 +1,28 @@
+import webview;
+
+fn main(): void {
+    let w = webview.Webview(true);
+
+    let page = <html>
+        <body style="font-family:-apple-system;background:#0f172a;color:#e2e8f0;
+                     display:grid;place-items:center;height:100vh;margin:0">
+            <div style="text-align:center">
+                <h1>Kyte Webview</h1>
+                <p>Native window, HTML from Kyte, two-way calls.</p>
+                <button onclick="window.greet('Ada').then(r => document.querySelector('#out').textContent = r)">
+                    Call Kyte
+                </button>
+                <p id="out"></p>
+            </div>
+        </body>
+    </html>;
+
+    w.setTitle("Kyte, Webview Demo");
+    w.setSize(900, 640, webview.HINT_NONE);
+    w.bind("greet", (req: string) => { return "\"Kyte received: " + req + "\""; });
+    w.setHtml(page);
+    w.eval("console.log('kyte -> js eval works')");
+
+    w.run();
+    w.delete();
+}

@@ -1,0 +1,123 @@
+//! Typed message-passing channels (`Channel<T>`).
+//!
+//! A `Channel<T>` is the thin Kyte-side handle over a channel object that lives
+//! in the C++20 runtime. It is the primitive the actor model and the CSP-style
+//! `spawn` code build on: one coroutine (or thread) hands a value to another
+//! without sharing mutable state, so ownership passes cleanly across the seam.
+//!
+//! The design decision here is deliberate thinness. The struct itself holds only
+//! an opaque `handle` (a `long`, because it is a raw runtime pointer or table
+//! index and an `int` would truncate a 64-bit address) plus the `Allocator` the
+//! caller wants values allocated from. All of the real work, the wait queue, the
+//! bounded buffer, the parking and waking of blocked coroutines, lives behind the
+//! four `kyte_channel_*` runtime intrinsics. This is what lets a channel cooperate
+//! with the async scheduler rather than block an OS thread: when a `recv` has no
+//! value ready, the runtime suspends the calling coroutine and resumes it when a
+//! sender arrives, all inside the reactor.
+//!
+//! Capacity chooses the rendezvous semantics. A capacity of `0` is an unbuffered
+//! (synchronous) channel: a `send` does not complete until a matching `recv` takes
+//! the value, so the two ends meet in a rendezvous. A positive capacity is a
+//! bounded buffer: sends succeed without a waiting receiver until the buffer fills,
+//! after which a further `send` waits for space.
+//!
+//! Lifetime is manual. The handle is a runtime resource, so the owner must call
+//! [`Channel.delete`] exactly once when the channel is finished with; dropping the
+//! handle without deleting leaks the runtime object, and deleting twice is guarded
+//! against here by zeroing the handle. See the wider concurrency story in the
+//! runtime's `concurrency.cpp` scheduler, and the actor and `spawn` helpers that
+//! sit on top of this type.
+
+import bytes;
+import mem.allocator;
+import assert;
+
+/// A typed channel over which values of `T` are passed between concurrent tasks.
+///
+/// The struct is a lightweight handle: it owns a runtime-side channel object
+/// referenced by [`Channel.handle`] and does not itself hold the buffered values.
+/// Construct it with an initial capacity (0 for an unbuffered rendezvous channel,
+/// or a positive bound for a buffered one) and an [`allocator.Allocator`], move
+/// values through it with [`Channel.send`] and [`Channel.recv`], and release the
+/// runtime object with [`Channel.delete`] when done.
+pub struct Channel<T> {
+    /// Opaque reference to the runtime-side channel object.
+    ///
+    /// This is a raw runtime pointer or table index, hence a `long` and not an
+    /// `int`: a 64-bit address stored in an `int` would truncate to garbage. A
+    /// value of `0` means the handle has been released (see [`Channel.delete`])
+    /// and must not be used for any further send or receive.
+    pub handle: long,
+    /// The allocator associated with this channel for values it manages.
+    ///
+    /// Retained so the channel's memory needs can be satisfied from the same
+    /// arena the caller chose, rather than an implicit global one.
+    pub allocator: allocator.Allocator,
+
+    /// Creates a channel with the given `capacity`, backed by a fresh runtime
+    /// channel object.
+    ///
+    /// A `capacity` of `0` yields an unbuffered channel where each `send`
+    /// rendezvouses with a `recv`; a positive `capacity` yields a buffered
+    /// channel that accepts up to that many pending values before a `send`
+    /// waits. The `alloc` allocator is stored on the struct for later use. The
+    /// returned channel owns a runtime resource, so the caller must eventually
+    /// call [`Channel.delete`].
+    init(capacity: int, alloc: allocator.Allocator) {
+        self.allocator = alloc;
+        self.handle = kyte_channel_create(capacity);
+    }
+
+    /// Sends `val` into the channel, transferring it to a receiver.
+    ///
+    /// On an unbuffered channel this waits until a receiver is ready to take the
+    /// value; on a buffered channel it completes immediately while space
+    /// remains, and otherwise waits for room. The wait is cooperative: the
+    /// runtime suspends the calling coroutine rather than blocking an OS thread.
+    pub fn send(self: Channel<T>, val: T): void {
+        kyte_channel_send(self.handle, val);
+    }
+
+    /// Receives the next value from the channel, waiting if none is ready yet.
+    ///
+    /// If the channel is empty the calling coroutine is suspended and resumed by
+    /// the runtime once a sender provides a value, so a blocked `recv` does not
+    /// occupy a thread. The value returned is the one handed over by the matching
+    /// [`Channel.send`].
+    pub fn recv(self: Channel<T>): T {
+        return kyte_channel_recv(self.handle);
+    }
+
+    /// Releases the runtime-side channel object and marks this handle dead.
+    ///
+    /// This must be called exactly once by the owner when the channel is no
+    /// longer needed, otherwise the runtime object leaks. It is safe against a
+    /// double delete: the handle is checked for non-zero before destruction and
+    /// then set back to `0`, so a second call is a no-op. After this returns the
+    /// channel must not be used for [`Channel.send`] or [`Channel.recv`].
+    pub fn delete(self: Channel<T>): void {
+
+        if (self.handle != 0) {
+            kyte_channel_destroy(self.handle);
+            self.handle = 0;
+        }
+    }
+}
+
+/// Round-trips a single string through an unbuffered channel to check the basic
+/// send/receive contract and clean teardown.
+///
+/// Uses a capacity of `0`, so the `send` and `recv` form a rendezvous within the
+/// one task, then asserts the received value matches what was sent and calls
+/// [`Channel.delete`] to release the handle.
+@test
+fn test_channel(): void {
+    let alloc = allocator.globalAllocator();
+    let ch = Channel<string>(0, alloc);
+
+    ch.send("hello from channel");
+    let val = ch.recv();
+    console.log("DEBUG: val received = " + val);
+    assert.isTrue(val == "hello from channel");
+    ch.delete();
+}

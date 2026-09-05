@@ -1,4 +1,4 @@
-//! Recursive-descent parser: Nova token stream -> abstract syntax tree.
+//! Recursive-descent parser: Kyte token stream -> abstract syntax tree.
 //!
 //! This is the second stage of the compiler frontend. It owns a fully
 //! tokenised buffer (the [`Parser.init`] path runs the lexer eagerly to EOF)
@@ -34,7 +34,7 @@
 //!     the current target.
 //!
 //!   - Exceptions are rejected with teaching errors, not merely a syntax error.
-//!     `throw`/`catch`-block/`try { ... }` no longer exist in Nova, and
+//!     `throw`/`catch`-block/`try { ... }` no longer exist in Kyte, and
 //!     [`Parser.rejectExceptions`] prints the migration guidance to the error
 //!     model (`fn f(): T | E`, prefix `try`, and `catch` as an expression
 //!     operator) rather than a bare "unexpected token".
@@ -291,7 +291,7 @@ pub const Parser = struct {
 
     /// Parses either a `{ ... }` block or a single statement, whichever follows.
     ///
-    /// This is the body form for `if`/`else`/`while`/`for`, which in Nova may be
+    /// This is the body form for `if`/`else`/`while`/`for`, which in Kyte may be
     /// braced or a single unbraced statement. A leading `{` is treated as a block
     /// rather than an object literal in statement position.
     fn parseStatementOrBlock(self: *Parser) ParserError!ast.Statement {
@@ -465,7 +465,7 @@ pub const Parser = struct {
 
     /// Parses a run of `@name(...)` attributes preceding a declaration or member.
     ///
-    /// Recognises the fixed vocabulary Nova supports: `@serializable`, `@test`,
+    /// Recognises the fixed vocabulary Kyte supports: `@serializable`, `@test`,
     /// `@deprecated("note")` (optional string note), `@route("METHOD", "path")`,
     /// and the shorthand HTTP verbs `@get/@post/@put/@delete("path")` which expand
     /// to a `route` attribute with the upper-cased verb as the method. String
@@ -1502,7 +1502,7 @@ pub const Parser = struct {
             .keyword_var => {
 
                 const t = self.current();
-                std.debug.print("Parser error: {s}:{}:{}: `var` is not a Nova keyword, use `let` for a mutable variable or `const` for a constant.\n", .{ self.file_path, t.line, t.column });
+                std.debug.print("Parser error: {s}:{}:{}: `var` is not a Kyte keyword, use `let` for a mutable variable or `const` for a constant.\n", .{ self.file_path, t.line, t.column });
                 return error.UnexpectedToken;
             },
             .keyword_const => return ast.Statement{ .let_stmt = try self.parseLetStmt(true) },
@@ -1587,7 +1587,7 @@ pub const Parser = struct {
     /// Always errors, printing a migration diagnostic for a removed exception
     /// keyword.
     ///
-    /// Nova has no exceptions: `throw`/`catch { }`/`try { }` were removed because
+    /// Kyte has no exceptions: `throw`/`catch { }`/`try { }` were removed because
     /// a thrown value was truncated to i32, leaked unwound frames, and longjmp out
     /// of an async fn is undefined behaviour. Two messages are produced: one for
     /// `try { ... }` explaining that `try` is a prefix operator on an expression,
@@ -1599,7 +1599,7 @@ pub const Parser = struct {
         if (tok.type == .keyword_try) {
 
             std.debug.print(
-                "{s}:{d}:{d}: error: `try {{ ... }}` (the exception form) does not exist in Nova.\n" ++
+                "{s}:{d}:{d}: error: `try {{ ... }}` (the exception form) does not exist in Kyte.\n" ++
                 "  `try` is a PREFIX operator on an expression, not a block:\n" ++
                 "      let raw = try readConfig(path);   // error -> return it from this fn\n" ++
                 "      let p   = loadPort() catch 8080;  // error -> use 8080\n" ++
@@ -1610,7 +1610,7 @@ pub const Parser = struct {
             return error.UnexpectedToken;
         }
         std.debug.print(
-            "{s}:{d}:{d}: error: '{s}' was removed from Nova, exceptions do not exist.\n" ++
+            "{s}:{d}:{d}: error: '{s}' was removed from Kyte, exceptions do not exist.\n" ++
             "  The thrown value could not survive: it was truncated to an i32, so `throw \"msg\"`\n" ++
             "  was caught as an integer. It also leaked every frame it unwound, and longjmp out\n" ++
             "  of an async fn is undefined behaviour.\n" ++

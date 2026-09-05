@@ -1,4 +1,4 @@
-//! Statement lowering for the LLVM backend: turns a Nova [`ast.Statement`] into
+//! Statement lowering for the LLVM backend: turns a Kyte [`ast.Statement`] into
 //! IR emitted through the active `LlvmCompiler` builder.
 //!
 //! This file owns the control-flow half of code generation. Every statement
@@ -13,7 +13,7 @@
 //! Two cross-cutting concerns dominate the code here and explain most of its
 //! bulk:
 //!
-//!   1. **ARC ownership at scope boundaries.** Nova is reference-counted (see
+//!   1. **ARC ownership at scope boundaries.** Kyte is reference-counted (see
 //!      `arc.zig`), so the compiler must retain on copy and release on scope
 //!      exit. A `let` that binds an owned value records the local in the current
 //!      [`Scope.owned_locals`]; a block, `break`, `continue`, or `return`
@@ -39,7 +39,7 @@
 //! already terminated (e.g. after a `return` inside a block).
 
 const std = @import("std");
-/// Nova AST node definitions; statements dispatch on [`ast.Statement`] and read
+/// Kyte AST node definitions; statements dispatch on [`ast.Statement`] and read
 /// their embedded expressions and type references.
 const ast = @import("../../frontend/ast.zig");
 /// LLVM-C bindings package (builder, module, value/type refs).
@@ -151,7 +151,7 @@ fn releaseScopesForLoopExit(self: *LlvmCompiler) anyerror!void {
     }
 }
 
-/// Lowers a single Nova statement to LLVM IR under the active builder position.
+/// Lowers a single Kyte statement to LLVM IR under the active builder position.
 ///
 /// This is the control-flow dispatcher for the backend. It first bails out if
 /// the current basic block already has a terminator (so dead statements after a
@@ -239,7 +239,7 @@ pub fn compileStatement(self: *LlvmCompiler, stmt: ast.Statement, func: Function
             .continue_stmt => |s| s.span,
             .defer_stmt => |s| s.span,
         };
-        const is_std = std.mem.indexOf(u8, span.file, "src/std/") != null or std.mem.eql(u8, span.file, "test_harness.nova");
+        const is_std = std.mem.indexOf(u8, span.file, "src/std/") != null or std.mem.eql(u8, span.file, "test_harness.ky");
         if (!is_std) {
             const desc = @tagName(stmt);
             if (self.cov_registry) |*reg| {

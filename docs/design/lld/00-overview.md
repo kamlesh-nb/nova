@@ -1,11 +1,11 @@
-# Nova compiler: low-level design (maintainer's guide)
+# Kyte compiler: low-level design (maintainer's guide)
 
-This is the low-level design reference for the Nova compiler (the `lang/` project). It is written for a new
+This is the low-level design reference for the Kyte compiler (the `lang/` project). It is written for a new
 maintainer who needs to be productive quickly: it explains the pipeline end to end, the one cross-cutting idea
 that the whole backend rests on (the i64 value word), the module map, and then hands off to per-file sections
 that document every `.zig` file and every function, public and private.
 
-The compiler is written in **Zig 0.16**. It lowers Nova source to **LLVM IR**, then to a native object, then
+The compiler is written in **Zig 0.16**. It lowers Kyte source to **LLVM IR**, then to a native object, then
 links a binary (in-process LLD or `clang++`). The runtime that the produced binaries link against is written
 in **C++20** and lives in `src/runtime/` (not covered here; this document is the compiler, not the runtime).
 
@@ -31,12 +31,12 @@ in **C++20** and lives in `src/runtime/` (not covered here; this document is the
 
 ## The pipeline, end to end
 
-A `nova <file>.nova -o out` invocation flows through these stages. Each arrow is a data hand-off; the type in
+A `kyte <file>.ky -o out` invocation flows through these stages. Each arrow is a data hand-off; the type in
 brackets is what crosses the boundary.
 
 ```mermaid
 flowchart TD
-    SRC["Nova source text"] -->|"chars"| LEX["lexer.zig"]
+    SRC["Kyte source text"] -->|"chars"| LEX["lexer.zig"]
     LEX -->|"Token stream"| PAR["parser.zig"]
     PAR -->|"AST (ast.zig)"| TC["type_checker.zig"]
     TC -->|"checked AST"| SEMA["sema/infer.zig + symbols/mono/ownership/subst"]
@@ -45,21 +45,21 @@ flowchart TD
     OBJ -->|".o"| LINK["link (in-process LLD / clang++)"]
     LINK -->|"native binary"| BIN["executable"]
 
-    SEMA -.->|"optional: NOVA_OPT / NOVA_OPT_EMIT"| OPT["optimiser: AST -> HIR -> MIR -> LIR + passes"]
+    SEMA -.->|"optional: KYTE_OPT / KYTE_OPT_EMIT"| OPT["optimiser: AST -> HIR -> MIR -> LIR + passes"]
     OPT -.->|"per-function: emit LLVM directly, else fall back to CG"| CG
 ```
 
-Driver-level orchestration (which command runs which stages, cross-compilation, the `~/.nova` layout) lives
+Driver-level orchestration (which command runs which stages, cross-compilation, the `~/.kyte` layout) lives
 in [50-cli-pipeline-drivers.md](50-cli-pipeline-drivers.md). The frontend (source to typed IR) is sections
 10-22. The backend (typed IR to LLVM) is sections 30-33. The optimiser and its optional emit path are
 section 40.
 
 ## The one idea to hold in your head: everything is the i64 word
 
-Codegen uses a single uniform value representation, `val_type` = LLVM `i64`. Every Nova value, whatever its
+Codegen uses a single uniform value representation, `val_type` = LLVM `i64`. Every Kyte value, whatever its
 source type, flows through the IR as this 64-bit word. What the word holds depends on the type:
 
-| Nova type | What the i64 word holds |
+| Kyte type | What the i64 word holds |
 |---|---|
 | `int` (32-bit), `bool`, enum discriminant | the integer, sign- or zero-extended to 64 bits |
 | `long` | the 64-bit integer directly |
@@ -89,7 +89,7 @@ offset` truncates to 32 bits and produces a garbage pointer. Heap addresses must
 
 - **ARC (automatic reference counting).** Not a garbage collector: retain/release are decided in
   sema/codegen. Every heap object carries an 8-byte header (`refcount` at ptr-8, `len` at ptr-4).
-  `nova_retain(ptr)` bumps the count; `nova_release(ptr, dtor)` drops it and calls `dtor` before free. A
+  `kyte_retain(ptr)` bumps the count; `kyte_release(ptr, dtor)` drops it and calls `dtor` before free. A
   string needs no destructor (null dtor); a struct with owned fields gets a synthesised `__destruct_*`.
   Ownership is computed in [21-sema-shadow-symbols-ownership-mono.md](21-sema-shadow-symbols-ownership-mono.md)
   (`ownership.zig`) and emitted in [33-codegen-arc-types.md](33-codegen-arc-types.md) (`arc.zig`). Verify
@@ -108,7 +108,7 @@ offset` truncates to 32 bits and produces a garbage pointer. Heap addresses must
 
 - **The optimiser and its two halves.** The optimiser lowers AST to HIR to MIR to LIR and runs passes
   (constfold, mem2reg, copyprop, dce, simplifycfg, arc_elision, inline). It has a report-only **shadow** half
-  (`NOVA_OPT`) that runs over the whole corpus as a gauge, and an **emit** half (`NOVA_OPT_EMIT`) that turns
+  (`KYTE_OPT`) that runs over the whole corpus as a gauge, and an **emit** half (`KYTE_OPT_EMIT`) that turns
   the optimised MIR into LLVM directly, with a per-function fallback to the AST codegen for anything it does
   not yet handle. Both are off by default. See [40-optimiser.md](40-optimiser.md) and the status table in
   `../optimiser-pending.md`.
@@ -117,17 +117,17 @@ offset` truncates to 32 bits and produces a garbage pointer. Heap addresses must
 
 ```bash
 cd lang
-zig build                 # builds `nova`, installs to ~/.nova/bin/nova, syncs std+runtime+deps to ~/.nova
-NOVA_ASAN=1 zig build     # also builds the sanitized runtime needed for the --asan gate
-nova <file.nova> -o out   # compile one file
-nova test <file.nova>     # run @test functions (note: skips main())
+zig build                 # builds `kyte`, installs to ~/.kyte/bin/kyte, syncs std+runtime+deps to ~/.kyte
+KYTE_ASAN=1 zig build     # also builds the sanitized runtime needed for the --asan gate
+kyte <file.ky> -o out   # compile one file
+kyte test <file.ky>     # run @test functions (note: skips main())
 conformance/run.sh -j     # the corpus, parallel (run before AND after a change)
-conformance/run.sh --asan # AddressSanitizer gate (needs NOVA_ASAN=1 build first)
+conformance/run.sh --asan # AddressSanitizer gate (needs KYTE_ASAN=1 build first)
 conformance/run.sh --arc  # ARC leak gate (baseline-gated)
 ```
 
-Debug switches: `NOVA_DUMP_MERGED=1` writes the merged IR; `NOVA_SEMA_SHADOW=1` diffs the type engines;
-`NOVA_OPT_EMIT_VERBOSE=1` logs which functions the emit path took versus rejected. Environment variables are
+Debug switches: `KYTE_DUMP_MERGED=1` writes the merged IR; `KYTE_SEMA_SHADOW=1` diffs the type engines;
+`KYTE_OPT_EMIT_VERBOSE=1` logs which functions the emit path took versus rejected. Environment variables are
 read via `init.environ_map.get("VAR")`, never `std.posix.getenv` (which does not work in this Zig).
 
 ## A note on the directory layout

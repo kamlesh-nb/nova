@@ -25,7 +25,7 @@ coroutine runtime on wasm). There is consequently no "flagship web server runnin
 wasm" to load test.
 
 What a wasm deployment does run is the **per request compute core**: the host performs
-the I/O and calls into the module with the request body. `compute_core.nova` is exactly
+the I/O and calls into the module with the request body. `compute_core.ky` is exactly
 the `CreateProduct` handler with the `async` and the database removed, that is, the pure
 work of one request:
 
@@ -43,11 +43,11 @@ handleOne call)`, not requests served over a socket.
 cd lang
 
 # native (main() runs 2,000,000 iterations; time the whole process)
-nova flagship/bench/compute_core.nova -o /tmp/flagbench
+kyte flagship/bench/compute_core.ky -o /tmp/flagbench
 /usr/bin/time -p /tmp/flagbench
 
 # wasm (a Node harness times runBench() across a range of iteration counts)
-nova flagship/bench/compute_core.nova --wasm -o /tmp/flagbench.wasm
+kyte flagship/bench/compute_core.ky --wasm -o /tmp/flagbench.wasm
 node flagship/bench/wasm-bench.mjs /tmp/flagbench.wasm
 ```
 

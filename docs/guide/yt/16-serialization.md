@@ -2,11 +2,11 @@
 
 - Chapter: [16-serialization.md](../16-serialization.md)
 - Estimated length: ~11 minutes
-- You will need: Nova installed, a terminal, and the guide's `examples/` folder handy.
+- You will need: Kyte installed, a terminal, and the guide's `examples/` folder handy.
 
 ## Hook (0:00)
 
-**Say:** Almost every real service has to turn data into JSON and read JSON back into data. In a lot of languages that means reflection at runtime, or hand-written parsing that drifts out of sync with your types. Nova does neither. In this video you will mark one struct as `@serializable`, and watch the compiler generate the parser and the writer for you, at compile time, with no reflection at all. By the end you will be able to deserialize JSON into a struct, walk its nested fields and lists, and serialize it straight back.
+**Say:** Almost every real service has to turn data into JSON and read JSON back into data. In a lot of languages that means reflection at runtime, or hand-written parsing that drifts out of sync with your types. Kyte does neither. In this video you will mark one struct as `@serializable`, and watch the compiler generate the parser and the writer for you, at compile time, with no reflection at all. By the end you will be able to deserialize JSON into a struct, walk its nested fields and lists, and serialize it straight back.
 
 ## What we will cover (0:25)
 
@@ -27,8 +27,8 @@
 **Say:** Let us look at the example. We will build a `User` that has a nested `Address` and a list of roles. First the imports and the nested struct.
 
 **On screen:**
-```nova
-// examples/23_serde.nova
+```kyte
+// examples/23_serde.ky
 import serde.source;
 import list;
 
@@ -45,7 +45,7 @@ struct Address {
 **Say:** Now the `User` struct, which pulls in that nested `Address` and a list.
 
 **On screen:**
-```nova
+```kyte
 @serializable
 struct User {
     pub id: long,
@@ -67,10 +67,10 @@ struct User {
 
 ## Segment: Deserializing with __bind (4:15)
 
-**Say:** Now to `main`. We start with a raw JSON string. It is written with escaped quotes because it is a normal Nova string, and it is split across a few lines with `+`.
+**Say:** Now to `main`. We start with a raw JSON string. It is written with escaped quotes because it is a normal Kyte string, and it is split across a few lines with `+`.
 
 **On screen:**
-```nova
+```kyte
 fn main(): void {
     let raw = "{\"id\":7,\"name\":\"Ada\",\"active\":true," +
               "\"address\":{\"street\":\"Main\",\"city\":\"Pune\"}," +
@@ -80,7 +80,7 @@ fn main(): void {
 **Say:** That JSON has an id, a name, a boolean, a nested address object, and an array of roles. Now we parse it into a `User` in a single call.
 
 **On screen:**
-```nova
+```kyte
     // Parse JSON into User via the compiler-generated binder.
     let u = User__bind(source.fromJson(raw));
     console.log(`id      = ${u.id}`);
@@ -97,7 +97,7 @@ fn main(): void {
 **Say:** The roles came in as a proper `List<string>`, so we can loop over it the normal way.
 
 **On screen:**
-```nova
+```kyte
     let i = 0;
     while (i < u.roles.size()) {
         console.log(`  role[${i}] = ${u.roles.at(i)}`);
@@ -105,14 +105,14 @@ fn main(): void {
     }
 ```
 
-**Say:** Nothing special here, this is the list handling you already know. `size()` gives the count, `at(i)` gives the element. The point is that the JSON array became a real Nova list through the generated binder, so you work with it exactly like any other list.
+**Say:** Nothing special here, this is the list handling you already know. `size()` gives the count, `at(i)` gives the element. The point is that the JSON array became a real Kyte list through the generated binder, so you work with it exactly like any other list.
 
 ## Segment: Serializing back with __toJson (7:15)
 
 **Say:** Now the other direction. We take our `User` value and turn it back into a JSON string with the generated writer.
 
 **On screen:**
-```nova
+```kyte
     // Serialise User to JSON via the compiler-generated writer (round-trips).
     console.log(`json    = ${User__toJson(u)}`);
 }
@@ -120,7 +120,7 @@ fn main(): void {
 
 **Say:** `User__toJson` walks the struct in field-declaration order and produces JSON. Because it is symmetric with `__bind`, this round-trips. The value we parsed in should come back out as the same JSON.
 
-**Run it:** `nova docs/guide/examples/23_serde.nova -o /tmp/serde && /tmp/serde`
+**Run it:** `kyte docs/guide/examples/23_serde.ky -o /tmp/serde && /tmp/serde`
 
 ```
 id      = 7

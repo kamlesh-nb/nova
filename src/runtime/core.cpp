@@ -1,5 +1,5 @@
 
-#include "nova_abi.h"
+#include "kyte_abi.h"
 #include "runtime_str.h"
 #include <atomic>
 #include <cerrno>
@@ -26,7 +26,7 @@
 #include <sys/socket.h>  // fd-passing (SCM_RIGHTS) shims below
 #endif
 
-// --- crash diagnostics (opt-in: NOVA_CRASH_TRACE=1) ---------------------------------------------
+// --- crash diagnostics (opt-in: KYTE_CRASH_TRACE=1) ---------------------------------------------
 // A fatal signal in a release build is otherwise just "Segmentation fault" with nothing to act on,
 // and a debugger is not always installable on the host where it reproduces. With this on, the
 // process prints its return-address stack to stderr before dying; llvm-symbolizer / addr2line turn
@@ -38,49 +38,49 @@
 // builds; on musl the handler prints the signal + fault address without frames.
 #if defined(__GLIBC__) || defined(__APPLE__)
 #include <execinfo.h>
-#define NOVA_HAVE_BACKTRACE 1
+#define KYTE_HAVE_BACKTRACE 1
 #else
 // musl (and other libcs without execinfo) still have the unwind ABI from libgcc/compiler-rt, so we
 // can walk return addresses even without backtrace()/backtrace_symbols().
 #include <unwind.h>
-#define NOVA_HAVE_UNWIND 1
+#define KYTE_HAVE_UNWIND 1
 #endif
 
 namespace {
-void nova_write_lit(const char *s) { (void)!::write(2, s, std::strlen(s)); }
+void kyte_write_lit(const char *s) { (void)!::write(2, s, std::strlen(s)); }
 
-void nova_write_hex(unsigned long long v) {
+void kyte_write_hex(unsigned long long v) {
   char h[16];
   int len = 0;
   if (v == 0) h[len++] = '0';
   while (v > 0) { int nib = (int)(v & 0xF); h[len++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10); v >>= 4; }
-  nova_write_lit("0x");
+  kyte_write_lit("0x");
   while (len > 0) { --len; (void)!::write(2, &h[len], 1); }
 }
 
-void nova_crash_handler(int sig, siginfo_t *info, void *) {
-#if defined(NOVA_HAVE_BACKTRACE)
+void kyte_crash_handler(int sig, siginfo_t *info, void *) {
+#if defined(KYTE_HAVE_BACKTRACE)
   void *frames[64];
   int n = ::backtrace(frames, 64);
 #endif
-  nova_write_lit("\n=== NOVA CRASH: fatal signal ");
-  nova_write_hex((unsigned long long)sig);
+  kyte_write_lit("\n=== KYTE CRASH: fatal signal ");
+  kyte_write_hex((unsigned long long)sig);
   // The faulting address is the whole diagnosis for a bad dereference: near-zero means a null
   // base, a small value means an offset off a null, and a wild value means a corrupted pointer.
-  nova_write_lit(" at fault addr ");
-  nova_write_hex((unsigned long long)(uintptr_t)(info ? info->si_addr : nullptr));
-  nova_write_lit(" ===\n");
-#if defined(NOVA_HAVE_BACKTRACE)
+  kyte_write_lit(" at fault addr ");
+  kyte_write_hex((unsigned long long)(uintptr_t)(info ? info->si_addr : nullptr));
+  kyte_write_lit(" ===\n");
+#if defined(KYTE_HAVE_BACKTRACE)
   ::backtrace_symbols_fd(frames, n, 2);
 #else
-  nova_write_lit("(no backtrace: this libc has no execinfo.h)\n");
+  kyte_write_lit("(no backtrace: this libc has no execinfo.h)\n");
 #endif
-  nova_write_lit("=== end crash ===\n");
+  kyte_write_lit("=== end crash ===\n");
   ::_exit(128 + sig);
 }
 
-__attribute__((constructor)) void nova_install_crash_handler() {
-  if (!std::getenv("NOVA_CRASH_TRACE")) return;
+__attribute__((constructor)) void kyte_install_crash_handler() {
+  if (!std::getenv("KYTE_CRASH_TRACE")) return;
   // An ALTERNATE stack is what makes this useful for the most common fatal fault of all: running
   // out of stack. That SIGSEGV is delivered on the very stack that just overflowed, so a normal
   // handler faults again immediately and the process dies silently with no output at all -- which
@@ -98,7 +98,7 @@ __attribute__((constructor)) void nova_install_crash_handler() {
 
   struct sigaction sa;
   std::memset(&sa, 0, sizeof(sa));
-  sa.sa_sigaction = nova_crash_handler;
+  sa.sa_sigaction = kyte_crash_handler;
   sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
   // NOT `::sigemptyset` — on macOS sigemptyset is a MACRO, and a macro cannot be namespace-
   // qualified (`::` then expands onto `(*(set)=0,0)` and fails to parse). Unqualified resolves to
@@ -114,58 +114,58 @@ __attribute__((constructor)) void nova_install_crash_handler() {
 
 extern "C" {
 
-void nova_log_string(const char *s) {
+void kyte_log_string(const char *s) {
   if (!s)
     return;
-  char *c = nova_to_cstr(s);
+  char *c = kyte_to_cstr(s);
   if (c) {
     std::puts(c);
     std::fflush(stdout);
-    nova_free_cstr(s, c);
+    kyte_free_cstr(s, c);
   }
 }
-void nova_log_info(const char *s) {
+void kyte_log_info(const char *s) {
   if (!s)
     return;
-  char *c = nova_to_cstr(s);
+  char *c = kyte_to_cstr(s);
   if (c) {
     std::printf("\x1b[34m[INFO]\x1b[0m %s\n", c);
     std::fflush(stdout);
-    nova_free_cstr(s, c);
+    kyte_free_cstr(s, c);
   }
 }
-void nova_log_debug(const char *s) {
+void kyte_log_debug(const char *s) {
   if (!s)
     return;
-  char *c = nova_to_cstr(s);
+  char *c = kyte_to_cstr(s);
   if (c) {
     std::printf("\x1b[90m[DEBUG]\x1b[0m %s\n", c);
     std::fflush(stdout);
-    nova_free_cstr(s, c);
+    kyte_free_cstr(s, c);
   }
 }
-void nova_log_err(const char *s) {
+void kyte_log_err(const char *s) {
   if (!s)
     return;
-  char *c = nova_to_cstr(s);
+  char *c = kyte_to_cstr(s);
   if (c) {
     std::fprintf(stderr, "\x1b[31m[ERROR]\x1b[0m %s\n", c);
     std::fflush(stderr);
-    nova_free_cstr(s, c);
+    kyte_free_cstr(s, c);
   }
 }
 
 // --- Runtime trace facility (M0) -------------------------------------------------------------
-// A file-based, per-line-flushed trace, gated on the NOVA_TRACE env var, so runtime diagnostics
+// A file-based, per-line-flushed trace, gated on the KYTE_TRACE env var, so runtime diagnostics
 // always surface (the scheduler debug was blocked by stderr being swallowed). Load-once gate, so
 // disabled cost is a single relaxed load; enabled cost is a mutexed unbuffered fprintf.
-static const bool g_trace_on = std::getenv("NOVA_TRACE") != nullptr;
+static const bool g_trace_on = std::getenv("KYTE_TRACE") != nullptr;
 static std::mutex g_trace_mu;
 static std::FILE *g_trace_fp = nullptr;
 
-static std::FILE *nova_trace_fp() {
+static std::FILE *kyte_trace_fp() {
     if (!g_trace_fp) {
-        const char *path = std::getenv("NOVA_TRACE");
+        const char *path = std::getenv("KYTE_TRACE");
         if (!path) return nullptr;
         g_trace_fp = std::fopen(path, "a");
         if (g_trace_fp) std::setvbuf(g_trace_fp, nullptr, _IONBF, 0); // unbuffered
@@ -173,37 +173,37 @@ static std::FILE *nova_trace_fp() {
     return g_trace_fp;
 }
 
-int nova_trace_enabled(void) { return g_trace_on ? 1 : 0; }
+int kyte_trace_enabled(void) { return g_trace_on ? 1 : 0; }
 
-void nova_trace_line(const char *s) {
+void kyte_trace_line(const char *s) {
     if (!g_trace_on) return;
     std::lock_guard<std::mutex> lk(g_trace_mu);
-    std::FILE *fp = nova_trace_fp();
+    std::FILE *fp = kyte_trace_fp();
     if (!fp) return;
     std::fprintf(fp, "%s\n", s ? s : "");
     std::fflush(fp);
 }
 
-void nova_trace_msg(long long nova_str) {
+void kyte_trace_msg(long long kyte_str) {
     if (!g_trace_on) return;
-    char *c = nova_to_cstr(reinterpret_cast<const char *>(nova_str));
-    nova_trace_line(c);
-    nova_free_cstr(reinterpret_cast<const char *>(nova_str), c);
+    char *c = kyte_to_cstr(reinterpret_cast<const char *>(kyte_str));
+    kyte_trace_line(c);
+    kyte_free_cstr(reinterpret_cast<const char *>(kyte_str), c);
 }
 
-void nova_trace_kv(long long nova_str, long long value) {
+void kyte_trace_kv(long long kyte_str, long long value) {
     if (!g_trace_on) return;
-    char *c = nova_to_cstr(reinterpret_cast<const char *>(nova_str));
+    char *c = kyte_to_cstr(reinterpret_cast<const char *>(kyte_str));
     std::lock_guard<std::mutex> lk(g_trace_mu);
-    std::FILE *fp = nova_trace_fp();
+    std::FILE *fp = kyte_trace_fp();
     if (fp) { std::fprintf(fp, "%s=%lld\n", c ? c : "", value); std::fflush(fp); }
-    nova_free_cstr(reinterpret_cast<const char *>(nova_str), c);
+    kyte_free_cstr(reinterpret_cast<const char *>(kyte_str), c);
 }
-// C++-internal variadic trace, used via the NOVA_TRACE macro (nova_abi.h).
-void nova_tracef(const char *fmt, ...) {
+// C++-internal variadic trace, used via the KYTE_TRACE macro (kyte_abi.h).
+void kyte_tracef(const char *fmt, ...) {
     if (!g_trace_on) return;
     std::lock_guard<std::mutex> lk(g_trace_mu);
-    std::FILE *fp = nova_trace_fp();
+    std::FILE *fp = kyte_trace_fp();
     if (!fp) return;
     va_list ap;
     va_start(ap, fmt);
@@ -219,15 +219,15 @@ void nova_tracef(const char *fmt, ...) {
 // thread-confined (a reactor worker owns its coroutines), so a thread-local free list retires that
 // traffic entirely: reuse is a pointer swap. Capped so an idle worker does not sit on memory.
 namespace {
-const int NOVA_OP_POOL_MAX = 256;
-thread_local void *g_op_pool[NOVA_OP_POOL_MAX];
+const int KYTE_OP_POOL_MAX = 256;
+thread_local void *g_op_pool[KYTE_OP_POOL_MAX];
 thread_local int g_op_pool_n = 0;
 thread_local long long g_op_pool_size = 0;
 }
 
 // `size` is eventloop.OP_SIZE, which differs per backend, so the pool is sized by the first caller
 // and reset if a larger record is ever requested.
-long long nova_op_alloc(long long size) {
+long long kyte_op_alloc(long long size) {
   if (size != g_op_pool_size) {
     // Backend changed the record size (only possible before any I/O); drop what we hold.
     for (int i = 0; i < g_op_pool_n; ++i) std::free(g_op_pool[i]);
@@ -238,16 +238,16 @@ long long nova_op_alloc(long long size) {
   return (long long)(intptr_t)std::malloc((size_t)size);
 }
 
-void nova_op_free(long long op) {
+void kyte_op_free(long long op) {
   if (!op) return;
-  if (g_op_pool_n < NOVA_OP_POOL_MAX) {
+  if (g_op_pool_n < KYTE_OP_POOL_MAX) {
     g_op_pool[g_op_pool_n++] = (void *)(intptr_t)op;
     return;
   }
   std::free((void *)(intptr_t)op);
 }
 
-// --- I/O accounting (opt-in: NOVA_IO_WATCHDOG=1) ------------------------------------------------
+// --- I/O accounting (opt-in: KYTE_IO_WATCHDOG=1) ------------------------------------------------
 // Answers the one question a stalled proactor cannot otherwise be asked: are operations OUTSTANDING
 // in the kernel (issued but never completed), or has the application simply stopped issuing them?
 // Those two have completely different causes and are indistinguishable from the outside -- in both
@@ -259,16 +259,16 @@ std::atomic<long long> g_resume_skipped{0};
 std::atomic<bool> g_io_watchdog_started{false};
 }
 
-extern "C" void nova_io_stat_issued(void)    { g_io_issued.fetch_add(1, std::memory_order_relaxed); }
-extern "C" void nova_io_stat_completed(void) { g_io_completed.fetch_add(1, std::memory_order_relaxed); }
-extern "C" void nova_io_stat_resume_skipped(void) { g_resume_skipped.fetch_add(1, std::memory_order_relaxed); }
+extern "C" void kyte_io_stat_issued(void)    { g_io_issued.fetch_add(1, std::memory_order_relaxed); }
+extern "C" void kyte_io_stat_completed(void) { g_io_completed.fetch_add(1, std::memory_order_relaxed); }
+extern "C" void kyte_io_stat_resume_skipped(void) { g_resume_skipped.fetch_add(1, std::memory_order_relaxed); }
 
-extern "C" void nova_io_watchdog_start(void) {
-  if (!std::getenv("NOVA_IO_WATCHDOG")) return;
+extern "C" void kyte_io_watchdog_start(void) {
+  if (!std::getenv("KYTE_IO_WATCHDOG")) return;
   bool expected = false;
   if (!g_io_watchdog_started.compare_exchange_strong(expected, true)) return;
   // M-4: the watchdog runs on its own thread; switch ARC to atomic before it starts.
-  nova_arc_go_multithreaded();
+  kyte_arc_go_multithreaded();
   std::thread([] {
     long long prev_i = -1, prev_c = -1;
     for (;;) {
@@ -276,18 +276,18 @@ extern "C" void nova_io_watchdog_start(void) {
       long long i = g_io_issued.load(std::memory_order_relaxed);
       long long c = g_io_completed.load(std::memory_order_relaxed);
       const char *tag = (i == prev_i && c == prev_c) ? "  <- IDLE (nothing moving)" : "";
-      std::fprintf(stderr, "nova io: issued=%lld completed=%lld outstanding=%lld resume_skipped=%lld%s\n",
+      std::fprintf(stderr, "kyte io: issued=%lld completed=%lld outstanding=%lld resume_skipped=%lld%s\n",
                    i, c, i - c, g_resume_skipped.load(std::memory_order_relaxed), tag);
       prev_i = i; prev_c = c;
     }
   }).detach();
 }
 
-long long nova_ffi_errno(void) { return (long long)errno; }
-void nova_ffi_set_errno(long long v) { errno = (int)v; }
+long long kyte_ffi_errno(void) { return (long long)errno; }
+void kyte_ffi_set_errno(long long v) { errno = (int)v; }
 // fcntl is variadic; a non-variadic FFI declaration mispasses the third arg on some ABIs
 // (arm64 passes varargs on the stack). This shim lets C handle the varargs correctly.
-long long nova_set_nonblock(long long fd) {
+long long kyte_set_nonblock(long long fd) {
 #ifdef _WIN32
   // Sockets on Windows are made non-blocking with ioctlsocket(FIONBIO), not fcntl.
   u_long nb = 1;
@@ -301,14 +301,14 @@ long long nova_set_nonblock(long long fd) {
 // open(2) is variadic (int open(const char*, int, ...)); a non-variadic FFI declaration
 // mispasses the mode argument on arm64 (varargs go on the stack, not in registers), exactly
 // as with fcntl above. This tiny shim lets C forward the mode correctly. It is the only C
-// left under io/file after M5; everything else in file and directory I/O is Nova over os/sys.
-long long nova_open(const char *path, long long flags, long long mode) {
+// left under io/file after M5; everything else in file and directory I/O is Kyte over os/sys.
+long long kyte_open(const char *path, long long flags, long long mode) {
   return (long long)::open(path, (int)flags, (unsigned int)mode);
 }
 
 // Blocking sleep for `ms` milliseconds (a coarse wait for polling/retry backoffs — e.g. an fd-handoff
 // app waiting for the service's rendezvous socket to appear). No reactor involved.
-void nova_sleep_ms(long long ms) {
+void kyte_sleep_ms(long long ms) {
   if (ms <= 0) return;
 #ifdef _WIN32
   ::Sleep((unsigned long)ms);
@@ -332,7 +332,7 @@ void nova_sleep_ms(long long ms) {
 // Send `fd` plus `len` bytes of ordinary payload (the already-consumed request prefix) over the
 // connected AF_UNIX socket `sock`. At least one payload byte always travels, since a zero-length
 // datagram would not carry the ancillary block reliably. Returns bytes sent (>=0) or -1.
-long long nova_send_fd(long long sock, const char *data, long long len, long long fd) {
+long long kyte_send_fd(long long sock, const char *data, long long len, long long fd) {
 #ifdef _WIN32
   (void)sock; (void)data; (void)len; (void)fd;
   return -1;
@@ -367,7 +367,7 @@ long long nova_send_fd(long long sock, const char *data, long long len, long lon
 // Receive an fd (and up to `cap` payload bytes) from the connected AF_UNIX socket `sock`. Writes the
 // received fd to *(int*)out_fd_ptr, or -1 if none arrived. Returns payload bytes (0 = peer closed) or
 // -1. The caller owns the received fd and must close it.
-long long nova_recv_fd(long long sock, char *buf, long long cap, long long out_fd_ptr) {
+long long kyte_recv_fd(long long sock, char *buf, long long cap, long long out_fd_ptr) {
 #ifdef _WIN32
   (void)sock; (void)buf; (void)cap;
   if (out_fd_ptr) *reinterpret_cast<int *>(out_fd_ptr) = -1;
@@ -403,43 +403,43 @@ long long nova_recv_fd(long long sock, char *buf, long long cap, long long out_f
   return (long long)n;
 #endif
 }
-char *nova_ffi_to_cstr(const char *nova_str) { return nova_to_cstr(nova_str); }
-void nova_ffi_free_cstr(const char *nova_str, char *c) { nova_free_cstr(nova_str, c); }
-const char *nova_ffi_from_cstr(const char *c) {
+char *kyte_ffi_to_cstr(const char *kyte_str) { return kyte_to_cstr(kyte_str); }
+void kyte_ffi_free_cstr(const char *kyte_str, char *c) { kyte_free_cstr(kyte_str, c); }
+const char *kyte_ffi_from_cstr(const char *c) {
   if (!c)
-    return nova_from_cstr("");
-  return nova_from_cstr(c);
+    return kyte_from_cstr("");
+  return kyte_from_cstr(c);
 }
 
-typedef long long (*nova_str_closure_fn)(long long env, long long arg);
-long long nova_invoke_str_closure(long long box, long long arg) {
+typedef long long (*kyte_str_closure_fn)(long long env, long long arg);
+long long kyte_invoke_str_closure(long long box, long long arg) {
   if (!box)
-    return (long long)nova_from_cstr("");
+    return (long long)kyte_from_cstr("");
   long long fn_ptr = *reinterpret_cast<long long *>(box);
   long long env = *reinterpret_cast<long long *>(box + sizeof(long long));
-  return reinterpret_cast<nova_str_closure_fn>(fn_ptr)(env, arg);
+  return reinterpret_cast<kyte_str_closure_fn>(fn_ptr)(env, arg);
 }
 
-typedef long long (*nova_void_closure_fn)(long long env);
-void nova_invoke_void_closure(long long box) {
+typedef long long (*kyte_void_closure_fn)(long long env);
+void kyte_invoke_void_closure(long long box) {
   if (!box)
     return;
   long long fn_ptr = *reinterpret_cast<long long *>(box);
   long long env = *reinterpret_cast<long long *>(box + sizeof(long long));
-  reinterpret_cast<nova_void_closure_fn>(fn_ptr)(env);
+  reinterpret_cast<kyte_void_closure_fn>(fn_ptr)(env);
 }
 
-void nova_exit(int code) { std::_Exit(code); }
-int64_t nova_time_now(void) {
+void kyte_exit(int code) { std::_Exit(code); }
+int64_t kyte_time_now(void) {
   using namespace std::chrono;
   return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
 }
-int64_t nova_time_now_ns(void) {
+int64_t kyte_time_now_ns(void) {
   using namespace std::chrono;
   return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
 }
 // Monotonic milliseconds, for measuring timeouts/deadlines (immune to wall-clock jumps).
-int64_t nova_mono_ms(void) {
+int64_t kyte_mono_ms(void) {
   using namespace std::chrono;
   return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
@@ -448,13 +448,13 @@ namespace {
 thread_local int t_failed = 0;
 thread_local char t_msg[1024] = {0};
 }
-void nova_test_reset(void) {
+void kyte_test_reset(void) {
   t_failed = 0;
   t_msg[0] = '\0';
 }
 
 static char t_current[256] = "";
-void nova_test_begin(const char *name) {
+void kyte_test_begin(const char *name) {
   if (!name) {
     t_current[0] = '\0';
     return;
@@ -468,7 +468,7 @@ void nova_test_begin(const char *name) {
   t_current[i] = '\0';
 }
 
-void nova_test_fail(const char *msg) {
+void kyte_test_fail(const char *msg) {
   t_failed = 1;
   if (msg) {
 
@@ -489,45 +489,45 @@ void nova_test_fail(const char *msg) {
                        "   unwound out of, so later tests do not run. Fix this one and re-run.)\n");
   std::_Exit(1);
 }
-int nova_test_did_fail(void) { return t_failed; }
-const char *nova_test_fail_message(void) {
+int kyte_test_did_fail(void) { return t_failed; }
+const char *kyte_test_fail_message(void) {
   int len = (int)std::strlen(t_msg);
-  long long p = nova_bytes_alloc(len);
+  long long p = kyte_bytes_alloc(len);
   if (!p)
     return "";
   std::memcpy((char *)p, t_msg, len);
   return (const char *)p;
 }
 
-long long *__nova_cov_counters = nullptr;
+long long *__kyte_cov_counters = nullptr;
 namespace {
 long long g_cov_count = 0;
 }
-void nova_coverage_dump(long long count) {
-  if (!__nova_cov_counters || count <= 0)
+void kyte_coverage_dump(long long count) {
+  if (!__kyte_cov_counters || count <= 0)
     return;
-  FILE *f = std::fopen("__nova_cov_data.bin", "wb");
+  FILE *f = std::fopen("__kyte_cov_data.bin", "wb");
   if (!f)
     return;
-  std::fwrite(__nova_cov_counters, sizeof(long long), (size_t)count, f);
+  std::fwrite(__kyte_cov_counters, sizeof(long long), (size_t)count, f);
   std::fclose(f);
 }
 namespace {
 void cov_atexit() {
-  if (__nova_cov_counters && g_cov_count > 0)
-    nova_coverage_dump(g_cov_count);
+  if (__kyte_cov_counters && g_cov_count > 0)
+    kyte_coverage_dump(g_cov_count);
 }
 }
-void nova_coverage_init(long long count) {
+void kyte_coverage_init(long long count) {
   if (count <= 0)
     return;
-  __nova_cov_counters =
+  __kyte_cov_counters =
       (long long *)std::calloc((size_t)count, sizeof(long long));
   g_cov_count = count;
   std::atexit(cov_atexit);
 }
 
-void nova_optional_deref_fail(const char *loc) {
+void kyte_optional_deref_fail(const char *loc) {
   std::fprintf(stderr,
     "\nabort: member access on an absent optional%s%s\n"
     "  a `T | undefined` value was `undefined` when a field/method was read.\n"
@@ -536,34 +536,34 @@ void nova_optional_deref_fail(const char *loc) {
   std::_Exit(134);
 }
 
-void nova_panic(const char *msg) {
+void kyte_panic(const char *msg) {
   if (msg) {
     const int n = *reinterpret_cast<const int *>(msg - 4);
     const int len = n < 0 ? 0 : n;
-    std::fprintf(stderr, "\nnova: panic: %.*s\n", len, msg);
+    std::fprintf(stderr, "\nkyte: panic: %.*s\n", len, msg);
   } else {
-    std::fprintf(stderr, "\nnova: panic\n");
+    std::fprintf(stderr, "\nkyte: panic\n");
   }
   std::_Exit(134);
 }
 
-void nova_panic_cstr(const char *msg) {
-  std::fprintf(stderr, "\nnova: panic: %s\n", msg ? msg : "");
+void kyte_panic_cstr(const char *msg) {
+  std::fprintf(stderr, "\nkyte: panic: %s\n", msg ? msg : "");
   std::_Exit(134);
 }
 
-// Copy raw bytes into a fresh Nova string (heap buffer with the 8-byte ARC header, len set).
-static long long nova_stacktrace_str(const char *data, long long len) {
+// Copy raw bytes into a fresh Kyte string (heap buffer with the 8-byte ARC header, len set).
+static long long kyte_stacktrace_str(const char *data, long long len) {
   if (len < 0) len = 0;
-  long long buf = nova_bytes_alloc(len);
+  long long buf = kyte_bytes_alloc(len);
   if (len > 0) std::memcpy((char *)(uintptr_t)buf, data, (size_t)len);
   return buf;
 }
 
-// Format a list of return addresses as `0x...` lines (one per frame) into a Nova string. Used on the
+// Format a list of return addresses as `0x...` lines (one per frame) into a Kyte string. Used on the
 // platforms without a symbolizing backtrace (Windows, musl); the addresses resolve with
 // llvm-symbolizer / addr2line / the debugger.
-static long long nova_stacktrace_from_addrs(void *const *addrs, int n) {
+static long long kyte_stacktrace_from_addrs(void *const *addrs, int n) {
   char line[64 * 20];
   int off = 0;
   for (int i = 0; i < n && i < 64; i++) {
@@ -572,38 +572,38 @@ static long long nova_stacktrace_from_addrs(void *const *addrs, int n) {
     if (w <= 0 || off + w >= (int)sizeof(line)) break;
     off += w;
   }
-  return nova_stacktrace_str(line, off);
+  return kyte_stacktrace_str(line, off);
 }
 
-#if defined(NOVA_HAVE_UNWIND)
+#if defined(KYTE_HAVE_UNWIND)
 namespace {
-struct NovaUnwindState {
+struct KyteUnwindState {
   void *addrs[64];
   int n;
 };
-_Unwind_Reason_Code nova_unwind_cb(struct _Unwind_Context *ctx, void *arg) {
-  NovaUnwindState *st = (NovaUnwindState *)arg;
+_Unwind_Reason_Code kyte_unwind_cb(struct _Unwind_Context *ctx, void *arg) {
+  KyteUnwindState *st = (KyteUnwindState *)arg;
   if (st->n < 64) st->addrs[st->n++] = (void *)(uintptr_t)_Unwind_GetIP(ctx);
   return _URC_NO_REASON;
 }
 } // namespace
 #endif
 
-// Capture the current call stack and return it as a Nova string, one frame per line. Works on every
+// Capture the current call stack and return it as a Kyte string, one frame per line. Works on every
 // supported target; frame 0 (this function) is skipped so the trace starts at the caller:
 //   - glibc / macOS: real symbol names via backtrace() + backtrace_symbols().
 //   - Windows: hex return addresses via RtlCaptureStackBackTrace().
 //   - musl / other libc: hex return addresses via the unwind ABI (_Unwind_Backtrace).
-long long nova_get_stacktrace(void) {
-#if defined(NOVA_HAVE_BACKTRACE)
+long long kyte_get_stacktrace(void) {
+#if defined(KYTE_HAVE_BACKTRACE)
   void *frames[64];
   int n = ::backtrace(frames, 64);
-  if (n <= 1) return nova_bytes_alloc(0);
+  if (n <= 1) return kyte_bytes_alloc(0);
   char **syms = ::backtrace_symbols(frames, n);
-  if (!syms) return nova_bytes_alloc(0);
+  if (!syms) return kyte_bytes_alloc(0);
   long long total = 0;
   for (int i = 1; i < n; i++) total += (long long)std::strlen(syms[i]) + 1; // + '\n'
-  long long buf = nova_bytes_alloc(total);
+  long long buf = kyte_bytes_alloc(total);
   char *p = (char *)(uintptr_t)buf;
   long long off = 0;
   for (int i = 1; i < n; i++) {
@@ -617,41 +617,41 @@ long long nova_get_stacktrace(void) {
 #elif defined(_WIN32)
   void *frames[64];
   USHORT n = ::RtlCaptureStackBackTrace(1 /* skip this fn */, 63, frames, nullptr);
-  return nova_stacktrace_from_addrs(frames, (int)n);
-#elif defined(NOVA_HAVE_UNWIND)
-  NovaUnwindState st;
+  return kyte_stacktrace_from_addrs(frames, (int)n);
+#elif defined(KYTE_HAVE_UNWIND)
+  KyteUnwindState st;
   st.n = 0;
-  _Unwind_Backtrace(nova_unwind_cb, &st);
+  _Unwind_Backtrace(kyte_unwind_cb, &st);
   // Skip frame 0 (this function): start the pointer one past it when there is more than one.
-  if (st.n <= 1) return nova_bytes_alloc(0);
-  return nova_stacktrace_from_addrs(&st.addrs[1], st.n - 1);
+  if (st.n <= 1) return kyte_bytes_alloc(0);
+  return kyte_stacktrace_from_addrs(&st.addrs[1], st.n - 1);
 #else
-  return nova_bytes_alloc(0);
+  return kyte_bytes_alloc(0);
 #endif
 }
 
-// nova_getenv/nova_setenv retired in M6: std/env.nova reads and writes the environment through
+// kyte_getenv/kyte_setenv retired in M6: std/env.ky reads and writes the environment through
 // the getenv/setenv bindings in os/sys. Process arguments stay here because the runtime entry
 // captures argv.
 
 static int g_argc = 0;
 static char **g_argv = nullptr;
-void nova_set_args(int argc, char **argv) {
+void kyte_set_args(int argc, char **argv) {
   g_argc = argc;
   g_argv = argv;
 }
-long long nova_arg_count(void) { return (long long)g_argc; }
-char *nova_arg_at(long long i) {
+long long kyte_arg_count(void) { return (long long)g_argc; }
+char *kyte_arg_at(long long i) {
   if (i < 0 || i >= (long long)g_argc || !g_argv)
-    return const_cast<char *>(nova_from_cstr(""));
-  return const_cast<char *>(nova_from_cstr(g_argv[(size_t)i]));
+    return const_cast<char *>(kyte_from_cstr(""));
+  return const_cast<char *>(kyte_from_cstr(g_argv[(size_t)i]));
 }
 
 // Scan s[from, n) for the first HTML metacharacter (& < > " '); return its index, or n if none. A tight
-// C loop over raw bytes replaces the per-byte Nova `s[i]` (a bounds-checked length-load + byte-load each
+// C loop over raw bytes replaces the per-byte Kyte `s[i]` (a bounds-checked length-load + byte-load each
 // iteration) that the escape-into-builder path used -- for the common clean string this is one scan that
 // returns n, so the caller appends the whole run with a single memcpy. Escaping was ~7% of server CPU.
-extern "C" int nova_html_scan(const char *s, int from, int n) {
+extern "C" int kyte_html_scan(const char *s, int from, int n) {
   int i = from;
   while (i < n) {
     unsigned char c = (unsigned char)s[i];
@@ -661,18 +661,18 @@ extern "C" int nova_html_scan(const char *s, int from, int n) {
   return n;
 }
 
-static char *nova_string_from(const char *c, int len) {
-  const char *s = nova_from_bytes(c, (long long)len);
+static char *kyte_string_from(const char *c, int len) {
+  const char *s = kyte_from_bytes(c, (long long)len);
   return const_cast<char *>(s ? s : "");
 }
 
-// Allocate an (uninitialised) Nova string buffer of LOGICAL length `len`, NUL-terminated at [len], so
+// Allocate an (uninitialised) Kyte string buffer of LOGICAL length `len`, NUL-terminated at [len], so
 // the debugger's built-in char* view + C-FFI work without Python formatters. The stdlib's allocString
 // routes through this instead of `bytes.alloc(len)` (which reserves no terminator). Over-allocate one
-// byte via nova_bytes_alloc(len+1), then rewrite the ARC length field (i32 @ ptr-4) to the logical len.
-extern "C" long long nova_str_alloc(long long len) {
+// byte via kyte_bytes_alloc(len+1), then rewrite the ARC length field (i32 @ ptr-4) to the logical len.
+extern "C" long long kyte_str_alloc(long long len) {
   if (len < 0) len = 0;
-  char *p = (char *)nova_bytes_alloc(len + 1);
+  char *p = (char *)kyte_bytes_alloc(len + 1);
   if (!p) return 0;
   p[len] = '\0';
   *reinterpret_cast<int *>(p - 4) = (int)len;
@@ -681,8 +681,8 @@ extern "C" long long nova_str_alloc(long long len) {
 // Hand-rolled base-10 integer formatter. The old snprintf("%lld") path parsed a format string, walked
 // locale state, and called into vfprintf for every int rendered -- a big share of a templated page's CPU
 // (ids, counts). This writes digits directly: build them backwards into a small buffer, then emit. ~5x
-// faster than snprintf and allocation-identical (one nova_string_from at the end).
-static int nova_i64_fmt(long long v, char *out) {
+// faster than snprintf and allocation-identical (one kyte_string_from at the end).
+static int kyte_i64_fmt(long long v, char *out) {
   char tmp[24];
   int ti = 0;
   bool neg = v < 0;
@@ -696,24 +696,24 @@ static int nova_i64_fmt(long long v, char *out) {
   while (ti > 0) out[n++] = tmp[--ti];
   return n;
 }
-char *nova_i64_to_string(long long v) {
+char *kyte_i64_to_string(long long v) {
   char buf[24];
-  int n = nova_i64_fmt(v, buf);
-  return nova_string_from(buf, n);
+  int n = kyte_i64_fmt(v, buf);
+  return kyte_string_from(buf, n);
 }
-char *nova_f64_to_string(double v) {
+char *kyte_f64_to_string(double v) {
   // Fast path: an INTEGER-valued double (the overwhelmingly common case for rendered numbers -- prices,
   // counts, ids stored as doubles) formats EXACTLY as its integer, with none of the shortest-round-trip
   // search. The old loop called snprintf("%.*g") + strtod up to 17 times PER number; for a page of 200
   // integer-valued prices that was hundreds of vfprintf/dtoa calls per request (top of the server
   // profile). Only genuine fractions fall through to the correct-rounding search.
-  if (v == 0.0) { return nova_string_from("0", 1); }
+  if (v == 0.0) { return kyte_string_from("0", 1); }
   if (v >= -9.007199254740992e15 && v <= 9.007199254740992e15) {
     long long iv = (long long)v;
     if ((double)iv == v) {
       char buf[24];
-      int n = nova_i64_fmt(iv, buf);
-      return nova_string_from(buf, n);
+      int n = kyte_i64_fmt(iv, buf);
+      return kyte_string_from(buf, n);
     }
   }
   char buf[32];
@@ -723,29 +723,29 @@ char *nova_f64_to_string(double v) {
     if (std::strtod(buf, nullptr) == v)
       break;
   }
-  return nova_string_from(buf, n);
+  return kyte_string_from(buf, n);
 }
-char *nova_bool_to_string(long long v) {
+char *kyte_bool_to_string(long long v) {
 
-  return const_cast<char *>(nova_from_bytes(v ? "true" : "false", v ? 4 : 5));
+  return const_cast<char *>(kyte_from_bytes(v ? "true" : "false", v ? 4 : 5));
 }
 
-char *nova_ieee_le_to_str(const char *data, int len) {
-  if (!data) return nova_f64_to_string(0.0);
+char *kyte_ieee_le_to_str(const char *data, int len) {
+  if (!data) return kyte_f64_to_string(0.0);
   unsigned char b[8] = {0};
   int n = (len == 4 || len == 8) ? len : 0;
   for (int i = 0; i < n; i++) b[i] = (unsigned char)data[i];
   if (len == 4) {
     float f;
     std::memcpy(&f, b, sizeof(f));
-    return nova_f64_to_string((double)f);
+    return kyte_f64_to_string((double)f);
   }
   double d;
   std::memcpy(&d, b, sizeof(d));
-  return nova_f64_to_string(len == 8 ? d : 0.0);
+  return kyte_f64_to_string(len == 8 ? d : 0.0);
 }
 
-long long nova_f64_bits(double d) {
+long long kyte_f64_bits(double d) {
   long long bits;
   std::memcpy(&bits, &d, sizeof(bits));
   return bits;
@@ -754,7 +754,7 @@ long long nova_f64_bits(double d) {
 // Read a big-endian IEEE-754 float of `len` bytes (4 = float4, 8 = float8) from `ptr` and return it as a
 // double. Used by the Postgres driver's BINARY result decode: the wire delivers float4/8 as fixed
 // big-endian bytes, so this reassembles them (network order) and bit-casts, with no ASCII parse.
-double nova_pg_be_f64(long long ptr, int len) {
+double kyte_pg_be_f64(long long ptr, int len) {
   if (!ptr) return 0.0;
   const unsigned char *p = reinterpret_cast<const unsigned char *>(ptr);
   if (len == 8) {
@@ -775,9 +775,9 @@ double nova_pg_be_f64(long long ptr, int len) {
 }
 
 // Read a big-endian SIGNED integer of `len` bytes (1/2/4/8) from `ptr`, sign-extended to 64 bits. Used by
-// the Postgres BINARY result decode for int2/int4/int8. Done in the runtime (not Nova) so the byte
-// assembly cannot trip Nova's checked-32-bit-int overflow trap.
-long long nova_pg_be_i64(long long ptr, int len) {
+// the Postgres BINARY result decode for int2/int4/int8. Done in the runtime (not Kyte) so the byte
+// assembly cannot trip Kyte's checked-32-bit-int overflow trap.
+long long kyte_pg_be_i64(long long ptr, int len) {
   if (!ptr || len <= 0 || len > 8) return 0;
   const unsigned char *p = reinterpret_cast<const unsigned char *>(ptr);
   unsigned long long acc = 0;
@@ -794,8 +794,8 @@ long long nova_pg_be_i64(long long ptr, int len) {
 // exact has-zero-byte trick `(x-ones) & ~x & high` (needles are all < 0x80, so no false positives on
 // UTF-8 data bytes). Portable (no arch intrinsics). Called ONCE per clean interpolated value (a bulk scan
 // of the whole value), not per byte, so the per-call cost is amortised over the string -- the failure mode
-// of the earlier per-interpolation FFI attempt is avoided. Unsigned throughout: no Nova int-overflow trap.
-int nova_html_find_meta(long long base, int start, int len) {
+// of the earlier per-interpolation FFI attempt is avoided. Unsigned throughout: no Kyte int-overflow trap.
+int kyte_html_find_meta(long long base, int start, int len) {
   if (!base || len <= 0) return len;
   if (start < 0) start = 0;
   const unsigned char *p = reinterpret_cast<const unsigned char *>(base);
@@ -822,22 +822,22 @@ int nova_html_find_meta(long long base, int start, int len) {
   return len;
 }
 
-extern "C" long long nova_bytes_alloc(long long size);
+extern "C" long long kyte_bytes_alloc(long long size);
 
-// Returns an HTML-escaped Nova string of `s`, escaping the five metacharacters
+// Returns an HTML-escaped Kyte string of `s`, escaping the five metacharacters
 // (& < > " ') exactly as the stdlib `web.response.escapeHtml` does. If `s` contains
 // none of them the ORIGINAL string is returned unchanged (no allocation), matching
 // the stdlib's free common case. This is the always-linked runtime the NSX child-escape
 // codegen calls, so interpolated `{expr}` content is ALWAYS escaped regardless of
 // whether the (DCE-able) stdlib helper was pulled into the compile. Length lives in the
 // object header at payload-4 (int32), refcount at payload-8.
-extern "C" long long nova_html_escape(long long s) {
+extern "C" long long kyte_html_escape(long long s) {
   if (!s) return s;
   const int len = *reinterpret_cast<const int32_t *>(s - 4);
   if (len <= 0) return s;
   const unsigned char *p = reinterpret_cast<const unsigned char *>(s);
   // First metachar (reuse the SWAR scanner); no metachars -> return input as-is.
-  const int first = nova_html_find_meta(s, 0, len);
+  const int first = kyte_html_find_meta(s, 0, len);
   if (first >= len) return s;
   // Compute the escaped length.
   long long out_len = 0;
@@ -851,7 +851,7 @@ extern "C" long long nova_html_escape(long long s) {
       default: out_len += 1; break;
     }
   }
-  const long long box = nova_bytes_alloc(out_len);
+  const long long box = kyte_bytes_alloc(out_len);
   if (!box) return s;
   char *o = reinterpret_cast<char *>(box);
   long long w = 0;
@@ -875,7 +875,7 @@ extern "C" long long nova_html_escape(long long s) {
 // (mirrors Go html/template's urlFilter). Returns the input unchanged for safe or
 // relative URLs; returns "#" (a harmless anchor) for a dangerous scheme. Leading
 // whitespace/control bytes are ignored the way browsers ignore them.
-extern "C" long long nova_url_sanitize(long long s) {
+extern "C" long long kyte_url_sanitize(long long s) {
   if (!s) return s;
   const int len = *reinterpret_cast<const int32_t *>(s - 4);
   if (len <= 0) return s;
@@ -920,14 +920,14 @@ extern "C" long long nova_url_sanitize(long long s) {
     if (!is_img) dangerous = true;
   }
   if (!dangerous) return s;
-  const long long box = nova_bytes_alloc(1);
+  const long long box = kyte_bytes_alloc(1);
   if (!box) return s;
   reinterpret_cast<char *>(box)[0] = '#';
   return box;
 }
 
-long long nova_spin_create(void) { return (long long)new std::atomic_flag{}; }
-void nova_spin_lock(long long h) {
+long long kyte_spin_create(void) { return (long long)new std::atomic_flag{}; }
+void kyte_spin_lock(long long h) {
   if (!h) return;
   auto *f = reinterpret_cast<std::atomic_flag *>(h);
   while (f->test_and_set(std::memory_order_acquire)) {
@@ -938,26 +938,26 @@ void nova_spin_lock(long long h) {
 #endif
   }
 }
-void nova_spin_unlock(long long h) {
+void kyte_spin_unlock(long long h) {
   if (h) reinterpret_cast<std::atomic_flag *>(h)->clear(std::memory_order_release);
 }
 
-long long nova_mutex_create(void) { return (long long)new std::mutex(); }
-void nova_mutex_lock(long long h) {
+long long kyte_mutex_create(void) { return (long long)new std::mutex(); }
+void kyte_mutex_lock(long long h) {
   if (h)
     reinterpret_cast<std::mutex *>(h)->lock();
 }
-void nova_mutex_unlock(long long h) {
+void kyte_mutex_unlock(long long h) {
   if (h)
     reinterpret_cast<std::mutex *>(h)->unlock();
 }
-void nova_mutex_destroy(long long h) {
+void kyte_mutex_destroy(long long h) {
   delete reinterpret_cast<std::mutex *>(h);
 }
-long long nova_condvar_create(void) {
+long long kyte_condvar_create(void) {
   return (long long)new std::condition_variable_any();
 }
-void nova_condvar_wait(long long cv, long long m) {
+void kyte_condvar_wait(long long cv, long long m) {
   if (cv && m) {
     std::mutex *mx = reinterpret_cast<std::mutex *>(m);
     std::unique_lock<std::mutex> lk(*mx, std::adopt_lock);
@@ -965,98 +965,98 @@ void nova_condvar_wait(long long cv, long long m) {
     lk.release();
   }
 }
-void nova_condvar_signal(long long cv) {
+void kyte_condvar_signal(long long cv) {
   if (cv)
     reinterpret_cast<std::condition_variable_any *>(cv)->notify_one();
 }
-void nova_condvar_broadcast(long long cv) {
+void kyte_condvar_broadcast(long long cv) {
   if (cv)
     reinterpret_cast<std::condition_variable_any *>(cv)->notify_all();
 }
-void nova_condvar_destroy(long long cv) {
+void kyte_condvar_destroy(long long cv) {
   delete reinterpret_cast<std::condition_variable_any *>(cv);
 }
-long long nova_rwlock_create(void) {
+long long kyte_rwlock_create(void) {
   return (long long)new std::shared_mutex();
 }
-void nova_rwlock_acquire_read(long long h) {
+void kyte_rwlock_acquire_read(long long h) {
   if (h)
     reinterpret_cast<std::shared_mutex *>(h)->lock_shared();
 }
-void nova_rwlock_release_read(long long h) {
+void kyte_rwlock_release_read(long long h) {
   if (h)
     reinterpret_cast<std::shared_mutex *>(h)->unlock_shared();
 }
-void nova_rwlock_acquire_write(long long h) {
+void kyte_rwlock_acquire_write(long long h) {
   if (h)
     reinterpret_cast<std::shared_mutex *>(h)->lock();
 }
-void nova_rwlock_release_write(long long h) {
+void kyte_rwlock_release_write(long long h) {
   if (h)
     reinterpret_cast<std::shared_mutex *>(h)->unlock();
 }
-void nova_rwlock_destroy(long long h) {
+void kyte_rwlock_destroy(long long h) {
   delete reinterpret_cast<std::shared_mutex *>(h);
 }
 
-int32_t nova_atomic_add_i32(int32_t *p, int32_t d) {
+int32_t kyte_atomic_add_i32(int32_t *p, int32_t d) {
   return __atomic_fetch_add(p, d, __ATOMIC_SEQ_CST);
 }
-int32_t nova_atomic_sub_i32(int32_t *p, int32_t d) {
+int32_t kyte_atomic_sub_i32(int32_t *p, int32_t d) {
   return __atomic_fetch_sub(p, d, __ATOMIC_SEQ_CST);
 }
 
-int32_t nova_atomic_cas_i32(int32_t *p, int32_t e, int32_t des) {
+int32_t kyte_atomic_cas_i32(int32_t *p, int32_t e, int32_t des) {
   return __atomic_compare_exchange_n(p, &e, des, false, __ATOMIC_SEQ_CST,
                                      __ATOMIC_SEQ_CST)
              ? 1
              : 0;
 }
-int32_t nova_atomic_load_i32(int32_t *p) {
+int32_t kyte_atomic_load_i32(int32_t *p) {
   return __atomic_load_n(p, __ATOMIC_SEQ_CST);
 }
-void nova_atomic_store_i32(int32_t *p, int32_t v) {
+void kyte_atomic_store_i32(int32_t *p, int32_t v) {
   __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
 }
-int64_t nova_atomic_add_i64(int64_t *p, int64_t d) {
+int64_t kyte_atomic_add_i64(int64_t *p, int64_t d) {
   return __atomic_fetch_add(p, d, __ATOMIC_SEQ_CST);
 }
-int64_t nova_atomic_sub_i64(int64_t *p, int64_t d) {
+int64_t kyte_atomic_sub_i64(int64_t *p, int64_t d) {
   return __atomic_fetch_sub(p, d, __ATOMIC_SEQ_CST);
 }
 
-int32_t nova_atomic_cas_i64(int64_t *p, int64_t e, int64_t des) {
+int32_t kyte_atomic_cas_i64(int64_t *p, int64_t e, int64_t des) {
   int64_t exp = e;
   return __atomic_compare_exchange_n(p, &exp, des, false, __ATOMIC_SEQ_CST,
                                      __ATOMIC_SEQ_CST)
              ? 1
              : 0;
 }
-int64_t nova_atomic_load_i64(int64_t *p) {
+int64_t kyte_atomic_load_i64(int64_t *p) {
   return __atomic_load_n(p, __ATOMIC_SEQ_CST);
 }
-void nova_atomic_store_i64(int64_t *p, int64_t v) {
+void kyte_atomic_store_i64(int64_t *p, int64_t v) {
   __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
 }
-int32_t nova_atomic_cas_bool(uint8_t *p, int32_t e, int32_t des) {
+int32_t kyte_atomic_cas_bool(uint8_t *p, int32_t e, int32_t des) {
   uint8_t exp = (uint8_t)e;
   return __atomic_compare_exchange_n(p, &exp, (uint8_t)des, false,
                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
              ? 1
              : 0;
 }
-int32_t nova_atomic_load_bool(uint8_t *p) {
+int32_t kyte_atomic_load_bool(uint8_t *p) {
   return __atomic_load_n(p, __ATOMIC_SEQ_CST);
 }
-void nova_atomic_store_bool(uint8_t *p, int32_t v) {
+void kyte_atomic_store_bool(uint8_t *p, int32_t v) {
   __atomic_store_n(p, (uint8_t)v, __ATOMIC_SEQ_CST);
 }
 
-// nova_close closes a file descriptor. It stays a runtime primitive: os/sys binds libc close
+// kyte_close closes a file descriptor. It stays a runtime primitive: os/sys binds libc close
 // (the reactor path uses sys.close), but the legacy tcp socket stack cannot import os/sys, because
 // os/sys exports a `socket` function that collides by name with the `socket` module those files
 // use (a name-based-resolution limit). Migrating close there needs an os.socket split (M6 note).
-int nova_close(int fd) {
+int kyte_close(int fd) {
 #ifdef _WIN32
   return _close(fd);
 #else
@@ -1066,11 +1066,11 @@ int nova_close(int fd) {
 
 #ifdef _WIN32
 // ---------------------------------------------------------------------------------------------------
-// POSIX syscall shims for Windows. os/sys.nova declares these as `extern("c")` against the libc names
+// POSIX syscall shims for Windows. os/sys.ky declares these as `extern("c")` against the libc names
 // (mmap/munmap/fsync/socketpair); the zig-mingw C library does not provide them, so the Windows target
 // fails to link (undefined symbol). We define the libc names here mapped onto the Win32 equivalents,
 // matching the exact ABI os/sys emits. Anonymous private RW mapping and file flush are all os/sys asks
-// of mmap/fsync, so prot/flags/fd/offset are ignored for mmap. Mirrors the nova_set_nonblock ->
+// of mmap/fsync, so prot/flags/fd/offset are ignored for mmap. Mirrors the kyte_set_nonblock ->
 // ioctlsocket and entropy -> BCryptGenRandom pattern already used above / in crypto.cpp.
 
 // mapAnon() passes MAP_PRIVATE|MAP_ANON RW; VirtualAlloc gives zero-filled committed pages. Returns

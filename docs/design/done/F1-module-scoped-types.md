@@ -14,7 +14,7 @@ Verified: gate 77 (two modules, each a different `Widget`) + all 3 SQL drivers +
   mangling (`getStructPrefix`, `methodSymbol` owners) and construction sites (`Widget()` via the typed
   result) all route colliding structs through the scoped name. KEY GOTCHA: a constructor name must be
   built via `methodSymbol` (→ `mangleTypeName`, which escapes `-`→`_da` etc.), NOT raw — a raw
-  `{name}_init` missed a scoped struct's init whose module path contained a hyphen (`nova-lang`).
+  `{name}_init` missed a scoped struct's init whose module path contained a hyphen (`kyte-lang`).
 - The whole change is a NO-OP when no struct name collides (gated on `colliding_types`), which kept the
   98→99 suite green at every stage.
 
@@ -45,11 +45,11 @@ a *no-op for all existing code* — the 98-case FUNC/SHADOW/ARC suite is guarant
 path activates only on a real collision. Repro to develop against (currently blocked by the diagnostic):
 
 ```
-a/wa.nova:  pub struct Widget { pub n: int  init(){self.n=1} pub fn val(self:Widget):int{return self.n} }
+a/wa.ky:  pub struct Widget { pub n: int  init(){self.n=1} pub fn val(self:Widget):int{return self.n} }
             pub fn mkA(): int { let w = Widget(); return w.val(); }
-b/wb.nova:  pub struct Widget { pub s: string init(){self.s="x"} pub fn len(self:Widget):int{return self.s.length} }
+b/wb.ky:  pub struct Widget { pub s: string init(){self.s="x"} pub fn len(self:Widget):int{return self.s.length} }
             pub fn mkB(): int { let w = Widget(); return w.len(); }
-main.nova:  import a.wa; import b.wb;  wa.mkA() + wb.mkB()   // never names Widget directly
+main.ky:  import a.wa; import b.wb;  wa.mkA() + wb.mkB()   // never names Widget directly
 ```
 
 ## The one shared primitive

@@ -2,20 +2,20 @@
 
 Status: SCOPE (2026-08-20). Goal owner: language soundness. Grounds on existing code (`src/frontend/sema/
 ownership.zig`, `src/frontend/sema/ossa/{ir,lower,verify,forward}.zig`) and the V1-V4 / Track-I work
-(tasks #194-201). Related: [[nova-value-semantics-completion]] closed the value-semantics escape channels;
+(tasks #194-201). Related: [[kyte-value-semantics-completion]] closed the value-semantics escape channels;
 this is the next step on the same axis — converting leak/double-free freedom from TESTED to PROVEN.
 
 ## Goal
 
 Turn the ownership / ARC-balance check from an **opt-in report** into a **default-on, fail-closed static
-guarantee**: a Nova program that compiles is statically proven **leak-free and double-free-free for owned
+guarantee**: a Kyte program that compiles is statically proven **leak-free and double-free-free for owned
 values** — the property ASAN/ARC currently CATCH at runtime, PROVEN at compile time. This is the
 "tested → proven" step vs Rust: instead of "we ran ASAN and it was clean," the compiler rejects any program
 whose owned values are not consumed exactly once.
 
 ## Current state (measured 2026-08-20)
 
-Three overlapping pieces, all opt-in via `NOVA_OWN_VERIFY` (=1 report, =hard fail on a proven imbalance),
+Three overlapping pieces, all opt-in via `KYTE_OWN_VERIFY` (=1 report, =hard fail on a proven imbalance),
 NONE in the default pipeline:
 
 - **`ownership.zig` (V1-V4):** per-path use-after-move + release-balance on owned LET-LOCALS. ~97-98%
@@ -36,12 +36,12 @@ ARC-audit CLEAN (every object released), ASAN clean. The V4' `verifyArcBalance` 
 sums TOTAL acquires vs TOTAL releases, so a value stored in two exclusive branches and released once at the
 merge shows a spurious imbalance. A partial corpus scan found 45+ accused cases dominated by two heavily-used
 correct functions (`serde_yaml_stringifyIndent` ×24, `ServiceProvider_require` ×17). **V4' found ZERO real
-leaks.** The path-sensitive OSSA verifier (`NOVA_OSSA`) passes all of them (census: 340 cases, **0
+leaks.** The path-sensitive OSSA verifier (`KYTE_OSSA`) passes all of them (census: 340 cases, **0
 imbalanced**).
 
 **Slice 1 fix (committed):** demoted the broken V4' balance verifier to a report (never fails the build) and
-routed `NOVA_OWN_VERIFY=hard` to the SOUND path-sensitive OSSA verifier + the sound use-after-move check.
-Gate: full corpus under `NOVA_OWN_VERIFY=hard` = 394/397 (only the 3 pre-existing crashes 118/189/42) -> **0
+routed `KYTE_OWN_VERIFY=hard` to the SOUND path-sensitive OSSA verifier + the sound use-after-move check.
+Gate: full corpus under `KYTE_OWN_VERIFY=hard` = 394/397 (only the 3 pre-existing crashes 118/189/42) -> **0
 false accusations across all 394 correct cases**.
 
 ## Slice 3 done (2026-08-20) — reassign modelled, incl. outer-local-in-branch via owned-value phi
@@ -74,17 +74,17 @@ old "loops deferred" note was stale). Closed in two layers:
     holding an owned value. `lowerReassign` now mints a fresh owned value for ANY non-owned-local-copy RHS
     (previously an owned-typed field access `x = e.field` that the classifier failed to flag as owned was
     marked dead, forcing a spurious mixed-liveness defer at the join — this hit `Mediator.send`).
-  Verified 398/398 under `NOVA_OSSA=hard`, 0 proven imbalances; the corpus reassign bucket is 0.
+  Verified 398/398 under `KYTE_OSSA=hard`, 0 proven imbalances; the corpus reassign bucket is 0.
 
-**Gate:** full corpus under `NOVA_OSSA=hard` = **397/397, 0 proven imbalances** (phi introduced no false
+**Gate:** full corpus under `KYTE_OSSA=hard` = **397/397, 0 proven imbalances** (phi introduced no false
 positives). Two `verify.zig` unit tests added (balanced phi-reassign clean; un-consumed phi result flagged as
 a leak). Synthetic case: straight-line + branch-local + outer-in-branch reassign all lower, 100% coverage,
 ASAN-clean.
 
-## Slice 5 investigated (2026-08-20) — the "consume forms" premise was wrong for Nova's convention
+## Slice 5 investigated (2026-08-20) — the "consume forms" premise was wrong for Kyte's convention
 
 Slice 5 was framed as "model every consume form: move-into-call, container insert, closure/async capture,
-trait widening" — on the assumption of a MOVE (+1) convention where those transfer ownership. **Nova does
+trait widening" — on the assumption of a MOVE (+1) convention where those transfer ownership. **Kyte does
 not use a move convention.** Verified against codegen:
 
 - **Calls are +0 / caller-owned.** `arc.zig` releaseLocalVariables releases EVERY owned non-param local at
@@ -98,7 +98,7 @@ not use a move convention.** Verified against codegen:
 - **No mid-scope move point exists**: nothing removes a local from `current_local_types` when it is
   pushed/sent/stored.
 
-So the only owned-value CONSUMES in Nova are: scope-end drop (`destroy`), `return` (`ret_owned`), and
+So the only owned-value CONSUMES in Kyte are: scope-end drop (`destroy`), `return` (`ret_owned`), and
 reassign-drop — **all three already modelled**. The model is balance-COMPLETE for the convention; the
 design-doc's move-into-call / container-insert consumes do not exist here.
 
@@ -107,7 +107,7 @@ USES entirely, so a use-after-consume flowing into a call (`x = other; foo(x_old
 `lower.zig` `emitOwnedUses` now emits a `borrow_use` for every live owned local mentioned in an expression
 statement, a let initializer, or a reassign RHS. `borrow_use` never consumes and never fails on correct code
 (the value is always live there), so this only ADDS true-positive use-after-consume coverage — 0 false
-positives. Gate: full corpus `NOVA_OSSA=hard` stays 397/397, 0 proven imbalances.
+positives. Gate: full corpus `KYTE_OSSA=hard` stays 397/397, 0 proven imbalances.
 
 **Deliberately still a false NEGATIVE (documented, separate issue):** a closure environment that escapes
 (captured-globals skip) is not ARC'd yet (specs §6.3 known leak). The OSSA model treats the captured local
@@ -116,13 +116,13 @@ itself + threading escape info into lowering — out of scope for the balance se
 
 ## Slice 6 done (2026-08-20) — default-on, fail-closed enforcement
 
-The sound verifier now runs on EVERY `nova build` / `nova test` and REJECTS a proven ARC release imbalance
+The sound verifier now runs on EVERY `kyte build` / `kyte test` and REJECTS a proven ARC release imbalance
 in a covered function (`std.process.exit(1)`), exactly like a type error — it no longer needs an env var.
 Wired in `builder.zig` + `tester.zig` via `reportQuiet(..., hard, quiet)`:
 - **(unset)** — enforce quietly (fail on a proven imbalance, no census noise).
-- **NOVA_OSSA=off** — disable (escape hatch).
-- **NOVA_OSSA=1** — report-only, verbose census (never fails).
-- **NOVA_OSSA=hard** — verbose census AND fail (the CI `--ossa` gate).
+- **KYTE_OSSA=off** — disable (escape hatch).
+- **KYTE_OSSA=1** — report-only, verbose census (never fails).
+- **KYTE_OSSA=hard** — verbose census AND fail (the CI `--ossa` gate).
 
 Safe because the verifier is sound (0 false positives) and DEFERS what it cannot prove rather than accusing.
 Gate: standard corpus with default-on enforcement = 395/398 (only the 3 known baseline failures 118/189/42);
@@ -132,7 +132,7 @@ accused, so an uncovered shape never fails a build.
 
 ## What this verifier IS (honest boundary, restated)
 
-In Nova, ARC is AUTOMATIC — a user cannot create a leak/double-free through ownership mistakes (codegen
+In Kyte, ARC is AUTOMATIC — a user cannot create a leak/double-free through ownership mistakes (codegen
 inserts retain/release). So this is NOT a Rust-style borrow checker over USER code; it is a **codegen
 ARC-balance self-verifier**: it proves the COMPILER's own ARC insertion is balanced (no compiler-introduced
 leaks/double-frees) for covered functions. Default-on, it would catch codegen regressions like the P1 UAF at
@@ -167,12 +167,12 @@ borrow checker's other guarantees stay runtime/absent. State that plainly; do no
 4. **Loop soundness.** `verify.zig` defers back-edges. Implement a CFG dataflow FIXPOINT (the consumed/live
    bitset converges over the loop) so loops are CHECKED, not deferred. This is the algorithmically hard piece
    and the biggest theoretical gap.
-5. **Consume-form completeness.** Model EVERY consume/borrow Nova has: move-into-call, `ret_owned`, container
+5. **Consume-form completeness.** Model EVERY consume/borrow Kyte has: move-into-call, `ret_owned`, container
    insert, closure/async capture, trait widening, optional/error-union wrap, the value-semantics deep-copies
    just added. A missed form = a FALSE NEGATIVE = a soundness hole. This is the deep completeness work that
    makes the guarantee real rather than partial.
 6. **Flip default-on, fail-closed.** Once coverage ~100% and 0 false positives corpus-wide, run the verifier
-   in the default `nova build` / `nova test` pipeline and REJECT proven violations, exactly like the type
+   in the default `kyte build` / `kyte test` pipeline and REJECT proven violations, exactly like the type
    checker. Add `expect_fail` ownership cases (deliberately-broken: leak, double-consume, path-imbalance)
    that MUST be rejected. Keep ASAN/ARC as a backstop until the verifier provably subsumes them.
 

@@ -1,0 +1,130 @@
+import assert;
+import list;
+import string;
+import datetime;
+import math;
+import db;
+import novadb;
+
+struct Rng {
+    pub state: long,
+    init(seed: long) { self.state = seed; }
+    pub fn nextU64(self: Rng): long {
+        self.state = self.state * 2862933555777941757 + 3037000493;
+        return self.state;
+    }
+    pub fn nextDouble(self: Rng): double {
+        let v = self.nextU64();
+        if (v < 0) { v = 0 - v; }
+        return ((v % 1000000000) as double) / 1000000000.0;
+    }
+}
+
+fn zetaSum(n: int, theta: double): double {
+    let sum = 0.0;
+    let i = 1;
+    while (i <= n) {
+        sum = sum + math.fpowf(i as double, 0.0 - theta);
+        i = i + 1;
+    }
+    return sum;
+}
+
+struct Zipfian {
+    pub rng: Rng,
+    pub n: int,
+    pub theta: double,
+    pub zeta_n: double,
+    pub alpha: double,
+    pub eta: double,
+    init(rng: Rng, n: int, theta: double) {
+        self.rng = rng;
+        self.n = n;
+        self.theta = theta;
+        let zeta_2 = zetaSum(2, theta);
+        self.zeta_n = zetaSum(n, theta);
+        self.alpha = 1.0 / (1.0 - theta);
+        let nd = n as double;
+        self.eta = (1.0 - math.fpowf(2.0 / nd, 1.0 - theta)) / (1.0 - zeta_2 / self.zeta_n);
+    }
+    pub fn next(self: Zipfian): int {
+        let u = self.rng.nextDouble();
+        let uz = u * self.zeta_n;
+        if (uz < 1.0) { return 0; }
+        if (uz < 1.0 + math.fpowf(0.5, self.theta)) { return 1; }
+        let r = self.eta * u - self.eta + 1.0;
+        return ((self.n as double) * math.fpowf(r, self.alpha)) as int;
+    }
+}
+
+fn genValue(size: int): string {
+    let s = "";
+    let i = 0;
+    while (i < size) { s = s + "x"; i = i + 1; }
+    return s;
+}
+
+fn runWorkload(name: string, conn: db.Connection, rng: Rng, recordCount: int,
+               opCount: int, readRatio: double, theta: double, value: string): void {
+    let zipf = Zipfian(rng, recordCount, theta);
+    let reads = 0;
+    let updates = 0;
+    let minNs: long = 999999999999;
+    let maxNs: long = 0;
+    let sumNs: long = 0;
+    let start = datetime.nowNs();
+    let op = 0;
+    while (op < opCount) {
+        let k = zipf.next();
+        let coin = rng.nextDouble();
+        let t0 = datetime.nowNs();
+        if (coin < readRatio) {
+            let rs = conn.query(`SELECT ykey, ydata FROM ycsb_bench WHERE ykey = 'user${k}'`, List<DbValue>());
+            reads = reads + 1;
+        } else {
+            conn.exec(`UPDATE ycsb_bench SET ydata = '${value}' WHERE ykey = 'user${k}'`, List<DbValue>());
+            updates = updates + 1;
+        }
+        let dt = datetime.nowNs() - t0;
+        if (dt < minNs) { minNs = dt; }
+        if (dt > maxNs) { maxNs = dt; }
+        sumNs = sumNs + dt;
+        op = op + 1;
+    }
+    let elapsedNs = datetime.nowNs() - start;
+    let opsPerSec = (opCount as double) * 1000000000.0 / (elapsedNs as double);
+    let avgUs = (sumNs as double) / (opCount as double) / 1000.0;
+    console.log(`Workload ${name}: ${opCount} ops (${reads} read / ${updates} update) in ${elapsedNs / 1000000} ms  ${opsPerSec as int} ops/sec  lat[min ${(minNs / 1000) as int}us / avg ${avgUs as int}us / max ${(maxNs / 1000) as int}us]`);
+    assert.equalInt(reads + updates, opCount);
+}
+
+@test
+fn ycsb_suite(): void {
+    let recordCount = 500;
+    let opCount = 300;
+    let theta = 0.99;
+    let valueSize = 64;
+
+    let rng = Rng(88172645463325252);
+    let drv = KyteDriver();
+    let conn = drv.connect("127.0.0.1:3009");
+    conn.exec("CREATE TABLE ycsb_bench (ykey TEXT PRIMARY KEY, ydata TEXT)", List<DbValue>());
+    let value = genValue(valueSize);
+
+    let loadStart = datetime.nowNs();
+    let i = 0;
+    while (i < recordCount) {
+        conn.exec(`INSERT INTO ycsb_bench (ykey, ydata) VALUES ('user${i}', '${value}')`, List<DbValue>());
+        i = i + 1;
+    }
+    let loadNs = datetime.nowNs() - loadStart;
+    let loadOps = (recordCount as double) * 1000000000.0 / (loadNs as double);
+    console.log("=== YCSB suite on BTreeDB (Zipfian theta=0.99) ===");
+    console.log(`LOAD: ${recordCount} inserts in ${loadNs / 1000000} ms  ${loadOps as int} ops/sec`);
+
+    runWorkload("A (50r/50u)", conn, rng, recordCount, opCount, 0.50, theta, value);
+    runWorkload("B (95r/5u)",  conn, rng, recordCount, opCount, 0.95, theta, value);
+    runWorkload("C (100r)",    conn, rng, recordCount, opCount, 1.00, theta, value);
+
+    conn.close();
+}

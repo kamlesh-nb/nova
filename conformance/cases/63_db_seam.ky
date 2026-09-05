@@ -1,0 +1,82 @@
+import assert;
+import list;
+import db;
+
+@test
+fn test_dbvalue_typed_accessors(): void {
+    let vi = db.dbInt(42);
+    assert.isTrue(vi.kind == DbType.Int4);
+    assert.equalInt(vi.asInt(), 42);
+    assert.isTrue(!vi.isNull());
+
+    let vt = db.dbText("kyte");
+    assert.isTrue(vt.kind == DbType.Text);
+    assert.equalStr(vt.asText(), "kyte");
+
+    let vb = db.dbBool(true);
+    assert.isTrue(vb.asBool());
+
+    let vn = db.dbNull();
+    assert.isTrue(vn.isNull());
+}
+
+@test
+fn test_dbvalue_decimal_roundtrip(): void {
+    let a: decimal = 0.1m;
+    let b: decimal = 0.2m;
+    let cell = db.dbDecimal(a + b);
+    assert.isTrue(cell.kind == DbType.Decimal);
+    let back: decimal = cell.asDecimal();
+    let expected: decimal = 0.3m;
+    assert.isTrue(back == expected);
+}
+
+fn buildResultSet(): ResultSet {
+    let rs = ResultSet();
+    rs.columns.push(Column("id", DbType.Int4));
+    rs.columns.push(Column("name", DbType.Text));
+
+    let r0 = Row();
+    r0.cells.push(db.dbInt(1));
+    r0.cells.push(db.dbText("planck"));
+    rs.rows.push(r0);
+
+    let r1 = Row();
+    r1.cells.push(db.dbInt(2));
+    r1.cells.push(db.dbNull());
+    rs.rows.push(r1);
+
+    rs.tag = "SELECT 2";
+    rs.rows_affected = 2;
+    return rs;
+}
+
+@test
+fn test_resultset_typed_readback(): void {
+    let rs = buildResultSet();
+    assert.equalInt(rs.rowCount(), 2);
+    assert.equalInt(rs.colCount(), 2);
+    assert.equalStr(rs.tag, "SELECT 2");
+
+    let c0 = rs.columns.get(0) ?? Column("", DbType.Null);
+    assert.equalStr(c0.name, "id");
+    assert.isTrue(c0.type_oid == DbType.Int4);
+
+    let row0 = rs.row(0);
+    assert.equalInt(row0.getInt(0), 1);
+    assert.equalStr(row0.getText(1), "planck");
+    assert.isTrue(!row0.isNull(1));
+
+    let row1 = rs.row(1);
+    assert.equalInt(row1.getInt(0), 2);
+    assert.isTrue(row1.isNull(1));
+}
+
+@test
+fn test_error_type(): void {
+    let ok = db.noError();
+    assert.isTrue(ok.isEmpty());
+    let err = DbError("42P01", "relation does not exist");
+    assert.isTrue(!err.isEmpty());
+    assert.equalStr(err.code, "42P01");
+}

@@ -8,7 +8,7 @@ Stage 2 (`.type_param` is a type) and stage 4 (per-instantiation destructors) ar
 **Stage 4b (monomorphize method bodies) is LANDED AND MANDATORY — the flag was deleted the same
 day** (an 'off' switch that selects memory corruption is a trap, not a fallback).
 ✅ **`Map` is NO LONGER excluded from mono, and `retainIfGenericStore` is DELETED.** §3's "Map is
-excluded by name and that is the next task" is **stale** (verified 2026-07-17): `map.nova` now holds
+excluded by name and that is the next task" is **stale** (verified 2026-07-17): `map.ky` now holds
 `Storage<K>`/`Storage<V>` typed fields, the generated `__destruct_Storage_K` releases the slots, and
 the two cases that failed when Map was included (`12_traits_dispatch`, `13_serde`) both pass, as does
 `14_collections_map`. `retainIfGenericStore` survives only in historical comments. **This unblocks
@@ -30,7 +30,7 @@ F5 stage 5.** Still open: stages 1, 3, 5, 6.
 > indistinguishable after parse — and for struct literals, indistinguishable *at* parse. A generic type
 > parameter is detected by testing whether a string is one uppercase letter.
 
-Verified in the checked-in IR (`__nova_test.ll`):
+Verified in the checked-in IR (`__kyte_test.ll`):
 
 ```llvm
 define void @List_push(i64 %0, i64 %1)
@@ -55,7 +55,7 @@ No `List_string_push`. No `__destruct_List_string`. One symbol per declaration.
 3. **Layout ignores type args.** `getFieldOffset` (`llvm_codegen.zig:738`) calls `getStructBaseName`
    then reads the *generic declaration's* fields. `getTypeSize` on a `T` field falls through to
    `if (is_wasm) 4 else 8` — a `T` is always one word.
-4. **Elements are boxed.** `list.nova:4-9` `allocCopy<T>` writes a single pointer-sized word.
+4. **Elements are boxed.** `list.ky:4-9` `allocCopy<T>` writes a single pointer-sized word.
 
 ### 2.2 `getStructBaseName` is the erasure function
 
@@ -128,7 +128,7 @@ and `__destruct_List<string>` becomes expressible.
 types** — memoised via `LLVMGetNamedGlobal` (`:865`). Precedent that a multi-type key works.
 
 **(c) `generateSerdeBinders` — `main.zig:273-394`.** The closest thing to monomorphization in the tree:
-it emits **Nova source text** per `@serializable` struct, special-cases `.generic` fields where
+it emits **Kyte source text** per `@serializable` struct, special-cases `.generic` fields where
 `g.name == "List"` (`:356`), switches on the **concrete element type** `g.params[0]` (`:358-370`), then
 **re-parses** the generated source (`:386-391`) and appends the decls. It specialises per concrete type
 argument today — just at the source level, by string emission, before the checker.
@@ -324,7 +324,7 @@ instantiated. **Cannot ship without it** — an unbounded worklist is a compiler
 >
 > ### ✅ 4b LANDED 2026-07-16 — and monomorphization is now MANDATORY (no flag)
 >
-> It shipped behind `NOVA_F4_MONO=1`, then **the flag was deleted the same day**. It stopped being
+> It shipped behind `KYTE_F4_MONO=1`, then **the flag was deleted the same day**. It stopped being
 > optional the moment `Map` moved onto `Storage<K>` (F5 §3.4b): an ERASED `Storage<K>` has inert ARC, so
 > nothing retains the key while the call-site retain still fires. The two do not compose, and the result
 > is an intermittent **use-after-free — 4 of 6 corpus runs** failed on 12_traits_dispatch. An "off"
@@ -333,7 +333,7 @@ instantiated. **Cannot ship without it** — an unbounded worklist is a compiler
 >
 > **The erasure is broken, and here is the measurement that says so** — one program, three bodies:
 >
-> | body | `nova_retain` | `nova_release` | |
+> | body | `kyte_retain` | `kyte_release` | |
 > |---|---|---|---|
 > | `List_push` (erased) | 0 | 0 | undecidable: `isRefCountedType("T")` is false, so it does nothing |
 > | `List_i32_push` | 0 | 0 | correct — `i32` is not refcounted |
@@ -397,7 +397,7 @@ instantiated. **Cannot ship without it** — an unbounded worklist is a compiler
 >
 > **The borrow-return audit (2026-07-15).** Of 123 `return <call>` sites in the stdlib returning a
 > ref-counted type, all but nine are constructors returning a fresh +1. **Level 0 is exactly one:**
-> `map.nova:125`, `return bytes.read_ptr(self.valsPtr, ...)`. **Level 1 is eight** that inherit it —
+> `map.ky:125`, `return bytes.read_ptr(self.valsPtr, ...)`. **Level 1 is eight** that inherit it —
 > `request.getHeader`/`getCookie`, `response.getHeader`, `app.param`, `source.getString`,
 > `findHeaderVal`, `set.has`, `yaml.at`. Fixing `Map.get` fixes all nine, and the fix is the Storage
 > migration — which needs 4b.
@@ -433,7 +433,7 @@ counted**, and the count is cheap to get without emitting anything.
    F4c, since Map today takes an explicit `hashFn` and works.
 3. **Do methods on `List<T>` become methods on the instantiation?** Affects F1's mangling. Presumably
    yes, per §3.3.
-4. **Separate compilation.** Monomorphization needs the generic's body at every use site. Nova merges
+4. **Separate compilation.** Monomorphization needs the generic's body at every use site. Kyte merges
    everything into one flat list today (F1 §2.1), so this is free *now* — but it forecloses separate
    compilation later. Accept and record.
 5. **Dedup key.** §3.5 item 2 needs care: two instantiations with identical substituted bodies but

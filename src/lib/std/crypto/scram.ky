@@ -1,0 +1,419 @@
+//! SCRAM client-side authentication (RFC 5802 and RFC 7677).
+//!
+//! SCRAM (Salted Challenge Response Authentication Mechanism) is the
+//! challenge-response login handshake used by PostgreSQL, MongoDB, and other
+//! services to prove a client knows a password WITHOUT ever sending the
+//! password, or anything reversible into it, over the wire. This file
+//! implements the client half of that exchange: it derives the cryptographic
+//! keys from the password and the server-supplied salt, builds the SASL
+//! messages, and produces the base64 client proof the server checks.
+//!
+//! Two hash variants are covered, because different servers negotiate
+//! different mechanisms:
+//!
+//!   1. SCRAM-SHA-256 (RFC 7677), built on PBKDF2-HMAC-SHA-256, SHA-256, and
+//!      HMAC-SHA-256. This is what modern PostgreSQL and MongoDB use, and is
+//!      the primary path. The `...B64` functions and the plain-named methods
+//!      of [`ScramClient`] all target this variant.
+//!   2. SCRAM-SHA-1 (RFC 5802), built on the SHA-1 primitives, kept for older
+//!      servers. Every SHA-1 entry point carries a `Sha1` suffix so the two
+//!      variants never accidentally cross.
+//!
+//! The key-derivation ladder is the heart of the mechanism and is shared by
+//! both variants (only the hash changes). Given the password, the server salt,
+//! and the iteration count, RFC 5802 section 3 defines:
+//!
+//!   SaltedPassword  := Hi(Normalize(password), salt, i)      // PBKDF2
+//!   ClientKey       := HMAC(SaltedPassword, "Client Key")
+//!   StoredKey       := H(ClientKey)
+//!   ClientSignature := HMAC(StoredKey, AuthMessage)
+//!   ClientProof     := ClientKey XOR ClientSignature
+//!   ServerKey       := HMAC(SaltedPassword, "Server Key")
+//!   ServerSignature := HMAC(ServerKey, AuthMessage)
+//!
+//! The `AuthMessage` binds the client-first-bare, server-first, and
+//! client-final-without-proof messages together, so the proof commits to the
+//! exact nonces and salt of THIS exchange and cannot be replayed. The server
+//! stores only `StoredKey` and `ServerKey`, never the password, and can verify
+//! `ClientProof` by recomputing `ClientKey` from it and hashing it back to
+//! `StoredKey`. The client then verifies the returned `ServerSignature` to
+//! confirm the server also knew the stored secrets, giving mutual
+//! authentication.
+//!
+//! A design note on the "raw" primitives: every step here works on raw binary
+//! digests (`sha256Raw`, `hmacSha256Raw`), not hex strings, and treats a Kyte
+//! `string` purely as a length-prefixed byte buffer. Only the final proof and
+//! server signature are base64-encoded, because those are the only values that
+//! travel as text in the SASL messages. Callers building a full handshake use
+//! [`ScramClient`]; the free functions are exposed mainly so a driver can drive
+//! the ladder step by step and so the RFC test vectors can pin each stage.
+//!
+//! The heavy lifting of the SHA and base64 primitives lives in [`crypto.hash.sha`] and
+//! [`crypto.base64`]; this file is pure message assembly and key derivation on
+//! top of them, with no I/O and no network state of its own.
+
+import bytes;
+import string;
+import list;
+import crypto.hash.sha;
+import crypto.base64;
+import assert;
+
+/// Computes the byte-wise XOR of two equal-length binary strings.
+///
+/// Used only to form the ClientProof (`ClientKey XOR ClientSignature`). The
+/// length is taken from `a`, so the caller must pass two buffers of identical
+/// length; a shorter `b` would read past its end. The result is a fresh heap
+/// buffer of `a.length` bytes reinterpreted as a `string`, i.e. arbitrary
+/// binary, not printable text.
+fn xorBytes(a: string, b: string): string {
+    let n = a.length;
+    let out = bytes.alloc(n);
+    let i = 0;
+    while (i < n) {
+        bytes.write_byte(out, i, bytes.read_byte(a, i) ^ bytes.read_byte(b, i));
+        i = i + 1;
+    }
+    return out as string;
+}
+
+/// SaltedPassword for SCRAM-SHA-256: `Hi(password, salt, i)` per RFC 5802.
+///
+/// This is PBKDF2-HMAC-SHA-256 over the password and the server-supplied salt,
+/// run for `iterations` rounds, producing a 32-byte (SHA-256 output width) key.
+/// The iteration count is dictated by the server in its first message and is
+/// what makes an offline dictionary attack expensive. This value is the root of
+/// the whole key ladder: [`clientKey`] and [`serverKey`] both derive from it.
+pub fn saltedPassword(password: string, salt: string, iterations: int): string {
+    return sha.pbkdf2HmacSha256(password, salt, iterations, 32);
+}
+
+/// ClientKey := `HMAC(SaltedPassword, "Client Key")`.
+///
+/// The literal ASCII string "Client Key" is the fixed HMAC message mandated by
+/// RFC 5802; it is not a secret. The ClientKey is never sent; it feeds
+/// [`storedKey`] (which the server persists) and the XOR in [`clientProof`].
+pub fn clientKey(saltedPw: string): string {
+    return sha.hmacSha256Raw(saltedPw, "Client Key");
+}
+
+/// StoredKey := `H(ClientKey)`, a plain SHA-256 of the ClientKey.
+///
+/// This is the value the server keeps on record. The client recomputes it only
+/// to derive [`clientSignature`]; the server uses it to check the proof by
+/// hashing the recovered ClientKey back to StoredKey.
+pub fn storedKey(ck: string): string {
+    return sha.sha256Raw(ck);
+}
+
+/// ClientSignature := `HMAC(StoredKey, AuthMessage)`.
+///
+/// Keying the HMAC with StoredKey and the message with the full AuthMessage is
+/// what binds the signature to this specific exchange (its nonces, salt, and
+/// iteration count). XORed with the ClientKey in [`clientProof`], it yields the
+/// value actually transmitted.
+pub fn clientSignature(sk: string, authMessage: string): string {
+    return sha.hmacSha256Raw(sk, authMessage);
+}
+
+/// ClientProof := `ClientKey XOR ClientSignature`, the value sent as `p=`.
+///
+/// Because the server knows StoredKey and can compute ClientSignature, it
+/// recovers ClientKey by XORing the proof back, then verifies `H(ClientKey)`
+/// equals its stored StoredKey. Both arguments are 32-byte SHA-256 digests, so
+/// [`xorBytes`] operates on equal lengths.
+pub fn clientProof(ck: string, cs: string): string {
+    return xorBytes(ck, cs);
+}
+
+/// ServerKey := `HMAC(SaltedPassword, "Server Key")`.
+///
+/// The counterpart to [`clientKey`] on the server side of the ladder, using the
+/// fixed ASCII label "Server Key". It keys the [`serverSignature`] that lets the
+/// client authenticate the server in turn.
+pub fn serverKey(saltedPw: string): string {
+    return sha.hmacSha256Raw(saltedPw, "Server Key");
+}
+
+/// ServerSignature := `HMAC(ServerKey, AuthMessage)`, the server's proof to us.
+///
+/// The server returns this base64-encoded as `v=` in its final message. The
+/// client recomputes it (see [`ScramClient.expectedServerSignature`]) and
+/// compares, which confirms the server also holds the stored secrets and
+/// completes mutual authentication.
+pub fn serverSignature(servKey: string, authMessage: string): string {
+    return sha.hmacSha256Raw(servKey, authMessage);
+}
+
+/// Runs the full SCRAM-SHA-256 client ladder and returns the base64 ClientProof.
+///
+/// Convenience wrapper that chains [`saltedPassword`], [`clientKey`],
+/// [`storedKey`], [`clientSignature`], and [`clientProof`], then base64-encodes
+/// the result ready to drop into the `p=` field of the client-final message.
+/// `salt` is the raw (already base64-decoded) server salt, and `authMessage` is
+/// the assembled `client-first-bare,server-first,client-final-without-proof`.
+pub fn computeProofB64(password: string, salt: string, iterations: int, authMessage: string): string {
+    let sp = saltedPassword(password, salt, iterations);
+    let ck = clientKey(sp);
+    let sk = storedKey(ck);
+    let cs = clientSignature(sk, authMessage);
+    return base64.encode(clientProof(ck, cs));
+}
+
+/// Runs the SCRAM-SHA-256 server ladder and returns the base64 ServerSignature.
+///
+/// The client calls this to compute the value it EXPECTS the server to return
+/// in `v=`, from the same password, salt, iteration count, and AuthMessage. A
+/// mismatch means the server did not know the stored secrets, so the client
+/// must reject the connection rather than trust it.
+pub fn computeServerSigB64(password: string, salt: string, iterations: int, authMessage: string): string {
+    let sp = saltedPassword(password, salt, iterations);
+    let ss = serverSignature(serverKey(sp), authMessage);
+    return base64.encode(ss);
+}
+
+/// SaltedPassword for the legacy SCRAM-SHA-1 mechanism (RFC 5802).
+///
+/// Identical in role to [`saltedPassword`] but uses PBKDF2-HMAC-SHA-1 and a
+/// 20-byte output, matching SHA-1's digest width. Kept for servers that only
+/// offer SCRAM-SHA-1; new deployments should prefer the SHA-256 path.
+pub fn saltedPasswordSha1(password: string, salt: string, iterations: int): string {
+    return sha.pbkdf2HmacSha1(password, salt, iterations, 20);
+}
+/// SCRAM-SHA-1 equivalent of [`computeProofB64`]: base64 ClientProof.
+///
+/// Walks the same ladder shape (SaltedPassword, ClientKey, StoredKey,
+/// ClientSignature, XOR) but with the SHA-1 primitives throughout. The XOR step
+/// reuses [`clientProof`] since it is hash-agnostic.
+pub fn computeProofB64Sha1(password: string, salt: string, iterations: int, authMessage: string): string {
+    let sp = saltedPasswordSha1(password, salt, iterations);
+    let ck = sha.hmacSha1Raw(sp, "Client Key");
+    let sk = sha.sha1Raw(ck);
+    let cs = sha.hmacSha1Raw(sk, authMessage);
+    return base64.encode(clientProof(ck, cs));
+}
+/// SCRAM-SHA-1 equivalent of [`computeServerSigB64`]: base64 ServerSignature.
+///
+/// Derives ServerKey via HMAC-SHA-1 and signs the AuthMessage with it, so the
+/// client can verify the server's `v=` reply under the SHA-1 mechanism.
+pub fn computeServerSigB64Sha1(password: string, salt: string, iterations: int, authMessage: string): string {
+    let sp = saltedPasswordSha1(password, salt, iterations);
+    let servKey = sha.hmacSha1Raw(sp, "Server Key");
+    return base64.encode(sha.hmacSha1Raw(servKey, authMessage));
+}
+
+/// Extracts the value of a SCRAM attribute given its `key=` prefix.
+///
+/// SCRAM messages are comma-separated `key=value` attributes. Given one such
+/// `part` (for example `r=abc123`) and the expected prefix `key` (for example
+/// `r=`), this returns everything after the prefix. If `part` does not start
+/// with `key` it returns the empty string, so a caller scanning parts can test
+/// each attribute name and only act on the one that matches.
+fn attrValue(part: string, key: string): string {
+    if (string.startsWith(part, key)) {
+        return string.slice(part, key.length, part.length);
+    }
+    return "";
+}
+
+/// Client-side driver for a full SCRAM handshake.
+///
+/// Holds the three inputs the client controls (username, password, and a
+/// freshly generated client nonce) and exposes the message-building steps of
+/// the exchange as methods. The typical flow is: send
+/// [`ScramClient.clientFirstMessage`], receive the server-first challenge, send
+/// [`ScramClient.clientFinalMessage`] (or the `Sha1` variant), then verify the
+/// server's reply against [`ScramClient.expectedServerSignature`].
+///
+/// The `clientNonce` must be a random, single-use value per handshake; reusing
+/// it defeats the replay protection the nonce exists to provide. This struct
+/// carries no connection state and performs no I/O; it only assembles and signs
+/// the strings the caller sends and receives.
+pub struct ScramClient {
+    /// SASL authentication identity (`n=` in the client-first message).
+    pub username: string,
+    /// The password, used only locally to derive keys via the SCRAM ladder. It
+    /// is never placed in any message; only the derived proof travels.
+    pub password: string,
+    /// The client-chosen random nonce (`r=` in client-first). Must be unique
+    /// per handshake; the server appends its own nonce to form the combined
+    /// nonce that both proofs commit to.
+    pub clientNonce: string,
+
+    /// The client-first-bare string `n=<username>,r=<nonce>`.
+    ///
+    /// This is the portion of the client-first message WITHOUT the GS2 channel
+    /// binding header, and it is the exact prefix later folded into the
+    /// AuthMessage, which is why it is a separate helper rather than inlined.
+    pub fn clientFirstBare(self: ScramClient): string {
+        return `n=${self.username},r=${self.clientNonce}`;
+    }
+
+    /// The full client-first message: `n,,` GS2 header plus the bare part.
+    ///
+    /// The leading `n,,` signals "no channel binding" (the client neither
+    /// requires nor supports it); the corresponding `c=biws` in the final
+    /// message is the base64 of exactly that header. This is the first string
+    /// sent to the server.
+    pub fn clientFirstMessage(self: ScramClient): string {
+        return `n,,${self.clientFirstBare()}`;
+    }
+
+    /// Builds the SCRAM-SHA-256 client-final message from the server challenge.
+    ///
+    /// Parses `serverFirst` for the combined nonce (`r=`), base64 salt (`s=`),
+    /// and iteration count (`i=`), reconstructs the AuthMessage, and appends the
+    /// base64 ClientProof as `p=`. The `c=biws` is the fixed base64 of the `n,,`
+    /// header, matching [`ScramClient.clientFirstMessage`]. This method does not
+    /// verify that the returned combined nonce actually begins with the client
+    /// nonce; the caller should check that separately if it matters. Use
+    /// [`ScramClient.clientFinalMessageSha1`] for SCRAM-SHA-1 servers.
+    pub fn clientFinalMessage(self: ScramClient, serverFirst: string): string {
+        let combinedNonce = "";
+        let saltB64 = "";
+        let iters = 0;
+        let parts = string.split(serverFirst, ",");
+        for (p in parts) {
+            if (string.startsWith(p, "r=")) { combinedNonce = attrValue(p, "r="); }
+            if (string.startsWith(p, "s=")) { saltB64 = attrValue(p, "s="); }
+            if (string.startsWith(p, "i=")) { iters = string.parseI64(attrValue(p, "i=")) as int; }
+        }
+        let salt = base64.decode(saltB64);
+        let clientFinalNoProof = `c=biws,r=${combinedNonce}`;
+        let authMessage = `${self.clientFirstBare()},${serverFirst},${clientFinalNoProof}`;
+        let proof = computeProofB64(self.password, salt, iters, authMessage);
+        return `${clientFinalNoProof},p=${proof}`;
+    }
+
+    /// Recomputes the ServerSignature the SCRAM-SHA-256 server should return.
+    ///
+    /// Parses the same `serverFirst` fields as
+    /// [`ScramClient.clientFinalMessage`] and rebuilds the identical
+    /// AuthMessage, then returns the expected base64 `v=` value. The caller
+    /// compares this against the server's actual reply, and on mismatch must
+    /// treat the server as unauthenticated and abort.
+    pub fn expectedServerSignature(self: ScramClient, serverFirst: string): string {
+        let combinedNonce = "";
+        let saltB64 = "";
+        let iters = 0;
+        let parts = string.split(serverFirst, ",");
+        for (p in parts) {
+            if (string.startsWith(p, "r=")) { combinedNonce = attrValue(p, "r="); }
+            if (string.startsWith(p, "s=")) { saltB64 = attrValue(p, "s="); }
+            if (string.startsWith(p, "i=")) { iters = string.parseI64(attrValue(p, "i=")) as int; }
+        }
+        let salt = base64.decode(saltB64);
+        let clientFinalNoProof = `c=biws,r=${combinedNonce}`;
+        let authMessage = `${self.clientFirstBare()},${serverFirst},${clientFinalNoProof}`;
+        return computeServerSigB64(self.password, salt, iters, authMessage);
+    }
+
+    /// SCRAM-SHA-1 counterpart of [`ScramClient.expectedServerSignature`].
+    ///
+    /// Identical message parsing and AuthMessage assembly, but computes the
+    /// expected `v=` under the SHA-1 mechanism via [`computeServerSigB64Sha1`].
+    pub fn expectedServerSignatureSha1(self: ScramClient, serverFirst: string): string {
+        let combinedNonce = "";
+        let saltB64 = "";
+        let iters = 0;
+        let parts = string.split(serverFirst, ",");
+        for (p in parts) {
+            if (string.startsWith(p, "r=")) { combinedNonce = attrValue(p, "r="); }
+            if (string.startsWith(p, "s=")) { saltB64 = attrValue(p, "s="); }
+            if (string.startsWith(p, "i=")) { iters = string.parseI64(attrValue(p, "i=")) as int; }
+        }
+        let salt = base64.decode(saltB64);
+        let clientFinalNoProof = `c=biws,r=${combinedNonce}`;
+        let authMessage = `${self.clientFirstBare()},${serverFirst},${clientFinalNoProof}`;
+        return computeServerSigB64Sha1(self.password, salt, iters, authMessage);
+    }
+
+    /// SCRAM-SHA-1 counterpart of [`ScramClient.clientFinalMessage`].
+    ///
+    /// Parses `serverFirst` and assembles the same client-final message shape,
+    /// but derives the `p=` proof through [`computeProofB64Sha1`] for servers
+    /// that negotiated the SHA-1 mechanism.
+    pub fn clientFinalMessageSha1(self: ScramClient, serverFirst: string): string {
+        let combinedNonce = "";
+        let saltB64 = "";
+        let iters = 0;
+        let parts = string.split(serverFirst, ",");
+        for (p in parts) {
+            if (string.startsWith(p, "r=")) { combinedNonce = attrValue(p, "r="); }
+            if (string.startsWith(p, "s=")) { saltB64 = attrValue(p, "s="); }
+            if (string.startsWith(p, "i=")) { iters = string.parseI64(attrValue(p, "i=")) as int; }
+        }
+        let salt = base64.decode(saltB64);
+        let clientFinalNoProof = `c=biws,r=${combinedNonce}`;
+        let authMessage = `${self.clientFirstBare()},${serverFirst},${clientFinalNoProof}`;
+        let proof = computeProofB64Sha1(self.password, salt, iters, authMessage);
+        return `${clientFinalNoProof},p=${proof}`;
+    }
+}
+
+/// The exact AuthMessage from the RFC 7677 section 3 worked example.
+///
+/// This is the concatenated `client-first-bare,server-first,client-final-without-proof`
+/// for the canonical `user`/`pencil` vector, used by
+/// [`test_scram_rfc7677_proof`] to pin the SHA-256 proof and server signature
+/// against the published expected values.
+const RFC_AUTH: string =
+    "n=user,r=rOprNGfwEbeRWgbNEkqO,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096,c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+
+/// Pins the SCRAM-SHA-256 proof and server signature to the RFC 7677 vector.
+///
+/// Feeds the published password, salt, and iteration count through
+/// [`computeProofB64`] and [`computeServerSigB64`] and asserts both base64
+/// outputs match the values in the RFC, which validates the whole SHA-256
+/// ladder end to end.
+@test
+fn test_scram_rfc7677_proof(): void {
+    let salt = base64.decode("W22ZaJ0SNY7soEsUEjb6gQ==");
+    assert.equalStr(computeProofB64("pencil", salt, 4096, RFC_AUTH),
+                    "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+    assert.equalStr(computeServerSigB64("pencil", salt, 4096, RFC_AUTH),
+                    "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+}
+
+/// Pins the SCRAM-SHA-1 exchange to the RFC 5802 section 5 worked example.
+///
+/// Drives a full [`ScramClient`] handshake with the published `user`/`pencil`
+/// vector: checks the client-first message, the client-final message produced
+/// by [`ScramClient.clientFinalMessageSha1`], and the server signature from
+/// [`computeServerSigB64Sha1`], all against the RFC's expected strings.
+@test
+fn test_scram_sha1_rfc5802(): void {
+    let c = ScramClient{
+        username: "user",
+        password: "pencil",
+        clientNonce: "fyko+d2lbbFgONRv9qkxdawL",
+    };
+    assert.equalStr(c.clientFirstMessage(), "n,,n=user,r=fyko+d2lbbFgONRv9qkxdawL");
+    let serverFirst = "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
+    assert.equalStr(c.clientFinalMessageSha1(serverFirst),
+                    "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=");
+    let authMessage = "n=user,r=fyko+d2lbbFgONRv9qkxdawL," + serverFirst
+        + ",c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j";
+    let salt = base64.decode("QSXCR+Q6sek8bf92");
+    assert.equalStr(computeServerSigB64Sha1("pencil", salt, 4096, authMessage), "rmF9pqV8S7suAoZWja4dJRkFsKQ=");
+}
+
+/// End-to-end SCRAM-SHA-256 client exchange against a fixed challenge.
+///
+/// Builds a [`ScramClient`] with a known nonce, checks the client-first
+/// message, then feeds a canned server-first challenge into
+/// [`ScramClient.clientFinalMessage`] and asserts the resulting client-final
+/// message (including the `p=` proof) exactly matches the expected string.
+@test
+fn test_scram_client_exchange(): void {
+
+    let c = ScramClient{
+        username: "user",
+        password: "pencil",
+        clientNonce: "rOprNGfwEbeRWgbNEkqO",
+    };
+    assert.equalStr(c.clientFirstMessage(), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+    let serverFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    assert.equalStr(c.clientFinalMessage(serverFirst),
+                    "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+}

@@ -13,7 +13,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 VERSION="$(tr -d '[:space:]' < "$ROOT/.zig-version")"
-DEST="${ZIG_INSTALL_DIR:-$HOME/.nova-zig}"
+DEST="${ZIG_INSTALL_DIR:-$HOME/.kyte-zig}"
 
 log() { echo "bootstrap-zig: $*" >&2; }
 

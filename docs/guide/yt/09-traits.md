@@ -2,11 +2,11 @@
 
 - Chapter: [09-traits.md](../09-traits.md)
 - Estimated length: ~11 minutes
-- You will need: Nova installed and on your PATH, a terminal, and the files `examples/15_traits.nova` and `examples/geometry.nova` from the guide.
+- You will need: Kyte installed and on your PATH, a terminal, and the files `examples/15_traits.ky` and `examples/geometry.ky` from the guide.
 
 ## Hook (0:00)
 
-**Say:** In this video we get to polymorphism, the ability to write one piece of code that works over many concrete types. In Nova the tool for that is the trait. By the end you will be able to declare a trait, implement it on several structs, pass values around by their trait type with dynamic dispatch, return a trait from a factory, downcast back to a concrete type, and even write a generic trait. Let us get into it.
+**Say:** In this video we get to polymorphism, the ability to write one piece of code that works over many concrete types. In Kyte the tool for that is the trait. By the end you will be able to declare a trait, implement it on several structs, pass values around by their trait type with dynamic dispatch, return a trait from a factory, downcast back to a concrete type, and even write a generic trait. Let us get into it.
 
 ## What we will cover (0:20)
 
@@ -22,7 +22,7 @@
 **Say:** A trait is an interface. It is a set of method signatures with no bodies, just the shapes. A struct opts in by writing `impl Trait` and supplying the actual methods. Here is a `Speaker` trait, and two structs that implement it.
 
 **On screen:**
-```nova
+```kyte
 trait Speaker {
     fn speak(self: Speaker): string;
 }
@@ -45,7 +45,7 @@ struct Cat impl Speaker {
 **Say:** Now the interesting part. When you hold a value through its trait type, calling a method dispatches dynamically, through a vtable, to the concrete type's implementation. Here is a function that takes a `Speaker` and just calls `speak` on it.
 
 **On screen:**
-```nova
+```kyte
 // Dispatch through a trait-typed parameter.
 fn announce(s: Speaker): void {
     console.log(s.speak());
@@ -59,7 +59,7 @@ fn announce(s: Speaker): void {
 **Say:** A factory function can return a trait type, which hides the concrete type from the caller. The caller asks for a Speaker and gets one, without knowing or caring which kind. Notice we build the structs here with the struct literal form, the one we mentioned back in the structs video.
 
 **On screen:**
-```nova
+```kyte
 // A factory returning a trait object: the caller sees only `Speaker`.
 fn make(kind: string): Speaker {
     if (kind == "dog") { return Dog{ name: "Rex" }; }
@@ -74,7 +74,7 @@ fn make(kind: string): Speaker {
 **Say:** Traits can also be generic, with type parameters that appear in the method signatures. Each `impl` fills in concrete type arguments. This `Handler` trait is generic over a request type `Q` and a response type `R`.
 
 **On screen:**
-```nova
+```kyte
 // ---- Generic trait: type parameters appear in the method signature ----
 trait Handler<Q, R> {
     fn handle(self, req: Q): R;
@@ -103,7 +103,7 @@ struct Doubler impl Handler<int, int> {
 **Say:** Now `main` exercises all of it. First, dynamic dispatch: same `announce` call, two different runtime types.
 
 **On screen:**
-```nova
+```kyte
 fn main(): void {
     // Dynamic dispatch: same call site, different runtime type.
     announce(Dog{ name: "Rex" });
@@ -117,7 +117,7 @@ fn main(): void {
 **Say:** We announce a Dog and a Cat, then ask the factory for a dog and let it speak. Next comes the downcast. A trait object can be brought back to its concrete type with `as`.
 
 **On screen:**
-```nova
+```kyte
     // Downcast a trait value back to its concrete type with `as`.
     let d = s as Dog;
     console.log(`downcast name = ${d.name}`);
@@ -126,7 +126,7 @@ fn main(): void {
 **Say:** `s` is a Speaker, but we know it is really a Dog, so `s as Dog` gives us a concrete Dog and now we can read `d.name` directly. Finally the two generic handlers.
 
 **On screen:**
-```nova
+```kyte
     // Generic trait, two instantiations.
     let h = GetUserHandler{};
     let dto = h.handle(GetUser{ id: 7 });
@@ -141,7 +141,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/15_traits.nova -o out && ./out
+kyte examples/15_traits.ky -o out && ./out
 ```
 
 ```
@@ -164,7 +164,7 @@ doubler(21) = 42
 **Say:** To round off, here is a tiny module called `geometry`, which pairs nicely with traits and structs. It shows a `pub struct Point` and some free functions, and it carries a `@test` so we can run it directly. Only `pub` declarations are visible to other modules.
 
 **On screen:**
-```nova
+```kyte
 pub struct Point {
     pub x: int,
     pub y: int,
@@ -185,7 +185,7 @@ pub fn manhattan(a: Point, b: Point): int {
 **Say:** `Point` is a public struct with public x and y and an `init`. `manhattan` computes the taxicab distance using an `if` expression to pick the positive difference on each axis. There is also a non-pub helper and a `pub perimeter`, and at the bottom a `@test` that checks the maths.
 
 **On screen:**
-```nova
+```kyte
 @test
 fn t_geometry(): void {
     let a = Point(0, 0);
@@ -195,14 +195,14 @@ fn t_geometry(): void {
 }
 ```
 
-**Say:** This file has no `main`, it has a `@test`, so we run it with `nova test`, which finds and runs the test functions rather than a main program.
+**Say:** This file has no `main`, it has a `@test`, so we run it with `kyte test`, which finds and runs the test functions rather than a main program.
 
 **Run it:**
 ```
-nova test examples/geometry.nova
+kyte test examples/geometry.ky
 ```
 
-**Say:** If the assertions hold, the test passes cleanly. That is the everyday loop: write a small module, add a `@test`, and run `nova test` to check it.
+**Say:** If the assertions hold, the test passes cleanly. That is the everyday loop: write a small module, add a `@test`, and run `kyte test` to check it.
 
 ## Recap (10:45)
 
@@ -216,4 +216,4 @@ nova test examples/geometry.nova
 
 ## Outro (11:00)
 
-**Say:** That closes out the object-style chapters. Next in the series we look at optionals, Nova's safe way to handle a value that might be missing. If this was useful, a like and subscribe keeps the series going. See you in the next video.
+**Say:** That closes out the object-style chapters. Next in the series we look at optionals, Kyte's safe way to handle a value that might be missing. If this was useful, a like and subscribe keeps the series going. See you in the next video.

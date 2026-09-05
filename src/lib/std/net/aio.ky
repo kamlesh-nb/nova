@@ -1,0 +1,202 @@
+//! Low-level async socket primitives that back the reactor-native network stack.
+//!
+//! This module is the thin seam between Kyte source and the C++ runtime's
+//! Boost.Asio-driven reactor: the `kyte_a*` externs (declared without a body
+//! here, resolved at link time against the runtime) do the actual listen,
+//! connect, and read/write work, while the plain-Kyte wrappers here give
+//! callers stable, typed entry points. Most of the free functions are legacy
+//! stubs kept for ABI/name stability; the supported, actively used surface is
+//! `AsyncStream` plus `asyncConnect`/`asyncConnectDeadline`/`delay`, which route
+//! through `net.eventedio`'s per-reactor `ReactorStream` when running inside a
+//! reactor (`poller.currentKq() > 0`) and fall back to the bare `async_*`
+//! externs otherwise.
+
+import net.poller;
+import net.eventedio;
+
+/// Legacy stub: always returns 0. Superseded by `AsyncStream.recvInto` and
+/// `net.eventedio.ReactorStream.recvInto`, kept only for name stability.
+pub fn socketRecvAsync(fd: int, buf: int, max: int): int {
+    return 0;
+}
+
+/// Legacy stub: always returns 0. Superseded by `aaccept`/`AsyncStream`.
+pub fn socketAcceptAsync(fd: int): int {
+    return 0;
+}
+
+/// Starts listening on all interfaces on the given port and returns an
+/// opaque server handle (a raw socket/listener id) for use with `aaccept`.
+pub fn serverListen(port: int): long {
+    return kyte_aserver_listen(port);
+}
+
+/// Starts listening on a specific host and port and returns an opaque
+/// server handle for use with `aaccept`.
+pub fn serverListenAddr(host: string, port: int): long {
+    return kyte_aserver_listen_addr(host, port);
+}
+
+/// Number of reactor worker threads the runtime has spun up.
+pub fn reactorCount(): int {
+    return kyte_worker_count() as int;
+}
+
+/// Pins the next spawned coroutine to reactor `rid`, overriding the default
+/// scheduling choice. Used to steer connection handling onto a specific worker.
+pub fn pinNextCoro(rid: int): void {
+    kyte_pin_next_coro(rid);
+}
+
+/// Blocks all reactor worker threads in place, used during coordinated
+/// shutdown or handoff so no worker picks up new work mid-transition.
+pub fn holdReactors(): void {
+    kyte_hold_all_reactors();
+}
+
+/// Legacy stub: always returns 0. Superseded by `asyncConnect`, which
+/// resolves through the reactor when one is active.
+pub fn aconnect(host: string, port: int): long {
+    return 0;
+}
+
+/// Legacy stub: always returns 0. Accepts a connection on the given server
+/// handle; superseded by the reactor-aware accept path in `net.eventedio`.
+pub fn aaccept(server: long): long {
+    return 0;
+}
+
+/// Legacy stub: always returns 0. Superseded by `AsyncStream.recvInto`.
+pub fn async_read(sock: long, buf: long, max: int): int {
+    return 0;
+}
+
+/// Legacy stub: always returns 0. Superseded by `AsyncStream.recvInto` with
+/// `setTimeout` set, which carries the deadline through `ReactorStream`.
+pub fn async_read_deadline(sock: long, buf: long, max: int, ms: int): int {
+    return 0;
+}
+
+/// Legacy stub: always returns 0. Superseded by `AsyncStream.sendStr`.
+pub fn async_write(sock: long, data: string): int {
+    return 0;
+}
+/// Closes a raw socket handle at the runtime level. Prefer `AsyncStream.close`,
+/// which also routes through the reactor's stream teardown when applicable.
+pub fn aclose(sock: long): void {
+    kyte_aclose(sock);
+}
+
+/// Common interface for an asynchronous, bidirectional byte stream: async
+/// receive and send, a synchronous close, and a configurable read timeout.
+pub trait AsyncIO {
+
+    async fn recvInto(self, buf: long, max: int): int;
+    async fn sendStr(self, data: string): int;
+    fn close(self): void;
+
+    fn setTimeout(self, ms: int): int;
+}
+
+/// A connected socket wrapped as an `AsyncIO` stream.
+///
+/// When `kq > 0` (this stream was created inside a running reactor), every
+/// operation is delegated to a `net.eventedio.ReactorStream` bound to that
+/// reactor's kqueue/epoll handle; otherwise it falls back to the bare
+/// `async_read`/`async_write` externs. Closing sets `sock` to 0, making the
+/// stream safe to close more than once.
+pub class AsyncStream impl AsyncIO {
+    /// Raw socket handle, or 0 once the stream has been closed.
+    pub sock: long,
+    /// Read timeout in milliseconds; 0 means no deadline is applied.
+    pub timeoutMs: int,
+    /// Reactor handle (kqueue/epoll fd) this stream is bound to, or 0 if it
+    /// is not running inside a reactor and should use the bare async path.
+    pub kq: int,
+    init(sock: long) { self.sock = sock; self.timeoutMs = 0; self.kq = 0; }
+
+    /// Reads up to `max` bytes into `buf`, honouring `timeoutMs` if set.
+    /// Returns the number of bytes read, applying the deadline variant when
+    /// `timeoutMs > 0`.
+    pub async fn recvInto(self: AsyncStream, buf: long, max: int): int {
+        if (self.kq > 0) {
+            let rs = eventedio.ReactorStream(self.sock as int, self.kq);
+            if (self.timeoutMs > 0) { return await rs.recvIntoDeadline(buf, max, self.timeoutMs); }
+            return await rs.recvInto(buf, max);
+        }
+        if (self.timeoutMs > 0) { return await async_read_deadline(self.sock, buf, max, self.timeoutMs); }
+        return await async_read(self.sock, buf, max);
+    }
+    /// Sets the read timeout in milliseconds; a non-positive value clears it
+    /// (falls back to blocking, no-deadline reads).
+    pub fn setTimeout(self: AsyncStream, ms: int): int {
+        self.timeoutMs = if (ms > 0) ms else 0;
+        return 0;
+    }
+
+    /// Writes the full contents of `data` to the stream.
+    pub async fn sendStr(self: AsyncStream, data: string): int {
+        if (self.kq > 0) {
+            let rs = eventedio.ReactorStream(self.sock as int, self.kq);
+            return await rs.sendStr(data);
+        }
+        return await async_write(self.sock, data);
+    }
+    /// True while the stream holds a live socket handle (has not been closed).
+    pub fn isOpen(self: AsyncStream): bool { return self.sock != 0; }
+    /// True while the stream holds a valid, positive socket handle.
+    pub fn ok(self: AsyncStream): bool { return self.sock > (0 as long); }
+    /// Closes the underlying socket (via the reactor stream when bound to
+    /// one) and clears `sock` to 0. Safe to call more than once.
+    pub fn close(self: AsyncStream): void {
+        if (self.sock != 0) {
+            if (self.kq > 0) {
+                let rs = eventedio.ReactorStream(self.sock as int, self.kq);
+                rs.close();
+            } else {
+                aclose(self.sock);
+            }
+            self.sock = 0;
+        }
+    }
+}
+
+/// Connects to `host:port` and returns an `AsyncStream` for it. When called
+/// inside a running reactor (`poller.currentKq() > 0`), the connection is
+/// established through `net.eventedio.reactorConnect` and the resulting
+/// stream is bound to that reactor; otherwise it falls back to the bare
+/// `aconnect` extern with no reactor binding.
+pub async fn asyncConnect(host: string, port: int): AsyncStream {
+    let ck = poller.currentKq();
+    if (ck > 0) {
+        let rs = await eventedio.reactorConnect(host, port, ck);
+        let s = AsyncStream(rs.fdOf() as long);
+        s.kq = ck;
+        return s;
+    }
+    let s = await aconnect(host, port);
+    return AsyncStream(s);
+}
+
+/// Connects to `host:port` with a connect-time deadline of `timeoutMs`
+/// milliseconds, using the reactor-bound path when running inside a reactor
+/// and falling back to the bare `aconnect` extern otherwise. Note the
+/// fallback path does not itself apply the deadline.
+pub async fn asyncConnectDeadline(host: string, port: int, timeoutMs: int): AsyncStream {
+    let ck = poller.currentKq();
+    if (ck > 0) {
+        let rs = await eventedio.reactorConnectDeadline(host, port, ck, timeoutMs);
+        let s = AsyncStream(rs.fdOf() as long);
+        s.kq = ck;
+        return s;
+    }
+    let s = await aconnect(host, port);
+    return AsyncStream(s);
+}
+
+/// Legacy stub: always returns 0, does not actually sleep. Superseded by `delay`.
+pub fn sleep(ms: int): int { return 0; }
+
+/// Suspends the current coroutine for `ms` milliseconds without blocking the
+/// reactor thread, via `net.eventedio.delayMs`.
+pub async fn delay(ms: int): void { await eventedio.delayMs(ms); }

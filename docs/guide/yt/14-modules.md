@@ -2,24 +2,24 @@
 
 - Chapter: [14-modules.md](../14-modules.md)
 - Estimated length: ~9 minutes
-- You will need: the `nova` compiler installed, a terminal, and the guide's `examples/` folder open
+- You will need: the `kyte` compiler installed, a terminal, and the guide's `examples/` folder open
 
 ## Hook (0:00)
 
-**Say:** In this video we will learn how Nova splits a program across files and controls what each file exposes. By the end you will know the three kinds of `import`, how to qualify each one, and how `pub` decides exactly what crosses a module boundary. It is a small, tidy system, and it is strict in a helpful way: referencing something private from another module is a hard compile error, not a warning.
+**Say:** In this video we will learn how Kyte splits a program across files and controls what each file exposes. By the end you will know the three kinds of `import`, how to qualify each one, and how `pub` decides exactly what crosses a module boundary. It is a small, tidy system, and it is strict in a helpful way: referencing something private from another module is a hard compile error, not a warning.
 
 ## What we will cover (0:25)
 
-- Every `.nova` file is a module
+- Every `.ky` file is a module
 - The three kinds of import: sibling files, stdlib paths, and `platform`
 - Visibility with `pub`, and why it is opt-in
 - A worked example that uses all three imports together
 
 ## Segment: modules and the three imports (0:55)
 
-**Say:** The rule to start with is simple: every `.nova` file is a module. You bring one module into another with `import`, and there are three kinds of import, all using the same syntax.
+**Say:** The rule to start with is simple: every `.ky` file is a module. You bring one module into another with `import`, and there are three kinds of import, all using the same syntax.
 
-**Say:** First, sibling files. Writing `import geometry;` resolves `geometry.nova` in the same directory. Second, stdlib paths, which are dotted, like `import collections.list;`. And here is the key detail: you always qualify by the last segment. So `collections.list` is used as `list.List`, and `serde.json` is used as `json` and its members. Third, the `platform` module. Writing `import platform;` pulls in a module the compiler synthesises for your build target, giving you things like `platform.os`, `platform.arch`, `platform.pointerSize`, and booleans like `isDarwin`, `isLinux`, `isWindows`, `isWasm`, and `isPosix`.
+**Say:** First, sibling files. Writing `import geometry;` resolves `geometry.ky` in the same directory. Second, stdlib paths, which are dotted, like `import collections.list;`. And here is the key detail: you always qualify by the last segment. So `collections.list` is used as `list.List`, and `serde.json` is used as `json` and its members. Third, the `platform` module. Writing `import platform;` pulls in a module the compiler synthesises for your build target, giving you things like `platform.os`, `platform.arch`, `platform.pointerSize`, and booleans like `isDarwin`, `isLinux`, `isWindows`, `isWasm`, and `isPosix`.
 
 ## Segment: visibility is opt-in (2:30)
 
@@ -27,12 +27,12 @@
 
 ## Segment: the sibling module (3:15)
 
-**Say:** Let us build a small sibling module first: a `geometry.nova` with one `pub struct` and a couple of `pub` functions, plus one private helper that importers cannot see.
+**Say:** Let us build a small sibling module first: a `geometry.ky` with one `pub struct` and a couple of `pub` functions, plus one private helper that importers cannot see.
 
 **On screen:**
-```nova
-// examples/geometry.nova
-// A tiny sibling module imported by 20_modules.nova. Only `pub` declarations are
+```kyte
+// examples/geometry.ky
+// A tiny sibling module imported by 20_modules.ky. Only `pub` declarations are
 // visible to other modules; a non-pub struct/fn referenced from another file is a
 // hard compile error. Both the struct and the free function below are `pub`.
 
@@ -67,11 +67,11 @@ pub fn perimeter(a: Point, b: Point): int {
 **Say:** Now the main program. It imports the sibling module, a stdlib module, and `platform`, and uses all three.
 
 **On screen:**
-```nova
-// examples/20_modules.nova
-// A Nova program is a set of MODULES that `import` one another.
+```kyte
+// examples/20_modules.ky
+// A Kyte program is a set of MODULES that `import` one another.
 //
-//   * `import geometry;`         : a SIBLING file (geometry.nova in this dir).
+//   * `import geometry;`         : a SIBLING file (geometry.ky in this dir).
 //   * `import collections.list;` : a dotted stdlib path; you qualify by the LAST
 //                                  segment, so `collections.list` becomes `list.List`.
 //   * `import platform;`         : a module the COMPILER synthesises for the build
@@ -110,7 +110,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/20_modules.nova -o out && ./out
+kyte examples/20_modules.ky -o out && ./out
 ```
 
 ```
@@ -133,11 +133,11 @@ isWindows = false
 
 **Say:** Quick recap:
 
-- Every `.nova` file is a module, and `import` brings one into another.
+- Every `.ky` file is a module, and `import` brings one into another.
 - Three kinds of import: sibling files by name, dotted stdlib paths qualified by their last segment, and the compiler-synthesised `platform` module.
 - Visibility is opt-in with `pub`, on structs, fields, methods, and functions.
 - Referencing a non-`pub` declaration across a module boundary is a hard compile error.
 
 ## Outro (8:50)
 
-**Say:** Next up we will look at concurrency, where Nova's `async`, `await`, and `spawn` come into play. If this helped, a like or subscribe keeps the series going. See you in the next one.
+**Say:** Next up we will look at concurrency, where Kyte's `async`, `await`, and `spawn` come into play. If this helped, a like or subscribe keeps the series going. See you in the next one.

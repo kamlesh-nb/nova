@@ -1,6 +1,6 @@
 # DB Production-Readiness Roadmap
 
-**Purpose.** The Nova DB drivers (NovaDB, PostgreSQL, MySQL, MSSQL, MongoDB) are protocol-complete and
+**Purpose.** The Kyte DB drivers (NovaDB, PostgreSQL, MySQL, MSSQL, MongoDB) are protocol-complete and
 live-verified, but they are *beta*, not production. This document is the plan to close that gap — the operational
 layer (pooling, transactions, timeouts, retries, real parameterization) that turns "four drivers that work in a
 demo" into "a data layer you would ship." **MongoDB is the first driver targeted for production readiness**
@@ -34,7 +34,7 @@ richer surface). MongoDB (`packages/nova-mongodb`): OP_MSG + BSON (binary/embedd
 7. **Full result-set materialization** — no cursors/streaming; a large query OOMs. *(Mongo especially: `find`
    returns a CURSOR — the current driver reads only the first batch.)*
 8. **No TLS to Mongo yet** — but this is easy: unlike TDS (which tunnels TLS in PRELOGIN), MongoDB does plain TLS
-   over the socket, so the existing fd-based `nova_tls_new`/`handshake`/`read`/`write` applies directly.
+   over the socket, so the existing fd-based `kyte_tls_new`/`handshake`/`read`/`write` applies directly.
 9. **Thin error taxonomy + no observability** — protocol errors are partially surfaced; no command monitoring,
    metrics, or logging hooks.
 
@@ -76,7 +76,7 @@ MongoDB is the pilot. Each phase has a DoD gated against a live `mongod` (standa
 set), leak-checked under ARC. Phases are ordered by "what unblocks a real app soonest."
 
 ### M1 — TLS + Atlas connectivity ⬜  *(fast; unblocks cloud)*
-Wire the existing fd-based `nova_tls_*` (verify_peer, SNI) into the Mongo `TcpClient` path; add a `tls=true` /
+Wire the existing fd-based `kyte_tls_*` (verify_peer, SNI) into the Mongo `TcpClient` path; add a `tls=true` /
 `mongodb+srv://` connection-string option. **DoD:** connect + `hello` + `insert`/`find` over TLS against a TLS
 `mongod` and against a MongoDB Atlas free-tier cluster (the real-world bar). *(No TDS-style tunneling needed —
 Mongo is plain TLS.)*
@@ -145,7 +145,7 @@ shape.
 ## 5. Sequencing & priorities
 
 1. **M1 (TLS/Atlas) + M2 (cursors)** first — they make the driver *usable against real data*, and are cheap
-   (TLS reuses `nova_tls_*`; cursors are a known protocol loop).
+   (TLS reuses `kyte_tls_*`; cursors are a known protocol loop).
 2. **M3 (pool) + M4 (timeouts/resilience)** — the safety-and-scale keystone; nothing is production without them.
 3. **M5 (concern/errors)** — correctness of durability + a real error surface.
 4. Read-side **micro-ORM prototype** (§4) — high value, low risk, proves the ergonomic layer.
@@ -160,7 +160,7 @@ for MySQL, `sp_prepexec`/RPC for MSSQL) — the injection + plan-cache fix. Tran
 
 ## 6. Non-goals (explicitly out of scope)
 
-- A full ORM (LINQ-style query generation, change tracking, migrations, lazy loading) — Nova targets the *micro*-
+- A full ORM (LINQ-style query generation, change tracking, migrations, lazy loading) — Kyte targets the *micro*-
   ORM point (SQL/command in, typed objects out). Migrations/change-tracking can be separate libraries later.
 - ODM/aggregation-pipeline DSLs beyond a thin typed builder.
 - Multi-driver distributed transactions / 2PC.

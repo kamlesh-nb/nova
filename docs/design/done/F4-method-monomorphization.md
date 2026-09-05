@@ -65,7 +65,7 @@ generics and make `isOwned`/codegen assert on a `.type_param` that reaches it (F
 
 ## Verification (each phase)
 `zig build; echo EXIT=$?` (NEVER `| tail` — it masks the exit; caught this session, `db82cee`) ·
-`NOVA=./zig-out/bin/nova ./conformance/run.sh` (58) · `--arc` (98) · `NOVA_ASAN=1 zig build` then
+`KYTE=./zig-out/bin/kyte ./conformance/run.sh` (58) · `--arc` (98) · `KYTE_ASAN=1 zig build` then
 `--asan` (98) · `zig build test`. Phase 4's gate IS the removal experiment going green.
 
 ## Measured refinements (2026-07-18, experiments — read before Phase 2)
@@ -146,7 +146,7 @@ body per concrete `U` (`List_Item_map_string`, U bound via a NEW `current_method
 `substTypeParams`), emitted from the Phase-1 `expr_method_args` worklist; and for an UNCALLED such method,
 either don't emit it (requires finding + rewiring the runtime reference that makes skip crash) or emit a
 sound-but-unspecialized variant. The runtime-reference crash is the sharp edge to isolate FIRST (get a
-backtrace: `NOVA_KEEP_OBJ=1`, lldb the test binary) before touching emission.
+backtrace: `KYTE_KEEP_OBJ=1`, lldb the test binary) before touching emission.
 
 ## Session progress already banked
 `72b0f82` (struct-level type-param receivers → 58→40 on removal). Everything else in
@@ -159,7 +159,7 @@ backtrace: `NOVA_KEEP_OBJ=1`, lldb the test binary) before touching emission.
   `substMethodParams`). `substTypeParams` now runs struct-subst (T from `current_instantiation`) THEN
   method-subst (U from `current_method_subst`). Behavior-neutral until something sets it.
 - **Phase 2a worklist** (mono.zig `method_insts` + `noteMethodInst`; infer.zig records at the
-  all-concrete point). Validated via NOVA_SEMA_SHADOW: chained map → `List<i32>.map<string>` +
+  all-concrete point). Validated via KYTE_SEMA_SHADOW: chained map → `List<i32>.map<string>` +
   `List<string>.map<string>`; single map over List<string> → `List<string>.map<i32>`.
 
 **BUILT + FUNCTIONAL but REVERTED (net regression):**

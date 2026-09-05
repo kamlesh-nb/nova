@@ -1,4 +1,4 @@
-//! Root module of the Nova compiler crate: the single Zig import surface that
+//! Root module of the Kyte compiler crate: the single Zig import surface that
 //! re-exports the frontend pipeline and anchors the test tree.
 //!
 //! In Zig, one file is the crate's root (its `root_source_file`), and every
@@ -38,18 +38,18 @@ const std = @import("std");
 /// through a short local name; it does not itself pull in any compiler module.
 const Io = std.Io;
 
-/// The Nova source parser: turns a token stream into the [`ast`] tree.
+/// The Kyte source parser: turns a token stream into the [`ast`] tree.
 ///
 /// Re-exported here as part of the frontend surface; the parser is the second
 /// pipeline stage after [`lexer`].
 pub const parser = @import("frontend/parser.zig");
-/// The source formatter (`nova fmt`): pretty-prints an [`ast`] back to canonical
-/// Nova source, so it is the inverse direction of [`parser`].
+/// The source formatter (`kyte fmt`): pretty-prints an [`ast`] back to canonical
+/// Kyte source, so it is the inverse direction of [`parser`].
 pub const formatter = @import("frontend/formatter.zig");
 /// Abstract syntax tree node definitions produced by [`parser`] and consumed by
 /// the [`sema`] passes and the [`formatter`].
 pub const ast = @import("frontend/ast.zig");
-/// The lexer: the first pipeline stage, tokenising raw Nova source text for
+/// The lexer: the first pipeline stage, tokenising raw Kyte source text for
 /// [`parser`].
 pub const lexer = @import("frontend/lexer.zig");
 /// The legacy/standalone type checker.
@@ -59,7 +59,7 @@ pub const lexer = @import("frontend/lexer.zig");
 /// (see [`shadow`]).
 pub const type_checker = @import("frontend/type_checker.zig");
 
-/// The type representation shared across the frontend: how Nova types are modelled
+/// The type representation shared across the frontend: how Kyte types are modelled
 /// in the compiler, consumed by [`infer`], [`mono`], and code generation.
 pub const types = @import("frontend/types.zig");
 
@@ -92,7 +92,7 @@ pub const sema = @import("frontend/sema/sema.zig");
 /// compiler, see the crate design notes.
 pub const mono = @import("frontend/sema/mono.zig");
 /// The shadow-typing harness: runs an alternate type engine alongside the
-/// primary one and diffs the results (enabled via `NOVA_SEMA_SHADOW`) to catch
+/// primary one and diffs the results (enabled via `KYTE_SEMA_SHADOW`) to catch
 /// divergences between the two.
 pub const shadow = @import("frontend/sema/shadow.zig");
 

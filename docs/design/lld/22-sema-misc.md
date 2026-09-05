@@ -6,7 +6,7 @@ The six, in one line each:
 
 - `escape.zig` is the P7 escape analysis. It classifies each owned allocation bound to a local as LOCAL or ESCAPES, computed as an interprocedural least fixpoint over the call graph. It is currently report-only (a gauge for the arena/value-struct promotion work), and defaults to ESCAPES so a wrong LOCAL cannot arise.
 - `alpha.zig` is the alpha-renamer. It walks each function and gives shadowing `let` bindings fresh, unique names (`x`, `x$1`, `x$2`) so later passes never confuse two distinct variables that happen to share a source name.
-- `builtins.zig` is the compile-time registry of builtin methods (`bytes.*`, `simd.*`, `console.*`), non-generic `mem` helpers, and bare-name runtime externs (`nova_*`), together with their return types.
+- `builtins.zig` is the compile-time registry of builtin methods (`bytes.*`, `simd.*`, `console.*`), non-generic `mem` helpers, and bare-name runtime externs (`kyte_*`), together with their return types.
 - `ids.zig` is the ExprId assigner. It stamps every AST expression node with a stable, copy-surviving `ExprId` so side tables can be keyed by node identity rather than by pointer address.
 - `inst_disp.zig` is the instantiation-dispatch overlay. For each generic instance (struct, free fn, method) it records a TypeId overlay (`tp_resolve`, `expr_types_inst`, `owned_inst`) so ownership and type decisions inside generic bodies can be made from TypeIds instead of the old string engine.
 - `sema.zig` is the small `Sema` container: it owns the TypeStore, SymbolTable and TypedIr for a compilation, plus a TypeId to display-name cache.
@@ -25,7 +25,7 @@ None of these carry semantic meaning in their integer value beyond the `unassign
 
 **Role in the pipeline:** This is the P7 escape analysis described in `docs/design/p7-sound-arena.md`. Its job is to decide, for each owned heap allocation that is bound to a local variable, whether that allocation ESCAPES the function (is stored into a field, returned, passed to a callee whose parameter escapes, captured by a closure, and so on) or stays LOCAL. A LOCAL allocation is a candidate for arena or stack promotion; an escaping one must stay ARC-managed. The analysis runs in two stages: Stage 1 classifies each alloc site, Stage 2 replaces the crude rule "anything passed to any call escapes" with interprocedural summaries, so a call argument escapes only if the callee's matching parameter actually escapes.
 
-The analysis is currently **report-only**: it prints a one-line summary when `report_enabled` (driven by `NOVA_ESCAPE_REPORT`) is set, and returns `Stats`. It does not yet drive codegen. Soundness is the whole point: the default classification is ESCAPES, a name becomes LOCAL only when no escape route touches it, and every unresolved callee (trait dispatch, closures, extern, unknown names) is treated conservatively. So a wrong LOCAL, the only dangerous direction, cannot arise from a missing route.
+The analysis is currently **report-only**: it prints a one-line summary when `report_enabled` (driven by `KYTE_ESCAPE_REPORT`) is set, and returns `Stats`. It does not yet drive codegen. Soundness is the whole point: the default classification is ESCAPES, a name becomes LOCAL only when no escape route touches it, and every unresolved callee (trait dispatch, closures, extern, unknown names) is treated conservatively. So a wrong LOCAL, the only dangerous direction, cannot arise from a missing route.
 
 **Key types & data structures:**
 
@@ -38,7 +38,7 @@ The analysis is currently **report-only**: it prints a one-line summary when `re
 
 **Module-level state / constants:**
 
-- **`pub var report_enabled: bool = false`**. When true, `analyze` prints the summary line. Set by the driver from the `NOVA_ESCAPE_REPORT` environment gate.
+- **`pub var report_enabled: bool = false`**. When true, `analyze` prints the summary line. Set by the driver from the `KYTE_ESCAPE_REPORT` environment gate.
 - The fixpoint round cap is the literal `24` in `analyze` (see below).
 
 **Functions (source order):**
@@ -75,7 +75,7 @@ The analysis is currently **report-only**: it prints a one-line summary when `re
 
 ## `src/frontend/sema/alpha.zig` (265 lines)
 
-**Role in the pipeline:** This is the alpha-renamer. Nova allows `let` shadowing (a legal, deliberately supported feature, see the memory note nova-shadowing-alpha-lookup), so within one function body the same source name can denote two different variables. Later passes that key state by name would confuse them. The renamer walks each function, and whenever a `let` binding reuses a name already seen anywhere in the function, it rewrites that binding (and all references resolving to it) to a fresh unique name of the form `name$N`. Names that do not collide are left exactly as written.
+**Role in the pipeline:** This is the alpha-renamer. Kyte allows `let` shadowing (a legal, deliberately supported feature, see the memory note kyte-shadowing-alpha-lookup), so within one function body the same source name can denote two different variables. Later passes that key state by name would confuse them. The renamer walks each function, and whenever a `let` binding reuses a name already seen anywhere in the function, it rewrites that binding (and all references resolving to it) to a fresh unique name of the form `name$N`. Names that do not collide are left exactly as written.
 
 The renamer is scope-aware: it maintains a stack of scopes, each holding `src -> renamed` bindings, and `lookup` searches inner-to-outer. Function parameters, closure parameters, `for` loop bindings and `catch` error names are bound "plain" (registered as seen, never renamed themselves), while `let` bindings go through the renaming path. It mutates the AST in place: `ident` expressions are rewritten to the resolved name, and `let` statement name fields are overwritten.
 
@@ -114,7 +114,7 @@ The renamer is scope-aware: it maintains a stack of scopes, each holding `src ->
 
 ## `src/frontend/sema/builtins.zig` (268 lines)
 
-**Role in the pipeline:** This is the compile-time registry of everything the compiler treats as a builtin rather than as ordinary Nova source: receiver-qualified builtin methods (`bytes.alloc`, `simd.add4`, `console.log`), a couple of non-generic `mem` helpers, and the bare-name runtime externs (`nova_test_fail`, `nova_reactor_resume`, and so on). Each entry carries the return type as a small `Ret` enum, which `retType` maps to a real `TypeId` on demand. infer.zig consults `find`/`isReceiver`/`findExtern` to type these calls, and codegen lowers them (SIMD entries in particular lower directly to LLVM vector intrinsics).
+**Role in the pipeline:** This is the compile-time registry of everything the compiler treats as a builtin rather than as ordinary Kyte source: receiver-qualified builtin methods (`bytes.alloc`, `simd.add4`, `console.log`), a couple of non-generic `mem` helpers, and the bare-name runtime externs (`kyte_test_fail`, `kyte_reactor_resume`, and so on). Each entry carries the return type as a small `Ret` enum, which `retType` maps to a real `TypeId` on demand. infer.zig consults `find`/`isReceiver`/`findExtern` to type these calls, and codegen lowers them (SIMD entries in particular lower directly to LLVM vector intrinsics).
 
 The registry is a plain flat array searched linearly. That is fine because it is small and consulted at compile time only. Anything not in these tables is treated as ordinary user code.
 
@@ -131,7 +131,7 @@ The registry is a plain flat array searched linearly. That is fine because it is
   - `simd.*`: the explicit SIMD surface. f64x4 (`splat4`/`make4`/`load4`/`add4`/`sub4`/`mul4`/`div4`/`fma4` return `.vec4`, `sum4` returns `.double`, `store4` returns `.void_`). Integer vectors (FR-simd-L1): u8x16, u32x4, u64x2 families with splat/load/store/arith/logic/shift; `movemaskU8x16` collapses sign bits to an `.int`. `clmulU64x2` (FR-simd-L2) is the carryless multiply / GHASH accelerator returning `.vec_u64x2`; it is named with the `U64x2` suffix so codegen routes it through `compileIntSimd`. Codegen lowers each SIMD entry to native LLVM vector ops in `compileSimdCall`.
   - `mem.xorBytes`: the one non-generic `mem` builtin (returns `.void_`). The comment notes the generic `mem` builtins (load/store/rotl/rotr/ctz/clz/bswap) are typed by a special case in infer.zig, not this table, because they are generic.
   - `console.*`: `log`/`info`/`err`/`debug`, all `.void_`.
-- **`pub const externs = [_]Builtin{...}`**. Bare-name runtime functions (`receiver = ""`). Test harness hooks (`nova_test_*`, `nova_arc_audit_report`), process/args (`nova_exit`, `nova_arg_count`, `nova_arg_at`), float/bit helpers (`nova_f64_bits`, `nova_pg_be_f64`, `nova_pg_be_i64`, `nova_html_find_meta`), `nova_f64_sqrt` (lowered to the `llvm.sqrt.f64` intrinsic in codegen, not a runtime symbol, so `math.fsqrt` gets one hardware instruction), mutex/spinlock primitives, thread ids, and the whole reactor/coroutine surface (`currentCoro`, `coroSuspend`, `coroStart`, `nova_reactor_*`, `nova_mono_ms`, `nova_evfilt_user`, and so on), plus process spawn helpers. A comment records that the wolfSSL TLS externs were removed in M13 (TLS is pure Nova now).
+- **`pub const externs = [_]Builtin{...}`**. Bare-name runtime functions (`receiver = ""`). Test harness hooks (`kyte_test_*`, `kyte_arc_audit_report`), process/args (`kyte_exit`, `kyte_arg_count`, `kyte_arg_at`), float/bit helpers (`kyte_f64_bits`, `kyte_pg_be_f64`, `kyte_pg_be_i64`, `kyte_html_find_meta`), `kyte_f64_sqrt` (lowered to the `llvm.sqrt.f64` intrinsic in codegen, not a runtime symbol, so `math.fsqrt` gets one hardware instruction), mutex/spinlock primitives, thread ids, and the whole reactor/coroutine surface (`currentCoro`, `coroSuspend`, `coroStart`, `kyte_reactor_*`, `kyte_mono_ms`, `kyte_evfilt_user`, and so on), plus process spawn helpers. A comment records that the wolfSSL TLS externs were removed in M13 (TLS is pure Kyte now).
 
 **Functions:**
 
@@ -140,11 +140,11 @@ The registry is a plain flat array searched linearly. That is fine because it is
 - **`pub fn find(receiver, name) ?Builtin`**. Linear scan of `table` for an exact `(receiver, name)` pair. Returns the row or null.
 - **`pub fn retType(store: *types.TypeStore, r: Ret) !types.TypeId`**. Maps a `Ret` to a real interned `TypeId` by calling the matching store constructor (`voidT`, `intT`, `longT`, `ptrT`, `stringT`, `boolT`, `decimalT`, `doubleT`, `vecF64x4T`, `vecU8x16T`, `vecU32x4T`, `vecU64x2T`). This is the only function that touches the TypeStore; the tables themselves are pure data. Can error if the store's intern fails.
 
-The file also contains several `test` blocks (not part of the shipped surface) that pin the invariants above: `bytes.alloc` returns a pointer distinct from int and not owned, the address-yielding methods all agree, reads yield values and writes yield void, console is all void, the whole test harness is declared, retired externs (`nova_file_open`, `__i32_to_string`) do not resolve, and receiver recognition rejects unknowns.
+The file also contains several `test` blocks (not part of the shipped surface) that pin the invariants above: `bytes.alloc` returns a pointer distinct from int and not owned, the address-yielding methods all agree, reads yield values and writes yield void, console is all void, the whole test harness is declared, retired externs (`kyte_file_open`, `__i32_to_string`) do not resolve, and receiver recognition rejects unknowns.
 
 **Gotchas / invariants:** the tables are the single source of truth for builtin return types; adding a builtin means adding a row here (and, for SIMD, a codegen lowering). Generic `mem` builtins are the exception and live in infer.zig. Lookups are exact-match and linear, so receiver and name spelling must match exactly.
 
-**Cross-references:** infer.zig calls `find`/`isReceiver`/`findExtern`/`retType` to type builtin calls (and separately special-cases the generic `mem.*` builtins). codegen (`compileSimdCall`/`compileIntSimd`) lowers the SIMD entries; `nova_f64_sqrt` is lowered to an LLVM intrinsic rather than emitted as a call.
+**Cross-references:** infer.zig calls `find`/`isReceiver`/`findExtern`/`retType` to type builtin calls (and separately special-cases the generic `mem.*` builtins). codegen (`compileSimdCall`/`compileIntSimd`) lowers the SIMD entries; `kyte_f64_sqrt` is lowered to an LLVM intrinsic rather than emitted as a call.
 
 ---
 
@@ -184,7 +184,7 @@ The file's `test` blocks pin the contract: id 0 is never handed out (0 means una
 
 ## `src/frontend/sema/inst_disp.zig` (263 lines)
 
-**Role in the pipeline:** This is the instantiation-dispatch overlay, part of the string-engine-removal work. Nova monomorphizes generics, but ownership and type decisions inside a generic body were historically made by reconstructing type names as strings. This pass instead records, per concrete instance, a TypeId overlay so those decisions can be made from TypeIds. For each instance it does two things: record `tp_resolve[{type_param, inst_key}] = concrete_arg` (so a type parameter resolves to its concrete TypeId under a given instantiation), and walk the generic body recording `expr_types_inst` (the concrete type of each expression under this instance) and `owned_inst` (its ownership disposition). With these in place, `typeOfExprConcrete` and `isOwnedTypeId` become total inside generic bodies keyed by `current_instantiation_id`, so codegen no longer needs the string engine there.
+**Role in the pipeline:** This is the instantiation-dispatch overlay, part of the string-engine-removal work. Kyte monomorphizes generics, but ownership and type decisions inside a generic body were historically made by reconstructing type names as strings. This pass instead records, per concrete instance, a TypeId overlay so those decisions can be made from TypeIds. For each instance it does two things: record `tp_resolve[{type_param, inst_key}] = concrete_arg` (so a type parameter resolves to its concrete TypeId under a given instantiation), and walk the generic body recording `expr_types_inst` (the concrete type of each expression under this instance) and `owned_inst` (its ownership disposition). With these in place, `typeOfExprConcrete` and `isOwnedTypeId` become total inside generic bodies keyed by `current_instantiation_id`, so codegen no longer needs the string engine there.
 
 There are three entry points, one per kind of generic thing: struct instances (`run`), free generic function instances (`runFreeFns` / `recordFreeFnInst`), and generic method instances (`runMethods`). Struct T-params come from the receiver struct's args; method U-params come from the method owner's args; a method combines both under one key.
 
@@ -210,7 +210,7 @@ There are three entry points, one per kind of generic thing: struct instances (`
 
 **Gotchas / invariants:** every overlay is keyed by `(e.id, inst)`, so ids.zig must have run first. Struct instances use one owner; method instances use two (struct then method) and the order matters (`concreteOf` applies primary before secondary). The pass is a no-op for non-generic instances and fails soft (`catch continue`, `orelse return`) rather than erroring, because it is an overlay: a missing entry falls back to the non-instance decision, it does not corrupt anything. The B1 transitive free-fn path is intentionally not covered here.
 
-**Cross-references:** built directly on infer.zig's TypedIr (`recordTpResolve`, `recordOwnedInst`, `recordTypeInst`, `typeOf`), `subst.substitute`, and mono.zig's instance lists (`free_fn_insts`, `method_insts`). It is the seam described in the memory notes nova-string-engine-removal / nova-optimiser-emit-path: it lets codegen/types.zig and codegen ownership decisions read TypeIds inside generic bodies (`current_instantiation_id`) instead of parsing type-name strings.
+**Cross-references:** built directly on infer.zig's TypedIr (`recordTpResolve`, `recordOwnedInst`, `recordTypeInst`, `typeOf`), `subst.substitute`, and mono.zig's instance lists (`free_fn_insts`, `method_insts`). It is the seam described in the memory notes kyte-string-engine-removal / kyte-optimiser-emit-path: it lets codegen/types.zig and codegen ownership decisions read TypeIds inside generic bodies (`current_instantiation_id`) instead of parsing type-name strings.
 
 ---
 

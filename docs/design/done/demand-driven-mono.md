@@ -2,10 +2,10 @@
 
 ## Problem (measured, 2026-08-16)
 
-A plaintext-HTTP web app (`plancksystems/perf/compare/nova`) compiles **28,750** monomorphized
+A plaintext-HTTP web app (`plancksystems/perf/compare/kyte`) compiles **28,750** monomorphized
 functions. From the T6 partition log:
 
-- `list.nova` = 17,417 functions, `rawbuffer.nova` = 9,330 → **93% of the whole build**.
+- `list.ky` = 17,417 functions, `rawbuffer.ky` = 9,330 → **93% of the whole build**.
 - ~500 crypto/TLS functions (p256/p384/rsa/x25519/aes/sha512/full TLS stack) for an app that never
   opens a TLS socket.
 
@@ -40,7 +40,7 @@ entirely.
 
 ### Roots (seed the worklist) — soundness-critical, from the codegen map
 
-- **Entry:** `main` decl (native) OR every `@test` fn decl (`nova test`, `tester.zig:28-46`). Mode-dependent.
+- **Entry:** `main` decl (native) OR every `@test` fn decl (`kyte test`, `tester.zig:28-46`). Mode-dependent.
 - **Trait vtable slots (dynamic dispatch):** for every concrete type whose trait object is materialized
   (`constructTraitObject`/`getGlobalVTable:1650`), root ALL impl methods that can land in a vtable slot
   + slot-0 dtor. A method reachable only through `dyn` dispatch appears nowhere else.
@@ -67,11 +67,11 @@ serde/vtable/dtor rooting). Trait-object creation roots the concrete impl's vtab
 Filter `compiler.functions` between `collectFunctions` (`declarations.zig:52`) and the declaration loop
 (`:824`), keyed by the mangled `FunctionInfo.name` OR by the method decl's SymbolId carried alongside.
 Non-reachable, non-root functions are removed before any `LLVMAddFunction`/body emit. Everything the
-runtime provides (nova_* externs) is untouched.
+runtime provides (kyte_* externs) is untouched.
 
 ## Phasing (measure-first, corpus-gated)
 
-- **R0 — report-only shadow (`NOVA_REACH_SHADOW=1`).** Build the reachability walk + root set; compute
+- **R0 — report-only shadow (`KYTE_REACH_SHADOW=1`).** Build the reachability walk + root set; compute
   the reachable decl set; PRINT `total / reachable / would-drop` counts and the full would-drop list.
   Emit nothing differently. Manually audit the drop list for anything live (a vtable method, a binder).
   Proves the win size AND that the set is a safe superset before any behaviour change.
@@ -81,10 +81,10 @@ runtime provides (nova_* externs) is untouched.
 - **R2 — incremental follow-up (optional).** Finer partition granularity so the `List` partition is not
   one monolith (helps incremental rebuilds further). Not required for the headline win.
 
-## Status (2026-08-19) — SOUND, default-ON for `nova build`, corpus-gated
+## Status (2026-08-19) — SOUND, default-ON for `kyte build`, corpus-gated
 
-Implemented in `src/frontend/sema/reach.zig` (walk + gate). **`nova build`: default-ON** (`NOVA_REACH_OFF`
-is the escape hatch). `nova test`: default-OFF, `NOVA_REACH_ON` opt-in (`NOVA_REACH_SHADOW` reports without
+Implemented in `src/frontend/sema/reach.zig` (walk + gate). **`kyte build`: default-ON** (`KYTE_REACH_OFF`
+is the escape hatch). `kyte test`: default-OFF, `KYTE_REACH_ON` opt-in (`KYTE_REACH_SHADOW` reports without
 gating). The root design auto-roots **every free function + every method of a NON-generic struct** as walk
 seeds, so the walk is sound against edges `expr_syms` doesn't model (trait/vtable dispatch, address-taken
 serde binders, closures into higher-order fns). The gate then prunes only a **generic-struct non-constructor
@@ -97,17 +97,17 @@ Pruning such a method left the vtable slot pointing at a dropped function, so th
 at runtime (`307_generic_struct_impl_trait`, `364_generic_struct_trait_dispatch` compiled + linked, then
 `Test process terminated abnormally`). Fix: a generic struct with any trait impl is treated as NON-prunable,
 so all its methods are rooted (over-approximate, sound; only touches generic structs that actually implement
-a trait). This bug was invisible to the plain corpus because that runs `nova test` with the gate OFF, so a
-new gate leg now re-runs the whole corpus with `NOVA_REACH_ON=1` (`gate.sh`) to keep the gate honest.
+a trait). This bug was invisible to the plain corpus because that runs `kyte test` with the gate OFF, so a
+new gate leg now re-runs the whole corpus with `KYTE_REACH_ON=1` (`gate.sh`) to keep the gate honest.
 
-Measured on the pizza app (`plancksystems/perf/compare/nova`, `[T6]` partition):
+Measured on the pizza app (`plancksystems/perf/compare/kyte`, `[T6]` partition):
 
-| | functions | list.nova | rawbuffer.nova |
+| | functions | list.ky | rawbuffer.ky |
 |---|---|---|---|
 | default (gate off) | 28,750 | 17,417 | 9,330 |
 | gate on (sound)    | **12,468 (−57%)** | 4,355 (−75%) | 6,220 (−33%) |
 
-Soundness so far (direct `nova test`, gate on): all serde / trait-dispatch / closure / async / generic
+Soundness so far (direct `kyte test`, gate on): all serde / trait-dispatch / closure / async / generic
 / enum / ORM / reactor cases exercised pass. `conformance/run.sh` cannot certify on this box — its
 negative-classifier SELF-TEST fails environmentally (the crash self-test programs get SIGKILL'd with no
 output → classified UNKNOWN → "HARNESS INTEGRITY BROKEN"), IDENTICALLY with and without the gate, so it
@@ -120,5 +120,5 @@ Before default-on: broad direct-invocation batch green + `--asan` clean + a real
 - `conformance/run.sh -j` (positive corpus) + `conformance/run.sh --asan` both green post-R1.
 - Build-time + `[T6] function partition` total on the pizza app: before 28,750 → after (target: the
   reachable subset, expected 3-5x fewer). Report the measured delta, not a claim.
-- Guard: keep `NOVA_REACH_SHADOW` report + a `NOVA_REACH_OFF` escape hatch to fall back to
+- Guard: keep `KYTE_REACH_SHADOW` report + a `KYTE_REACH_OFF` escape hatch to fall back to
   emit-everything if a soundness gap is found in the field.

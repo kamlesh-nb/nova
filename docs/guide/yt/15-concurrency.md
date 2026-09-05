@@ -2,11 +2,11 @@
 
 - Chapter: [15-concurrency.md](../15-concurrency.md)
 - Estimated length: ~11 minutes
-- You will need: the `nova` compiler installed, a terminal, and the guide's `examples/` folder open
+- You will need: the `kyte` compiler installed, a terminal, and the guide's `examples/` folder open
 
 ## Hook (0:00)
 
-**Say:** In this video we will learn how Nova does concurrency. It has first-class `async` and `await`, compiled to real coroutines, so there is no callback soup and no green-thread library to import. By the end you will know how to launch work concurrently with `spawn`, join it with `await`, and hand values between tasks using channels. We will run two small programs that both finish cleanly.
+**Say:** In this video we will learn how Kyte does concurrency. It has first-class `async` and `await`, compiled to real coroutines, so there is no callback soup and no green-thread library to import. By the end you will know how to launch work concurrently with `spawn`, join it with `await`, and hand values between tasks using channels. We will run two small programs that both finish cleanly.
 
 ## What we will cover (0:25)
 
@@ -28,9 +28,9 @@
 **Say:** Let us see it in action. This program has a couple of small async functions, then launches three computations concurrently and combines them.
 
 **On screen:**
-```nova
-// examples/21_async.nova
-// Nova has first-class async/await built on LLVM coroutines.
+```kyte
+// examples/21_async.ky
+// Kyte has first-class async/await built on LLVM coroutines.
 //
 //   * `async fn f(): T`   : a function that may suspend; calling it yields a value
 //                           when awaited (or block-driven from a sync caller).
@@ -60,7 +60,7 @@ async fn sumOfSquares(a: int, b: int): int {
 **Say:** Now the interesting part, where we actually run things concurrently.
 
 **On screen:**
-```nova
+```kyte
 // Launch three async computations CONCURRENTLY with `spawn`, then await all three
 // and combine the results.
 async fn run(): int {
@@ -85,7 +85,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/21_async.nova -o out && ./out
+kyte examples/21_async.ky -o out && ./out
 ```
 
 ```
@@ -96,11 +96,11 @@ nova examples/21_async.nova -o out && ./out
 
 ## Segment: channels (7:30)
 
-**Say:** Returning a result is one pattern. Sometimes tasks need to hand values to one another as they go. For that Nova has async channels, in the `concurrency.asyncchan` module. The key behaviour is that a `chanRecv` parks the receiving task until a value is available, and it is woken by a `chanSend`. So producer and consumer coordination is deterministic: no polling, no sleeps.
+**Say:** Returning a result is one pattern. Sometimes tasks need to hand values to one another as they go. For that Kyte has async channels, in the `concurrency.asyncchan` module. The key behaviour is that a `chanRecv` parks the receiving task until a value is available, and it is woken by a `chanSend`. So producer and consumer coordination is deterministic: no polling, no sleeps.
 
 **On screen:**
-```nova
-// examples/22_channels.nova
+```kyte
+// examples/22_channels.ky
 // Channels let concurrent tasks hand values to one another. A producer task
 // `chanSend`s into the channel; a consumer `await chanRecv`s, parking until a
 // value is available and being woken by the send. This is deterministic: no
@@ -133,7 +133,7 @@ fn main(): void {
 
 **Run it:**
 ```
-nova examples/22_channels.nova -o out && ./out
+kyte examples/22_channels.ky -o out && ./out
 ```
 
 ```
@@ -144,7 +144,7 @@ received sum = 42
 
 ## Segment: the same runtime powers the server (9:45)
 
-**Say:** One last thing worth knowing. The same runtime underneath these examples powers Nova's HTTP server. Each connection is a coroutine, so a handler that `await`s some I/O yields the core to other connections instead of blocking a thread. The little vocabulary you just learned is the exact vocabulary that scales up to real servers.
+**Say:** One last thing worth knowing. The same runtime underneath these examples powers Kyte's HTTP server. Each connection is a coroutine, so a handler that `await`s some I/O yields the core to other connections instead of blocking a thread. The little vocabulary you just learned is the exact vocabulary that scales up to real servers.
 
 ## Recap (10:15)
 
@@ -158,4 +158,4 @@ received sum = 42
 
 ## Outro (10:50)
 
-**Say:** Next up we will look at serialization, turning Nova values into JSON and back. If this helped, a like or subscribe keeps the series going. See you in the next one.
+**Say:** Next up we will look at serialization, turning Kyte values into JSON and back. If this helped, a like or subscribe keeps the series going. See you in the next one.

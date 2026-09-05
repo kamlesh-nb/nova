@@ -1,7 +1,7 @@
 
-//! Hand-written lexer: the first stage of the Nova compiler front end.
+//! Hand-written lexer: the first stage of the Kyte compiler front end.
 //!
-//! This module turns raw Nova source text (a borrowed `[]const u8`) into a
+//! This module turns raw Kyte source text (a borrowed `[]const u8`) into a
 //! forward stream of [`Token`]s that the parser pulls one at a time via
 //! [`Lexer.nextToken`]. There is no separate token buffer: the lexer is a
 //! pull-based scanner holding a cursor into the source, so a whole file is
@@ -49,7 +49,7 @@
 
 const std = @import("std");
 
-/// The full set of lexical token kinds Nova recognises.
+/// The full set of lexical token kinds Kyte recognises.
 ///
 /// Members fall into four groups: `keyword_*` reserved words (produced only via
 /// [`tokenTypeFromKeyword`]), literal kinds ([`TokenType.integer`] ..

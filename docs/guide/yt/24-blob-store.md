@@ -2,7 +2,7 @@
 
 - Chapter: [24-blob-store.md](../24-blob-store.md)
 - Estimated length: ~10 minutes
-- You will need: Nova installed and the guide's `packages/nova-orchestrator` handy. Watching Video 23 on the orchestrator first is essential, since this is how its manifests get their binaries.
+- You will need: Kyte installed and the guide's `packages/nova-orchestrator` handy. Watching Video 23 on the orchestrator first is essential, since this is how its manifests get their binaries.
 
 ## Hook (0:00)
 
@@ -44,7 +44,7 @@ get(sha)         read, re-hash, return only if it matches
 has(sha)         validSha then exists
 ```
 
-**Say:** Blob bodies are ordinary Nova strings, which are length-prefixed and binary-safe, so a native binary round-trips through the file API with no text encoding in the way. On top of the raw store there is a naming layer, Registry, that maps app and version to a digest, so you can say shop version 1.4.0 is this digest, and later promote it to current.
+**Say:** Blob bodies are ordinary Kyte strings, which are length-prefixed and binary-safe, so a native binary round-trips through the file API with no text encoding in the way. On top of the raw store there is a naming layer, Registry, that maps app and version to a digest, so you can say shop version 1.4.0 is this digest, and later promote it to current.
 
 ## Segment: artifactd over HTTP (4:00)
 
@@ -53,9 +53,9 @@ has(sha)         validSha then exists
 **On screen:**
 ```sh
 artifactd
-# NOVA_ARTIFACT_ROOT   blobs + apps root   (default ./artifacts-store)
-# NOVA_ARTIFACT_TOKEN  deploy token        (empty = auth OFF, dev only)
-# NOVA_PORT            listen port         (default 8135)
+# KYTE_ARTIFACT_ROOT   blobs + apps root   (default ./artifacts-store)
+# KYTE_ARTIFACT_TOKEN  deploy token        (empty = auth OFF, dev only)
+# KYTE_PORT            listen port         (default 8135)
 
 PUT /artifacts/{sha}          201 stored, 200 present, 409 body != sha, 413 too big
 GET /artifacts/{sha}          the bytes, verified on read, 404 if absent

@@ -1,0 +1,79 @@
+
+import assert;
+import list;
+import string;
+import env;
+import metrics;
+import db;
+import postgres;
+import mysql;
+import mssql;
+import novadb;
+import mongodb;
+
+fn sqlRoundtrip(drv: Driver, connectionString: string, textType: string): string {
+    let conn = drv.connect(connectionString);
+    let none = List<DbValue>();
+    conn.exec("DROP TABLE IF EXISTS kyte_live_probe", none);
+    let c = conn.exec("CREATE TABLE kyte_live_probe (id INT, name " + textType + ")", none);
+    if (c.hasError()) { conn.close(); return "create: " + c.err.message; }
+    let i = conn.exec("INSERT INTO kyte_live_probe (id, name) VALUES (1, 'Alice')", none);
+    if (i.hasError()) { conn.close(); return "insert: " + i.err.message; }
+    let rs = conn.query("SELECT id, name FROM kyte_live_probe", none);
+    if (rs.hasError()) { conn.close(); return "select: " + rs.err.message; }
+    if (rs.rowCount() != 1) { conn.close(); return "expected 1 row, got " + metrics.numStr(rs.rowCount() as long); }
+    let r = rs.row(0);
+    let okId = r.getInt(0) == 1;
+    let okName = string.eql(r.getText(1), "Alice");
+    conn.exec("DROP TABLE kyte_live_probe", none);
+    conn.close();
+    if (!okId) { return "id mismatch"; }
+    if (!okName) { return "name mismatch"; }
+    return "";
+}
+
+fn skip(label: string, envVar: string): void {
+    console.log("  SKIP  " + label + " (set " + envVar + " to run live)");
+}
+
+@test
+fn live_postgres(): void {
+    let connectionString = env.get("KYTE_PG_DSN");
+    if (string.eql(connectionString, "")) { skip("postgres", "KYTE_PG_DSN"); return; }
+    let err = sqlRoundtrip(PgDriver(), connectionString, "TEXT");
+    assert.equalStr("", err);
+}
+
+@test
+fn live_mysql(): void {
+    let connectionString = env.get("KYTE_MYSQL_DSN");
+    if (string.eql(connectionString, "")) { skip("mysql", "KYTE_MYSQL_DSN"); return; }
+    let err = sqlRoundtrip(MyDriver(), connectionString, "VARCHAR(32)");
+    assert.equalStr("", err);
+}
+
+@test
+fn live_mssql(): void {
+    let connectionString = env.get("KYTE_MSSQL_DSN");
+    if (string.eql(connectionString, "")) { skip("mssql", "KYTE_MSSQL_DSN"); return; }
+    let err = sqlRoundtrip(MssqlDriver(), connectionString, "VARCHAR(32)");
+    assert.equalStr("", err);
+}
+
+@test
+fn live_btreedb(): void {
+    let connectionString = env.get("KYTE_BTREE_DSN");
+    if (string.eql(connectionString, "")) { skip("novadb", "KYTE_BTREE_DSN"); return; }
+    let err = sqlRoundtrip(KyteDriver(), connectionString, "TEXT");
+    assert.equalStr("", err);
+}
+
+@test
+fn live_mongodb(): void {
+    let connectionString = env.get("KYTE_MONGO_DSN");
+    if (string.eql(connectionString, "")) { skip("mongodb", "KYTE_MONGO_DSN"); return; }
+    let conn = MongoDriver().connect(connectionString);
+    let rs = conn.query("{\"ping\": 1}", List<DbValue>());
+    conn.close();
+    assert.isFalse(rs.hasError());
+}

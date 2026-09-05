@@ -1,17 +1,17 @@
 .{
-    .name = .nova,
+    .name = .kyte,
     .version = "0.1.0",
-    .fingerprint = 0xfae65c8f2150b029,
+    .fingerprint = 0xe0c8d5e4b7f7929d,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Vendored locally (deps/llvm-zig) so the toolchain has no GitHub-fetch
         // dependency and the LLVM link can be statically wired to the LLVM 22
-        // drop from build.zig (P5 #20, "deploy only nova").
+        // drop from build.zig (P5 #20, "deploy only kyte").
         .llvm = .{
             .path = "deps/llvm-zig",
         },
         // NOTE: there is no fetched LLVM mirror. A static build (`-Dstatic-llvm`) links a LOCAL LLVM
-        // pointed at by NOVA_LLVM_PREFIX (an installed apt/brew llvm-21, whose libLLVM*.a build.zig
+        // pointed at by KYTE_LLVM_PREFIX (an installed apt/brew llvm-21, whose libLLVM*.a build.zig
         // globs), or the hardcoded dev prefix. The former self-hosted `llvm-dist` GitHub mirror was
         // removed (the repo no longer exists); the CI release workflow installs LLVM 21 from the OS
         // package manager instead. See configureLlvmLink in build.zig and .github/workflows/release.yml.

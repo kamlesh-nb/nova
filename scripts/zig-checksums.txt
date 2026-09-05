@@ -1,5 +1,5 @@
 # Pinned Zig toolchain checksums (L4 reproducible builds).
-# Nova is pinned to the version in ../.zig-version; these are the official
+# Kyte is pinned to the version in ../.zig-version; these are the official
 # sha256sums of that release's tarballs from https://ziglang.org/download/index.json.
 # scripts/bootstrap-zig.sh fetches the host's tarball and verifies it against this list.
 # When moving the pin: bump .zig-version, build.zig `pinned_zig_version`, AND these lines.

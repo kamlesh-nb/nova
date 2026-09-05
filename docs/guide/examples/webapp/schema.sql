@@ -1,4 +1,4 @@
--- Schema for the PostgreSQL-backed build of the web app (main_postgres.nova). `run-live.sh` applies
+-- Schema for the PostgreSQL-backed build of the web app (main_postgres.ky). `run-live.sh` applies
 -- this file so the GET endpoint has a few rows to return on a fresh database.
 CREATE TABLE IF NOT EXISTS products (id INT PRIMARY KEY, name TEXT, price INT);
 

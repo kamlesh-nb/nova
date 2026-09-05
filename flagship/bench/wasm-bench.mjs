@@ -5,10 +5,10 @@ let memory, exports;
 const view = () => new DataView(memory.buffer);
 const u8 = () => new Uint8Array(memory.buffer);
 const p32 = (x) => Number((typeof x === 'bigint' ? x : BigInt(x)) & 0xffffffffn);
-const box = (v) => { const p = p32(exports.nova_bytes_alloc(8n)); view().setBigInt64(p, BigInt.asIntN(64, v), true); return BigInt(p); };
+const box = (v) => { const p = p32(exports.ky_bytes_alloc(8n)); view().setBigInt64(p, BigInt.asIntN(64, v), true); return BigInt(p); };
 const env = new Proxy({
-  nova_valopt_box: box,
-  nova_valopt_unbox: (bx) => { const p = p32(bx); return p ? view().getBigInt64(p, true) : 0n; },
+  kyte_valopt_box: box,
+  kyte_valopt_unbox: (bx) => { const p = p32(bx); return p ? view().getBigInt64(p, true) : 0n; },
 }, { get(t, k) { return t[k] ?? (() => 0n); } });
 const m = await WebAssembly.instantiate(b, { env });
 exports = m.instance.exports; memory = exports.memory;

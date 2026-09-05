@@ -1,6 +1,6 @@
 # 15. Concurrency
 
-Nova has first-class `async`/`await`, compiled to real coroutines (there is no callback soup and no
+Kyte has first-class `async`/`await`, compiled to real coroutines (there is no callback soup and no
 green-thread library to import). The vocabulary is small:
 
 - **`async fn f(): T`**: a function that may *suspend*. Its body can use `await` and `spawn`.
@@ -19,9 +19,9 @@ async program from a plain `main` without making `main` itself async.
 The example launches three async computations concurrently with `spawn`, awaits all three, and combines
 them, and it terminates:
 
-```nova
-// examples/21_async.nova
-// Nova has first-class async/await built on LLVM coroutines.
+```kyte
+// examples/21_async.ky
+// Kyte has first-class async/await built on LLVM coroutines.
 //
 //   * `async fn f(): T`   : a function that may suspend; calling it yields a value
 //                           when awaited (or block-driven from a sync caller).
@@ -73,13 +73,13 @@ Output:
 
 ## Channels
 
-For tasks that need to *hand values to one another* rather than just return a result, Nova has async
+For tasks that need to *hand values to one another* rather than just return a result, Kyte has async
 channels (`concurrency.asyncchan`). A `chanRecv` **parks** the receiving task until a value is available
 and is woken by a `chanSend`, so producer/consumer coordination is deterministic, with no polling and
 no sleeps:
 
-```nova
-// examples/22_channels.nova
+```kyte
+// examples/22_channels.ky
 // Channels let concurrent tasks hand values to one another. A producer task
 // `chanSend`s into the channel; a consumer `await chanRecv`s, parking until a
 // value is available and being woken by the send. This is deterministic: no
@@ -124,7 +124,7 @@ received sum = 42
 
 `spawn` is what makes the three `square`/`sumOfSquares` calls actually *concurrent*: awaiting them one
 by one only joins already-running tasks, it does not serialize them. The same runtime underneath powers
-Nova's HTTP server: each connection is a coroutine, so a handler that `await`s I/O yields the core to
+Kyte's HTTP server: each connection is a coroutine, so a handler that `await`s I/O yields the core to
 other connections instead of blocking a thread.
 
 Next: [Serialization](16-serialization.md)

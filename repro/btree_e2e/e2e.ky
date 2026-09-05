@@ -1,0 +1,25 @@
+import assert;
+import list;
+import string;
+import db;
+import novadb;
+
+@test
+fn btree_e2e_crud(): void {
+    let drv = KyteDriver();
+    let conn = drv.connect("127.0.0.1:3009");
+
+    conn.exec("CREATE TABLE kyte_e2e (id INT PRIMARY KEY, name TEXT, age INT)", List<DbValue>());
+    conn.exec("INSERT INTO kyte_e2e (id, name, age) VALUES (1, 'Alice', 25)", List<DbValue>());
+    conn.exec("INSERT INTO kyte_e2e (id, name, age) VALUES (2, 'Bob', 19)", List<DbValue>());
+
+    let rs = conn.query("SELECT id, name, age FROM kyte_e2e", List<DbValue>());
+    assert.equalInt(rs.rowCount(), 2);
+
+    let r0 = rs.row(0);
+    assert.equalInt(r0.getInt(0), 1);
+    assert.equalStr(r0.getText(1), "Alice");
+    assert.equalInt(r0.getInt(2), 25);
+
+    conn.close();
+}

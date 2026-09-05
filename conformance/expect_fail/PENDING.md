@@ -1,7 +1,7 @@
 # Pending negative tests (checks that SHOULD fail but don't yet)
 
 These document real soundness gaps. Each snippet **currently compiles** but *should* be a
-compile error. When the check lands, move the snippet into `expect_fail/` as a real `.nova`
+compile error. When the check lands, move the snippet into `expect_fail/` as a real `.ky`
 case with an `// EXPECT-FAIL: typecheck` directive — the harness then verifies it is rejected
 **for that reason**.
 
@@ -16,17 +16,17 @@ Do NOT put these in `expect_fail/` yet — they'd make the harness red (they com
 
 ## ✅ DONE — enforced, verified 2026-07-17
 
-- **Generic instantiation arity mismatch** → `generic_arity_mismatch.nova`
-- **Type args on a non-generic type** → `type_args_on_non_generic.nova`
-- **Duplicate type parameter names** → `duplicate_type_param.nova`
-- **Condition must be boolean** → `non_bool_condition.nova`
+- **Generic instantiation arity mismatch** → `generic_arity_mismatch.ky`
+- **Type args on a non-generic type** → `type_args_on_non_generic.ky`
+- **Duplicate type parameter names** → `duplicate_type_param.ky`
+- **Condition must be boolean** → `non_bool_condition.ky`
 - **Assignment (let-init) type mismatch** — `isTypeCompatible` is numeric⇄numeric only.
-- **Argument count mismatch** → `wrong_arg_count.nova`. *(Was documented "BLOCKED on namespaced
+- **Argument count mismatch** → `wrong_arg_count.ky`. *(Was documented "BLOCKED on namespaced
   resolution"; that is **stale** — F1 stage 3a's ambiguity-is-an-error check unblocked it and it
   now rejects with no stdlib false positives. Verified by running PENDING's own snippet.)*
-- **Constructor arg count** → `constructor_arg_count.nova`
+- **Constructor arg count** → `constructor_arg_count.ky`
 - **Narrowing / signedness / ptr truncation / int literal overflow / decimal** → their own cases.
-- **Return type mismatch** → `return_type_mismatch.nova`.
+- **Return type mismatch** → `return_type_mismatch.ky`.
   ⚠️ **This check REGRESSED and was repaired 2026-07-17.** `checkReturnType` exempted *every* int
   literal (`if (intLiteralValue(value) != null) return;`) so that `return 4000000000` from a `uint`
   fn could adapt — but the exemption was unconditional, so **`fn f(): string { return 42; }`
@@ -41,7 +41,7 @@ Do NOT put these in `expect_fail/` yet — they'd make the harness red (they com
 ✅ **The live SEGFAULT is FIXED.** `let s = l.get(5); let n = s.length;` on an absent optional
 used to read through address 0 and SEGV. It now ABORTS with
 `member access on an absent optional at <file>:<line>` — codegen guards a member deref whose
-object is optional-typed (specs §3.4, gated by `cases/38_optional_deref_guard.nova`; corpus
+object is optional-typed (specs §3.4, gated by `cases/38_optional_deref_guard.ky`; corpus
 ASAN-clean). See-through ergonomics (`xs.get(i).field`, commit 950495c) are kept; the guard is a
 no-op on present values.
 
@@ -51,7 +51,7 @@ branch-scoped rule (§3.4a: an early-exit `if (x==undefined) return;` does not n
 optionals become painful. These are the cases that should eventually be a compile error rather than
 a runtime trap:
 
-```nova
+```kyte
 let s: string | undefined = "hi";
 let x: string = s;                 // should ERROR: string | undefined is not string
 let n = takes(s);                  // should ERROR: passing optional where string expected
@@ -67,7 +67,7 @@ runtime-guarded (they do not deref), and are the remaining static-soundness work
 No `.tuple` case in `resolveExprType`; **`ls.names` — the destructuring field — is never read in
 `type_checker.zig`**, so destructured bindings are never registered and have no type.
 
-```nova
+```kyte
 fn divide(a: int, b: int): (int, string) { return (a / b, "err"); }
 @test
 fn t(): void {
@@ -86,7 +86,7 @@ Full detail: `docs/route-handling-via-mediator.md` §8.D.
 
 ## ✅ Null-coalesce present-path type reinterpret (`opt ?? Fallback().field`) — CHECK LANDED 2026-09-03
 
-Now enforced: `expect_fail/null_coalesce_scalar_reinterpret.nova`. The type checker rejects a
+Now enforced: `expect_fail/null_coalesce_scalar_reinterpret.ky`. The type checker rejects a
 `??` whose unwrapped-present type and fallback type are a scalar-vs-heap-aggregate mismatch (the
 pointer-as-scalar reinterpret shape), e.g. `Box | undefined ?? int`, with a diagnostic that also
 points at the usual cause: `.field`/`.method()` binding to the FALLBACK
@@ -100,7 +100,7 @@ through a reliable path (`leftTypeIsReliableForNc` excludes bare-name free-funct
 flat by-name table mis-resolves `parse(x)` across modules). Full corpus stayed 444/444.
 
 ## Private field access from outside the struct (F1 stage 4)
-```nova
+```kyte
 struct Secret { hidden: i32, init() { self.hidden = 5; } }
 @test
 fn t(): void {

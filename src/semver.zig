@@ -12,7 +12,7 @@
 //!      node-semver dialect used by npm and Cargo, i.e. `^`, `~`, comparators
 //!      (`>= > <= < =`), `x`/`*` wildcards, `a - b` hyphen ranges, and `||`
 //!      alternation. This is what a manifest writes when it depends on
-//!      `"nova-http@^1.2.0"`.
+//!      `"kyte-http@^1.2.0"`.
 //!
 //! It is deliberately allocation-free and dependency-free: everything works on
 //! borrowed `[]const u8` slices of the caller's text, and the only failure mode

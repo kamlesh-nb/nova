@@ -1,5 +1,5 @@
 
-#include "nova_abi.h"
+#include "kyte_abi.h"
 #include "runtime_str.h"
 #include <cerrno>
 #include <cstdio>
@@ -10,10 +10,10 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <mswsock.h> // WSAID_CONNECTEX / LPFN_CONNECTEX, for nova_wsa_connectex below
+#include <mswsock.h> // WSAID_CONNECTEX / LPFN_CONNECTEX, for kyte_wsa_connectex below
 #pragma comment(lib, "ws2_32.lib")
 using socklen_t = int;
-static inline int nova_close_fd(int fd) { return ::closesocket(fd); }
+static inline int kyte_close_fd(int fd) { return ::closesocket(fd); }
 #else
 #include <arpa/inet.h>
 #include <csignal>
@@ -27,7 +27,7 @@ static inline int nova_close_fd(int fd) { return ::closesocket(fd); }
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-static inline int nova_close_fd(int fd) { return ::close(fd); }
+static inline int kyte_close_fd(int fd) { return ::close(fd); }
 #endif
 
 #if defined(__linux__)
@@ -46,27 +46,27 @@ static inline int nova_close_fd(int fd) { return ::close(fd); }
 #endif
 #endif
 
-enum NovaIsoNs
+enum KyteIsoNs
 {
-  NOVA_NS_PID = 1,
-  NOVA_NS_MOUNT = 2,
-  NOVA_NS_UTS = 4,
-  NOVA_NS_IPC = 8,
-  NOVA_NS_NET = 16,
-  NOVA_NS_USER = 32,
+  KYTE_NS_PID = 1,
+  KYTE_NS_MOUNT = 2,
+  KYTE_NS_UTS = 4,
+  KYTE_NS_IPC = 8,
+  KYTE_NS_NET = 16,
+  KYTE_NS_USER = 32,
 };
 
 extern "C"
 {
 
-  // File and directory I/O (nova_file_*/nova_dir_*) was retired in M5: it now lives in Nova over
-  // the raw POSIX syscalls in os/sys (src/std/io/file.nova, src/std/io/dir.nova). The blocking socket
-  // layer moved to Nova over os/socket (M14.2); what remains here is process spawn. TLS is pure Nova.
+  // File and directory I/O (kyte_file_*/kyte_dir_*) was retired in M5: it now lives in Kyte over
+  // the raw POSIX syscalls in os/sys (src/std/io/file.ky, src/std/io/dir.ky). The blocking socket
+  // layer moved to Kyte over os/socket (M14.2); what remains here is process spawn. TLS is pure Kyte.
 
-  // Length of a Nova string (its 4-byte header at s-4). Shared with compress.cpp in the unity build.
+  // Length of a Kyte string (its 4-byte header at s-4). Shared with compress.cpp in the unity build.
   namespace
   {
-    inline int nova_str_len(const char *s)
+    inline int kyte_str_len(const char *s)
     {
       return s ? *reinterpret_cast<const int *>(s - 4) : 0;
     }
@@ -83,7 +83,7 @@ extern "C"
 
 #ifndef _WIN32
 
-  static std::vector<char *> nova_build_argv(const char *cmd, const char *args_str,
+  static std::vector<char *> kyte_build_argv(const char *cmd, const char *args_str,
                                              std::vector<std::string> &storage)
   {
     storage.clear();
@@ -113,10 +113,10 @@ extern "C"
     return argv;
   }
 
-  ProcessContext *nova_process_spawn(const char *cmd, const char *args_str)
+  ProcessContext *kyte_process_spawn(const char *cmd, const char *args_str)
   {
-    char *c_cmd = nova_to_cstr(cmd);
-    char *c_args = nova_to_cstr(args_str);
+    char *c_cmd = kyte_to_cstr(cmd);
+    char *c_args = kyte_to_cstr(args_str);
 
     int in_pipe[2] = {-1, -1};
     int out_pipe[2] = {-1, -1};
@@ -130,8 +130,8 @@ extern "C"
         ::close(out_pipe[0]);
       if (out_pipe[1] >= 0)
         ::close(out_pipe[1]);
-      nova_free_cstr(cmd, c_cmd);
-      nova_free_cstr(args_str, c_args);
+      kyte_free_cstr(cmd, c_cmd);
+      kyte_free_cstr(args_str, c_args);
       return nullptr;
     }
 
@@ -142,8 +142,8 @@ extern "C"
       ::close(in_pipe[1]);
       ::close(out_pipe[0]);
       ::close(out_pipe[1]);
-      nova_free_cstr(cmd, c_cmd);
-      nova_free_cstr(args_str, c_args);
+      kyte_free_cstr(cmd, c_cmd);
+      kyte_free_cstr(args_str, c_args);
       return nullptr;
     }
 
@@ -157,15 +157,15 @@ extern "C"
       ::close(out_pipe[0]);
       ::close(out_pipe[1]);
       std::vector<std::string> storage;
-      std::vector<char *> argv = nova_build_argv(c_cmd, c_args, storage);
+      std::vector<char *> argv = kyte_build_argv(c_cmd, c_args, storage);
       ::execvp(argv[0], argv.data());
       _exit(127);
     }
 
     ::close(in_pipe[0]);
     ::close(out_pipe[1]);
-    nova_free_cstr(cmd, c_cmd);
-    nova_free_cstr(args_str, c_args);
+    kyte_free_cstr(cmd, c_cmd);
+    kyte_free_cstr(args_str, c_args);
 
     ProcessContext *ctx = new ProcessContext{(long)pid, in_pipe[1], out_pipe[0], 0, false};
     return ctx;
@@ -245,10 +245,10 @@ extern "C"
     ::close(a->in_fd);
     ::close(a->out_fd);
 
-    if ((a->ns_flags & NOVA_NS_UTS) && a->hostname && a->hostname[0])
+    if ((a->ns_flags & KYTE_NS_UTS) && a->hostname && a->hostname[0])
       ::sethostname(a->hostname, std::strlen(a->hostname));
 
-    if (a->ns_flags & NOVA_NS_MOUNT)
+    if (a->ns_flags & KYTE_NS_MOUNT)
     {
       if (a->rootfs && a->rootfs[0])
       {
@@ -260,7 +260,7 @@ extern "C"
         ::mount("", "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
       }
 
-      if (a->ns_flags & NOVA_NS_PID)
+      if (a->ns_flags & KYTE_NS_PID)
         ::mount("proc", "/proc", "proc", 0, nullptr);
     }
 
@@ -276,15 +276,15 @@ extern "C"
   }
 #endif
 
-  ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_str, long ns_flags,
+  ProcessContext *kyte_process_spawn_isolated(const char *cmd, const char *args_str, long ns_flags,
                                               const char *rootfs, const char *hostname, int drop_caps,
                                               int no_new_privs, int seccomp_deny)
   {
 #if defined(__linux__)
-    char *c_cmd = nova_to_cstr(cmd);
-    char *c_args = nova_to_cstr(args_str);
-    char *c_rootfs = nova_to_cstr(rootfs);
-    char *c_host = nova_to_cstr(hostname);
+    char *c_cmd = kyte_to_cstr(cmd);
+    char *c_args = kyte_to_cstr(args_str);
+    char *c_rootfs = kyte_to_cstr(rootfs);
+    char *c_host = kyte_to_cstr(hostname);
 
     int in_pipe[2] = {-1, -1}, out_pipe[2] = {-1, -1};
     if (::pipe(in_pipe) != 0 || ::pipe(out_pipe) != 0)
@@ -299,28 +299,28 @@ extern "C"
         ::close(out_pipe[0]);
         ::close(out_pipe[1]);
       }
-      nova_free_cstr(cmd, c_cmd);
-      nova_free_cstr(args_str, c_args);
-      nova_free_cstr(rootfs, c_rootfs);
-      nova_free_cstr(hostname, c_host);
+      kyte_free_cstr(cmd, c_cmd);
+      kyte_free_cstr(args_str, c_args);
+      kyte_free_cstr(rootfs, c_rootfs);
+      kyte_free_cstr(hostname, c_host);
       return nullptr;
     }
 
     static thread_local std::vector<std::string> storage;
-    std::vector<char *> argv = nova_build_argv(c_cmd ? c_cmd : "", c_args, storage);
+    std::vector<char *> argv = kyte_build_argv(c_cmd ? c_cmd : "", c_args, storage);
 
     int clone_flags = SIGCHLD;
-    if (ns_flags & NOVA_NS_PID)
+    if (ns_flags & KYTE_NS_PID)
       clone_flags |= CLONE_NEWPID;
-    if (ns_flags & NOVA_NS_MOUNT)
+    if (ns_flags & KYTE_NS_MOUNT)
       clone_flags |= CLONE_NEWNS;
-    if (ns_flags & NOVA_NS_UTS)
+    if (ns_flags & KYTE_NS_UTS)
       clone_flags |= CLONE_NEWUTS;
-    if (ns_flags & NOVA_NS_IPC)
+    if (ns_flags & KYTE_NS_IPC)
       clone_flags |= CLONE_NEWIPC;
-    if (ns_flags & NOVA_NS_NET)
+    if (ns_flags & KYTE_NS_NET)
       clone_flags |= CLONE_NEWNET;
-    if (ns_flags & NOVA_NS_USER)
+    if (ns_flags & KYTE_NS_USER)
       clone_flags |= CLONE_NEWUSER;
 
     IsoChildArgs cargs{argv.data(), in_pipe[0], out_pipe[1], ns_flags,
@@ -342,19 +342,19 @@ extern "C"
       ::close(in_pipe[1]);
       ::close(out_pipe[0]);
       ::close(out_pipe[1]);
-      nova_free_cstr(cmd, c_cmd);
-      nova_free_cstr(args_str, c_args);
-      nova_free_cstr(rootfs, c_rootfs);
-      nova_free_cstr(hostname, c_host);
+      kyte_free_cstr(cmd, c_cmd);
+      kyte_free_cstr(args_str, c_args);
+      kyte_free_cstr(rootfs, c_rootfs);
+      kyte_free_cstr(hostname, c_host);
       return nullptr;
     }
 
     ::close(in_pipe[0]);
     ::close(out_pipe[1]);
-    nova_free_cstr(cmd, c_cmd);
-    nova_free_cstr(args_str, c_args);
-    nova_free_cstr(rootfs, c_rootfs);
-    nova_free_cstr(hostname, c_host);
+    kyte_free_cstr(cmd, c_cmd);
+    kyte_free_cstr(args_str, c_args);
+    kyte_free_cstr(rootfs, c_rootfs);
+    kyte_free_cstr(hostname, c_host);
 
     return new ProcessContext{(long)pid, in_pipe[1], out_pipe[0], 0, false};
 #else
@@ -364,11 +364,11 @@ extern "C"
     (void)drop_caps;
     (void)no_new_privs;
     (void)seccomp_deny;
-    return nova_process_spawn(cmd, args_str);
+    return kyte_process_spawn(cmd, args_str);
 #endif
   }
 
-  int nova_process_write_stdin(ProcessContext *ctx, const char *data)
+  int kyte_process_write_stdin(ProcessContext *ctx, const char *data)
   {
     if (!ctx || ctx->in_fd < 0 || !data)
       return -1;
@@ -379,7 +379,7 @@ extern "C"
     return (int)n;
   }
 
-  int nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len)
+  int kyte_process_read_stdout(ProcessContext *ctx, char *buf, int max_len)
   {
     if (!ctx || ctx->out_fd < 0 || !buf || max_len <= 0)
       return -1;
@@ -387,7 +387,7 @@ extern "C"
     return (int)n;
   }
 
-  int nova_process_wait(ProcessContext *ctx)
+  int kyte_process_wait(ProcessContext *ctx)
   {
     if (!ctx)
       return -1;
@@ -414,12 +414,12 @@ extern "C"
     return ctx->exit_code;
   }
 
-  long long nova_process_pid(ProcessContext *ctx)
+  long long kyte_process_pid(ProcessContext *ctx)
   {
     return ctx ? (long long)ctx->pid : 0;
   }
 
-  int nova_process_try_wait(ProcessContext *ctx)
+  int kyte_process_try_wait(ProcessContext *ctx)
   {
     if (!ctx)
       return -1;
@@ -444,14 +444,14 @@ extern "C"
     return ctx->exit_code;
   }
 
-  int nova_process_kill(ProcessContext *ctx, int sig)
+  int kyte_process_kill(ProcessContext *ctx, int sig)
   {
     if (!ctx || ctx->pid <= 0)
       return -1;
     return ::kill((pid_t)ctx->pid, sig) == 0 ? 0 : -1;
   }
 
-  void nova_process_free(ProcessContext *ctx)
+  void kyte_process_free(ProcessContext *ctx)
   {
     if (!ctx)
       return;
@@ -469,13 +469,13 @@ extern "C"
   }
 #else
 
-  ProcessContext *nova_process_spawn(const char *cmd, const char *args_str)
+  ProcessContext *kyte_process_spawn(const char *cmd, const char *args_str)
   {
     (void)cmd;
     (void)args_str;
     return nullptr;
   }
-  ProcessContext *nova_process_spawn_isolated(const char *cmd, const char *args_str, long ns_flags,
+  ProcessContext *kyte_process_spawn_isolated(const char *cmd, const char *args_str, long ns_flags,
                                               const char *rootfs, const char *hostname, int drop_caps,
                                               int no_new_privs, int seccomp_deny)
   {
@@ -489,69 +489,69 @@ extern "C"
     (void)seccomp_deny;
     return nullptr;
   }
-  int nova_process_write_stdin(ProcessContext *ctx, const char *data)
+  int kyte_process_write_stdin(ProcessContext *ctx, const char *data)
   {
     (void)ctx;
     (void)data;
     return -1;
   }
-  int nova_process_read_stdout(ProcessContext *ctx, char *buf, int max_len)
+  int kyte_process_read_stdout(ProcessContext *ctx, char *buf, int max_len)
   {
     (void)ctx;
     (void)buf;
     (void)max_len;
     return -1;
   }
-  int nova_process_wait(ProcessContext *ctx)
+  int kyte_process_wait(ProcessContext *ctx)
   {
     (void)ctx;
     return -1;
   }
-  long long nova_process_pid(ProcessContext *ctx)
+  long long kyte_process_pid(ProcessContext *ctx)
   {
     (void)ctx;
     return 0;
   }
-  int nova_process_try_wait(ProcessContext *ctx)
+  int kyte_process_try_wait(ProcessContext *ctx)
   {
     (void)ctx;
     return -1;
   }
-  int nova_process_kill(ProcessContext *ctx, int sig)
+  int kyte_process_kill(ProcessContext *ctx, int sig)
   {
     (void)ctx;
     (void)sig;
     return -1;
   }
-  void nova_process_free(ProcessContext *ctx) { (void)ctx; }
+  void kyte_process_free(ProcessContext *ctx) { (void)ctx; }
 #endif
-  WatcherContext *nova_fs_watcher_create(const char *path)
+  WatcherContext *kyte_fs_watcher_create(const char *path)
   {
     (void)path;
     return nullptr;
   }
-  const char *nova_fs_watcher_next_event(WatcherContext *ctx)
+  const char *kyte_fs_watcher_next_event(WatcherContext *ctx)
   {
     (void)ctx;
     return nullptr;
   }
-  void nova_fs_watcher_free_event(const char *ptr) { (void)ptr; }
-  void nova_fs_watcher_close(WatcherContext *ctx) { (void)ctx; }
+  void kyte_fs_watcher_free_event(const char *ptr) { (void)ptr; }
+  void kyte_fs_watcher_close(WatcherContext *ctx) { (void)ctx; }
 
 #ifdef _WIN32
   // Overlapped connect for the IOCP reactor.
   //
-  // This is the ONE piece of the Windows port that cannot be a Nova `extern("c")` binding, and the
+  // This is the ONE piece of the Windows port that cannot be a Kyte `extern("c")` binding, and the
   // reason is Winsock's own design rather than a preference: AcceptEx is a real export of mswsock.lib
   // and so binds by name, but ConnectEx is deliberately NOT exported — it is only reachable by asking
-  // a socket for its address at runtime via WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER). Nova's FFI
+  // a socket for its address at runtime via WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER). Kyte's FFI
   // binds named symbols and has no way to call a pointer obtained at runtime, so the WSAIoctl + the
-  // indirect call are done here and exposed under a stable name that Nova CAN bind.
+  // indirect call are done here and exposed under a stable name that Kyte CAN bind.
   //
   // The pointer is per-provider, not per-socket, so one resolution serves the process; the socket
   // argument to WSAIoctl is only used to pick the provider. Returns 0 when the connect is under way
   // (inline or pending — either way the completion lands on the port), -1 otherwise.
-  int nova_wsa_connectex(long long s, void *addr, int addrlen, void *overlapped)
+  int kyte_wsa_connectex(long long s, void *addr, int addrlen, void *overlapped)
   {
     static LPFN_CONNECTEX fn = nullptr;
     if (!fn)

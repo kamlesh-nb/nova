@@ -11,8 +11,8 @@ value. Use it for money and anywhere binary floating point would drift: with `fl
 - **No implicit conversion between `int` and `decimal`.** Mixing a bare `int` with a `decimal` is a *compile error*:
   always write the decimal literal (`2m`, not `2`). Convert an `int` explicitly when you need to.
 
-```nova
-// examples/18_decimal.nova
+```kyte
+// examples/18_decimal.ky
 // `decimal` is exact base-10 arithmetic (IEEE 754-2008 decimal128, BID). Use it
 // for money and anything where 0.1 + 0.2 must be EXACTLY 0.3. Literals take an
 // `m` suffix: `0.1m`, `9.99m`, `100m`. All of `+ - * / %` and the six

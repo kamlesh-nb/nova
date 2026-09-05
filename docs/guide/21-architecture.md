@@ -1,23 +1,23 @@
-# 21. How Nova works: architecture
+# 21. How Kyte works: architecture
 
-The earlier chapters showed Nova from the outside: the syntax you write and the behaviour you get.
-This chapter looks under the bonnet. It is not needed to write Nova, but it explains why the language
+The earlier chapters showed Kyte from the outside: the syntax you write and the behaviour you get.
+This chapter looks under the bonnet. It is not needed to write Kyte, but it explains why the language
 behaves the way it does, which helps when you are reasoning about performance, memory, or a tricky
-concurrency bug. Nothing here changes the surface language; it is the same Nova, seen from the
+concurrency bug. Nothing here changes the surface language; it is the same Kyte, seen from the
 implementer's side.
 
 ## Three languages, one toolchain
 
-Nova is built from three parts, each in the language that suits it best:
+Kyte is built from three parts, each in the language that suits it best:
 
-- **The compiler is written in Zig.** It reads your `.nova` files and lowers them, through LLVM, to a
+- **The compiler is written in Zig.** It reads your `.ky` files and lowers them, through LLVM, to a
   native binary. Zig was chosen for its simplicity and its direct, allocator-explicit control over
   memory, which matters in a compiler that manipulates large trees.
-- **The runtime is written in C++20.** It is the small library every Nova program links against: the
+- **The runtime is written in C++20.** It is the small library every Kyte program links against: the
   async scheduler, the network reactor, channels, and the memory primitives. C++ was chosen for its
   mature concurrency facilities and coroutines.
-- **The standard library is written in Nova itself.** Collections, strings, JSON and BSON, the HTTP and
-  web framework, the SQL layer, crypto and TLS: all of it is Nova compiled from source, not a foreign
+- **The standard library is written in Kyte itself.** Collections, strings, JSON and BSON, the HTTP and
+  web framework, the SQL layer, crypto and TLS: all of it is Kyte compiled from source, not a foreign
   binding. The language is expressive enough to write its own standard library, which is the best
   evidence that it is expressive enough for yours.
 
@@ -26,7 +26,7 @@ smaller, runtime-free surface, where the host supplies input and output.
 
 ## From source to binary
 
-A single `.nova` file travels through a fixed pipeline. Each stage hands a more precise representation
+A single `.ky` file travels through a fixed pipeline. Each stage hands a more precise representation
 to the next:
 
 1. **Lexer.** Turns the source text into tokens.
@@ -41,8 +41,8 @@ to the next:
    `List<int>` stores and loads real 32-bit integers, with no boxing.
 5. **Code generation.** The typed IR is lowered to LLVM IR, then to a native object file. LLVM does the
    machine-level optimisation and instruction selection.
-6. **Linking.** The object is linked against the runtime library into a final executable. Nova can do
-   this in-process (it can carry LLD, the LLVM linker, inside the compiler), so a delivered `nova`
+6. **Linking.** The object is linked against the runtime library into a final executable. Kyte can do
+   this in-process (it can carry LLD, the LLVM linker, inside the compiler), so a delivered `kyte`
    needs no external `clang` or system linker to produce a binary.
 
 Two representations of your program exist at once during a build: the front end merges the whole
@@ -52,7 +52,7 @@ program never uses.
 
 ### Honest primitives
 
-Nova's number types mean exactly what they say, because that is what maps cleanly onto the machine and
+Kyte's number types mean exactly what they say, because that is what maps cleanly onto the machine and
 onto LLVM. `int` is a 32-bit signed integer, `long` is 64-bit, and there is a distinct `ptr` type for
 raw addresses. This honesty matters at the boundary with the runtime: a heap address is 64 bits, so it
 must be held in a `long` or a `ptr`, never an `int`, or the top half is lost. You rarely touch this in
@@ -86,7 +86,7 @@ them, so `int | SomeIntLikeError` is never ambiguous about which side you are ho
 
 ## Memory management: ARC, not a garbage collector
 
-Nova manages memory with **automatic reference counting** (ARC), decided at compile time, not with a
+Kyte manages memory with **automatic reference counting** (ARC), decided at compile time, not with a
 tracing garbage collector. Chapter 13 covers this from the writing-code side; here is the mechanism.
 
 Every heap object carries an 8-byte header immediately before the data it hands you: a reference count
@@ -112,17 +112,17 @@ cores).
 
 ### Reference cycles
 
-Reference counting has one well-known limit, and Nova does not hide it: a **cycle** of strong
+Reference counting has one well-known limit, and Kyte does not hide it: a **cycle** of strong
 references is not collected. If object A holds a strong reference to B and B holds one back to A, their
 counts never reach zero, so the pair leaks when the rest of the program lets go of them. A tracing
 garbage collector would find and free such a cycle; ARC will not, because it only ever looks at a single
 object's count.
 
-Nova does not currently have a `weak` or `unowned` reference to break a cycle for you, so the
-responsibility is yours by construction. In practice this is rarely a problem for the workloads Nova
+Kyte does not currently have a `weak` or `unowned` reference to break a cycle for you, so the
+responsibility is yours by construction. In practice this is rarely a problem for the workloads Kyte
 targets, because the data has a clear owner: a request owns its handlers, a connection owns its buffers,
 a tree owns its nodes. The pattern is to keep ownership a one-way tree (parent owns child), and where a
-child needs to refer back up, hold the parent by something that is not a strong reference to a Nova
+child needs to refer back up, hold the parent by something that is not a strong reference to a Kyte
 object, an id, an index, or a value it can look the parent up by, rather than a second strong pointer
 that would close the loop. This is a real constraint, not a solved one, and it is called out here rather
 than left for you to discover.
@@ -150,15 +150,15 @@ part of the runtime. The backend is selected per platform:
 
 On a readiness backend the kernel tells the reactor when a socket can be read or written, and the
 runtime then does the transfer. On a completion backend (IOCP, io_uring) the runtime hands the kernel
-the operation and is told when it has finished. The runtime hides this difference so the same Nova code
+the operation and is told when it has finished. The runtime hides this difference so the same Kyte code
 runs on all of them; the design notes in the repository record the traps that live at that seam.
 
-On Linux the runtime carries **both** backends in the one `libnovacore.a`, and picks between them once
-per process at start-up: `epoll` is the default, and `io_uring` is opt-in via the `NOVA_REACTOR=uring`
+On Linux the runtime carries **both** backends in the one `libkytecore.a`, and picks between them once
+per process at start-up: `epoll` is the default, and `io_uring` is opt-in via the `KYTE_REACTOR=uring`
 environment variable. Even when you ask for `io_uring` the runtime still probes the running kernel first
 (the header being present says nothing about whether the kernel supports it, or whether it has been
 switched off administratively), and falls back to `epoll` if it is not available. Most deployments stay
-on the `epoll` default, which runs everywhere Nova runs.
+on the `epoll` default, which runs everywhere Kyte runs.
 
 On top of coroutines and the reactor sit the higher-level tools you actually reach for: `when_all` and
 `selectAny` to combine futures, channels to pass values between tasks, and an actor style built on
@@ -189,8 +189,8 @@ its synchronisation on the common path.
 ## The runtime library and self-contained delivery
 
 Everything the compiler needs at your program's link time is bundled: the C++ runtime is prebuilt into
-a single static library, `libnovacore.a`, and the compiler can link with LLD in-process. So a Nova
-toolchain is genuinely self-contained. On the machine that runs `nova build`, there is no requirement
+a single static library, `libkytecore.a`, and the compiler can link with LLD in-process. So a Kyte
+toolchain is genuinely self-contained. On the machine that runs `kyte build`, there is no requirement
 for a system `clang`, a system linker, or an installed LLVM: the compiler carries what it needs and
 links against the prebuilt runtime archive. The next chapter shows how those bundles are built, and how
 one machine can build them for another architecture.
@@ -203,7 +203,7 @@ If you want to read the implementation, the shape is:
   typed-IR passes: infer, monomorphise, ownership, lower).
 - `src/backend/` is the back end, including `codegen/` (the LLVM lowering).
 - `src/runtime/` is the C++ runtime (the scheduler and reactor, the memory primitives).
-- `src/lib/std/` is the standard library, in Nova.
+- `src/lib/std/` is the standard library, in Kyte.
 - `packages/` (at the repository root, beside `lang/`) holds the concrete database drivers, which plug
   into the standard library's database seam.
 

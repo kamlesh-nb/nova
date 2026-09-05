@@ -2,7 +2,7 @@
 
 **Status:** Proposed. Date: 2026-08-04. No code yet, this is the design of record for review.
 
-**Goal.** Make Nova's web framework mirror .NET MediatR point to point, as a real runtime framework
+**Goal.** Make Kyte's web framework mirror .NET MediatR point to point, as a real runtime framework
 that lives in the standard library, not in the compiler. The HTTP layer should only bind a request and
 call `mediator.send(request)`. The mediator picks the handler for that request type, runs the pipeline
 of behaviours around it, and returns the response. This matches ASP.NET Minimal API + MediatR:
@@ -37,9 +37,9 @@ and the `IPipelineBehavior<TReq,TResp>` chain from the DI container, per request
 
 ---
 
-## 2. The Nova constraint that shapes everything
+## 2. The Kyte constraint that shapes everything
 
-Nova has **no runtime reflection**, and generics are **monomorphised** (erased at runtime to i64 value
+Kyte has **no runtime reflection**, and generics are **monomorphised** (erased at runtime to i64 value
 words). So we cannot, at runtime, take a request object and reflect its type to find a handler the way
 MediatR does. Two facts save us:
 
@@ -54,7 +54,7 @@ MediatR does. Two facts save us:
 So the compiler's job shrinks to the **irreducible type-directed minimum**: per handler, emit a small
 adapter and a registration call; per route, emit a small endpoint that binds the request type and
 serialises the response type. Everything else (the registry, `send`, the pipeline, DI, scopes,
-ordering) is ordinary Nova in the stdlib, where it can be read, tested, and evolved.
+ordering) is ordinary Kyte in the stdlib, where it can be read, tested, and evolved.
 
 ---
 
@@ -62,7 +62,7 @@ ordering) is ordinary Nova in the stdlib, where it can be read, tested, and evol
 
 All in `web` / a new `mediator` stdlib module, none in the compiler.
 
-| MediatR | Nova | Shape |
+| MediatR | Kyte | Shape |
 |---|---|---|
 | `IRequest<TResponse>` | `Request<TResponse>` | marker trait on a request struct, declares its response type |
 | `IRequestHandler<TRequest,TResponse>` | `RequestHandler<TRequest,TResponse>` | `async fn handle(self, req: TRequest): TResponse` |
@@ -70,7 +70,7 @@ All in `web` / a new `mediator` stdlib module, none in the compiler.
 | `IServiceProvider` scope | `ServiceScope` | one per `send`, so handler + behaviours share scoped services |
 | `ISender.Send` | `Mediator.send<TReq,TResp>(req): TResp` | runtime dispatch |
 
-```nova
+```kyte
 @serializable struct GetUserById impl Request<UserDto> { pub id: int }
 
 struct GetUserByIdHandler impl RequestHandler<GetUserById, UserDto> {
@@ -106,14 +106,14 @@ Mediator {
 `HandlerAdapter` is the type-erased executor for one handler. It is a trait object so the map can hold
 adapters for many request types uniformly:
 
-```nova
+```kyte
 trait HandlerAdapter {
     // req and the return travel as erased value words; the concrete adapter casts.
     async fn execute(self, req: <erased>, scope: ServiceScope): <erased>;
 }
 ```
 
-**This erased carrier is the one hard mechanism to nail down** (section 7). Because Nova trait dispatch
+**This erased carrier is the one hard mechanism to nail down** (section 7). Because Kyte trait dispatch
 is already fully type-erased (every value is an i64 word), a compiler-generated
 `GetUserByIdHandler__Adapter impl HandlerAdapter` can take the erased request word, treat it as
 `GetUserById`, resolve `GetUserByIdHandler` from the scope, `await handle(req)`, and return the
@@ -122,7 +122,7 @@ guarantees the adapter and the caller agree on the concrete types.
 
 ### 4.2 `send`
 
-```nova
+```kyte
 async fn send<TReq, TResp>(self: Mediator, req: TReq): TResp {
     let key   = serde.typeName<TReq>();
     let scope = self.provider.createScope();          // one scope per send (per request)
@@ -140,11 +140,11 @@ The pipeline (`runPipeline`, `Next`) is the machinery we already built and teste
 changes from "compiler-baked dispatch" to "resolved handler adapter". Behaviours stay ordered and can
 short-circuit or wrap, and now they share `scope` with the handler.
 
-### 4.3 Registration (compiler-generated, but ordinary Nova)
+### 4.3 Registration (compiler-generated, but ordinary Kyte)
 
 The compiler scans `impl RequestHandler<Q,R>` and emits one visible function:
 
-```nova
+```kyte
 // <generated>, but real registration, not baked dispatch
 fn __registerHandlers(m: Mediator): void {
     m.register("GetUserById", GetUserByIdHandler__Adapter{});
@@ -210,7 +210,7 @@ The validation **behaviour** is generic and registered once. The validation **ru
 `AddValidatorsFromAssembly`). The generic behaviour resolves the validator for the current request by
 its type key and short-circuits on failure.
 
-```nova
+```kyte
 // Per-type rules, auto-discovered by the compiler (scan impl Validator<T>):
 struct CreateProductValidator impl Validator<CreateProduct> {
     fn validate(self, cmd: CreateProduct): List<string> {
@@ -251,7 +251,7 @@ For the rare genuinely per-request-type behaviour, the request opts in with a **
 single generic behaviour acts only when the request carries it. This is MediatR's marker-interface
 idiom (`request is ICacheable`) and keeps registration to one `useBehavior`, no per-type wiring:
 
-```nova
+```kyte
 // Marker: this request's response may be cached.
 trait Cacheable {}
 @serializable struct GetProductById impl Request<ProductDto>, Cacheable { pub id: int }
@@ -282,7 +282,7 @@ settled how, empirically:
 
 **What does NOT work:**
 - `any` as the carrier: it **corrupts** a heap struct on the round trip (the open `any`-ownership hole,
-  memory `nova-any-ownership-model`).
+  memory `kyte-any-ownership-model`).
 - Inline `x as Message` upcast: **crashes**.
 - Generic widen `fn box<T>(x: T): Message { return x }`: **type error** (no widening of an unconstrained
   `T`). Trait bounds `<T: Message>` **do not parse** (unsupported syntax).
@@ -299,7 +299,7 @@ settled how, empirically:
 - The runtime `send` is **non-generic**: `send(req: Message, key: string): Response`. It looks up the
   registered adapter by `key`, opens a scope, runs the pipeline with the adapter as terminal, returns a
   `Response`.
-- The **compiler generates the tiny per-type glue** where concrete types are needed, all ordinary Nova:
+- The **compiler generates the tiny per-type glue** where concrete types are needed, all ordinary Kyte:
   - per handler `impl RequestHandler<Q,R>`: an adapter `Q__Adapter impl HandlerAdapter` whose
     `execute(req: Message, scope)` does `let q = req as Q` (concrete downcast, works), builds the
     handler from the scope (DI), `await handle(q)`, and serialises `R` to a `Response`; plus a
@@ -362,7 +362,7 @@ map".
    ergonomics.
 3. **Runtime `Mediator`**: registry, `send`, scope-per-send, reuse the existing pipeline/`Next`.
 4. **Compiler:** replace baked dispatch generation with adapter + `__registerHandlers` generation
-   (much smaller, and it emits ordinary Nova). Endpoint glue calls `send`.
+   (much smaller, and it emits ordinary Kyte). Endpoint glue calls `send`.
 5. **HTTP layer:** `app.get<T>` binds + `send` + serialise; `App` exposes `app.mediator` for direct
    `send`.
 6. **Behaviours:** port validation (per-type validator), transaction (scoped), exception, logging.

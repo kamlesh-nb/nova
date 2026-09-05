@@ -1,6 +1,6 @@
 // Scalar N-body (Computer Language Benchmarks Game), faithful to the reference Go 1.go algorithm.
 // Portable (no x86 AVX intrinsics), so it runs on arm64 and is apples-to-apples with the scalar
-// Go/Rust/Nova versions in this comparison.
+// Go/Rust/Kyte versions in this comparison.
 using System;
 using System.Globalization;
 

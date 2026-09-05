@@ -1,0 +1,49 @@
+import assert;
+import bytes;
+import os.sys;
+import net.poller;
+
+async fn echoOnce(r: poller.Reactor, fd: int): void {
+    r.addRead(fd, currentCoro());
+    coroSuspend();
+    let buf = r.getBuffer();
+    let n = sys.read(fd, buf, 4096);
+    if (n > 0) {
+        sys.write(fd, buf, n);
+    }
+    r.putBuffer(buf);
+}
+
+@test
+fn test_coroutine_reactor_echo(): void {
+    let (client, server) = sys.newSocketPair(sys.AF_UNIX, sys.SOCK_STREAM);
+    let r = poller.Reactor(16, 4096, 8);
+
+    let h = coroStart(echoOnce(r, server));
+    assert.isTrue(h != 0);
+
+    let out = bytes.alloc(4);
+    bytes.write_byte(out, 0, 112);
+    bytes.write_byte(out, 1, 105);
+    bytes.write_byte(out, 2, 110);
+    bytes.write_byte(out, 3, 103);
+    assert.isTrue(sys.write(client, out, 4) == 4);
+
+    let n = r.poll(1000);
+    assert.equalInt(n, 1);
+    let tok = r.readyToken(0);
+    assert.isTrue(tok != 0);
+    let done = kyte_reactor_resume(tok);
+    assert.equalInt(done as int, 1);
+
+    let inb = bytes.alloc(16);
+    assert.isTrue(sys.read(client, inb, 16) == 4);
+    assert.equalInt(bytes.read_byte(inb, 0) as int, 112);
+    assert.equalInt(bytes.read_byte(inb, 3) as int, 103);
+
+    bytes.free(out);
+    bytes.free(inb);
+    assert.equalInt(sys.close(client), 0);
+    assert.equalInt(sys.close(server), 0);
+    r.destroy();
+}

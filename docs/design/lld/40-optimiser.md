@@ -1,6 +1,6 @@
-# Low-Level Design: the Nova optimiser middle-end (`src/optimiser/` + the LIR emit path)
+# Low-Level Design: the Kyte optimiser middle-end (`src/optimiser/` + the LIR emit path)
 
-This chapter is a file-by-file, function-by-function reference for the Nova middle-end: the three-tier
+This chapter is a file-by-file, function-by-function reference for the Kyte middle-end: the three-tier
 HIR / MIR / LIR pipeline, the lowering chain that feeds it, the pass pipeline that optimises it, and the
 one backend module that turns the optimised IR into LLVM directly. It is written for a maintainer who is
 new to the code and wants to be productive without reverse-engineering the whole thing first. It documents
@@ -19,7 +19,7 @@ most important thing to understand before touching this code.
 
 **The three tiers.** Each is a strict lowering of the one above it:
 
-- **HIR** (`hir.zig`) is a typed, desugared tree stored in a flat node table. It is the AST with Nova sugar
+- **HIR** (`hir.zig`) is a typed, desugared tree stored in a flat node table. It is the AST with Kyte sugar
   removed (`for`, `switch`, `?.`, `??`, string interpolation, ternary all lower to explicit `if` / `loop` /
   compare forms) and, as ownership threading matures, explicit `retain` / `release` nodes. It is still a tree
   because desugaring reads most naturally as a structural rewrite.
@@ -42,11 +42,11 @@ holds the pipeline array, in dependency order: `mem2reg`, `constfold`, `copyprop
 **Two modes: the M0-M5 shadow versus the emit half.** These share the tiers and the passes but differ in
 what they produce.
 
-- The **shadow** (`driver.lowerProgramShadow`, gated by `NOVA_OPT` in the build path) lowers every function
+- The **shadow** (`driver.lowerProgramShadow`, gated by `KYTE_OPT` in the build path) lowers every function
   through all four tiers, runs the passes, and reports coverage. It does NOT emit anything: the AST backend
   still produces the program. Its job is to prove the machinery is correct and measure how much of the corpus
-  it covers. This is milestones M0 (scaffold) through M5 (inline), all landed and firing behind `NOVA_OPT`.
-- The **emit half** (`backend/codegen/lir_emit.zig`, gated by the SEPARATE `NOVA_OPT_EMIT`) actually emits an
+  it covers. This is milestones M0 (scaffold) through M5 (inline), all landed and firing behind `KYTE_OPT`.
+- The **emit half** (`backend/codegen/lir_emit.zig`, gated by the SEPARATE `KYTE_OPT_EMIT`) actually emits an
   LLVM function body from the optimised MIR. This is milestone M6, in progress. It is a per-function FALLBACK:
   `tryEmit` returns false for anything outside a provable subset, and codegen then emits that function from
   the AST unchanged. So nothing regresses; only functions the emitter can prove it handles take the new path.
@@ -220,7 +220,7 @@ contract between the lowering, the passes, and the emitter, and the free helpers
     layout from the object's threaded TypeId (a string indexes a byte with zext; an array GEPs the i64-word
     element). Float-element arrays are rejected downstream.
   - **`tuple_new: {args}`** -- tuple construction `(a, b, ...)`: a positional heap aggregate, N i64 words
-    (`nova_bytes_alloc`), element k at offset `k*8`, each arg stored as the raw i64 word. Distinct from
+    (`kyte_bytes_alloc`), element k at offset `k*8`, each arg stored as the raw i64 word. Distinct from
     `struct_new` because a tuple has no named struct / field names; the layout is purely positional. The emit
     path gates it to all-scalar element tuples (owned-element tuples need element ARC + a tuple destructor).
   - **`template: {parts}`** -- string interpolation. Carries the ORDERED part values; every part is a `string`
@@ -326,7 +326,7 @@ fold -> DCE -> simplify cycle.
 
 **Role in the pipeline.** The middle-end entry point. It owns the pass pipeline array, the per-function
 `optimise` routine, and the whole-program SHADOW (`lowerProgramShadow`) that `builder.zig` calls under
-`NOVA_OPT`. The emit path calls `optimise` directly on its one function; it does not use `lowerProgramShadow`.
+`KYTE_OPT`. The emit path calls `optimise` directly on its one function; it does not use `lowerProgramShadow`.
 
 **Module-level state / constants.**
 
@@ -625,7 +625,7 @@ the mapping so downstream uses see the constant. dce then removes the now-dead f
 - **`fn run(allocator, func) !bool`** (the `pass.run`) -- allocates a `konst` map (Value -> known constant),
   then does a single forward sweep. On a `const_int` it records the value; on a `binop` with both operands
   known AND not a float (checked on the result type AND both operand types via `mir.isFloatTy`), it folds via
-  `fold`, then WRAPS the result to the result type's width via `mir.wrapToWidth` (width-honesty: Nova's `int`
+  `fold`, then WRAPS the result to the result type's width via `mir.wrapToWidth` (width-honesty: Kyte's `int`
   is 32-bit; folding at i64 would miscompile a chained overflow like `(2e9 + 2e9) >> 20`). If the width is
   unknown (no store / not an int prim, e.g. a bool compare result) it leaves the raw fold (already 0/1).
   Rewrites the instruction op to `const_int`.
@@ -793,7 +793,7 @@ so it is ready.
 
 **Role in the pipeline.** The LIR->LLVM emitter, i.e. the emit half (M6). For a candidate function it lowers
 AST -> HIR -> MIR, runs the optimiser, and emits LLVM DIRECTLY from the optimised MIR, so the ARC-elision /
-fold / inline actually reach the binary. It is gated behind `NOVA_OPT_EMIT` (separate from the `NOVA_OPT`
+fold / inline actually reach the binary. It is gated behind `KYTE_OPT_EMIT` (separate from the `KYTE_OPT`
 shadow) and is a strict per-function FALLBACK: `tryEmit` returns false for anything outside the emittable
 subset and codegen emits that function from the AST. Nothing regresses; only provably-correct functions take
 the new path. This one file holds the entire admission policy (the gates) and the entire emission (the LLVM
@@ -801,9 +801,9 @@ per op).
 
 **Module-level state / constants.**
 
-- **`pub var emit_enabled: bool = false`** -- set from `NOVA_OPT_EMIT` in `builder.zig` (and, since the
+- **`pub var emit_enabled: bool = false`** -- set from `KYTE_OPT_EMIT` in `builder.zig` (and, since the
   vacuous-gate fix, `tester.zig`). Off by default, so default builds are byte-identical.
-- **`pub var emit_verbose: bool = false`** -- set from `NOVA_OPT_EMIT_VERBOSE`; logs each function taken (and
+- **`pub var emit_verbose: bool = false`** -- set from `KYTE_OPT_EMIT_VERBOSE`; logs each function taken (and
   each reject reason) for proof-of-fire.
 - **`const Callee = struct { fn_val, fn_type }`**, **`const IntKind = struct { width: u32, signed: bool,
   is_bool: bool }`**, **`const IndexKind = enum { string, array_word }`**, **`const StructDropKind = enum {
@@ -878,7 +878,7 @@ per op).
   and f32 ARRAYS keep real 32-bit storage and still fall back.
 - **`fn resolveCallee(compiler, name, nargs) ?Callee`** (private) -- resolves a direct call by source name to an
   LLVM function, but ONLY if its signature is ALL-WORD: `nargs` word (i64) params and a word or void return.
-  Nova passes every non-array param as the i64 word, so such a call needs no coercion. Anything else (array=ptr
+  Kyte passes every non-array param as the i64 word, so such a call needs no coercion. Anything else (array=ptr
   params, wider / narrower ABI, varargs, arg-count mismatch) -> null (fall back).
 - **`fn isStringTid` / `fn isArrayWordTid` / `fn isScalarTupleTid`** (private) -- type classifiers. `isStringTid`
   = the `string` primitive (an ARC heap pointer whose release needs no destructor, so the one owned type
@@ -924,10 +924,10 @@ per op).
   with a null dtor).
 - **`fn stringFieldStructDropKind(compiler, tid) ?StructDropKind`** (private, D3) -- classifies a struct whose
   owned fields are ALL bare strings (every field scalar or `string`). Returns `.heap` (a class / escaping
-  struct: `nova_release(ptr, __destruct_*)`) or `.value` (a value struct: `dropValueStruct` calls
+  struct: `kyte_release(ptr, __destruct_*)`) or `.value` (a value struct: `dropValueStruct` calls
   `__destruct_*` directly on the inline storage, no free), or null (any other owned field kind -> fall back).
   KEY finding: a plain `struct` is a VALUE struct in this build, so a string-field struct is usually dropped
-  via `dropValueStruct`, not `nova_release`.
+  via `dropValueStruct`, not `kyte_release`.
 - **`fn isConstStrResult(mf, v) bool`** (private) -- true if `v` is a `const_str` (an immortal interned
   literal). A literal moved into a struct's string field needs NO retain, so construction with const_str string
   fields is admitted; a non-literal (named) string field would need a retain and falls back.
@@ -948,7 +948,7 @@ per op).
   undefined` renders as `string`), which is exactly why B6's string-optional params were not emitting. A value
   optional returns null.
 - **`fn isValueOptionalTid(compiler, tid) bool`** (private) -- true if `tid` is a store `.optional` that is NOT
-  a reference optional, i.e. a BOXED value optional. The AST boxes it (`nova_valopt_box`) so a present 0 is
+  a reference optional, i.e. a BOXED value optional. The AST boxes it (`kyte_valopt_box`) so a present 0 is
   distinguishable from absent; the emit path has no boxing and would flow the raw word (a miscompile). Gating
   on the TYPE here catches a value optional arriving via a typed local or a call result, which the whole-
   function HIR `.undefined` guard misses.
@@ -994,7 +994,7 @@ per op).
     (`callTargetsValueOptionalParam`, cannot box).
   - **`struct_new`** -- the struct must be known and FULLY initialised (every declared field supplied, so
     zero-init is never relied on); every field must be scalar, OR a bare `string` field whose arg is a
-    `const_str` literal (moved in, no retain). Holds for both a heap struct (released via `nova_release` + real
+    `const_str` literal (moved in, no retain). Holds for both a heap struct (released via `kyte_release` + real
     `__destruct_`) and a value struct (inline stack bytes, `dropValueStruct`).
   - **`tuple_new`** -- the result must be a scalar tuple and every element a scalar int / bool.
   - **`field_get` / `field_set`** -- the base must be a known struct and the field scalar (reads / writes work
@@ -1037,7 +1037,7 @@ per op).
     `LLVMBuildStore(val, addr)`.
   - **`cast`** -- `canonicalizeInt(src, width, signed)` to the RESULT width (an int<-long cast truncates).
   - **`struct_new`** -- `getTypeSize`, then a value struct uses `buildValueStructStorage` and a heap struct
-    `compileAlloc(nova_bytes_alloc)`; each field is stored at `base + getFieldOffset`, inttoptr to the field's
+    `compileAlloc(kyte_bytes_alloc)`; each field is stored at `base + getFieldOffset`, inttoptr to the field's
     real LLVM type, `castFromValType` the word, store. Reuses the SAME layout + cast helpers as the AST.
   - **`tuple_new`** -- `compileAlloc(N*8)`, each element word stored at `base + k*8` via inttoptr to `ptr_type`.
   - **`field_get`** -- `base + getFieldOffset`, inttoptr to the field type, `LLVMBuildLoad2`, then

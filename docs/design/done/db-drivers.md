@@ -1,4 +1,4 @@
-# Designing High-Performance Database Drivers in Nova
+# Designing High-Performance Database Drivers in Kyte
 
 > ## ⛔ STATUS 2026-07-17 — DEFERRED, AND NOT BUILDABLE AS WRITTEN. READ THIS FIRST.
 >
@@ -27,7 +27,7 @@
 > ### ⚠️ §0's constraint list is STALE — all three scares are FIXED (measured 2026-07-17)
 > | §0 claim | Reality |
 > |---|---|
-> | "Nova Maps crash with a SIGBUS if they grow past their initial load factor" | **FIXED.** 5000 keys from a presize of 8, many resizes → clean. |
+> | "Kyte Maps crash with a SIGBUS if they grow past their initial load factor" | **FIXED.** 5000 keys from a presize of 8, many resizes → clean. |
 > | "`${value}` crashes with a SIGSEGV at runtime" for i64/f64 | **FIXED** (`5cf9a14`). Both fine. |
 > | "`let f = self.hashFn; (f)(key) // CRASH!`" | **FIXED.** Bare fns and lambdas share one representation (specs §10 #18). |
 >
@@ -36,9 +36,9 @@
 > exist*. Do not plan against it. (The real blockers are the error model, raw-byte crypto for auth, and
 > mid-stream TLS negotiation — see the plan.)
 
-This document describes the architectural specifications and concrete designs for high-performance database drivers (**PostgreSQL**, **MySQL**, **MSSQL (TDS)**, and **MongoDB**) using the Nova programming language. 
+This document describes the architectural specifications and concrete designs for high-performance database drivers (**PostgreSQL**, **MySQL**, **MSSQL (TDS)**, and **MongoDB**) using the Kyte programming language. 
 
-Nova is a compiled, statically typed language featuring Automatic Reference Counting (ARC), explicit `self` struct method semantics, and a Boost.Asio-backed stackless coroutine scheduler (`async`/`await`/`go`). 
+Kyte is a compiled, statically typed language featuring Automatic Reference Counting (ARC), explicit `self` struct method semantics, and a Boost.Asio-backed stackless coroutine scheduler (`async`/`await`/`go`). 
 
 The driver designs here support both:
 1. **Synchronous APIs** (built on top of `net.tcp.socket.TcpStream` for CLI tools, background jobs, and migrations).
@@ -46,18 +46,18 @@ The driver designs here support both:
 
 ---
 
-## 0. Key Nova Constraints & Design Rules
+## 0. Key Kyte Constraints & Design Rules
 
 To prevent runtime memory leaks, SIGSEGV crashes, and unexpected performance drops, all driver implementations must adhere to these language-level rules:
 
 ### 0.1 String Allocation and Byte Helpers
-Under the hood, Nova's ARC memory allocator requires an 8-byte object header:
+Under the hood, Kyte's ARC memory allocator requires an 8-byte object header:
 ```text
 [ptr-8] refcount (i64)   [ptr-4] length (i32)   [ptr..] data
 ```
 Using `bytes.alloc(len) as string` directly without writing bytes returns a string containing **uninitialized garbage memory**. All binary serialization must allocate, write all bytes (including null terminators), and then cast.
 Always use safe serialization helpers:
-```nova
+```kyte
 pub fn pg_byte1(b: int): string {
     let p = bytes.alloc(1);
     bytes.write_byte(p, 0, b & 255);
@@ -66,15 +66,15 @@ pub fn pg_byte1(b: int): string {
 ```
 
 ### 0.2 Integer Width and Bitwise Safety
-Nova's `int` is mapped directly to `i64` on native compilation. Local and parameter stack slots are always 64-bit wide. Avoid assumptions about byte truncation. Use bitwise operations (`& 255`, `>> 8`) rather than integer division/modulo to prevent sign-extension bugs during packet formatting.
+Kyte's `int` is mapped directly to `i64` on native compilation. Local and parameter stack slots are always 64-bit wide. Avoid assumptions about byte truncation. Use bitwise operations (`& 255`, `>> 8`) rather than integer division/modulo to prevent sign-extension bugs during packet formatting.
 
 ### 0.3 The Bare-Function Local Call gotcha
-In Nova, a bare function (e.g. `string.hash` or an unboxed struct method) is a raw code pointer. Calling a field directly works:
-```nova
+In Kyte, a bare function (e.g. `string.hash` or an unboxed struct method) is a raw code pointer. Calling a field directly works:
+```kyte
 (self.hashFn)(key) // OK
 ```
 However, copying it to a local first and then calling it will crash (SIGBUS/Hyperspace jump):
-```nova
+```kyte
 let f = self.hashFn;
 (f)(key) // CRASH! Expects a closure box {fn_ptr, env}
 ```
@@ -85,15 +85,15 @@ String interpolation using `${value}` compiles fine but **crashes with a SIGSEGV
 * **Rule:** If formatting integers or doubles in queries/BSON/logs, manually cast them to `int` first (if safe), or write a custom string formatter. Never interpolate `f64` or `i64` directly in a template string.
 
 ### 0.5 Pre-sizing Collections
-Nova Maps crash with a SIGBUS if they grow past their initial load factor.
+Kyte Maps crash with a SIGBUS if they grow past their initial load factor.
 * **Rule:** Pre-size all internal maps (such as parameter builders, command options, or BSON parsers) to their maximum expected capacity at initialization:
-  ```nova
+  ```kyte
   let fields = Map<string, string>(256, string.hash);
   ```
 
 ### 0.6 Performance & Latency Tracking
 To accurately profile queries without relying on low-resolution timers, utilize `datetime.nowNs()` (nanoseconds) instead of `datetime.now()` (seconds). Latency must be calculated in milliseconds as:
-```nova
+```kyte
 let latency_ms = ((end_ns - start_ns) as double) / 1000000.0;
 ```
 
@@ -103,8 +103,8 @@ let latency_ms = ((end_ns - start_ns) as double) / 1000000.0;
 
 To allow SQL drivers to be interchangeable, we define a unified non-generic `DbConnection` trait.
 
-```nova
-// db_client.nova
+```kyte
+// db_client.ky
 import list;
 
 pub struct Row {
@@ -150,8 +150,8 @@ PostgreSQL implements a message-framed binary protocol. Front-end and back-end p
 
 ### 2.1 Serialization & Helpers
 
-```nova
-// pg_helpers.nova
+```kyte
+// pg_helpers.ky
 import bytes;
 
 pub fn pg_byte1(b: int): string {
@@ -187,8 +187,8 @@ pub fn pg_frame(t: int, payload: string): string {
 
 ### 2.2 Connection & Driver Core
 
-```nova
-// pg_client.nova
+```kyte
+// pg_client.ky
 import net.tcp.socket;
 import net.asyncio;
 import list;
@@ -293,7 +293,7 @@ pub struct PgConn {
             if (self.is_async) {
                 asyncio.aclose(self.fd as i64);
             } else {
-                nova_close(self.fd as i32);
+                kyte_close(self.fd as i32);
             }
             self.fd = -1;
         }
@@ -320,8 +320,8 @@ MySQL utilizes packet structures containing a 3-byte little-endian length and a 
 
 ### 3.1 Serialization & Helpers
 
-```nova
-// mysql_helpers.nova
+```kyte
+// mysql_helpers.ky
 import bytes;
 
 pub fn my_byte1(b: int): string {
@@ -354,8 +354,8 @@ pub fn my_packet(payload: string, seq: int): string {
 
 ### 3.2 Driver Implementation
 
-```nova
-// mysql_client.nova
+```kyte
+// mysql_client.ky
 import net.tcp.socket;
 import mysql_helpers;
 import list;
@@ -481,8 +481,8 @@ MSSQL utilizes Tabular Data Stream (TDS) packets featuring an 8-byte header:
 
 ### 4.1 Serialization & Helpers
 
-```nova
-// mssql_helpers.nova
+```kyte
+// mssql_helpers.ky
 import bytes;
 
 pub fn tds_byte1(b: int): string {
@@ -526,8 +526,8 @@ pub fn to_utf16le(s: string): string {
 
 ### 4.2 Driver Implementation
 
-```nova
-// mssql_client.nova
+```kyte
+// mssql_client.ky
 import net.tcp.socket;
 import mssql_helpers;
 import list;
@@ -631,8 +631,8 @@ MongoDB communicates via `OP_MSG` (Opcode 2013). High-performance data represent
 
 ### 5.1 OP_MSG Struct & BSON Serialization Design
 
-```nova
-// bson.nova
+```kyte
+// bson.ky
 import bytes;
 import list;
 import string;
@@ -659,7 +659,7 @@ pub fn bson_string(name: string, value: string): string {
 // Value is parsed as a double, reinterpreted to 64-bit integer bits, and serialized.
 pub fn bson_double(name: string, value: double): string {
     let type_prefix = bson_byte1(1); // 0x01 Double
-    let bits = value as int;        // Reinterprets double bits to 64-bit int slot in Nova
+    let bits = value as int;        // Reinterprets double bits to 64-bit int slot in Kyte
     
     let p = bytes.alloc(8);
     bytes.write_byte(p, 0, bits & 255);
@@ -699,8 +699,8 @@ pub fn bson_document(payload: string): string {
 
 ### 5.2 MongoDB Client
 
-```nova
-// mongo_client.nova
+```kyte
+// mongo_client.ky
 import net.tcp.socket;
 import bson;
 import bytes;

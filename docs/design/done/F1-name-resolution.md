@@ -14,7 +14,7 @@ error). The stage table in §5 is the truth; done-criteria in §7 are 0/9 ticked
 
 ## 1. The claim
 
-> Nova has no symbol table. It has ~10 flat `StringHashMap`s keyed by mangled strings, and when an
+> Kyte has no symbol table. It has ~10 flat `StringHashMap`s keyed by mangled strings, and when an
 > exact lookup misses it **linearly scans every function in the program looking for an underscore-
 > delimited suffix match**. The first match in hash-iteration order wins.
 
@@ -41,7 +41,7 @@ merged.appendSlice(source);                                     // :482-483
 ```
 
 Every declaration from every module is appended to **one flat `ArrayList`**. The `import_decl` is
-**discarded**. Source text is concatenated into `merged.nova` (written at `main.zig:1226`).
+**discarded**. Source text is concatenated into `merged.ky` (written at `main.zig:1226`).
 
 **Nothing records which module a name came from.** There is no import table, no alias map, no
 visibility, no export list. The only residue is `span.file` on each AST node.
@@ -49,16 +49,16 @@ visibility, no export list. The only residue is `span.file` on each AST node.
 ### 2.2 Mangling is the file path, and it is not stable — ✅ **FIXED 2026-07-15**
 
 > ✅ **Fixed.** `getModulePrefix` now strips whichever stdlib root the file was found under —
-> including the absolute `$HOME/.nova/std/` fallback it used to miss — using `indexOf` rather than
-> `startsWith`. The `.nova/std/` case now yields exactly what `src/std/` already yielded, so
+> including the absolute `$HOME/.kyte/std/` fallback it used to miss — using `indexOf` rather than
+> `startsWith`. The `.kyte/std/` case now yields exactly what `src/std/` already yielded, so
 > src-resolved builds are unchanged and HOME-resolved builds simply agree.
 >
 > **Measured:** path-dependent symbols **109 → 0**. And the actual claim, proven directly: the same
-> source compiled with the stdlib resolved via `src/std/` versus via `~/.nova/std/` now produces a
+> source compiled with the stdlib resolved via `src/std/` versus via `~/.kyte/std/` now produces a
 > **byte-identical symbol set** (`nm | sort | md5` → `fd2c3518…` both ways). Before, one build carried
-> `_Users_kamlesh_.nova_std_string_hash` and the other `string_hash`. **Builds are reproducible.**
+> `_Users_kamlesh_.ky_std_string_hash` and the other `string_hash`. **Builds are reproducible.**
 >
-> Cut over only after `NOVA_SEMA_SHADOW=1` predicted **0 new collisions** — which mattered:
+> Cut over only after `KYTE_SEMA_SHADOW=1` predicted **0 new collisions** — which mattered:
 > `declarations.zig:737-748` dedups functions by name, so a collision introduced by the rename would
 > have *silently dropped one*. Corpus 26/26; YCSB and the driver repro clean end-to-end.
 >
@@ -67,17 +67,17 @@ visibility, no export list. The only residue is `span.file` on each AST node.
 `getModulePrefix` (`llvm_codegen.zig:1841-1861`) derives the prefix by taking `span.file`, stripping
 `src/std/` or `src/lib/`, and replacing every `/` with `_`.
 
-But the stdlib loader falls back to an **absolute** path — `"{HOME}/.nova/std/{sub}"` (`main.zig:422`) —
+But the stdlib loader falls back to an **absolute** path — `"{HOME}/.kyte/std/{sub}"` (`main.zig:422`) —
 which starts with neither prefix. So:
 
 | Same file, found via | Symbol |
 |---|---|
-| `src/std/string.nova` | `string_hash` |
-| `~/.nova/std/string.nova` | `_Users_kamlesh_.nova_std_string_hash` |
+| `src/std/string.ky` | `string_hash` |
+| `~/.kyte/std/string.ky` | `_Users_kamlesh_.ky_std_string_hash` |
 
 **The same source file produces a different linker symbol depending on which path it was found under**,
 and the user's home directory is embedded in the symbol. `lastIndexOfScalar(path, '.')` also truncates
-at the *last* dot, so `.nova` in a directory name survives as a literal `.` inside an LLVM symbol.
+at the *last* dot, so `.ky` in a directory name survives as a literal `.` inside an LLVM symbol.
 
 `isAlreadyNamespaced` (`llvm_codegen.zig:659-676`) is a **hardcoded 40-entry prefix allowlist**
 (`"string"`, `"json"`, `"list"`, `"map"`, `"serde_json"`, …). A user function named `map_reduce` or
@@ -168,7 +168,7 @@ for months as "string heap corruption".
 guarded on 2026-07-15**, pinned by `expect_fail/method_shadowed_by_global_fn`. It is now a compile
 error (`MethodOrFunctionNotFound`). What it used to do:
 
-```nova
+```kyte
 fn describe(a: int, b: int, c: int): string { ... }
 struct Thing { pub v: int, ... }          // no `describe` method
 let t = Thing(7);  t.describe()
@@ -200,7 +200,7 @@ cannot tell which, and nothing frees them.**
 
 ## 2.8 Stage 1+2 results — measured, and they re-rank this document
 
-Shadow mode (`NOVA_SEMA_SHADOW=1`, `src/sema/`) built the symbol table alongside legacy resolution and
+Shadow mode (`KYTE_SEMA_SHADOW=1`, `src/sema/`) built the symbol table alongside legacy resolution and
 instrumented the real `resolveCalleeName`. **Two of this document's claims did not survive contact with
 the numbers.** Recording that is the point of a shadow stage.
 
@@ -208,9 +208,9 @@ the numbers.** Recording that is the point of a shadow stage.
 
 | Finding | Measure |
 |---|---|
-| ~~**Path-dependent symbols**~~ (§2.2) — ✅ **FIXED**, 109 → 0; identical symbol set from both resolution paths | Was: **109 of 204 symbols = 53%** on `ycsb.nova` embed `$HOME` in the **linker symbol**: `_Users_kamlesh_.nova_std_collections_list_allocCopy`. The build is **not reproducible across machines**, and the same file yields a different symbol depending on the path it was found under. |
+| ~~**Path-dependent symbols**~~ (§2.2) — ✅ **FIXED**, 109 → 0; identical symbol set from both resolution paths | Was: **109 of 204 symbols = 53%** on `ycsb.ky` embed `$HOME` in the **linker symbol**: `_Users_kamlesh_.ky_std_collections_list_allocCopy`. The build is **not reproducible across machines**, and the same file yields a different symbol depending on the path it was found under. |
 | ~~**Unguarded call path**~~ (§2.6) | ✅ **FIXED 2026-07-15.** And the *silent* case was demonstrated first: a **zero-arg** global makes `t.describe()` lower to `call @describe()` with matching arity, so the LLVM verifier is blind — it printed `got=WRONG-global-fn`, **exit 0**. A clean compile, a wrong answer, no diagnostic. Now a compile error; pinned by `expect_fail/method_shadowed_by_global_fn` (verified to unexpectedly-compile without the guard). |
-| **No block scope / last-`let`-wins types** (§2.4) | ✅ **FIXED 2026-07-15** (`src/sema/alpha.zig`, pinned by `16_block_scope`, verified to fail first). Was: **PROVEN** — `repro/block_scope_aliasing.nova`, specs §10 #23. `let x = 1; if (true) { let x = 2; } return x;` → **returns 2**. And a `let v = "…"` inside **`if (false)`** retypes a live `let v = 42` as `string`, so `${v}` reads a string header at `[42-4]` → **SIGSEGV**; deleting the dead branch makes the identical program print `42`. **Dead code segfaults live code.** This is the single worst live defect F1 fixes, and it is now the strongest argument for the scope tree. |
+| **No block scope / last-`let`-wins types** (§2.4) | ✅ **FIXED 2026-07-15** (`src/sema/alpha.zig`, pinned by `16_block_scope`, verified to fail first). Was: **PROVEN** — `repro/block_scope_aliasing.ky`, specs §10 #23. `let x = 1; if (true) { let x = 2; } return x;` → **returns 2**. And a `let v = "…"` inside **`if (false)`** retypes a live `let v = 42` as `string`, so `${v}` reads a string header at `[42-4]` → **SIGSEGV**; deleting the dead branch makes the identical program print `42`. **Dead code segfaults live code.** This is the single worst live defect F1 fixes, and it is now the strongest argument for the scope tree. |
 
 ### What is LATENT (do not oversell it)
 
@@ -218,10 +218,10 @@ the numbers.** Recording that is the point of a shadow stage.
 
 | Program | symbols | scan reached | **ambiguous** |
 |---|---|---|---|
-| `ycsb.nova` | 204 | **0** | **0** |
-| `driver_alloc_churn_crash.nova` | 150 | **0** | **0** |
-| `14_collections_map.nova` | 82 | 30 | **0** |
-| `13_serde.nova` | — | 49 | **0** |
+| `ycsb.ky` | 204 | **0** | **0** |
+| `driver_alloc_churn_crash.ky` | 150 | **0** | **0** |
+| `14_collections_map.ky` | 82 | 30 | **0** |
+| `13_serde.ky` | — | 49 | **0** |
 
 The static check predicted 6 ambiguous names on `ycsb` (`contains`, `hash`, `delete`, `set`). The real
 resolver reached the scan **zero times** there: the exact-match paths (steps 1–3) always won. The static
@@ -302,10 +302,10 @@ O(depth), deterministic, and it makes shadowing (N4) fall out for free.
 - `import x.y;` binds `y` in the importing scope to module `x.y`'s scope. Only `pub` symbols are
   visible (`pub` already exists in the AST).
 - **Module identity is the logical import path** (`std.string`), **not the filesystem path.** This is
-  what kills §2.2: the same module has one identity whether found in `src/std/` or `~/.nova/std/`.
+  what kills §2.2: the same module has one identity whether found in `src/std/` or `~/.kyte/std/`.
 - Two modules may both define `Config`. Resolving bare `Config` where both are imported is an **error
   naming both** (N2).
-- `merged.nova` remains as a debug artifact only. **Nothing may depend on text concatenation.**
+- `merged.ky` remains as a debug artifact only. **Nothing may depend on text concatenation.**
 
 ### 3.4 Mangling
 
@@ -369,7 +369,7 @@ taken**. Given that today's resolution is nondeterministic, expect stage 2 to fi
 ## 6. Open questions
 
 1. **Ambiguity policy.** Two imported modules export `parse`. Error always, or last-import-wins, or
-   require qualification? *Recommendation:* **error**, require `json.parse`. Nova is already written
+   require qualification? *Recommendation:* **error**, require `json.parse`. Kyte is already written
    this way by convention.
 2. **Does `import x.y` bind `y` or `x.y`?** Today's code says `json.parse`, i.e. the last segment.
    Confirm, and decide aliasing (`import a.b as c`).

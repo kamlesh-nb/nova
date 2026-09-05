@@ -1,0 +1,206 @@
+//! Test assertions for Kyte `@test` functions.
+//!
+//! This is the tiny assertion vocabulary that Kyte test cases lean on. Each
+//! helper checks one condition and, when it does not hold, reports the failure
+//! through the runtime hook `kyte_test_fail`. There is no returned error and no
+//! exception: a failing assertion is a side effect that the test harness reads,
+//! so the caller does not have to thread a result through its own code. On the
+//! happy path every helper simply returns `void` and the test keeps running.
+//!
+//! The design here is deliberately blunt. Rather than one generic `assert`
+//! taking an arbitrary boolean, the file exposes many small, purpose-named
+//! helpers (`equalInt`, `equalStr`, `gt`, `contains`, and so on). The reason is
+//! the message: a named helper knows both operands and their meaning, so it can
+//! build a human-readable "Expected X, got Y" string that a bare boolean assert
+//! could never produce. That is the whole value of the module, so the failure
+//! text is where the care goes.
+//!
+//! String work is delegated to the standard [`string`] module (equality via
+//! [`string.eql`], substring search via [`string.indexOf`]) rather than
+//! comparing bytes here, so these assertions follow the same semantics as the
+//! rest of the standard library. The `+` concatenation in the failure messages
+//! relies on Kyte's built-in coercion of `int` to its decimal text.
+//!
+//! Everything is `pub` because assertions are meant to be imported and called
+//! from user test files. There are no invariants for the caller to uphold; the
+//! only contract is that calling one of these inside a running `@test` will
+//! abort that test if the condition fails.
+
+import string;
+import bytes;
+
+/// Fails the current test unconditionally with the given message.
+///
+/// This is the raw escape hatch used when none of the shaped helpers fit, for
+/// example inside a branch that should never be reached. Every other helper in
+/// this file ultimately funnels its failure through the same runtime hook,
+/// `kyte_test_fail`, that this function calls directly.
+pub fn fail(msg: string): void {
+    kyte_test_fail(msg);
+}
+
+/// Asserts that `val` is `true`, failing the test otherwise.
+///
+/// Because the helper only knows a boolean, its failure message cannot say what
+/// the condition meant, only "Expected true, got false". Prefer a shaped helper
+/// like [`equalInt`] or [`equalStr`] when you are really comparing two values,
+/// so the message can name both operands.
+pub fn isTrue(val: bool): void {
+    if (!val) {
+        kyte_test_fail("Expected true, got false");
+    }
+}
+
+/// Asserts that `val` is `false`, failing the test otherwise.
+///
+/// The mirror of [`isTrue`]. Same caveat about the terse message: it can only
+/// report "Expected false, got true" since it has no idea what the boolean
+/// stood for.
+pub fn isFalse(val: bool): void {
+    if (val) {
+        kyte_test_fail("Expected false, got true");
+    }
+}
+
+/// Asserts two integers are equal, reporting both values on failure.
+///
+/// The argument order is `(actual, expected)`, and the failure message is built
+/// as "Expected <expected>, got <actual>" so a reader can see which side was
+/// wrong. The `+` operator coerces each `int` to its decimal text.
+pub fn equalInt(actual: int, expected: int): void {
+    if (actual != expected) {
+        let msg = "Expected " + expected + ", got " + actual;
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts two integers differ, failing if they are equal.
+///
+/// The inverse of [`equalInt`]. When they do match there is only one value to
+/// report, so the message reads "Expected values to differ, both were <value>".
+pub fn notEqualInt(actual: int, expected: int): void {
+    if (actual == expected) {
+        let msg = "Expected values to differ, both were " + actual;
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts two strings are equal by content, quoting both on failure.
+///
+/// Equality is decided by [`string.eql`], a full byte-content comparison, not a
+/// pointer or identity check. The failure message wraps each operand in escaped
+/// double quotes so trailing spaces or emptiness are visible in the output.
+pub fn equalStr(actual: string, expected: string): void {
+    if (!string.eql(actual, expected)) {
+        let msg = "Expected \"" + expected + "\", got \"" + actual + "\"";
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts two strings differ by content, failing if they are equal.
+///
+/// The inverse of [`equalStr`], also decided by [`string.eql`]. When they match
+/// the single shared value is quoted in the message.
+pub fn notEqualStr(actual: string, expected: string): void {
+    if (string.eql(actual, expected)) {
+        let msg = "Expected strings to differ, both were \"" + actual + "\"";
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts that `haystack` contains `needle` as a substring.
+///
+/// Uses [`string.indexOf`], which returns `-1` when the substring is absent, so
+/// the check is "index is not `-1`". An empty `needle` is found at index 0 and
+/// therefore passes. On failure both strings are quoted in the message.
+pub fn contains(haystack: string, needle: string): void {
+    if (string.indexOf(haystack, needle) == -1) {
+        let msg = "Expected \"" + haystack + "\" to contain \"" + needle + "\"";
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts that `val` is not zero.
+///
+/// A convenience over [`notEqualInt`] with `expected` fixed at 0, useful for
+/// checking that a count, length, or handle came back non-empty. See [`zero`]
+/// for the opposite check.
+pub fn notZero(val: int): void {
+    if (val == 0) {
+        kyte_test_fail("Expected non-zero value, got 0");
+    }
+}
+
+/// Asserts that `val` is exactly zero, reporting the value on failure.
+///
+/// The complement of [`notZero`]. When the value is non-zero the message names
+/// it, "Expected 0, got <value>".
+pub fn zero(val: int): void {
+    if (val != 0) {
+        let msg = "Expected 0, got " + val;
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts the strict ordering `a > b`.
+///
+/// Fails when `a <= b` (so equal values fail), and the message spells out the
+/// relation that was expected, "Expected <a> > <b>". See [`gte`] for the
+/// non-strict form.
+pub fn gt(a: int, b: int): void {
+    if (a <= b) {
+        let msg = "Expected " + a + " > " + b;
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts the ordering `a >= b`, allowing equality.
+///
+/// Fails only when `a < b`. The non-strict counterpart to [`gt`]; see [`lte`]
+/// for the reverse direction.
+pub fn gte(a: int, b: int): void {
+    if (a < b) {
+        let msg = "Expected " + a + " >= " + b;
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts the strict ordering `a < b`.
+///
+/// Fails when `a >= b` (so equal values fail). The mirror of [`gt`]; see [`lte`]
+/// for the non-strict form.
+pub fn lt(a: int, b: int): void {
+    if (a >= b) {
+        let msg = "Expected " + a + " < " + b;
+        kyte_test_fail(msg);
+    }
+}
+
+/// Asserts the ordering `a <= b`, allowing equality.
+///
+/// Fails only when `a > b`. The non-strict counterpart to [`lt`] and the mirror
+/// of [`gte`].
+pub fn lte(a: int, b: int): void {
+    if (a > b) {
+        let msg = "Expected " + a + " <= " + b;
+        kyte_test_fail(msg);
+    }
+}
+
+/// Self-test that exercises the passing path of the core helpers.
+///
+/// It calls each assertion with inputs that must hold, so the test succeeds
+/// only if none of them fire `kyte_test_fail`. This guards the mechanics of the
+/// module itself, that a satisfied assertion stays silent and lets the test
+/// complete, rather than checking any behaviour under test elsewhere.
+@test
+fn test_assert_mechanics(): void {
+    isTrue(true);
+    isFalse(false);
+    equalInt(42, 42);
+    notEqualInt(42, 43);
+    gt(10, 5);
+    gte(10, 10);
+    lt(5, 10);
+    lte(10, 10);
+}

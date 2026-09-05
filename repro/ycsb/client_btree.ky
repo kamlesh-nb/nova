@@ -1,0 +1,11 @@
+import ycsb_client_core;
+import db;
+import novadb;
+import env;
+
+fn main(): void {
+    let connectionString = env.get("YCSB_DSN");
+    if (connectionString.length == 0) { connectionString = "127.0.0.1:3009"; }
+    let conn = KyteDriver().connect(connectionString);
+    ycsb_client_core.dispatch(conn, "CREATE TABLE ycsb_af (ykey TEXT PRIMARY KEY, ydata TEXT)");
+}

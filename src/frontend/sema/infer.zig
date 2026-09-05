@@ -1818,10 +1818,10 @@ pub const Inferer = struct {
     }
 
     /// Records an [`OptDerefError`] for reaching through an optional/error-union
-    /// without unwrapping. Honours the `NOVA_OPT_AUDIT` env var to also print
+    /// without unwrapping. Honours the `KYTE_OPT_AUDIT` env var to also print
     /// the site to stderr for debugging where see-throughs occur.
     fn recordOptDeref(self: *Inferer, fa: ast.FieldAccess, is_method: bool, kind: OptDerefKind) void {
-        if (std.c.getenv("NOVA_OPT_AUDIT") != null)
+        if (std.c.getenv("KYTE_OPT_AUDIT") != null)
             std.debug.print("OPT-SEETHROUGH {s} {s}:{d}:{d} .{s}\n", .{ if (is_method) "method" else "field", fa.span.file, fa.span.line, fa.span.col, fa.field });
         self.optional_deref_errors.append(self.allocator, .{ .span = fa.span, .field = fa.field, .is_method = is_method, .kind = kind }) catch {};
     }
@@ -2024,7 +2024,7 @@ pub const Inferer = struct {
     /// error rather than a tolerable miss.
     ///
     /// Returns false (non-fatal) for a curated set that legitimately fails local
-    /// resolution: `self`, runtime intrinsics (`nova_*`), the magic receivers
+    /// resolution: `self`, runtime intrinsics (`kyte_*`), the magic receivers
     /// (`bytes`/`console`/`sync`/`atomic`), builtin receivers and types, and any
     /// name that resolves to a known module. Anything else is a genuine
     /// undefined name and returns true, feeding
@@ -2032,7 +2032,7 @@ pub const Inferer = struct {
     fn isFatalUnresolvedIdent(self: *Inferer, name: []const u8) bool {
         if (std.mem.eql(u8, name, "self")) return false;
 
-        if (std.mem.startsWith(u8, name, "nova_")) return false;
+        if (std.mem.startsWith(u8, name, "kyte_")) return false;
 
         const magic = [_][]const u8{ "bytes", "console", "sync", "atomic" };
         for (magic) |m| if (std.mem.eql(u8, name, m)) return false;
@@ -3120,7 +3120,7 @@ test "infer: a comparison is BOOL, not i32" {
 
     var l = ast.Expression{ .kind = .{ .literal = .{ .integer = 1 } } };
     var r = ast.Expression{ .kind = .{ .literal = .{ .integer = 2 } } };
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var cmp_e = ast.Expression{ .kind = .{ .binary = .{ .left = &l, .right = &r, .op = .lt, .span = sp } } };
     const cmp = try inf.inferExpr(&cmp_e);
     try testing.expectEqual(try f.store.boolT(), cmp);
@@ -3140,7 +3140,7 @@ test "T4: a binary over two unknowns is UNRESOLVED, not i32" {
 
     var l = ast.Expression{ .kind = .{ .ident = "nope" } };
     var r = ast.Expression{ .kind = .{ .ident = "alsonope" } };
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var add_e = ast.Expression{ .kind = .{ .binary = .{ .left = &l, .right = &r, .op = .add, .span = sp } } };
     const t = try inf.inferExpr(&add_e);
     try testing.expect(f.store.get(t) == .unresolved);
@@ -3218,7 +3218,7 @@ test "TypedIr: sub-expressions are recorded too, not just the root" {
 
     var l = ast.Expression{ .kind = .{ .literal = .{ .integer = 1 } } };
     var r = ast.Expression{ .kind = .{ .literal = .{ .integer = 2 } } };
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var add = ast.Expression{ .kind = .{ .binary = .{ .left = &l, .right = &r, .op = .add, .span = sp } } };
     var idg = ids.Assigner.init();
     stampIds(&idg, &.{&add});
@@ -3287,7 +3287,7 @@ test "infer: bitwise `&`/`|` yield the OPERAND type, not bool" {
     defer f.deinit();
     var inf = Inferer.init(a, &f.store, &f.tab, &f.low);
     defer inf.deinit();
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
 
     var l = ast.Expression{ .kind = .{ .literal = .{ .integer = 6 } } };
     var r = ast.Expression{ .kind = .{ .literal = .{ .integer = 3 } } };
@@ -3315,7 +3315,7 @@ test "infer: assignment yields the assigned VALUE, not void" {
     defer f.deinit();
     var inf = Inferer.init(a, &f.store, &f.tab, &f.low);
     defer inf.deinit();
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
 
     try inf.push();
     try inf.bind("x", try f.store.intT());
@@ -3349,7 +3349,7 @@ fn genericListProgram(sp: ast.Span, methods: []ast.MethodDecl) [1]ast.Declaratio
 test "F4: `List<string>.get()` is string, substitute T from the RECEIVER's args" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3400,7 +3400,7 @@ test "F4: `List<string>.get()` is string, substitute T from the RECEIVER's args"
 test "F4: a generic FUNCTION call substitutes from its explicit type args" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3460,7 +3460,7 @@ test "F4: a generic FUNCTION call substitutes from its explicit type args" {
 test "F4: a generic struct's FIELD substitutes too, `Box<string>.v` is string" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3497,7 +3497,7 @@ test "F4: a generic struct's FIELD substitutes too, `Box<string>.v` is string" {
 test "F4: calling a field that HOLDS a function, `(self.hashFn)(key)`" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3550,7 +3550,7 @@ test "F4: calling a field that HOLDS a function, `(self.hashFn)(key)`" {
 test "F2: `if (s != undefined)` narrows s inside the branch (specs.md 3.4a)" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3594,7 +3594,7 @@ test "F2: `if (s != undefined)` narrows s inside the branch (specs.md 3.4a)" {
 // equality check failed, mirroring [`Narrowing.when_true`].
 test "F2: `if (s == undefined)` narrows the ELSE branch (specs.md 3.4a)" {
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3641,7 +3641,7 @@ test "F2: `if (s == undefined)` narrows the ELSE branch (specs.md 3.4a)" {
 test "F2: only a plain BINDING narrows, a field does not (specs.md 3.4a)" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3669,7 +3669,7 @@ test "F2: only a plain BINDING narrows, a field does not (specs.md 3.4a)" {
 test "F2: a closure's params come from the EXPECTED type (specs.md 6.3a)" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3746,7 +3746,7 @@ test "F2: a closure's params come from the EXPECTED type (specs.md 6.3a)" {
 test "F2: a method call on a TRAIT receiver resolves (`src.getString(k)`)" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3796,7 +3796,7 @@ test "F2: a method call on a TRAIT receiver resolves (`src.getString(k)`)" {
 test "F2: `go` yields future<T> and `await` unwraps it (specs.md 7.1)" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3843,7 +3843,7 @@ test "F2: `go` yields future<T> and `await` unwraps it (specs.md 7.1)" {
 test "F2: a closure param is inferred from its USE in the body (specs.md 6.3a)" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();
@@ -3875,7 +3875,7 @@ test "F2: a closure param is inferred from its USE in the body (specs.md 6.3a)" 
 test "F2: `(a, b) => a + b` stays unresolved, the limit, not a guess" {
 
     const a = testing.allocator;
-    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.nova" };
+    const sp = ast.Span{ .start = 0, .end = 0, .line = 1, .col = 1, .file = "t.ky" };
     var f = Fixture.init(a);
     f.low = lower.Lowerer.init(a, &f.store);
     defer f.deinit();

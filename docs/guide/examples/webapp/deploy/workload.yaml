@@ -1,11 +1,11 @@
-# The FINALISED deploy manifest for this Nova web app. It tells the orchestrator how to RUN the app
+# The FINALISED deploy manifest for this Kyte web app. It tells the orchestrator how to RUN the app
 # (binary by hash, replicas, load balancing, health, exposure). It does NOT carry the app's own
-# configuration: Nova keeps that file-based and outside the orchestrator. The app reads its settings from
+# configuration: Kyte keeps that file-based and outside the orchestrator. The app reads its settings from
 # an `app.yaml` at the project root through `app.config` (see Chapter 18); orchd never injects config as
 # environment variables, because co-located apps would collide on the same names. Commit this in your
 # repo; the deploy action fills in the artifact digest and writes it to the orchestrator, which
 # reconciles from it.
-apiVersion: nova/v1
+apiVersion: kyte/v1
 kind: App
 metadata:
   name: webapp

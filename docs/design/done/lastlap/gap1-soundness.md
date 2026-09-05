@@ -2,7 +2,7 @@
 
 Scope: does codegen still make an ownership / boxing / dtor / layout **decision** by rendering a type to
 a name string and matching that string, rather than from the TypeId? That is the "string engine" that
-Nova's memory records as the root of its soundness debt. Verdict up front, then the evidence.
+Kyte's memory records as the root of its soundness debt. Verdict up front, then the evidence.
 
 **Verdict: the corruption-class gap is NOT currently live.** Empirically, every live ownership decision
 that has a resolvable TypeId agrees with the string baseline (shadow gate `td_disagree = 0`), and the
@@ -67,7 +67,7 @@ is decidable; only if `live_sema` is absent or the lowered type is undecidable d
 `resolveExpressionTypeName` (`types.zig:1357-1423`) returns `renderLegacy(concreteTid)` whenever the
 instantiation overlay resolves the expression (`if (typeOfExprConcrete(self, expr_ptr)) |ctid| return
 renderLegacy(st, ctid);`, lines 1419-1421). The `substTypeParams`-based `s_name` (line 1376) is returned
-only on the null branch -- per the doc's `NOVA_TID_CENSUS` sweep that is exactly **one** expr in the whole
+only on the null branch -- per the doc's `KYTE_TID_CENSUS` sweep that is exactly **one** expr in the whole
 corpus (`68_generic_method_mono`, a lambda reifying its parent method's `<T>`, doc lines 123-128). So the
 name these 74 sites consume is TypeId-derived in the normal path; it is then used to *look up* a struct
 layout (`self.structs.get(name)`) or *mangle* a call target -- a wrong answer there is a missing-symbol
@@ -75,7 +75,7 @@ layout (`self.structs.get(name)`) or *mangle* a call target -- a wrong answer th
 
 ### 1d. Empirical proof there is no live disagreement (shadow gate, run 2026-08-15)
 
-Built `zig build` clean, then ran `NOVA_SEMA_SHADOW=1 nova test <case>` on the guard cases the design doc
+Built `zig build` clean, then ran `KYTE_SEMA_SHADOW=1 kyte test <case>` on the guard cases the design doc
 names (119, 279, 123, 68, 310, 40, plus 02/42/309/307). The gate prints the ownership-decision diff
 between `isOwnedTypeId` (TypeId engine) and `legacyStringOwnership` (the historical name rule):
 
@@ -205,10 +205,10 @@ Two gates, both required:
 ```bash
 cd lang
 # (a) no live disagreement between the TypeId engine and the string baseline, corpus-wide:
-NOVA_SEMA_SHADOW=1 conformance/run.sh            # every case must print td_disagree=0, keystone-DISAGREE=0,
+KYTE_SEMA_SHADOW=1 conformance/run.sh            # every case must print td_disagree=0, keystone-DISAGREE=0,
                                                  # and (once the engine is deleted) erased-residual=0
-# (b) memory-safety gate -- the failure class is UAF/double-free that plain `nova test` masks:
-NOVA_ASAN=1 zig build && conformance/run.sh --asan   # green ASAN corpus is the ONLY go signal
+# (b) memory-safety gate -- the failure class is UAF/double-free that plain `kyte test` masks:
+KYTE_ASAN=1 zig build && conformance/run.sh --asan   # green ASAN corpus is the ONLY go signal
 ```
 
 ## MILESTONE 2026-08-16: the soundness-hazardous string engine is DELETED
@@ -221,7 +221,7 @@ is deleted (d1b8b60), folded into `ownedByName` as an inline erased-body structu
   **ZERO that decide a generic/user type's ownership or layout** (the soundness hazard). The 51 the lint
   counts are all CANONICAL-identity checks — `bool`(12), `any`(12), `string`(11), `void`(3), primitives —
   whose name IS their identity (no type-params, no instantiation), plus a few BUILTIN special-cases
-  (`Atomic` intrinsic ops, `Str` zero-copy, `List<` element parsing, `NovaConnection`) that key on a fixed
+  (`Atomic` intrinsic ops, `Str` zero-copy, `List<` element parsing, `KyteConnection`) that key on a fixed
   builtin name, not a rendered generic instantiation. None is the "decide a generic type from its spelling"
   bug class.
 
@@ -231,7 +231,7 @@ a soundness hazard:
   boundary via `symbolName`). These must exist — you cannot emit LLVM without turning a type into a name.
 - `ownedByName` / `isOwnedDeclaredType`: name→TypeId bridges, already TypeId-FIRST; the string tail is the
   shadow-proven-safe erased-body structural default.
-- `legacyStringOwnership` / `tdShadowDiff`: the dev-only proof harness (runs only under NOVA_SEMA_SHADOW).
+- `legacyStringOwnership` / `tdShadowDiff`: the dev-only proof harness (runs only under KYTE_SEMA_SHADOW).
 - `substituteFieldType` / `substTypeParams` + the parallel string struct destructor: DUPLICATE machinery —
   a real code-cleanup opportunity, but NOT a soundness issue (the TypeId destructor path is primary).
 
@@ -243,7 +243,7 @@ duplicate code, not a defect. The soundness bar for gap 1 is met and proven.
 - **Slice A (05dae86):** restored the blind `string-typedecision-lint` (was grepping the pre-reorg path,
   false green; true count 51, re-baselined). See below.
 - **Slice B (5d3341b):** `resolveExpressionTypeName`'s PRODUCTION path is now TypeId-only. The erased-body
-  fallback returned `substTypeParams(renderLegacy(t))`; a corpus sweep (`NOVA_RESOLVE_FALLBACK`, 230
+  fallback returned `substTypeParams(renderLegacy(t))`; a corpus sweep (`KYTE_RESOLVE_FALLBACK`, 230
   samples, 0 DIFF) proved it is always a bare type-param there and `substTypeParams` is an identity, so it
   now renders the TypeId directly. `substTypeParams` survives only under the census baseline. Verified:
   14/14 generic/dtor/stdlib guard cases, shadow MUST-be-0 invariants all 0, 10/10 ASAN-clean.

@@ -1,0 +1,258 @@
+//! The SHA family facade: the one import an application reaches for when it
+//! wants a hash, an HMAC, or a PBKDF2-derived key.
+//!
+//! The real number crunching lives in the leaf modules under `crypto/hash/`
+//! (`sha256`, `sha512`, `sha1`), `crypto/mac/hmac`, and `crypto/kdf/pbkdf2`.
+//! Those leaf modules speak in raw pointers and lengths, because that is the
+//! natural shape for a block-oriented compression function and it lets the same
+//! core hash a `string`, a slice of a wire buffer, or any other run of bytes
+//! without copying. This file is the thin, ergonomic layer over them: it takes
+//! a Kyte `string`, allocates a correctly sized output buffer, calls the leaf
+//! primitive with `(ptr, len, out)`, and hands the result back either as raw
+//! digest bytes or as a lowercase hex `string`.
+//!
+//! Two output flavours exist for every primitive, and the split is deliberate.
+//! The `*Raw` functions return the digest as its exact bytes (32 for SHA-256, 64
+//! for SHA-512, 20 for SHA-1), which is what you feed straight into another
+//! cryptographic step, a MAC, or a binary protocol field. The plain functions
+//! wrap the raw digest in [`toHex`] so it is safe to print, log, compare in a
+//! test, or embed in a URL or JSON document. Keeping the raw form as the base
+//! and layering hex on top means the hex path never has to re-hash: it just
+//! formats bytes that already exist.
+//!
+//! A caution that the API cannot enforce for you: SHA-1 and plain unsalted
+//! hashing are provided because real protocols (TLS, Git, older SCRAM flows)
+//! still require them, not because they are safe for passwords. For password
+//! storage reach for [`pbkdf2HmacSha256`] with a per-user salt and a high
+//! iteration count, never a bare [`sha256`].
+//!
+//! Everything here is a pure function of its inputs, allocates exactly one
+//! output buffer, and holds no state, so the functions are freely reusable
+//! across requests and threads. The `@test` block at the end pins each
+//! primitive to published Known Answer Test vectors (NIST for the hashes, RFC
+//! 2202 / RFC 6070 for HMAC and PBKDF2), so a regression in any leaf module
+//! surfaces here as a failing vector.
+
+import bytes;
+import crypto.hash.sha256;
+import crypto.hash.sha512;
+import crypto.hash.sha1;
+import crypto.mac.hmac;
+import crypto.kdf.pbkdf2;
+import assert;
+
+/// Encodes a run of raw bytes as a lowercase hexadecimal `string`.
+///
+/// Each input byte becomes exactly two hex characters, high nibble first, so the
+/// output is always twice the length of `raw` (an empty input yields the empty
+/// string). This is the formatting step every non-`Raw` function in this file
+/// leans on to turn a binary digest into printable, comparable text. It reads
+/// the input byte by byte and indexes into a fixed digit table rather than
+/// branching per nibble, which keeps the inner loop tight. It is not
+/// hex-specific to hashes: any byte string, including a binary key or nonce,
+/// can be rendered with it.
+pub fn toHex(raw: string): string {
+    /// Lookup table mapping a 4-bit nibble (0..15) to its lowercase hex glyph.
+    const digits: string = "0123456789abcdef";
+    /// Number of input bytes; the output is `2 * n` characters.
+    let n = raw.length;
+    /// Freshly allocated output buffer, two hex characters per input byte.
+    let out = bytes.alloc(n * 2);
+    /// Index of the input byte currently being encoded.
+    let i = 0;
+    while (i < n) {
+        /// The current input byte, an integer in 0..255.
+        let b = bytes.read_byte(raw, i);
+        bytes.write_byte(out, i * 2, bytes.read_byte(digits, (b >> 4) & 15));
+        bytes.write_byte(out, i * 2 + 1, bytes.read_byte(digits, b & 15));
+        i = i + 1;
+    }
+    return out as string;
+}
+
+/// Computes the SHA-256 digest of `input` and returns the 32 raw digest bytes.
+///
+/// Returns the binary digest, not hex: use this when the bytes feed straight
+/// into another cryptographic step or a binary field. For a printable digest
+/// call [`sha256`], which hex-encodes this result. The input is passed to the
+/// leaf hasher by pointer and length, so no copy of `input` is made.
+pub fn sha256Raw(input: string): string {
+    /// Output buffer sized to the SHA-256 digest length (256 bits = 32 bytes).
+    let out = bytes.alloc(32);
+    sha256.hashInto(input as ptr, input.length, out);
+    return out as string;
+}
+
+/// Computes the SHA-512 digest of `input` and returns the 64 raw digest bytes.
+///
+/// The 512-bit variant of [`sha256Raw`]: same contract, wider digest. For a
+/// hex `string` use [`sha512`].
+pub fn sha512Raw(input: string): string {
+    /// Output buffer sized to the SHA-512 digest length (512 bits = 64 bytes).
+    let out = bytes.alloc(64);
+    sha512.hashInto(input as ptr, input.length, out);
+    return out as string;
+}
+
+/// Computes the SHA-1 digest of `input` and returns the 20 raw digest bytes.
+///
+/// SHA-1 is cryptographically broken against collision attacks and must not be
+/// used where collision resistance matters. It stays here because protocols
+/// like TLS 1.2 HMAC, Git object IDs, and legacy SCRAM still mandate it. For a
+/// hex `string` use [`sha1`].
+pub fn sha1Raw(input: string): string {
+    /// Output buffer sized to the SHA-1 digest length (160 bits = 20 bytes).
+    let out = bytes.alloc(20);
+    sha1.hashInto(input as ptr, input.length, out);
+    return out as string;
+}
+
+/// Computes HMAC-SHA256 over `msg` under `key` and returns the 32 raw MAC bytes.
+///
+/// HMAC is the keyed-hash construction from RFC 2104: it authenticates `msg`
+/// against anyone who does not hold `key`, which a bare hash cannot do. Any key
+/// length is accepted (the leaf HMAC folds an over-long key through the hash and
+/// zero-pads a short one). Returns raw bytes; [`hmacSha256`] returns the hex
+/// form. Compare MACs with a constant-time check, never a plain string compare,
+/// to avoid leaking equality through timing.
+pub fn hmacSha256Raw(key: string, msg: string): string {
+    /// Output buffer sized to the HMAC-SHA256 tag length (32 bytes).
+    let out = bytes.alloc(32);
+    hmac.hmacSha256(key as ptr, key.length, msg as ptr, msg.length, out);
+    return out as string;
+}
+
+/// Computes HMAC-SHA1 over `msg` under `key` and returns the 20 raw MAC bytes.
+///
+/// The SHA-1 variant of [`hmacSha256Raw`]. HMAC-SHA1 remains acceptable as a MAC
+/// (its security does not depend on SHA-1 collision resistance) and is still
+/// required by TLS 1.2 cipher suites and older SCRAM-SHA-1 authentication.
+pub fn hmacSha1Raw(key: string, msg: string): string {
+    /// Output buffer sized to the HMAC-SHA1 tag length (20 bytes).
+    let out = bytes.alloc(20);
+    hmac.hmacSha1(key as ptr, key.length, msg as ptr, msg.length, out);
+    return out as string;
+}
+
+/// SHA-256 of `input` as a 64-character lowercase hex `string`.
+///
+/// The printable counterpart of [`sha256Raw`]; identical digest, hex-encoded via
+/// [`toHex`]. Convenient for logging, tests, and text protocols. Do NOT use it
+/// for password storage: it is fast and unsalted, so reach for
+/// [`pbkdf2HmacSha256`] instead.
+pub fn sha256(input: string): string { return toHex(sha256Raw(input)); }
+/// SHA-512 of `input` as a 128-character lowercase hex `string`.
+///
+/// Printable counterpart of [`sha512Raw`].
+pub fn sha512(input: string): string { return toHex(sha512Raw(input)); }
+/// SHA-1 of `input` as a 40-character lowercase hex `string`.
+///
+/// Printable counterpart of [`sha1Raw`]. See that function for why SHA-1 is
+/// retained despite being unfit for collision resistance.
+pub fn sha1(input: string): string { return toHex(sha1Raw(input)); }
+/// HMAC-SHA256 of `msg` under `key` as a 64-character lowercase hex `string`.
+///
+/// Printable counterpart of [`hmacSha256Raw`]. When comparing a received tag,
+/// prefer comparing the raw bytes with a constant-time check over comparing this
+/// hex text.
+pub fn hmacSha256(key: string, msg: string): string { return toHex(hmacSha256Raw(key, msg)); }
+
+/// Derives a `dkLen`-byte key from `password` and `salt` using PBKDF2-HMAC-SHA256.
+///
+/// This is the function to use for password verification and key stretching, per
+/// RFC 8018. `iterations` is the deliberate cost factor: raising it makes each
+/// guess proportionally more expensive for an attacker, so pick the largest
+/// value your latency budget tolerates (tens to hundreds of thousands is
+/// typical) and store it alongside the salt so you can verify later. `salt`
+/// should be unique and random per password. `dkLen` is the requested output
+/// length in bytes and sizes the returned buffer directly; the result is raw
+/// derived bytes, so wrap it in [`toHex`] if you need text. Larger `dkLen` and
+/// higher `iterations` both cost more time, since the underlying HMAC is run
+/// once per block per iteration.
+pub fn pbkdf2HmacSha256(password: string, salt: string, iterations: int, dkLen: int): string {
+    /// Derived-key output buffer of the caller-requested length `dkLen`.
+    let out = bytes.alloc(dkLen);
+    pbkdf2.pbkdf2Sha256(password as ptr, password.length, salt as ptr, salt.length, iterations, out, dkLen);
+    return out as string;
+}
+
+/// Derives a `dkLen`-byte key from `password` and `salt` using PBKDF2-HMAC-SHA1.
+///
+/// The SHA-1 PRF variant of [`pbkdf2HmacSha256`], with the same cost-factor and
+/// salt guidance. Provide it because several existing standards pin the PRF to
+/// HMAC-SHA1 (WPA2, older PKCS#5 deployments); prefer the SHA-256 variant for
+/// new designs.
+pub fn pbkdf2HmacSha1(password: string, salt: string, iterations: int, dkLen: int): string {
+    /// Derived-key output buffer of the caller-requested length `dkLen`.
+    let out = bytes.alloc(dkLen);
+    pbkdf2.pbkdf2Sha1(password as ptr, password.length, salt as ptr, salt.length, iterations, out, dkLen);
+    return out as string;
+}
+
+/// Pins the plain hash functions to published NIST Known Answer Test vectors.
+///
+/// Covers SHA-256 of "hello" and of the empty string, SHA-512 of "abc", and
+/// SHA-1 of "abc". A failure here means a leaf hash module changed behaviour or
+/// the hex encoding broke, not that the test itself is wrong: these digests are
+/// fixed by the standards.
+@test
+fn test_sha_kats(): void {
+    assert.equalStr(sha256("hello"), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+    assert.equalStr(sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assert.equalStr(sha512("abc"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+    assert.equalStr(sha1("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+}
+
+/// Pins HMAC-SHA256 and HMAC-SHA1 to the RFC 2202 / RFC 4231 "Jefe" test vector.
+///
+/// Exercises both the hex convenience path ([`hmacSha256`]) and the raw-then-hex
+/// path ([`hmacSha1Raw`] fed through [`toHex`]) against the same well known key
+/// and message.
+@test
+fn test_hmac_kat(): void {
+    assert.equalStr(hmacSha256("Jefe", "what do ya want for nothing?"),
+                    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    assert.equalStr(toHex(hmacSha1Raw("Jefe", "what do ya want for nothing?")),
+                    "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79");
+}
+
+/// Pins PBKDF2-HMAC-SHA1 to the RFC 6070 test vectors.
+///
+/// Checks the "password" / "salt" derivation at 1, 2, and 4096 iterations, so a
+/// change to either the iteration loop or the SHA-1 PRF is caught.
+@test
+fn test_pbkdf2_sha1_kats(): void {
+    assert.equalStr(toHex(pbkdf2HmacSha1("password", "salt", 1, 20)),
+                    "0c60c80f961f0e71f3a9b524af6012062fe037a6");
+    assert.equalStr(toHex(pbkdf2HmacSha1("password", "salt", 2, 20)),
+                    "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957");
+    assert.equalStr(toHex(pbkdf2HmacSha1("password", "salt", 4096, 20)),
+                    "4b007901b765489abead49d926f721d065a429c1");
+}
+
+/// Verifies that the `*Raw` and hex-returning functions agree.
+///
+/// Asserts `toHex(sha256Raw(x)) == sha256(x)` and the same for HMAC-SHA256,
+/// which is the invariant the two-flavour design rests on: the hex functions
+/// must be exactly [`toHex`] applied to the raw digest, never a separate
+/// computation that could drift.
+@test
+fn test_raw_matches_hex(): void {
+    assert.equalStr(toHex(sha256Raw("hello")), sha256("hello"));
+    assert.equalStr(toHex(hmacSha256Raw("Jefe", "what do ya want for nothing?")),
+                    hmacSha256("Jefe", "what do ya want for nothing?"));
+}
+
+/// Pins PBKDF2-HMAC-SHA256 to the standard "password" / "salt" test vectors.
+///
+/// Mirrors [`test_pbkdf2_sha1_kats`] for the SHA-256 PRF at 1, 2, and 4096
+/// iterations with a 32-byte derived key.
+@test
+fn test_pbkdf2_kats(): void {
+    assert.equalStr(toHex(pbkdf2HmacSha256("password", "salt", 1, 32)),
+                    "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    assert.equalStr(toHex(pbkdf2HmacSha256("password", "salt", 2, 32)),
+                    "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43");
+    assert.equalStr(toHex(pbkdf2HmacSha256("password", "salt", 4096, 32)),
+                    "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+}

@@ -1,6 +1,6 @@
-//! The `nova fmt` source formatter and its comment-preserving glue.
+//! The `kyte fmt` source formatter and its comment-preserving glue.
 //!
-//! This file is the CLI-side driver for the code formatter: it reads a `.nova`
+//! This file is the CLI-side driver for the code formatter: it reads a `.ky`
 //! file (or every file in the tree), runs it through the real pretty-printer in
 //! [`frontend/formatter.zig`], and writes the result back in place. The
 //! formatter itself only knows about the AST, so on its own it would DISCARD
@@ -25,11 +25,11 @@
 //! neither must comment reinjection. If EITHER check fails the file is left
 //! byte-for-byte untouched and a diagnostic is printed, rather than risk writing
 //! back something that alters program meaning. This is why an unsupported
-//! construct causes `nova fmt` to skip a file instead of mangling it: correctness
+//! construct causes `kyte fmt` to skip a file instead of mangling it: correctness
 //! is preferred over always-formatting.
 //!
 //! The entry point is [`cmdFmt`], dispatched from the CLI driver in
-//! `src/main.zig` for the `nova fmt` subcommand.
+//! `src/main.zig` for the `kyte fmt` subcommand.
 
 /// The Zig standard library, used here for allocation, slicing/`mem` helpers,
 /// `ArrayList`, sorting, and `std.process.Init`.
@@ -44,7 +44,7 @@ const Io = std.Io;
 /// Generated build-time options module. Imported for availability alongside the
 /// other driver modules; not referenced directly in this file.
 const build_options = @import("build_options");
-/// Nova's AST node definitions. Imported for availability; the AST is produced
+/// Kyte's AST node definitions. Imported for availability; the AST is produced
 /// and consumed here only indirectly through [`parser`] and [`formatter`].
 const ast = @import("frontend/ast.zig");
 /// The lexer. [`sameTokenStream`] and [`codeTokenSpans`] drive `Lexer` directly
@@ -80,8 +80,8 @@ const sema_mod = @import("frontend/sema/sema.zig");
 /// The monomorphisation sema pass. Imported for availability; not referenced
 /// here.
 const sema_mono = @import("frontend/sema/mono.zig");
-/// The build/driver pipeline. [`cmdFmt`] calls `pipeline.findNovaFiles` to
-/// discover every `.nova` source under the current directory in batch mode.
+/// The build/driver pipeline. [`cmdFmt`] calls `pipeline.findKyteFiles` to
+/// discover every `.ky` source under the current directory in batch mode.
 const pipeline = @import("pipeline.zig");
 
 
@@ -315,21 +315,21 @@ fn appendCommentInsert(
     order.* += 1;
 }
 
-/// Formats a single `.nova` file in place, preserving its comments, and only
+/// Formats a single `.ky` file in place, preserving its comments, and only
 /// writes back if doing so provably does not change the code.
 ///
 /// The pipeline is: read the file, parse it to an AST (a parse error is reported
 /// with the file name and propagated), pretty-print via
 /// [`frontend/formatter.zig`], then guard the result with [`sameTokenStream`]. If
 /// the formatter would alter the code token stream (an unsupported construct) the
-/// file is left untouched and skipped; with `NOVA_FMT_DEBUG` set in the
+/// file is left untouched and skipped; with `KYTE_FMT_DEBUG` set in the
 /// environment it additionally prints the first diverging token pair to aid
 /// diagnosis. It then re-injects comments with [`reinjectComments`] and runs the
 /// SAME guard a second time, skipping on failure. Only when both guards pass is
 /// the comment-preserved text written back over `file_path`.
 ///
 /// `init` carries the I/O implementation and the environment map used for the
-/// read, the write, and the `NOVA_FMT_DEBUG` lookup.
+/// read, the write, and the `KYTE_FMT_DEBUG` lookup.
 fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: []const u8) !void {
     const source = try Io.Dir.readFileAlloc(.cwd(), init.io, file_path, allocator, .unlimited);
     defer allocator.free(source);
@@ -348,7 +348,7 @@ fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: [
     defer allocator.free(formatted);
 
     if (!sameTokenStream(source, formatted)) {
-        if (init.environ_map.get("NOVA_FMT_DEBUG") != null) {
+        if (init.environ_map.get("KYTE_FMT_DEBUG") != null) {
             var la = lexer.Lexer.init(source);
             var lb = lexer.Lexer.init(formatted);
             while (true) {
@@ -375,11 +375,11 @@ fn formatFile(allocator: std.mem.Allocator, init: std.process.Init, file_path: [
     try Io.Dir.writeFile(.cwd(), init.io, .{ .data = with_comments, .sub_path = file_path, .flags = .{} });
 }
 
-/// CLI entry point for `nova fmt`, dispatched from the driver in `src/main.zig`.
+/// CLI entry point for `kyte fmt`, dispatched from the driver in `src/main.zig`.
 ///
-/// With an explicit path argument (`args.len >= 3`, i.e. `nova fmt <file>`) it
-/// formats just that file. Otherwise it recursively discovers every `.nova` file
-/// under the current directory via [`pipeline.findNovaFiles`] and formats each,
+/// With an explicit path argument (`args.len >= 3`, i.e. `kyte fmt <file>`) it
+/// formats just that file. Otherwise it recursively discovers every `.ky` file
+/// under the current directory via [`pipeline.findKyteFiles`] and formats each,
 /// then prints a count. Per-file errors are caught and reported without aborting
 /// the batch: a failure on one file logs a message and, in the directory mode,
 /// `continue`s to the next (note the printed `Formatted N files` count is the
@@ -398,9 +398,9 @@ pub fn cmdFmt(allocator: std.mem.Allocator, init: std.process.Init, args: []cons
             for (list.items) |item| allocator.free(item);
             list.deinit(allocator);
         }
-        try pipeline.findNovaFiles(allocator, init.io, .cwd(), ".", &list);
+        try pipeline.findKyteFiles(allocator, init.io, .cwd(), ".", &list);
         if (list.items.len == 0) {
-            std.debug.print("No .nova files found to format.\n", .{});
+            std.debug.print("No .ky files found to format.\n", .{});
             return;
         }
         var formatted_count: usize = 0;

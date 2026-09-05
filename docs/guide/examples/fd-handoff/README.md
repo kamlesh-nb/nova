@@ -12,11 +12,11 @@ client.
 
 ## The two roles
 
-- `router.nova` (the proxy role) binds a TCP port and a named `AF_UNIX` rendezvous socket, waits for
+- `router.ky` (the proxy role) binds a TCP port and a named `AF_UNIX` rendezvous socket, waits for
   the workers to connect, then accepts TCP clients. For each client it reads the request prefix (as an
   L7 proxy would, to route on it), then passes the client fd plus that prefix to a worker and closes
   its own copy. With `WORKERS=2` it round-robins across two workers, the proxy to N replicas shape.
-- `worker.nova` (the app role) connects to the rendezvous socket and loops receiving handed-off client
+- `worker.ky` (the app role) connects to the rendezvous socket and loops receiving handed-off client
   sockets. For each one it writes an HTTP response directly to the client and closes it.
 
 ## Run it
@@ -36,23 +36,23 @@ served by another process, load-balanced across workers, with the router out of 
 a **synchronous, blocking** prototype, so its request rate is not a throughput comparison against the
 reactor path.
 
-The runtime primitive it is built on is small and general: `nova_send_fd` / `nova_recv_fd` in the C++
+The runtime primitive it is built on is small and general: `kyte_send_fd` / `kyte_recv_fd` in the C++
 runtime (they build the `msghdr` / `cmsghdr` ancillary block, which is why they are C shims rather
-than raw FFI), surfaced in Nova as `os.socket.sendFd` / `os.socket.recvFd` plus the `AF_UNIX`
+than raw FFI), surfaced in Kyte as `os.socket.sendFd` / `os.socket.recvFd` plus the `AF_UNIX`
 helpers (`newUnix`, `unixPair`, `makeSockaddrUn`). POSIX only for now: Windows fd-passing needs
 `WSADuplicateSocket` and a different protocol.
 
 ## The same handoff wired into the real service + web app
 
-`router.nova` / `worker.nova` are the minimal illustration. The real thing is now wired into the
+`router.ky` / `worker.ky` are the minimal illustration. The real thing is now wired into the
 production pieces and is exercised by `run-service.sh`:
 
-- **service** gains a handoff mode: set `NOVA_HANDOFF_SOCK` and it binds a TCP front port plus that
+- **service** gains a handoff mode: set `KYTE_HANDOFF_SOCK` and it binds a TCP front port plus that
   `AF_UNIX` rendezvous, and hands each accepted client socket to a backend app round-robin instead of
   forwarding bytes (`proxy.serveHandoffOnReactor`). It does not parse HTTP or copy responses, so this
   is effectively an L4 accept-and-pass. The keep-alive backend pool is not used in this mode (the proxy
   holds no backend TCP connections at all).
-- **the web app** gains a handoff receiver: set `NOVA_HANDOFF_SOCK` and `app.run` connects to the
+- **the web app** gains a handoff receiver: set `KYTE_HANDOFF_SOCK` and `app.run` connects to the
   rendezvous and serves the sockets service hands it, on its reactor, with the identical request
   pipeline (`reactorHandoffBody` + the reactor's new `OP_RECVFD` op).
 

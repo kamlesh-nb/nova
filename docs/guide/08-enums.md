@@ -12,8 +12,8 @@ You inspect an enum with `switch`, which matches a variant and, for payload vari
 payload in the `case`. An enum may also declare methods (after its variants) that dispatch on `self`:
 the same per-variant `switch` shape, packaged as a method.
 
-```nova
-// examples/14_enums.nova
+```kyte
+// examples/14_enums.ky
 // Enums are tagged unions. Variants may be payload-less (`Color.Red`) or
 // carry a payload (`Node.Leaf(3)`). `switch` matches a variant and binds its
 // payload; a method on the enum dispatches per variant over `self`.

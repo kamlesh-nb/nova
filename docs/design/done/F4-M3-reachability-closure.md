@@ -83,7 +83,7 @@ BEFORE emission, symbolically (name-only, no IR, so no string-parser calls):
 ## Dependencies for the FULL string-parser retirement (beyond this build)
 - **F2-6 stage-5 completion** — every DESTRUCTOR built via TypeId (the string struct/tuple/storage builders
   unreachable), so `substituteFieldType`/`storageElem`/`getTupleElementType` have no caller. See
-  `F2-6-stage5-release-site-migration.md` (Phase E) and `nova-f2-6-stage4-parked`.
+  `F2-6-stage5-release-site-migration.md` (Phase E) and `kyte-f2-6-stage4-parked`.
 - **Abstract-residue elimination** — fully monomorphize `base_needed` method bodies so no `List<U>` residue
   remains → then EVERY erased body is deletable and the erasure-rule `isRefCountedType("U")` calls vanish.
   This changes the method-monomorphization model (base bodies are erased BY DESIGN for inferred-arg calls),
@@ -93,4 +93,4 @@ BEFORE emission, symbolically (name-only, no IR, so no string-parser calls):
 R1 (Approach A, globalDCE) → measure + inspect the surviving abstract-residue set → R2 (Approach B pre-pass,
 gated by the R1 oracle) → then the stage-5 + abstract-residue efforts for the full parser retirement. R1
 alone is a safe, shippable code-size win and de-risks everything after it. See
-[[nova-mono-completion-progress]] and `F4-monomorphization-completion.md`.
+[[kyte-mono-completion-progress]] and `F4-monomorphization-completion.md`.

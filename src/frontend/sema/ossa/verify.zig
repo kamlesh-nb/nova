@@ -1,8 +1,8 @@
 //! Ownership-SSA (OSSA) balance verifier: the self-check that proves every
 //! owned value in a function is consumed exactly once on every path.
 //!
-//! Nova is reference-counted, not garbage-collected, so the codegen that emits
-//! `nova_retain`/`nova_release` pairs is where memory correctness is actually
+//! Kyte is reference-counted, not garbage-collected, so the codegen that emits
+//! `kyte_retain`/`kyte_release` pairs is where memory correctness is actually
 //! decided. This pass exists to catch a mistake in that emission BEFORE it
 //! reaches a running binary. It runs over the ownership IR built in
 //! [`ir`] (a small SSA form where each value carries an [`ir.Ownership`]) and

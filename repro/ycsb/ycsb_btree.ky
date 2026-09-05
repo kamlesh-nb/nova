@@ -1,0 +1,11 @@
+import ycsb_core;
+import db;
+import novadb;
+
+@test
+fn ycsb_btree_suite(): void {
+    let conn = KyteDriver().connect("127.0.0.1:3009");
+    ycsb_core.runSuite("BTreeDB", conn,
+        "CREATE TABLE ycsb_af (ykey TEXT PRIMARY KEY, ydata TEXT)",
+        10000, 5000, 0.99, false);
+}

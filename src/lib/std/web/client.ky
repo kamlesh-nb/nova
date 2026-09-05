@@ -1,0 +1,497 @@
+//! HTTP client for outbound requests: connection handling, TLS, redirects, keep-alive pooling,
+//! and thin JSON helpers.
+//!
+//! Three layers are provided, from simplest to most controllable. `HttpClient` is a bare
+//! one-shot request/response over plain TCP, useful for quick internal calls where the URL is
+//! already split into host/port/path. `Http` is the general-purpose entry point: it parses a
+//! full URL, handles TLS (via `crypto.tls.truststore` and `net.tlsmembio`), follows redirects up
+//! to a hop limit, and exposes `get`/`post`/`put`/`patch`/`del`/`head` convenience wrappers plus
+//! certificate-verified variants. `KeepAlivePool` lets callers reuse connections across requests
+//! (via `Http.requestVia`) instead of paying a fresh connect and TLS handshake every time.
+//!
+//! `HttpConn` is the shared low-level connection: it multiplexes plain and TLS traffic behind one
+//! `writeStr`/`recv` surface so the request-building code above does not need to branch on
+//! `secure`. Response framing (`httpMessageLen`) understands both `Content-Length` and chunked
+//! `Transfer-Encoding`, returning -1 when more bytes are needed and -2 when the connection must be
+//! closed to detect the end of the body. `getJson`/`postJson` sit on top of `Http` and
+//! `serde.source`/`serde.bind` to deserialise a JSON response body straight into a typed value.
+
+import bytes;
+import mem.allocator;
+import string;
+import list;
+import map;
+import net.tcp.client;
+import net.tcp.stream;
+import net.tlsmembio;
+import crypto.tls.truststore;
+import net.url;
+import serde.source;
+import web.request;
+import web.response;
+import web.status;
+import crypto.base64;
+
+/// The value for an `Authorization: Bearer <token>` header. Used for OAuth
+/// access tokens and API keys (Stripe, Resend, SendGrid, and most JSON APIs).
+pub fn bearer(token: string): string {
+    return "Bearer " + token;
+}
+
+/// The value for an `Authorization: Basic <base64(user:pass)>` header (RFC 7617).
+pub fn basicAuth(user: string, pass: string): string {
+    return "Basic " + base64.encode(user + ":" + pass);
+}
+
+/// Minimal one-shot HTTP client over a plain (non-TLS) TCP socket.
+///
+/// Each call opens a fresh connection, sends the request with `Connection: close`, reads the
+/// whole response, and closes. There is no redirect following, TLS, or connection reuse; use
+/// `Http` for those.
+pub struct HttpClient {
+
+    /// Issues a GET request to `host:port/path` and returns the parsed response.
+    pub fn get(host: string, port: int, path: string): response.Response {
+        let headers = Map<string, string>(16, string.hash);
+        headers.set("Host", host);
+        let req = request.Request{
+            method: "GET",
+            path: path,
+            query: Map<string, string>(16, string.hash),
+            headers: headers,
+            cookies: Map<string, string>(16, string.hash),
+            body: "",
+        };
+        return HttpClient.send(host, port, req);
+    }
+
+    /// Issues a POST request with `body`, setting `Content-Length` automatically.
+    pub fn post(host: string, port: int, path: string, body: string): response.Response {
+        let headers = Map<string, string>(16, string.hash);
+        headers.set("Host", host);
+        headers.set("Content-Length", `${body.length}`);
+        let req = request.Request{
+            method: "POST",
+            path: path,
+            query: Map<string, string>(16, string.hash),
+            headers: headers,
+            cookies: Map<string, string>(16, string.hash),
+            body: body,
+        };
+        return HttpClient.send(host, port, req);
+    }
+
+    /// Sends a fully-built `req` to `host:port` and returns the parsed response.
+    ///
+    /// Forces `Connection: close` and fills in `Host` if the caller did not set one. Reads up to
+    /// 65536 bytes in a single call, so a response larger than that will be truncated. Returns a
+    /// synthetic `InternalServerError` response (rather than raising) if the connection fails.
+    pub fn send(host: string, port: int, req: request.Request): response.Response {
+        let stream = client.TcpClient.connect(host, port);
+        if (stream.fd < 0) {
+            return response.Response(Status.InternalServerError, "Connection failed");
+        }
+
+        let request_line = req.method + " " + req.path + " HTTP/1.1\r\n";
+
+        if (req.headers.get("Host") == undefined) {
+            req.headers.set("Host", host);
+        }
+
+        req.headers.set("Connection", "close");
+
+        let header_lines = List<string>();
+        req.headers.forEach((key, value) => {
+            header_lines.push(key + ": " + value);
+        });
+        let headers_str = string.join(header_lines, "\r\n");
+
+        let full_request = request_line + headers_str + "\r\n\r\n" + req.body;
+        stream.write(full_request);
+
+        let raw_response = stream.readAll(65536);
+        stream.close();
+
+        return response.Response.parse(raw_response);
+    }
+}
+
+/// Internal connection handle shared by both the pooled and one-shot request paths; wraps a raw
+/// socket fd and, when `secure`, a TLS memory-BIO, behind one write/recv surface.
+struct HttpConn {
+    pub secure: bool,
+    pub fd: int,
+    pub bio: tlsmembio.TlsBio,
+    pub scratch: ptr,
+    pub cap: int,
+
+    /// Drains any TLS records the BIO has queued for the wire out through the socket.
+    fn tlsFlush(self: HttpConn): void {
+        while (self.bio.pendingOut() > 0) {
+            let n = self.bio.pull(self.scratch, self.cap);
+            if (n <= 0) { return; }
+            stream.sendBytes(self.fd, self.scratch, n);
+        }
+    }
+
+    /// Drives the TLS handshake to completion by pumping `step`/feed against the socket; returns
+    /// 0 on success, -1 if the socket closes or the BIO reports an error mid-handshake.
+    fn tlsHandshake(self: HttpConn): int {
+        while (true) {
+            let st = self.bio.step();
+            self.tlsFlush();
+            if (st == 0) { return 0; }
+            if (st < 0) { return 0 - 1; }
+            let n = stream.recvBytes(self.fd, self.scratch, self.cap);
+            if (n <= 0) { return 0 - 1; }
+            self.bio.feed(self.scratch, n);
+        }
+        return 0 - 1;
+    }
+
+    /// Writes `data` to the connection, encrypting through the TLS BIO first when `secure`.
+    fn writeStr(self: HttpConn, data: string): int {
+        if (self.secure) {
+            self.bio.writeApp(data as ptr, data.length);
+            self.tlsFlush();
+            return data.length;
+        }
+        return stream.sendStr(self.fd, data);
+    }
+
+    /// Reads up to `max` bytes, decrypting through the TLS BIO first when `secure`. Returns an
+    /// empty string on connection close or error (there is no separate EOF signal).
+    fn recv(self: HttpConn, max: int): string {
+        if (self.secure) {
+            let out = bytes.alloc(max);
+            while (true) {
+                let pl = self.bio.readApp(out, max);
+                if (pl > 0) { let s = bytes.read_string(out, pl); bytes.free(out); return s; }
+                if (pl < 0) { bytes.free(out); return ""; }
+                let n = stream.recvBytes(self.fd, self.scratch, self.cap);
+                if (n <= 0) { bytes.free(out); return ""; }
+                self.bio.feed(self.scratch, n);
+            }
+            bytes.free(out);
+            return "";
+        }
+        let buf = bytes.alloc(max);
+        let n = stream.recvBytes(self.fd, buf, max);
+        if (n <= 0) { bytes.free(buf); return ""; }
+        let sp = bytes.read_string(buf, n);
+        bytes.free(buf);
+        return sp;
+    }
+
+    /// Tears down the TLS BIO, frees the scratch buffer, and closes the socket fd.
+    fn close(self: HttpConn): void {
+        self.bio.closeBio();
+        bytes.free(self.scratch);
+        if (self.fd >= 0) { stream.closeFd(self.fd); self.fd = -1; }
+    }
+}
+
+/// Determines whether `buf` contains a complete HTTP message and, if so, its total length.
+///
+/// Returns the total byte length (headers plus body) once enough of `buf` has arrived, honouring
+/// either `Content-Length` or chunked `Transfer-Encoding` (looking for the terminal `0\r\n\r\n`
+/// chunk). Returns -1 when more bytes are still needed. Returns -2 when neither framing header is
+/// present, meaning the caller must keep reading until the connection closes.
+pub fn httpMessageLen(buf: string): int {
+    let headerEnd = indexOfSeq(buf, "\r\n\r\n");
+    if (headerEnd < 0) { return -1; }
+    let bodyStart = headerEnd + 4;
+    let headerBlock = string.toLowerCase(string.slice(buf, 0, headerEnd));
+
+    let clPos = indexOfSeq(headerBlock, "content-length:");
+    if (clPos >= 0) {
+        let n = parseHeaderInt(headerBlock, clPos + 15);
+        let total = bodyStart + n;
+        if (buf.length >= total) { return total; }
+        return -1;
+    }
+    if (indexOfSeq(headerBlock, "transfer-encoding:") >= 0 && indexOfSeq(headerBlock, "chunked") >= 0) {
+        let term = indexOfSeqFrom(buf, "0\r\n\r\n", bodyStart);
+        if (term >= 0) { return term + 5; }
+        return -1;
+    }
+    return -2;
+}
+
+/// Parses the decimal integer starting at `start` in `s`, skipping leading spaces/tabs.
+fn parseHeaderInt(s: string, start: int): int {
+    let i = start;
+    while (i < s.length && (s[i] == 32 || s[i] == 9)) { i = i + 1; }
+    let n = 0;
+    while (i < s.length && s[i] >= 48 && s[i] <= 57) { n = n * 10 + (s[i] - 48); i = i + 1; }
+    return n;
+}
+
+fn indexOfSeq(hay: string, needle: string): int { return indexOfSeqFrom(hay, needle, 0); }
+
+fn indexOfSeqFrom(hay: string, needle: string, from: int): int {
+    if (needle.length == 0) { return from; }
+    let i = if (from > 0) from else 0;
+    while (i + needle.length <= hay.length) {
+        let j = 0;
+        while (j < needle.length && hay[i + j] == needle[j]) { j = j + 1; }
+        if (j == needle.length) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// A per-host pool of idle keep-alive connections, used by `Http.requestVia` to avoid reconnecting
+/// (and re-handshaking TLS) on every request.
+pub struct KeepAlivePool {
+    /// Idle connections keyed by `host:port` (with a `:s`/`:p` suffix for secure/plain).
+    pub idle: Map<string, List<HttpConn>>,
+    /// Maximum number of idle connections kept per host key; extras are closed rather than pooled.
+    pub maxIdlePerHost: int,
+
+    /// Creates a pool. `maxIdlePerHost <= 0` falls back to a default of 4.
+    init(maxIdlePerHost: int) {
+        self.idle = Map<string, List<HttpConn>>(16, string.hash);
+        self.maxIdlePerHost = if (maxIdlePerHost > 0) maxIdlePerHost else 4;
+    }
+
+    /// Builds the pool key distinguishing host, port, and TLS scheme.
+    fn key(self: KeepAlivePool, host: string, port: int, secure: bool): string {
+        return host + ":" + itoa(port) + (if (secure) ":s" else ":p");
+    }
+
+    /// Removes and returns an idle connection for `host:port` (matching `secure`), or `undefined`
+    /// if none is pooled.
+    pub fn take(self: KeepAlivePool, host: string, port: int, secure: bool): HttpConn | undefined {
+        let k = self.key(host, port, secure);
+        let lst = self.idle.get(k);
+        if (lst == undefined) { return undefined; }
+        let l = lst ?? List<HttpConn>();
+        if (l.size() == 0) { return undefined; }
+        return l.pop();
+    }
+
+    /// Returns `conn` to the idle pool for reuse. If the host is already at `maxIdlePerHost`, the
+    /// connection is closed instead of pooled and `false` is returned.
+    pub fn put(self: KeepAlivePool, host: string, port: int, secure: bool, conn: HttpConn): bool {
+        let k = self.key(host, port, secure);
+        let existing = self.idle.get(k);
+        let l = if (existing == undefined) List<HttpConn>() else (existing ?? List<HttpConn>());
+        if (l.size() >= self.maxIdlePerHost) { conn.close(); return false; }
+        l.push(conn);
+        self.idle.set(k, l);
+        return true;
+    }
+
+    /// Returns the number of idle connections currently pooled for `host:port`/`secure`.
+    pub fn idleCount(self: KeepAlivePool, host: string, port: int, secure: bool): int {
+        let lst = self.idle.get(self.key(host, port, secure));
+        if (lst == undefined) { return 0; }
+        return (lst ?? List<HttpConn>()).size();
+    }
+}
+
+/// Converts `v` to its decimal string representation (used for the pool key's port number).
+fn itoa(v: int): string {
+    if (v == 0) { return "0"; }
+    let n = v; let neg = n < 0; if (neg) { n = 0 - n; }
+    let s = "";
+    while (n > 0) { let d = n % 10; s = string.slice("0123456789", d, d + 1) + s; n = n / 10; }
+    return if (neg) "-" + s else s;
+}
+
+/// Full-featured HTTP client: URL parsing, TLS, up to 5 redirect hops, and optional keep-alive
+/// pooling. Prefer the `get`/`post`/... convenience methods for simple calls, `request`/
+/// `requestTimeout` when custom headers or a timeout are needed, and `requestVia` when reusing
+/// connections through a `KeepAlivePool` matters.
+pub struct Http {
+
+    /// Sends `method urlStr` with `headers` and `body`, following up to 5 redirects. TLS
+    /// certificates are NOT verified (no CA bundle is supplied); use `getVerified`/`postVerified`
+    /// for verified TLS.
+    pub fn request(method: string, urlStr: string, headers: Map<string, string>, body: string): response.Response {
+        return Http.doRequest(method, urlStr, headers, body, 0, 5, "");
+    }
+
+    /// Same as `request`, but aborts the connection after `timeoutMs` milliseconds of inactivity.
+    pub fn requestTimeout(method: string, urlStr: string, headers: Map<string, string>, body: string, timeoutMs: int): response.Response {
+        return Http.doRequest(method, urlStr, headers, body, timeoutMs, 5, "");
+    }
+
+    /// Sends a request reusing an idle connection from `pool` when one is available, otherwise
+    /// connecting fresh; the connection is returned to `pool` afterwards unless the response (or
+    /// a framing failure) requires closing it. Unlike `request`, this path does NOT follow
+    /// redirects.
+    pub fn requestVia(pool: KeepAlivePool, method: string, urlStr: string, headers: Map<string, string>, body: string): response.Response {
+        let u = url.parse(urlStr);
+        let reused = pool.take(u.host, u.port, u.secure);
+        let conn = HttpConn{ secure: u.secure, fd: -1, bio: tlsmembio.newClientBio(u.host), scratch: bytes.alloc(33792), cap: 33792 };
+        let fresh = true;
+        if (reused != undefined) {
+            conn = reused ?? conn;
+            fresh = false;
+        } else {
+            let fd = stream.connect(u.host, u.port);
+            if (fd < 0) { return response.Response(Status.InternalServerError, "connection failed"); }
+            conn = HttpConn{ secure: u.secure, fd: fd, bio: tlsmembio.newClientBio(u.host), scratch: bytes.alloc(33792), cap: 33792 };
+            if (u.secure && conn.tlsHandshake() != 0) { conn.close(); return response.Response(Status.InternalServerError, "TLS handshake failed"); }
+        }
+
+        let reqLine = method + " " + u.path + " HTTP/1.1\r\n";
+        let hdrs = List<string>();
+        hdrs.push("Host: " + u.host);
+        hdrs.push("Connection: keep-alive");
+        if (body.length > 0) { hdrs.push(`Content-Length: ${body.length}`); }
+        headers.forEach((k, v) => { hdrs.push(k + ": " + v); });
+        conn.writeStr(reqLine + string.join(hdrs, "\r\n") + "\r\n\r\n" + body);
+
+        let buf = "";
+        let mustClose = false;
+        while (true) {
+            let total = httpMessageLen(buf);
+            if (total >= 0) { break; }
+            if (total == -2) { mustClose = true; }
+            let chunk = conn.recv(65536);
+            if (chunk.length == 0) { mustClose = true; break; }
+            buf = buf + chunk;
+        }
+
+        let resp = response.Response.parse(buf);
+        let connHdr = string.toLowerCase(resp.getHeader("connection") ?? "");
+        if (mustClose || string.contains(connHdr, "close")) {
+            conn.close();
+        } else {
+            pool.put(u.host, u.port, u.secure, conn);
+        }
+        return resp;
+    }
+
+    /// Core one-shot request implementation: connects, optionally performs a TLS handshake
+    /// (verified against `caPem` when non-empty), sends the request, reads the full response, and
+    /// recursively follows redirects (301/302/303/307/308) while `hopsLeft > 0`, downgrading to
+    /// GET with no body except for 307/308 which preserve method and body.
+    fn doRequest(method: string, urlStr: string, headers: Map<string, string>, body: string, timeoutMs: int, hopsLeft: int, caPem: string): response.Response {
+        let u = url.parse(urlStr);
+
+        let fd = stream.connect(u.host, u.port);
+        if (fd < 0) {
+            return response.Response(Status.InternalServerError, "connection failed");
+        }
+        if (timeoutMs > 0) { stream.setTimeout(fd, timeoutMs); }
+        let store = truststore.loadPemBundle(caPem);
+        let bio: tlsmembio.TlsBio = if (u.secure && caPem.length > 0) tlsmembio.newClientBioVerify(u.host, store) else tlsmembio.newClientBio(u.host);
+        let conn = HttpConn{ secure: u.secure, fd: fd, bio: bio, scratch: bytes.alloc(33792), cap: 33792 };
+        if (u.secure) {
+            if (conn.tlsHandshake() != 0) {
+                conn.close();
+                return response.Response(Status.InternalServerError, "TLS handshake failed");
+            }
+        }
+
+        let reqLine = method + " " + u.path + " HTTP/1.1\r\n";
+        let hdrs = List<string>();
+        hdrs.push("Host: " + u.host);
+        hdrs.push("Connection: close");
+        hdrs.push("Accept-Encoding: gzip");
+        if (body.length > 0) { hdrs.push(`Content-Length: ${body.length}`); }
+        let sawUA = false;
+        headers.forEach((k, v) => {
+            hdrs.push(k + ": " + v);
+            if (string.toLowerCase(k) == "user-agent") { sawUA = true; }
+        });
+        if (!sawUA) { hdrs.push("User-Agent: kyte-http/1.0"); }
+        let full = reqLine + string.join(hdrs, "\r\n") + "\r\n\r\n" + body;
+        conn.writeStr(full);
+
+        let parts = List<string>();
+        while (true) {
+            let chunk = conn.recv(65536);
+            if (chunk.length == 0) { break; }
+            parts.push(chunk);
+        }
+        conn.close();
+        let resp = response.Response.parse(string.join(parts, ""));
+        let code = Status.toCode(resp.status);
+
+        if ((code == 301 || code == 302 || code == 303 || code == 307 || code == 308) && hopsLeft > 0) {
+            let loc = resp.getHeader("location") ?? "";
+            if (loc.length > 0) {
+                let nextUrl = Http.resolveLocation(u, loc);
+                let keepMethod = code == 307 || code == 308;
+                let nextMethod = if (keepMethod) method else "GET";
+                let nextBody = if (keepMethod) body else "";
+                return Http.doRequest(nextMethod, nextUrl, headers, nextBody, timeoutMs, hopsLeft - 1, caPem);
+            }
+        }
+
+        return resp;
+    }
+
+    /// Resolves a `Location` header value against `base`: absolute URLs pass through unchanged,
+    /// absolute paths keep the base's scheme/host/port, and relative paths are appended.
+    fn resolveLocation(base: url.Url, loc: string): string {
+        if (string.contains(loc, "://")) { return loc; }
+        let origin = base.scheme + "://" + base.host + ":" + `${base.port}`;
+        if (string.startsWith(loc, "/")) { return origin + loc; }
+        return origin + "/" + loc;
+    }
+
+    fn emptyHeaders(): Map<string, string> {
+        return Map<string, string>(8, string.hash);
+    }
+
+    /// Sends a GET request to `urlStr` with no extra headers, following redirects.
+    pub fn get(urlStr: string): response.Response {
+        return Http.request("GET", urlStr, Http.emptyHeaders(), "");
+    }
+    /// Sends a POST request to `urlStr` with `body` and no extra headers, following redirects.
+    pub fn post(urlStr: string, body: string): response.Response {
+        return Http.request("POST", urlStr, Http.emptyHeaders(), body);
+    }
+    /// Sends a PUT request to `urlStr` with `body` and no extra headers, following redirects.
+    pub fn put(urlStr: string, body: string): response.Response {
+        return Http.request("PUT", urlStr, Http.emptyHeaders(), body);
+    }
+    /// Sends a PATCH request to `urlStr` with `body` and no extra headers, following redirects.
+    pub fn patch(urlStr: string, body: string): response.Response {
+        return Http.request("PATCH", urlStr, Http.emptyHeaders(), body);
+    }
+    /// Sends a DELETE request to `urlStr` with no extra headers, following redirects.
+    pub fn del(urlStr: string): response.Response {
+        return Http.request("DELETE", urlStr, Http.emptyHeaders(), "");
+    }
+    /// Sends a HEAD request to `urlStr` with no extra headers, following redirects.
+    pub fn head(urlStr: string): response.Response {
+        return Http.request("HEAD", urlStr, Http.emptyHeaders(), "");
+    }
+
+    /// Sends a GET request with TLS certificate verification against the PEM CA bundle `caPem`.
+    pub fn getVerified(urlStr: string, caPem: string): response.Response {
+        return Http.doRequest("GET", urlStr, Http.emptyHeaders(), "", 0, 5, caPem);
+    }
+    /// Sends a POST request with TLS certificate verification against the PEM CA bundle `caPem`.
+    pub fn postVerified(urlStr: string, body: string, caPem: string): response.Response {
+        return Http.doRequest("POST", urlStr, Http.emptyHeaders(), body, 0, 5, caPem);
+    }
+}
+
+
+/// Sends a GET request to `urlStr` and deserialises the JSON response body into `T`.
+///
+/// Does not set an `Accept` header or check the response status; a non-JSON or error body will
+/// fail during `serde.bind`.
+pub fn getJson<T>(urlStr: string): T {
+    let r = Http.get(urlStr);
+    let src = source.fromJson(r.body);
+    return serde.bind<T>(src);
+}
+
+/// Sends a POST request with `jsonBody` and a `Content-Type: application/json` header, and
+/// deserialises the JSON response body into `T`.
+pub fn postJson<T>(urlStr: string, jsonBody: string): T {
+    let hdrs = Map<string, string>(4, string.hash);
+    hdrs.set("Content-Type", "application/json");
+    let r = Http.request("POST", urlStr, hdrs, jsonBody);
+    let src = source.fromJson(r.body);
+    return serde.bind<T>(src);
+}
