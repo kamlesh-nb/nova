@@ -5,7 +5,7 @@ import Domain.Dtos.ProductDto;
 
 // The repository is the ONE place that knows SQL. Handlers depend on it, never on a connection or a
 // driver. Its field is the `Connection` TRAIT, not a concrete type, so the same repository runs over
-// the in-memory connection (offline, in tests) and over a real NovaDB/Postgres connection with no
+// the in-memory connection (offline, in tests) and over a real PostgreSQL connection with no
 // change. Parameters are built with `db.dbInt`/`db.dbText`/`db.dbLong` and bound to `$1,$2,...`; the
 // micro-ORM (`orm.bindOne`/`orm.bindAll`) maps result rows onto `ProductDto` by column name.
 pub struct ProductRepository {

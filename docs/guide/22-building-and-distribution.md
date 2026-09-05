@@ -143,7 +143,7 @@ supported host builds:
 The one input Zig cannot synthesise is the target architecture's LLVM, so a second-architecture build
 on the same host needs that architecture's LLVM install pointed at by `NOVA_LLVM_PREFIX`. The native
 build needs no target flag and links the host LLVM (the hardcoded dev prefix, or your
-`NOVA_LLVM_PREFIX`). The same matrix applies to the sibling toolchain repos (nls, NovaDB, the
+`NOVA_LLVM_PREFIX`). The same matrix applies to the sibling toolchain repos (nls and the
 orchestrator): each uses the same `-Dtarget` pass-through, and only the ones that link LLVM (the
 compiler and nls) need the per-architecture `NOVA_LLVM_PREFIX`.
 

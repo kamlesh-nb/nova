@@ -1,13 +1,13 @@
-# 18. Data access: the db seam, drivers, and NovaDB
+# 18. Data access: the db seam, drivers, and the repository pattern
 
 The web service in the previous chapter stored its products in memory. Real services keep their data in
 a database. This chapter shows how Nova talks to one: the `db` seam that every driver implements, the
-drivers themselves (NovaDB, PostgreSQL, MySQL, SQL Server, MongoDB), the micro-ORM that turns rows into
-your typed structs, and the repository pattern that keeps all of this out of your handlers. At the end we
-take the exact web app from Chapter 17 and point it at a live NovaDB, changing one file.
+drivers themselves (PostgreSQL, MySQL, SQL Server, MongoDB), the micro-ORM that turns rows into your
+typed structs, and the repository pattern that keeps all of this out of your handlers. At the end we take
+the exact web app from Chapter 17 and point it at a live PostgreSQL, changing one file.
 
 The running code for this chapter is `examples/28_db_drivers.nova` (the seam and the ORM, verifiable
-offline) and `examples/webapp/src/main_novadb.nova` (the same web app, backed by NovaDB).
+offline) and `examples/webapp/main_postgres.nova` (the same web app, backed by PostgreSQL).
 
 ## One seam, many drivers
 
@@ -16,7 +16,6 @@ package that implements it:
 
 | Database   | Import            | Open a connection |
 |------------|-------------------|-------------------|
-| NovaDB     | `import novadb;`  | `NovaDriver().connect("novadb://user:pass@127.0.0.1:3009?db=shop")` |
 | PostgreSQL | `import postgres;`| `PgDriver().connect("postgresql://user:pass@127.0.0.1:5432/shop")` |
 | MySQL      | `import mysql;`   | `MyDriver().connect("mysql://user:pass@127.0.0.1:3306/shop")` |
 | SQL Server | `import mssql;`   | `MssqlDriver().connect("mssql://user:pass@127.0.0.1:1433/shop")` |
@@ -28,27 +27,28 @@ databases. You pick the driver in one place, at startup, and everything above it
 A driver package is laid out by responsibility, not by a per-file prefix: `connection` (the
 connection-string parser), `codec` (the wire protocol), `proto` (transport framing), `typemap` (type
 mapping), `auth`, and `stmt`. The one file a consumer touches is the seam module named after the database
-(`novadb`, `postgres`, ...), which exposes the driver and connection types.
+(`postgres`, `mysql`, ...), which exposes the driver and connection types.
 
 ## Connection strings
 
-A NovaDB connection string is a URL:
+A PostgreSQL connection string is a URL:
 
 ```
-novadb://user:password@host:port?db=name&tls=verify&tlsCAFile=/etc/ca.pem
+postgresql://user:password@host:port/database?sslmode=verify-full&sslrootcert=/etc/ca.pem
 ```
 
-Everything except the host is optional. The bare `host:port` form works too, so all of these are valid:
+Everything except the host is optional, so all of these are valid:
 
 ```nova
-NovaDriver().connect("novadb://app:secret@db.internal:3009?db=shop");  // full URL
-NovaDriver().connect("127.0.0.1:3009?db=shop");                        // no scheme, no credentials
-NovaDriver().connect("127.0.0.1:3009");                               // minimal; defaults fill the rest
+PgDriver().connect("postgresql://app:secret@db.internal:5432/shop");   // full URL
+PgDriver().connect("postgresql://127.0.0.1:5432/shop");                // no credentials
+PgDriver().connect("postgresql://127.0.0.1/shop");                     // minimal; defaults fill the rest
 ```
 
-The query parameters are `db` (database name), `user`/`password` (an alternative to the `user:pass@`
-userinfo), `tls` (`true` to encrypt, `verify` to also validate the server certificate), and `tlsCAFile`
-(a PEM bundle for verification). When no port is given it defaults to `3009`.
+The database is a path segment (`/shop`). User, password, and database are percent-decoded (RFC 3986).
+The query parameters are `sslmode` (`disable`, `require`, or `verify-full`), `sslrootcert` (a CA bundle
+for verification), and `connect_timeout` (in seconds). When no port is given it defaults to `5432`, the
+user defaults to `postgres`, and the database defaults to the user.
 
 ## Values and parameters
 
@@ -112,7 +112,7 @@ building a `ResultSet` by hand exactly as a driver would return it, then binding
 
 Put the data access behind a repository so your handlers never see SQL. The important detail is the
 field type: the repository holds the `Connection` **trait**, not a concrete driver type, so the same
-repository runs against the in-memory database, NovaDB, or any other driver.
+repository runs against the in-memory database, PostgreSQL, or any other driver.
 
 ```nova
 import data.db;
@@ -173,12 +173,13 @@ plain field of `T`, or the `$N` placeholders are not contiguous from `$1`, the b
 `naem` is a compile error, not a runtime surprise. The check skips `SELECT *` and computed expressions,
 where it cannot know the shape.
 
-## Swapping the web app onto NovaDB
+## Swapping the web app onto PostgreSQL
 
 Chapter 17's app built an `InMemoryConnection` in its composition root. `InMemoryConnection` implements
-the same `Connection` trait NovaDB does, which is why the repository never needed to know the difference.
-To move the app onto a real database, change the composition root and nothing else. There is no container
-and no downcast: you construct a different `Connection` and pass it to the same `ProductRepository`.
+the same `Connection` trait the PostgreSQL driver does, which is why the repository never needed to know
+the difference. To move the app onto a real database, change the composition root and nothing else. There
+is no container and no downcast: you construct a different `Connection` and pass it to the same
+`ProductRepository`.
 
 `examples/webapp/src/main.nova` (the default, in-memory build):
 
@@ -188,17 +189,18 @@ let repo = ProductRepository(conn);
 registerProducts(app, repo);
 ```
 
-`examples/webapp/main_novadb.nova` is the same app with a live NovaDB. The only change is the connection:
+`examples/webapp/main_postgres.nova` is the same app with a live PostgreSQL. The only change is the
+connection:
 
 ```nova
-let conn = PooledConnection(dsn, poolSize);   // a Connection backed by a NovaDB pool
+let conn = PooledConnection(dsn, poolSize);   // a Connection backed by a PostgreSQL pool
 let repo = ProductRepository(conn);
 registerProducts(app, repo);
 ```
 
 There is one rule that shapes `PooledConnection`: **do not open a socket in `main`.** Connecting is
 asynchronous, and you cannot drive an asynchronous call to completion from the synchronous `main` before
-the event loop starts. So `PooledConnection` wraps a `pool.Pool(NovaDriver(), dsn, size)`, which is
+the event loop starts. So `PooledConnection` wraps a `pool.Pool(PgDriver(), dsn, size)`, which is
 constructed synchronously and opens its connections LAZILY, inside a request, where the handler is already
 awaiting:
 
@@ -207,7 +209,7 @@ awaiting:
 pub struct PooledConnection impl Connection {
     p: pool.Pool,
     init(dsn: string, size: int) {
-        self.p = pool.Pool(NovaDriver(), dsn, size);
+        self.p = pool.Pool(PgDriver(), dsn, size);
         self.p.configure(size, 0, false);
     }
     async fn query(self: PooledConnection, sql: string, params: List<DbValue>): ResultSet {
@@ -222,7 +224,7 @@ pub struct PooledConnection impl Connection {
 
 Everything else, the features, handlers, DTOs, validators, routes, and views, is shared between the two
 builds without a single change. That is the payoff of writing the repository against the seam. Because
-`main_novadb.nova` imports the `novadb` package, the project needs that dependency and the driver
+`main_postgres.nova` imports the `postgres` package, the project needs that dependency and the driver
 reachable; `run-live.sh` wires it up and builds it for you.
 
 ## Transactions
@@ -272,10 +274,10 @@ pulls documents in batches the same way.
 
 ## Running it live
 
-`examples/run-live.sh` runs the whole loop end to end: it builds and starts a NovaDB server on
-`127.0.0.1:3009`, builds `main_novadb`, starts the app, and curls a create and a read so you can watch a
-value travel from an HTTP request into NovaDB and back out. It then puts the app behind the orchestrator,
-which is the subject of Chapter 21.
+`examples/run-live.sh` runs the whole loop end to end: it connects to a PostgreSQL server on
+`127.0.0.1:5432`, seeds the schema, builds `main_postgres`, starts the app, and curls a create and a read
+so you can watch a value travel from an HTTP request into PostgreSQL and back out. It then puts the app
+behind the orchestrator, which is the subject of Chapter 23.
 
 ## MongoDB: the document API
 
@@ -564,7 +566,5 @@ MongoDB driver, and vice versa.
 - Chapter 17 for the web framework the repository plugs into.
 - Chapter 19 for package management: how you add a driver dependency with `nova get`.
 - Chapter 20 for the database drivers, each with its intro, package deployment, and connection string.
-- Chapter 23 for deploying this NovaDB-backed app under the orchestrator (service, orchd, orchctl).
-- Chapter 25 for NovaDB itself: the engine on the other end of the connection, its SQL and document modes,
-  and how to run and configure the server.
+- Chapter 23 for deploying this PostgreSQL-backed app under the orchestrator (service, orchd, orchctl).
 - Chapter 16 for `@serializable`, which powers both JSON responses and the ORM binder.

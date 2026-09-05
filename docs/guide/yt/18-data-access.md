@@ -1,4 +1,4 @@
-# Video 18: Data access and NovaDB
+# Video 18: Data access and PostgreSQL
 
 - Chapter: [18-data-access.md](../18-data-access.md)
 - Estimated length: ~15 minutes
@@ -6,18 +6,18 @@
 
 ## Hook (0:00)
 
-**Say:** In the last video we built a web service, but it kept its products in memory. Real services use a database. In this video you will see how Nova talks to one. There is a single interface, the `Connection` seam, that every driver implements, so the code you write does not change when you change databases. You will see the drivers, the connection strings, how the micro-ORM turns rows into your typed structs, and finally we will take the exact web app from the last video and point it at a live NovaDB by changing one file.
+**Say:** In the last video we built a web service, but it kept its products in memory. Real services use a database. In this video you will see how Nova talks to one. There is a single interface, the `Connection` seam, that every driver implements, so the code you write does not change when you change databases. You will see the drivers, the connection strings, how the micro-ORM turns rows into your typed structs, and finally we will take the exact web app from the last video and point it at a live PostgreSQL by changing one file.
 
 ## What we will cover (0:30)
 
 **On screen:**
 ```
-- One seam, many drivers: NovaDB, PostgreSQL, MySQL, SQL Server, MongoDB
-- Connection strings: the novadb:// URL and the bare form
+- One seam, many drivers: PostgreSQL, MySQL, SQL Server, MongoDB
+- Connection strings: the postgresql:// URL and the bare form
 - Typed parameters: DbValue and $1 placeholders, never string concatenation
 - The micro-ORM: bindAll and bindOne into @serializable structs
 - The repository: written against the Connection trait
-- Swapping the web app onto a real NovaDB
+- Swapping the web app onto a real PostgreSQL
 ```
 
 ## Segment: One seam, many drivers (1:00)
@@ -26,7 +26,6 @@
 
 **On screen:**
 ```
-NovaDB      import novadb;    NovaDriver().connect("novadb://user:pass@127.0.0.1:3009?db=shop")
 PostgreSQL  import postgres;  PgDriver().connect("postgresql://user:pass@127.0.0.1:5432/shop")
 MySQL       import mysql;     MyDriver().connect("mysql://user:pass@127.0.0.1:3306/shop")
 SQL Server  import mssql;     MssqlDriver().connect("mssql://user:pass@127.0.0.1:1433/shop")
@@ -37,18 +36,18 @@ MongoDB     import mongodb;   mongodb.open("mongodb://user:pass@127.0.0.1:27017/
 
 ## Segment: Connection strings (2:30)
 
-**Say:** A NovaDB connection string is a URL. Everything except the host is optional, and the bare host and port form works too.
+**Say:** A PostgreSQL connection string is a URL. Everything except the host is optional, and the bare host and port form works too.
 
 **On screen:**
 ```
-novadb://user:password@host:port?db=name&tls=verify&tlsCAFile=/etc/ca.pem
+postgresql://user:password@host:port/name?tls=verify&tlsCAFile=/etc/ca.pem
 
-NovaDriver().connect("novadb://app:secret@db.internal:3009?db=shop");  // full URL
-NovaDriver().connect("127.0.0.1:3009?db=shop");                        // no scheme, no credentials
-NovaDriver().connect("127.0.0.1:3009");                               // minimal; defaults fill the rest
+PgDriver().connect("postgresql://app:secret@db.internal:5432/shop");  // full URL
+PgDriver().connect("127.0.0.1:5432/shop");                            // no scheme, no credentials
+PgDriver().connect("127.0.0.1:5432");                                 // minimal; defaults fill the rest
 ```
 
-**Say:** The query parameters are the database name, credentials as an alternative to the userinfo, and TLS options: `tls=true` to encrypt, `tls=verify` to also validate the server certificate against a CA file. No port defaults to 3009.
+**Say:** The URL carries the database name in the path, credentials as an alternative to the userinfo, and TLS options: `tls=true` to encrypt, `tls=verify` to also validate the server certificate against a CA file. No port defaults to 5432.
 
 ## Segment: Typed parameters (3:45)
 
@@ -126,9 +125,9 @@ pub struct ProductRepository impl Service {
 
 **Say:** This is the whole repository from the web app. Await the I/O, then bind the rows with the synchronous binder. It is written once and never changes, whichever database backs it.
 
-## Segment: Swapping the web app onto NovaDB (9:15)
+## Segment: Swapping the web app onto PostgreSQL (9:15)
 
-**Say:** Here is the payoff. The web app from Video 17 built an in-memory connection in its composition root. That in-memory connection implements the same `Connection` trait NovaDB does, which is why the repository never noticed the difference. To move onto a real database we change the composition root and nothing else. There is no container and no downcast: we construct a different `Connection` and pass it to the same repository.
+**Say:** Here is the payoff. The web app from Video 17 built an in-memory connection in its composition root. That in-memory connection implements the same `Connection` trait PostgreSQL does, which is why the repository never noticed the difference. To move onto a real database we change the composition root and nothing else. There is no container and no downcast: we construct a different `Connection` and pass it to the same repository.
 
 **On screen:**
 ```nova
@@ -136,8 +135,8 @@ pub struct ProductRepository impl Service {
 let conn = InMemoryConnection();
 let repo = ProductRepository(conn);
 
-// main_novadb.nova (the same app, live NovaDB): only the connection changes
-let conn = PooledConnection(dsn, poolSize);   // a Connection over a NovaDB pool
+// main_postgres.nova (the same app, live PostgreSQL): only the connection changes
+let conn = PooledConnection(dsn, poolSize);   // a Connection over a PostgreSQL pool
 let repo = ProductRepository(conn);
 ```
 
@@ -149,7 +148,7 @@ let repo = ProductRepository(conn);
 
 ## Segment: Running it live (12:30)
 
-**Say:** To see it end to end, the guide ships `run-live.sh`. It starts a NovaDB server, builds the NovaDB-backed app, and curls a create and a read, so you watch a value travel from an HTTP request into NovaDB and back.
+**Say:** To see it end to end, the guide ships `run-live.sh`. It starts a PostgreSQL server, builds the PostgreSQL-backed app, and curls a create and a read, so you watch a value travel from an HTTP request into PostgreSQL and back.
 
 **Run it:**
 ```sh
@@ -162,12 +161,12 @@ cd docs/guide/examples && ./run-live.sh
 
 **Say:** Let us recap.
 
-- Nova has one data-access seam, `Connection`, and a driver per database: NovaDB, PostgreSQL, MySQL, SQL Server, MongoDB.
-- A connection string is a URL, `novadb://user:pass@host:port?db=name`, and a bare host and port works too.
+- Nova has one data-access seam, `Connection`, and a driver per database: PostgreSQL, MySQL, SQL Server, MongoDB.
+- A connection string is a URL, `postgresql://user:pass@host:port/name`, and a bare host and port works too.
 - Values are typed `DbValue` parameters with dollar-N placeholders, never string-concatenated.
 - The micro-ORM binds rows into `@serializable` structs with `bindAll` and `bindOne`.
 - Write your repository against the `Connection` trait, and the same code runs on any database.
-- Swapping the web app onto NovaDB changed one file, because the repository depends on the seam.
+- Swapping the web app onto PostgreSQL changed one file, because the repository depends on the seam.
 
 ## Outro (15:00)
 

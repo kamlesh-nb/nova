@@ -2,11 +2,11 @@
 
 - Chapter: [23-deploying-with-the-orchestrator.md](../23-deploying-with-the-orchestrator.md)
 - Estimated length: ~14 minutes
-- You will need: Nova installed, Zig (to build the NovaDB server), curl, and the guide's `examples/` folder. Watching Video 18 on data access first is essential, since we deploy that NovaDB-backed app.
+- You will need: Nova installed, a PostgreSQL server, curl, and the guide's `examples/` folder. Watching Video 18 on data access first is essential, since we deploy that PostgreSQL-backed app.
 
 ## Hook (0:00)
 
-**Say:** You have a NovaDB-backed web service. In this video we run it the way you would in production: several replicas behind a load balancer, supervised and kept at their desired count. Nova ships a small orchestrator for exactly this. The parts we use here are three binaries that mirror the Kubernetes control-plane and data-plane split, service, orchd, and orchctl; a fourth binary, artifactd, delivers the actual application binaries and hosts the orchestrator's own config store. By the end of this one you will have curled your app through a real load balancer and operated its config store from the command line.
+**Say:** You have a PostgreSQL-backed web service. In this video we run it the way you would in production: several replicas behind a load balancer, supervised and kept at their desired count. Nova ships a small orchestrator for exactly this. The parts we use here are three binaries that mirror the Kubernetes control-plane and data-plane split, service, orchd, and orchctl; a fourth binary, artifactd, delivers the actual application binaries and hosts the orchestrator's own config store. By the end of this one you will have curled your app through a real load balancer and operated its config store from the command line.
 
 ## What we will cover (0:30)
 
@@ -21,22 +21,22 @@
 
 ## Segment: The shape of a deployment (1:00)
 
-**Say:** Here is the picture. Two replicas of your app, a proxy in front of them, a control-plane agent keeping them alive, NovaDB holding your application data, and artifactd holding the orchestrator's own config store.
+**Say:** Here is the picture. Two replicas of your app, a proxy in front of them, a control-plane agent keeping them alive, PostgreSQL holding your application data, and artifactd holding the orchestrator's own config store.
 
 **On screen:**
 ```
                 service  (:8090, round-robin, health checks)
                 /     \
-  app replica A (:8080)  app replica B (:8081)     <- your NovaDB-backed web app
+  app replica A (:8080)  app replica B (:8081)     <- your PostgreSQL-backed web app
                 \     /
-                 NovaDB (:3009)                     <- your app's data (products table)
+                 PostgreSQL (:5432)                 <- your app's data (products table)
                    ^
                  orchd  (reconciles replicas, writes the discovery file service reads)
                    |
                  artifactd (:8135)                  <- deploy blobs + the orchestrator config store
 ```
 
-**Say:** Notice the split: NovaDB holds your products table, and artifactd holds the orchestrator's config store, its cluster membership and workload definitions, over a small `/cfg/*` HTTP surface snapshotted to a `config.snap` file. The orchestrator does not run a database of its own.
+**Say:** Notice the split: PostgreSQL holds your products table, and artifactd holds the orchestrator's config store, its cluster membership and workload definitions, over a small `/cfg/*` HTTP surface snapshotted to a `config.snap` file. The orchestrator does not run a database of its own.
 
 ## Segment: The three binaries (2:15)
 
@@ -102,7 +102,7 @@ orchctl upgrade-plan store.dump            # the safe rolling-upgrade node order
 
 ## Segment: The whole loop (9:15)
 
-**Say:** Let us run all of it. The guide's `run-live.sh` starts NovaDB, builds and starts two replicas of the app on 8080 and 8081, exercises the app directly, then starts service on 8090 and curls the app through the proxy three times so you see the round-robin. It finishes by inspecting a config-store dump with orchctl.
+**Say:** Let us run all of it. The guide's `run-live.sh` starts PostgreSQL, builds and starts two replicas of the app on 8080 and 8081, exercises the app directly, then starts service on 8090 and curls the app through the proxy three times so you see the round-robin. It finishes by inspecting a config-store dump with orchctl.
 
 **Run it:**
 ```sh
@@ -111,13 +111,13 @@ cd docs/guide/examples && ./run-live.sh
 
 **On screen:**
 ```
-== 3/5  exercise the app directly (write -> NovaDB -> read back)
+== 3/5  exercise the app directly (write -> PostgreSQL -> read back)
 == 4/5  put the app behind service (data plane, load-balancing the two replicas)
    GET through service on :8090 three times (round-robins across the two replicas)
 == 5/5  operate the config store with orchctl (offline ops CLI)
 ```
 
-**Say:** It builds everything it needs, the NovaDB server, the app, the orchestrator binaries, and cleans up every process on exit. That is a full deployment on one machine.
+**Say:** It builds everything it needs, the app and the orchestrator binaries, connects to PostgreSQL, and cleans up every process on exit. That is a full deployment on one machine.
 
 ## Segment: Production concerns (11:30)
 
@@ -130,7 +130,7 @@ cd docs/guide/examples && ./run-live.sh
 - The orchestrator's core is three binaries: service the data plane, orchd the control plane, orchctl the offline ops CLI. A fourth, artifactd, delivers binaries and is the next video.
 - service load-balances your app replicas with health checks and several strategies.
 - orchd keeps replicas at their desired count and can publish service discovery for service.
-- The config store lives in artifactd, over its `/cfg/*` HTTP routes and a `config.snap` snapshot, not in a database. Your app's own data stays in NovaDB.
+- The config store lives in artifactd, over its `/cfg/*` HTTP routes and a `config.snap` snapshot, not in a database. Your app's own data stays in PostgreSQL.
 - orchctl inspects and repairs that store and plans safe rolling upgrades, all offline.
 
 ## Outro (14:00)

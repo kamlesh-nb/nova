@@ -17,7 +17,7 @@
 - ctx.bind<T>(): typed input from query, path, and form
 - NSX views: auto-escaped {expr}, response.raw for fragments
 - Wiring: routes.nova per feature + a plain composition root
-- The Connection seam: in-memory now, real NovaDB by changing one file
+- The Connection seam: in-memory now, real PostgreSQL by changing one file
 - Testing offline with app.dispatch
 ```
 
@@ -195,7 +195,7 @@ assert.equalInt(res.status.toCode(), 404);
 
 ## Segment: The same app, real database (14:00)
 
-**Say:** The project also has main_novadb.nova at its root: the same app over a real NovaDB. Put it next to src/main.nova and only the composition root differs. Every slice, the repository, the handlers, the views are identical, because they depend on the Connection trait, never on a driver.
+**Say:** The project also has main_postgres.nova at its root: the same app over a real PostgreSQL. Put it next to src/main.nova and only the composition root differs. Every slice, the repository, the handlers, the views are identical, because they depend on the Connection trait, never on a driver.
 
 **On screen:**
 ```nova
@@ -204,13 +204,13 @@ let repo = ProductRepository(conn);
 registerProducts(app, repo);
 ```
 
-**Say:** The pooled connection is built synchronously and opens NovaDB connections lazily, inside requests. That matters: opening a connection is asynchronous, and you cannot drive an asynchronous call from the synchronous main before the event loop starts. We take this apart properly in the next video.
+**Say:** The pooled connection is built synchronously and opens PostgreSQL connections lazily, inside requests. That matters: opening a connection is asynchronous, and you cannot drive an asynchronous call from the synchronous main before the event loop starts. We take this apart properly in the next video.
 
 ## Recap and outro (15:30)
 
-**Say:** That is a Nova web application. Vertical slices, one RouteHandler per feature, typed input from ctx.bind, auto-escaped NSX views, a plain composition root, and a Connection seam that lets you go from in-memory to a real database by changing one file. There is more in the box: server-sent events for live updates, sessions and cookies, and middleware for CORS, CSRF, and rate limiting. In the next video we wire this app to a live NovaDB, meet the micro-ORM and the drivers, and see the whole data-access story.
+**Say:** That is a Nova web application. Vertical slices, one RouteHandler per feature, typed input from ctx.bind, auto-escaped NSX views, a plain composition root, and a Connection seam that lets you go from in-memory to a real database by changing one file. There is more in the box: server-sent events for live updates, sessions and cookies, and middleware for CORS, CSRF, and rate limiting. In the next video we wire this app to a live PostgreSQL, meet the micro-ORM and the drivers, and see the whole data-access story.
 
 **On screen:**
 ```
-Next: Video 18, Data access and NovaDB
+Next: Video 18, Data access and PostgreSQL
 ```

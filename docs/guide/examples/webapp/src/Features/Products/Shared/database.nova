@@ -5,8 +5,8 @@ import data.db;
 //
 // This is the whole point of the `data.db` seam: `Connection` is a trait, so the repository (and
 // therefore every feature slice) is written once against it and never names a concrete database.
-// Here we back it with a `List<Row>`; `main_novadb.nova` swaps in the real NovaDB driver and NOT ONE
-// line of feature or repository code changes. It only understands the three columns this app uses
+// Here we back it with a `List<Row>`; `main_postgres.nova` swaps in the real PostgreSQL driver and NOT
+// ONE line of feature or repository code changes. It only understands the three columns this app uses
 // (id, name, price); a real driver speaks full SQL.
 pub struct InMemoryConnection impl Connection {
     pub rows: List<Row>,

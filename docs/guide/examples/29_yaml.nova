@@ -13,7 +13,7 @@ fn numOf(v: yaml.YamlValue): long { return yaml.asNumber(v) ?? -1; }
 @test
 fn parse_a_config(): void {
     // A typical config: scalars, a nested map, and a sequence.
-    let text = "name: shop\nport: 8080\ndb:\n  host: 127.0.0.1\n  pool: 16\ntags:\n  - web\n  - novadb\n";
+    let text = "name: shop\nport: 8080\ndb:\n  host: 127.0.0.1\n  pool: 16\ntags:\n  - web\n  - postgres\n";
     let doc = yaml.parse(text);
 
     assert.isTrue(strOf(yaml.get(doc, "name")) == "shop");

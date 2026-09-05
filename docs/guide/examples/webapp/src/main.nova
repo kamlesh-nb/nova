@@ -5,7 +5,7 @@
 // plain constructor arguments, resolved right here where you can see them.
 //
 // This default build uses an in-memory Connection so it runs and its tests pass with no database.
-// `main_novadb.nova` is the SAME app over a real NovaDB connection; only this file changes.
+// `main_postgres.nova` is the SAME app over a real PostgreSQL connection; only this file changes.
 import web.app;
 import Features.Products.Shared.database;
 import Features.Products.Shared.repository;

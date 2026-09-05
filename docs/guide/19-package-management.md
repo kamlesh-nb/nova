@@ -256,7 +256,7 @@ The PostgreSQL driver lives in a repository called `nova-postgres`, and its
 `src/postgres.nova`, so you write `import postgres;`. The convention across the
 Nova drivers is a repository named `nova-<module>` whose importable module is
 `<module>`: `nova-postgres` gives `postgres`, `nova-mysql` gives `mysql`,
-`nova-novadb` gives `novadb`, and so on.
+`nova-mssql` gives `mssql`, and so on.
 
 Stdlib modules (chapter 14) and dependency modules therefore live in different
 resolution stages, but at the call site they look identical: you write
@@ -334,7 +334,7 @@ your Nova code compiles or which dependencies it pulls.
 ## Where to go next
 
 - **Chapter 20, Database drivers**, is the canonical place this all comes
-  together: adding a driver such as `nova-postgres` or `nova-novadb` to a project
+  together: adding a driver such as `nova-postgres` or `nova-mysql` to a project
   is the textbook use of `nova get`, and each driver's chapter shows the git URL
   to add, the module name to import, and the connection string to pass.
 - **Chapter 14, Modules and visibility**, covers the sibling-file and stdlib

@@ -1,9 +1,9 @@
 import list;
 import data.db;
 import pool;
-import novadb;
+import postgres;
 
-// A `Connection` backed by a connection POOL. This is what `main_novadb.nova` passes to the repository
+// A `Connection` backed by a connection POOL. This is what `main_postgres.nova` passes to the repository
 // instead of the in-memory connection, so the SAME repository code runs against a real database.
 //
 // Why a pool and not a single eager connection: opening a connection is async, and driving an async
@@ -20,7 +20,7 @@ pub struct PooledConnection impl Connection {
     p: pool.Pool,
 
     init(dsn: string, size: int) {
-        self.p = pool.Pool(NovaDriver(), dsn, size);
+        self.p = pool.Pool(PgDriver(), dsn, size);
         self.p.configure(size, 0, false);
     }
 

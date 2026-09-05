@@ -7,9 +7,9 @@ seam. Because every SQL driver speaks the same `Connection` vocabulary, the quer
 is identical whichever engine you point it at. MongoDB is the one exception: it is not relational, so it
 carries a native document API alongside the seam.
 
-This chapter is a tour of the five drivers (NovaDB, PostgreSQL, MySQL, SQL Server, MongoDB), how to add
-each one to a project, and how to connect and run a query. The data layer above the driver, the ORM and
-the repository, is covered in the Data access chapter; here we stay close to the wire.
+This chapter is a tour of the four drivers (PostgreSQL, MySQL, SQL Server, MongoDB), how to add each one
+to a project, and how to connect and run a query. The data layer above the driver, the ORM and the
+repository, is covered in the Data access chapter; here we stay close to the wire.
 
 ## One seam, many packages
 
@@ -47,7 +47,7 @@ let rs = await conn.query("SELECT id, name FROM users WHERE id = $1 AND name = $
 ```
 
 `db.noParams()` is the tidy way to spell an empty parameter list for a statement that binds nothing. The
-placeholder style is PostgreSQL-flavoured (`$1`, `$2`) across all four SQL drivers, and each driver
+placeholder style is PostgreSQL-flavoured (`$1`, `$2`) across all three SQL drivers, and each driver
 rewrites it to its own engine's placeholder syntax internally.
 
 `query` returns a `ResultSet` you can read positionally:
@@ -81,93 +81,11 @@ p.release(conn);                   // return it to the pool for reuse
 `Pool(driver, dsn, maxIdle)` is the constructor; `acquire()` is `async` (it may need to open a fresh
 connection), and `release(conn)` is synchronous. `configure(maxOpen, maxLifetimeMs, validateOnBorrow)`
 tunes the bounds, and `discard(conn)` drops a connection you no longer trust rather than returning it.
-The same `Pool` type backs `PgDriver`, `MyDriver`, `MssqlDriver`, `NovaDriver`, and `MongoDriver`
-without change: there is no per-driver pool. `ResilientPool` wraps a `Pool` with a circuit breaker for
-services that must degrade gracefully when the database is unreachable.
+The same `Pool` type backs `PgDriver`, `MyDriver`, `MssqlDriver`, and `MongoDriver` without change: there
+is no per-driver pool. `ResilientPool` wraps a `Pool` with a circuit breaker for services that must
+degrade gracefully when the database is unreachable.
 
 Now the drivers, one at a time.
-
-## NovaDB
-
-NovaDB is Nova's own embedded storage engine: a B-tree based, MVCC database with a write-ahead log and a
-SQL front end, spoken over a compact binary protocol. It is the default choice for a Nova service's
-application data. (The orchestrator does not run on it: it keeps its small control-plane state in
-`artifactd`, not a database. See Chapters 23 and 25.)
-
-### Add it to your project
-
-```sh
-nova get https://github.com/kamlesh-nb/nova-novadb
-```
-
-That appends the dependency to your `project.json`:
-
-```json
-{
-  "dependencies": [
-    "https://github.com/kamlesh-nb/nova-novadb"
-  ]
-}
-```
-
-Then import it. You usually import `db` too, for the `DbValue` constructors:
-
-```nova
-import novadb;
-import db;
-```
-
-The driver type is `NovaDriver` and the connection type is `NovaConnection`; both come from the `novadb`
-module.
-
-### Connect and query
-
-```nova
-let conn = await NovaDriver().connect("novadb://admin@127.0.0.1:3009?db=shop");
-
-let params = List<DbValue>();
-params.push(db.dbInt(1));
-let rs = await conn.query("SELECT id, name FROM products WHERE id = $1", params);
-
-let ins_params = List<DbValue>();
-ins_params.push(db.dbText("Margherita"));
-ins_params.push(db.dbLong(9));
-let ins = await conn.exec("INSERT INTO products (name, price) VALUES ($1, $2)", ins_params);
-```
-
-### Connection string
-
-A NovaDB DSN is a URL, and everything except the host is optional:
-
-```
-novadb://user:password@host:port?db=name&tls=verify&tlsCAFile=/etc/ca.pem
-```
-
-The scheme is optional, so a bare `host:port` parses identically, and all of these are valid:
-
-```nova
-NovaDriver().connect("novadb://app:secret@db.internal:3009?db=shop");  // full URL
-NovaDriver().connect("127.0.0.1:3009?db=shop");                        // no scheme, no credentials
-NovaDriver().connect("127.0.0.1:3009");                                // minimal; defaults fill the rest
-```
-
-The parts, and their defaults:
-
-- Credentials come from a `user:password@` userinfo prefix, or from the `?user=` and `?password=` query
-  parameters. The userinfo form overrides the query parameters. Defaults are user `admin`, empty
-  password.
-- The database name is set by `?db=<name>` and defaults to `nova`. Note that it is a query parameter, not
-  a path segment: a trailing `/shop` is discarded (it is treated as "not the port"), so use `?db=shop`.
-- The port defaults to `3009`.
-- TLS is off by default. `?tls=true` encrypts the link; `?tls=verify` also validates the server
-  certificate against the PEM bundle named by `?tlsCAFile=<path>`.
-
-### Notes
-
-Prepared statements are emulated client-side: NovaDB substitutes the bound parameters into the statement
-on the client before sending it, rather than caching a server-side plan. A `NovaConnection` allows one
-in-flight request at a time (there is a `busy` guard), so use a `pool.Pool` when you need concurrency.
-TLS runs over the standard-library async TLS stack.
 
 ## PostgreSQL
 
@@ -215,8 +133,8 @@ postgresql://user:password@host:port/database?sslmode=...&sslrootcert=...&connec
 - The scheme is optional. User, password, and database are percent-decoded (RFC 3986), so `p%40ss`
   becomes `p@ss`. IPv6 literals in brackets, `[::1]:5432`, are handled without splitting inside the
   address.
-- The database is a path segment (`/mydb`), unlike NovaDB. Defaults: user `postgres`, database equal to
-  the user, port `5432`.
+- The database is a path segment (`/mydb`). Defaults: user `postgres`, database equal to the user, port
+  `5432`.
 - `sslmode` is `disable` (the default), `require`, or `verify-full`; `sslrootcert` is the CA bundle for
   verification; `connect_timeout` is in seconds and defaults to 10.
 
@@ -466,7 +384,7 @@ convert, because the compiler resolves the concrete type only outside the async 
 
 You rarely read cells by index in application code. The micro-ORM in `data.orm` maps a result set onto
 your typed structs by column name, and the generic `Repository<T>` wraps a `Connection` so your handlers
-never see SQL. This layer is shared across all four SQL drivers, since it is written against the seam.
+never see SQL. This layer is shared across all three SQL drivers, since it is written against the seam.
 
 Mark the target struct `@serializable` so the compiler generates the binder, then bind a result set:
 
@@ -514,9 +432,7 @@ a `Repository`. `str.Str.toOwned()` promotes a view to an owned string when a va
 ## Where to go next
 
 - The Data access chapter puts the seam to work inside a web app: the repository pattern, transactions
-  on a held connection, and swapping the same app from an in-memory connection onto a live NovaDB by
+  on a held connection, and swapping the same app from an in-memory connection onto a live PostgreSQL by
   changing one file. It also covers the full MongoDB document API.
-- The Deploying chapter runs a NovaDB-backed service under the orchestrator, which itself stores its
-  desired state in NovaDB over this same driver.
-- Chapter 25 documents NovaDB the database itself: the storage engine behind this driver, its SQL and
-  document modes, running the server, and its `db.json` configuration.
+- The Deploying chapter runs a PostgreSQL-backed service under the orchestrator, which keeps its own
+  control-plane state in `artifactd`.

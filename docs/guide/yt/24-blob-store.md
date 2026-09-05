@@ -103,4 +103,4 @@ spec.artifact = "sha256:abcd..."     on a workload
 
 ## Recap and outro (10:00)
 
-**Say:** That closes the deploy path, and the series. A binary is named by its own hash, artifactd serves it over a verified PUT and GET, four safety properties mean bad bytes never run, and each node pulls, verifies, caches, and spawns. You have now gone from your first console.log all the way to a NovaDB-backed web app, deployed behind a load balancer, with its binaries delivered by content address. One language, one toolchain, one storage engine, end to end. Now go and build something.
+**Say:** That closes the deploy path, and the series. A binary is named by its own hash, artifactd serves it over a verified PUT and GET, four safety properties mean bad bytes never run, and each node pulls, verifies, caches, and spawns. You have now gone from your first console.log all the way to a PostgreSQL-backed web app, deployed behind a load balancer, with its binaries delivered by content address. One language, one toolchain, end to end. Now go and build something.

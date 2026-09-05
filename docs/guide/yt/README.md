@@ -41,9 +41,9 @@ The timestamps are a guide, not a rule. Speak at your own pace and adjust.
 | 15 | [Concurrency](15-concurrency.md) | `async`, `await`, `spawn`, channels |
 | 16 | [Serialization](16-serialization.md) | JSON serde, `@serializable` |
 | 17 | [Web](17-web.md) | Vertical slices, `RouteHandler`, `ctx.bind`, NSX views, the composition root |
-| 18 | [Data access and the ORM](18-data-access.md) | The `db` seam, `DbValue`, the micro-ORM, `Repository<T>`, connection strings, backing the web app with NovaDB |
+| 18 | [Data access and the ORM](18-data-access.md) | The `db` seam, `DbValue`, the micro-ORM, `Repository<T>`, connection strings, backing the web app with PostgreSQL |
 | 19 | [Package management](19-package-management.md) | `project.json`, `nova get`, the lockfile, `nova init`, import resolution, publishing |
-| 20 | [Database drivers](20-database-drivers.md) | NovaDB, PostgreSQL, MySQL, SQL Server, MongoDB: add, import, connect |
+| 20 | [Database drivers](20-database-drivers.md) | PostgreSQL, MySQL, SQL Server, MongoDB: add, import, connect |
 | 23 | [Deploying with the orchestrator](23-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on artifactd |
 | 24 | [Artifact delivery: the blob store](24-blob-store.md) | content-addressed `artifactd`, sha PUT/GET, Bearer auth, deploy by digest |
 
@@ -52,5 +52,5 @@ The timestamps are a guide, not a rule. Speak at your own pace and adjust.
 Record in numbered order. Each video assumes the viewer has watched the ones before it, and the outros
 are written to lead into the next one. Videos 01 to 06 are the fundamentals, 07 to 11 are the type and
 error model, 12 to 14 fill in the details, 15 to 17 build up to real concurrent and web apps, 18 backs
-the app with NovaDB, 19 and 20 cover package management and the database drivers, 23 deploys it with the
+the app with PostgreSQL, 19 and 20 cover package management and the database drivers, 23 deploys it with the
 orchestrator, and 24 closes the deploy path with content-addressed artifact delivery.

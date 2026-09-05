@@ -9,7 +9,7 @@ config:
 
   # Add typed sections here and read each with `app.config.bind<T>("name")` from an @serializable struct.
   # db:
-  #   dsn: "novadb://127.0.0.1:3009?db=shop"
+  #   dsn: "postgresql://127.0.0.1:5432/shop"
   #   poolSize: 16
 
 # Read by the ORCHESTRATOR when deployed (it ignores `config:` above; the app ignores these). Commented
