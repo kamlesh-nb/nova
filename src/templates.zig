@@ -317,8 +317,12 @@ pub const web_view_sample =
     \\// A `{expr}` interpolation is HTML-ESCAPED automatically, so user text like a product name is safe by
     \\// default: you never call an escaper here. To insert an ALREADY-rendered HTML fragment unescaped (one
     \\// view composing another), wrap it in `response.raw(fragment)` from `web.response`.
+    \\//
+    \\// The root carries `id="product"`: that is the hypermedia SWAP TARGET the wwwroot/index.html demo
+    \\// aims at (htmx and htmz replace this element with the returned card; Unpoly and Alpine AJAX match it
+    \\// by id in the response). Rename it in both places if you retarget the demo.
     \\pub fn productCard(name: string, price: int): Html {
-    \\    return <div class="rounded-lg border border-slate-200 p-4 shadow-sm">
+    \\    return <div id="product" class="rounded-lg border border-slate-200 p-4 shadow-sm">
     \\        <h3 class="font-semibold text-slate-800">{name}</h3>
     \\        <p class="mt-1 text-sm text-slate-500">{price}</p>
     \\    </div>;
@@ -341,8 +345,79 @@ pub const web_domain_entity_sample =
     \\}
 ;
 
-/// The root `index.html` shell the web app is served under.
-pub const web_index_html_sample =
+/// The root `index.html` shell, wired for **htmx** (`nova init web --framework htmx`, the default).
+///
+/// htmx reads plain HTML attributes (`hx-get`/`hx-target`/`hx-swap`) and swaps the HTML fragment the
+/// server returns into the page. That is exactly what this template's handlers already return (a product
+/// card, `Status.Ok, html`), so the button below is a working end-to-end demo with no extra server code.
+pub const web_index_html_htmx =
+    \\<!doctype html>
+    \\<html lang="en">
+    \\<head>
+    \\  <meta charset="utf-8">
+    \\  <meta name="viewport" content="width=device-width, initial-scale=1">
+    \\  <title>Nova Web App</title>
+    \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
+    \\       Run `npm install` once, then `npm run css:watch` while developing. -->
+    \\  <link rel="stylesheet" href="/app.css">
+    \\  <!-- htmx, the hypermedia framework. It turns the hx-* attributes below into AJAX calls and swaps
+    \\       the returned HTML fragment into the page, so your Nova handlers just return the markup they
+    \\       already render. Pin the version you build against. -->
+    \\  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    \\</head>
+    \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
+    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <p class="mt-2 text-slate-600">A hypermedia app powered by htmx. The button GETs a product and swaps
+    \\     the returned card (its <code>id="product"</code>) into the page, with no reload.</p>
+    \\  <button class="mt-4 rounded-lg bg-slate-800 px-4 py-2 text-white hover:bg-slate-700"
+    \\          hx-get="/api/products/1" hx-target="#product" hx-swap="outerHTML">
+    \\    Load product #1
+    \\  </button>
+    \\  <div id="product" class="mt-4 text-slate-400">Not loaded yet.</div>
+    \\</body>
+    \\</html>
+;
+
+/// The root `index.html` shell, wired for **Unpoly** (`nova init web --framework unpoly`).
+///
+/// Unpoly follows a link/form, fetches the URL, and swaps the element matching `up-target` using the
+/// element of the SAME selector in the response. So the returned product card must carry `id="product"`
+/// (it does -- see the NSX view). Plain HTML fragments, no special content type: a straight fit for the
+/// handlers here.
+pub const web_index_html_unpoly =
+    \\<!doctype html>
+    \\<html lang="en">
+    \\<head>
+    \\  <meta charset="utf-8">
+    \\  <meta name="viewport" content="width=device-width, initial-scale=1">
+    \\  <title>Nova Web App</title>
+    \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
+    \\       Run `npm install` once, then `npm run css:watch` while developing. -->
+    \\  <link rel="stylesheet" href="/app.css">
+    \\  <!-- Unpoly, the hypermedia framework (script + its stylesheet). It follows up-* links/forms and
+    \\       swaps the matching fragment from the HTML response. Pin the version you build against. -->
+    \\  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/unpoly@3.10.2/unpoly.min.css">
+    \\  <script src="https://cdn.jsdelivr.net/npm/unpoly@3.10.2/unpoly.min.js"></script>
+    \\</head>
+    \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
+    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <p class="mt-2 text-slate-600">A hypermedia app powered by Unpoly. The link GETs a product and swaps
+    \\     the matching <code>#product</code> fragment from the response, with no reload.</p>
+    \\  <a href="/api/products/1" up-target="#product" up-follow
+    \\     class="mt-4 inline-block rounded-lg bg-slate-800 px-4 py-2 text-white hover:bg-slate-700">
+    \\    Load product #1
+    \\  </a>
+    \\  <div id="product" class="mt-4 text-slate-400">Not loaded yet.</div>
+    \\</body>
+    \\</html>
+;
+
+/// The root `index.html` shell, wired for **htmz** (`nova init web --framework htmz`).
+///
+/// htmz has no CDN package -- it IS the ~166-byte inline snippet below. A link with `target=htmz` loads
+/// the URL into the hidden iframe; the iframe's onload then replaces the element named by the URL hash
+/// (`#product`) with the response body, so the returned card (which carries `id="product"`) drops in.
+pub const web_index_html_htmz =
     \\<!doctype html>
     \\<html lang="en">
     \\<head>
@@ -355,7 +430,83 @@ pub const web_index_html_sample =
     \\</head>
     \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
     \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
-    \\  <p class="mt-2 text-slate-600">Vertical-slice API. Try <code class="rounded bg-slate-100 px-1.5 py-0.5">GET /api/products/1</code>.</p>
+    \\  <p class="mt-2 text-slate-600">A hypermedia app powered by htmz. The link GETs a product into the
+    \\     hidden iframe, which swaps the <code>#product</code> fragment in place, with no reload.</p>
+    \\  <a href="/api/products/1#product" target=htmz
+    \\     class="mt-4 inline-block rounded-lg bg-slate-800 px-4 py-2 text-white hover:bg-slate-700">
+    \\    Load product #1
+    \\  </a>
+    \\  <div id="product" class="mt-4 text-slate-400">Not loaded yet.</div>
+    \\  <!-- htmz, the entire library: a hidden iframe that swaps the response into the element named by
+    \\       the URL hash. Keep it at the end of the body. -->
+    \\  <iframe hidden name=htmz onload="setTimeout(()=>document.querySelector(this.contentWindow.location.hash||null)?.replaceWith(...this.contentDocument.body.children))"></iframe>
+    \\</body>
+    \\</html>
+;
+
+/// The root `index.html` shell, wired for **Alpine AJAX** (`nova init web --framework alpine`).
+///
+/// Alpine AJAX (the alpine-ajax plugin on Alpine.js) intercepts an `x-target` link/form, fetches the URL,
+/// and merges the response elements whose ids are listed (`product`) into the page. So the returned card
+/// must carry `id="product"` (it does). The plugin script MUST load BEFORE Alpine's core; both `defer`.
+pub const web_index_html_alpine =
+    \\<!doctype html>
+    \\<html lang="en">
+    \\<head>
+    \\  <meta charset="utf-8">
+    \\  <meta name="viewport" content="width=device-width, initial-scale=1">
+    \\  <title>Nova Web App</title>
+    \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
+    \\       Run `npm install` once, then `npm run css:watch` while developing. -->
+    \\  <link rel="stylesheet" href="/app.css">
+    \\  <!-- Alpine AJAX: the alpine-ajax plugin FIRST, then Alpine core (order matters), both deferred.
+    \\       Pin the versions you build against. -->
+    \\  <script defer src="https://cdn.jsdelivr.net/npm/@imacrayon/alpine-ajax@0.12.4/dist/cdn.min.js"></script>
+    \\  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+    \\</head>
+    \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
+    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <p class="mt-2 text-slate-600">A hypermedia app powered by Alpine AJAX. The link GETs a product and
+    \\     merges the returned <code>#product</code> fragment into the page, with no reload.</p>
+    \\  <a href="/api/products/1" x-target="product"
+    \\     class="mt-4 inline-block rounded-lg bg-slate-800 px-4 py-2 text-white hover:bg-slate-700">
+    \\    Load product #1
+    \\  </a>
+    \\  <div id="product" class="mt-4 text-slate-400">Not loaded yet.</div>
+    \\</body>
+    \\</html>
+;
+
+/// The root `index.html` shell, wired for **datastar** (`nova init web --framework datastar`).
+///
+/// datastar reads `data-*` attributes and drives reactive signals in the browser. The counter below works
+/// with only the CDN script (no server round-trip), so it is a live demo out of the box. datastar's
+/// server-driven actions (`@get`/`@post`) expect a `text/event-stream` SSE response that PATCHES elements,
+/// not a plain HTML fragment -- for that path, stream `datastar-patch-elements` events from a Nova SSE
+/// handler (`web.sse`, see the guide's SSE section), rather than returning a fragment as these handlers do.
+pub const web_index_html_datastar =
+    \\<!doctype html>
+    \\<html lang="en">
+    \\<head>
+    \\  <meta charset="utf-8">
+    \\  <meta name="viewport" content="width=device-width, initial-scale=1">
+    \\  <title>Nova Web App</title>
+    \\  <!-- Styles are built by Tailwind CLI from styles/app.css into wwwroot/app.css.
+    \\       Run `npm install` once, then `npm run css:watch` while developing. -->
+    \\  <link rel="stylesheet" href="/app.css">
+    \\  <!-- datastar, the hypermedia framework, loaded as an ES module. It reads the data-* attributes below
+    \\       and keeps the DOM in sync with its reactive signals. Pin the version you build against. -->
+    \\  <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js"></script>
+    \\</head>
+    \\<body class="mx-auto max-w-2xl p-10 font-sans text-slate-800">
+    \\  <h1 class="text-2xl font-bold tracking-tight">Nova Web App</h1>
+    \\  <p class="mt-2 text-slate-600">A hypermedia app powered by datastar. The counter below is a reactive
+    \\     signal, driven entirely by data-* attributes.</p>
+    \\  <div data-signals="{count: 0}" class="mt-4">
+    \\    <button class="rounded-lg bg-slate-800 px-4 py-2 text-white hover:bg-slate-700" data-on-click="$count++">
+    \\      Clicked <span data-text="$count"></span> times
+    \\    </button>
+    \\  </div>
     \\</body>
     \\</html>
 ;

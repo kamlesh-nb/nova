@@ -2,7 +2,8 @@
 //!
 //! This module turns an empty directory into a working Nova project by writing
 //! a fixed set of starter files and directories to disk. It is the code behind
-//! `nova init <console|web|desktop> --name X` and `nova add-feature <name>`. It
+//! `nova init <console|web|desktop> --name X [--framework <htmx|datastar|unpoly|htmz|alpine>]` and
+//! `nova add-feature <name>`. It
 //! deals purely in filesystem effects: it creates directories, writes template
 //! text into files, and prints progress to stderr. It does not compile, parse,
 //! or type-check anything.
@@ -105,16 +106,41 @@ fn scaffoldFile(allocator: std.mem.Allocator, io: std.Io, project: []const u8, r
     try Io.Dir.writeFile(.cwd(), io, .{ .data = content, .sub_path = full, .flags = .{} });
 }
 
+/// The hypermedia frameworks `nova init web --framework` accepts. All are a natural fit for this
+/// template's "handler returns an HTML fragment" model: htmx/htmz/unpoly/alpine swap that fragment into
+/// the page (differing only in how they target it), and datastar drives reactive signals (its server
+/// actions want an SSE stream, which Nova serves via `web.sse`). SPA/JSON frameworks are deliberately
+/// excluded -- they are a different, non-hypermedia model.
+const web_frameworks = [_][]const u8{ "htmx", "datastar", "unpoly", "htmz", "alpine" };
+
+fn isValidFramework(framework: []const u8) bool {
+    for (web_frameworks) |f| {
+        if (std.mem.eql(u8, framework, f)) return true;
+    }
+    return false;
+}
+
+/// Returns the `index.html` body for the chosen hypermedia `framework`. The templates differ only in the
+/// CDN `<script>`/snippet they load and the demo widget they wire up; everything else in the scaffolded
+/// tree is framework-agnostic. Assumes `framework` was already validated by [`isValidFramework`].
+fn indexHtmlFor(framework: []const u8) []const u8 {
+    if (std.mem.eql(u8, framework, "datastar")) return templates.web_index_html_datastar;
+    if (std.mem.eql(u8, framework, "unpoly")) return templates.web_index_html_unpoly;
+    if (std.mem.eql(u8, framework, "htmz")) return templates.web_index_html_htmz;
+    if (std.mem.eql(u8, framework, "alpine")) return templates.web_index_html_alpine;
+    return templates.web_index_html_htmx;
+}
+
 /// Writes the full ASP.NET-style web-app starter tree into `project`.
 ///
-/// The `web` template is the largest layout: a vertical-slice structure where
-/// each use case (CreateProduct, GetProductById) has its own folder of
-/// command/query/response/validator/handler files, plus a shared repository, an
-/// `.nsx` view, a domain entity, static `wwwroot`, tests, and the Tailwind/npm
-/// tooling files. Rather than a long sequence of explicit writes, the layout is
-/// expressed as a data table of `{ rel, content }` pairs driven through
-/// [`scaffoldFile`], so adding a file to the template is a one-line table entry.
-fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !void {
+/// The `web` template is the largest layout: a vertical-slice structure where each use case
+/// (CreateProduct, GetProductById) has its own folder of command/query/response/validator/handler files,
+/// plus a shared repository, an `.nsx` view, a domain entity, static `wwwroot`, tests, and the
+/// Tailwind/npm tooling files. Rather than a long sequence of explicit writes, the layout is expressed as
+/// a data table of `{ rel, content }` pairs driven through [`scaffoldFile`], so adding a file to the
+/// template is a one-line table entry. `framework` selects only which `wwwroot/index.html` is written
+/// (see [`indexHtmlFor`]); the rest of the tree is identical.
+fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8, framework: []const u8) !void {
     // Anonymous record type for one entry in the web-layout table: a project
     // relative path and the template body to write there.
     const f = struct { rel: []const u8, content: []const u8 };
@@ -145,7 +171,7 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8) !v
         .{ .rel = "src/Domain/Entities/Product.nova", .content = templates.web_domain_entity_sample },
         .{ .rel = "src/Domain/Dtos/ProductDto.nova", .content = templates.web_get_response_sample },
         .{ .rel = "src/Domain/Dtos/CreateProductDto.nova", .content = templates.web_create_response_sample },
-        .{ .rel = "wwwroot/index.html", .content = templates.web_index_html_sample },
+        .{ .rel = "wwwroot/index.html", .content = indexHtmlFor(framework) },
         .{ .rel = "tests/features/products_test.nova", .content = templates.web_test_sample },
 
         .{ .rel = "package.json", .content = templates.web_package_json_sample },
@@ -176,7 +202,7 @@ fn scaffoldDesktop(allocator: std.mem.Allocator, io: std.Io, project: []const u8
 
 pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []const []const u8) !void {
     if (args.len < 3) {
-        std.debug.print("Usage: nova init <console|web|desktop> --name <project_name>\n", .{});
+        std.debug.print("Usage: nova init <console|web|desktop> --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
         return;
     }
     var template_type = args[2];
@@ -190,11 +216,15 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         !std.mem.eql(u8, template_type, "desktop"))
     {
         std.debug.print("Invalid template type '{s}'. Expected 'console', 'web', or 'desktop'.\n", .{template_type});
-        std.debug.print("Usage: nova init <console|web|desktop> --name <project_name>\n", .{});
+        std.debug.print("Usage: nova init <console|web|desktop> --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
         return;
     }
 
     var project_name: ?[]const u8 = null;
+    // The hypermedia framework wired into a `web` app's wwwroot/index.html: which CDN <script> it loads
+    // and the demo widget it ships. Defaults to htmx (its fragment-swap model matches the fragment the
+    // scaffolded handlers already return). Ignored for console/desktop.
+    var framework: []const u8 = "htmx";
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--name") or std.mem.eql(u8, args[i], "-n")) {
@@ -205,7 +235,21 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
                 std.debug.print("Missing argument for name flag.\n", .{});
                 return error.MissingNameArgument;
             }
+        } else if (std.mem.eql(u8, args[i], "--framework") or std.mem.eql(u8, args[i], "-f")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                framework = args[i];
+            } else {
+                std.debug.print("Missing argument for --framework flag (expected one of htmx|datastar|unpoly|htmz|alpine).\n", .{});
+                return error.MissingFrameworkArgument;
+            }
         }
+    }
+
+    if (!isValidFramework(framework)) {
+        std.debug.print("Invalid framework '{s}'. Expected one of: htmx, datastar, unpoly, htmz, alpine.\n", .{framework});
+        std.debug.print("Usage: nova init web --name <project_name> [--framework <htmx|datastar|unpoly|htmz|alpine>]\n", .{});
+        return;
     }
 
     if (project_name == null) {
@@ -242,7 +286,7 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
         defer allocator.free(test_path);
         try Io.Dir.writeFile(.cwd(), init.io, .{ .data = templates.console_test_sample, .sub_path = test_path, .flags = .{} });
     } else if (std.mem.eql(u8, template_type, "web")) {
-        try scaffoldWeb(allocator, init.io, project_name.?);
+        try scaffoldWeb(allocator, init.io, project_name.?, framework);
     } else {
         try scaffoldDesktop(allocator, init.io, project_name.?);
     }
@@ -267,7 +311,11 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
     defer allocator.free(gitignore_path);
     Io.Dir.writeFile(.cwd(), init.io, .{ .data = "build/\n*.o\n", .sub_path = gitignore_path, .flags = .{} }) catch {};
 
-    std.debug.print("Project '{s}' initialized successfully.\n", .{project_name.?});
+    if (std.mem.eql(u8, template_type, "web")) {
+        std.debug.print("Project '{s}' initialized successfully (hypermedia framework: {s}).\n", .{ project_name.?, framework });
+    } else {
+        std.debug.print("Project '{s}' initialized successfully.\n", .{project_name.?});
+    }
 }
 
 pub fn cmdAddFeature(allocator: std.mem.Allocator, init: std.process.Init, name: []const u8) !void {
