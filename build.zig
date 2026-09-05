@@ -517,7 +517,7 @@ fn addKyteArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
     const version = b.graph.environ_map.get("KYTE_VERSION") orelse "dev";
     const bundle = b.fmt("kyte-{s}-{s}-{s}", .{ version, os_name, arch_name });
 
-    const archive_step = b.step("archive", "Package a self-installing, versioned, checksummed toolchain bundle (kyte + nls + stdlib) for this host");
+    const archive_step = b.step("archive", "Package a self-installing, versioned, checksummed toolchain bundle (kyte + kynalyzer + stdlib) for this host");
 
     const home = b.graph.environ_map.get("HOME") orelse
         b.graph.environ_map.get("USERPROFILE") orelse
@@ -530,10 +530,10 @@ fn addKyteArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
             \\if (Test-Path $stage) {{ Remove-Item -Recurse -Force $stage }}
             \\New-Item -ItemType Directory -Force -Path "$stage/bin","$stage/lib" | Out-Null
             \\Copy-Item -Force "{[home]s}/.kyte/bin/kyte.exe" "$stage/bin/kyte.exe"
-            \\# nls: PURE ZIG (no LLVM link), built from the sibling repo unless KYTE_ARCHIVE_SKIP_NLS=1,
-            \\# matching the Unix path -- skip only when the nls repo is not checked out.
-            \\if ($env:KYTE_ARCHIVE_SKIP_NLS -eq "1") {{ Write-Host "archive: KYTE_ARCHIVE_SKIP_NLS=1 -- bundling without nls" }}
-            \\else {{ Push-Location ../nls; zig build "-Dkyte-src=../lang/src/root.zig"; Pop-Location; Copy-Item -Force "{[home]s}/.kyte/bin/nls.exe" "$stage/bin/nls.exe" }}
+            \\# kynalyzer: PURE ZIG (no LLVM link), built from the sibling repo unless KYTE_ARCHIVE_SKIP_KYNALYZER=1,
+            \\# matching the Unix path -- skip only when the kynalyzer repo is not checked out.
+            \\if ($env:KYTE_ARCHIVE_SKIP_KYNALYZER -eq "1") {{ Write-Host "archive: KYTE_ARCHIVE_SKIP_KYNALYZER=1 -- bundling without kynalyzer" }}
+            \\else {{ Push-Location ../kynalyzer; zig build "-Dkyte-src=../lang/src/root.zig"; Pop-Location; Copy-Item -Force "{[home]s}/.kyte/bin/kynalyzer.exe" "$stage/bin/kynalyzer.exe" }}
             \\# A -Dstatic-llvm build (the release path) links LLVM into kyte.exe and needs NO DLL -- the
             \\# static prefix has no bin/LLVM-C.dll, so the copy below simply no-ops. It stays only to keep
             \\# a legacy DYNAMIC build (`zig build archive` without -Dstatic-llvm) self-contained, where the
@@ -572,16 +572,16 @@ fn addKyteArchive(b: *std.Build, exe: *std.Build.Step.Compile, target: std.Build
         \\rm -rf "$STAGE"
         \\mkdir -p "$STAGE/bin" "$STAGE/lib"
         \\cp "{[home]s}/.kyte/bin/kyte" "$STAGE/bin/kyte"
-        \\# nls: build fresh from the sibling compiler repo (installs to ~/.kyte/bin/nls). It is PURE ZIG
+        \\# kynalyzer: build fresh from the sibling compiler repo (installs to ~/.kyte/bin/kynalyzer). It is PURE ZIG
         \\# (no LLVM link -- the LSP only touches the frontend re-exports, not codegen), so it builds on
         \\# any runner with the bundled Zig toolchain alone; pinned to THIS lang checkout via -Dkyte-src.
-        \\# Set KYTE_ARCHIVE_SKIP_NLS=1 only to intentionally ship a kyte+stdlib bundle without the LSP
-        \\# (e.g. when the nls repo is not checked out).
-        \\if [ "${{KYTE_ARCHIVE_SKIP_NLS:-0}}" = "1" ]; then
-        \\  echo "archive: KYTE_ARCHIVE_SKIP_NLS=1 -- bundling without nls (language server)"
+        \\# Set KYTE_ARCHIVE_SKIP_KYNALYZER=1 only to intentionally ship a kyte+stdlib bundle without the LSP
+        \\# (e.g. when the kynalyzer repo is not checked out).
+        \\if [ "${{KYTE_ARCHIVE_SKIP_KYNALYZER:-0}}" = "1" ]; then
+        \\  echo "archive: KYTE_ARCHIVE_SKIP_KYNALYZER=1 -- bundling without kynalyzer (language server)"
         \\else
-        \\  ( cd ../nls && zig build -Dkyte-src=../lang/src/root.zig )
-        \\  cp "{[home]s}/.kyte/bin/nls" "$STAGE/bin/nls"
+        \\  ( cd ../kynalyzer && zig build -Dkyte-src=../lang/src/root.zig )
+        \\  cp "{[home]s}/.kyte/bin/kynalyzer" "$STAGE/bin/kynalyzer"
         \\fi
         \\cp "{[home]s}/.kyte/lib/libkytecore.a" "$STAGE/lib/"
         \\rsync -a "{[home]s}/.kyte/std/" "$STAGE/std/"

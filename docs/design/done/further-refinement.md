@@ -562,7 +562,7 @@ lang trait change against the out-of-repo drivers).
   pinned commit SHAs is the high-value minimum.
 - No `library` init template (confirmed); the desktop template is a single `main.ky` with no project.json
   or tests.
-- LSP (nls) has hover, goto-definition, completion, signatureHelp, documentSymbol, formatting, and
+- LSP (kynalyzer) has hover, goto-definition, completion, signatureHelp, documentSymbol, formatting, and
   diagnostics, but NOT rename, find-references, code-actions, or semantic tokens.
 - WASM: `build.zig:284-301` has the wasm build artifact commented out, and the docs contradict each other
   (execution-plan.md claims `--wasm` 104/104 resolved; language-specification.md:478 says it "fails even for

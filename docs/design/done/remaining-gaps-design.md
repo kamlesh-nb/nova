@@ -33,29 +33,29 @@ LLVM" and recommended bring-your-own. That was WRONG, from stale recall. Verifie
 2. **Un-hardcode the local static default.** `build.zig`'s `static_llvm_prefix` is a hardcoded dev-machine
    path; it only affects a `-Dstatic-llvm` build run locally off that box without `KYTE_LLVM_PREFIX`. CI
    overrides it, so this is cosmetic — make it a sensible per-OS default or require `KYTE_LLVM_PREFIX`.
-3. **Ship `nls` in the bundles (user request: "make nls same as language").** `nls` is a SEPARATE project
-   (`/kyte-lang/nls`, own `build.zig`) currently SKIPPED in release.yml (`KYTE_ARCHIVE_SKIP_NLS=1`). Good
-   news: `nls` is a **pure-Zig binary with NO LLVM link** (the LSP uses only the frontend re-exports via
+3. **Ship `kynalyzer` in the bundles (user request: "make kynalyzer same as language").** `kynalyzer` is a SEPARATE project
+   (`/kyte-lang/kynalyzer`, own `build.zig`) currently SKIPPED in release.yml (`KYTE_ARCHIVE_SKIP_KYNALYZER=1`). Good
+   news: `kynalyzer` is a **pure-Zig binary with NO LLVM link** (the LSP uses only the frontend re-exports via
    `-Dkyte-src=…/lang/src/root.zig`; codegen/`llvm` is not reachable), ~5.8 MB, and "cross-compiles
    unchanged". **[verified]** So "same as language" is straightforward and actually EASIER than the
    compiler:
-   - Build `nls` for all 6 targets — and because it is pure Zig, it can be **cross-compiled from a single
+   - Build `kynalyzer` for all 6 targets — and because it is pure Zig, it can be **cross-compiled from a single
      runner** (no per-host LLVM), unlike the compiler.
-   - Pin it to the SAME lang source revision (`-Dkyte-src`) so `nls` and `kyte` never drift, and stamp the
-     SAME version (extend `check-version-sync.sh` to cover nls).
-   - Include the `nls` binary in each release archive (drop `KYTE_ARCHIVE_SKIP_NLS`, or a companion
-     `nls-<triple>` artifact) so an install carries the compiler + LSP together.
+   - Pin it to the SAME lang source revision (`-Dkyte-src`) so `kynalyzer` and `kyte` never drift, and stamp the
+     SAME version (extend `check-version-sync.sh` to cover kynalyzer).
+   - Include the `kynalyzer` binary in each release archive (drop `KYTE_ARCHIVE_SKIP_KYNALYZER`, or a companion
+     `kynalyzer-<triple>` artifact) so an install carries the compiler + LSP together.
 4. **Contributor dev builds** use dynamic system LLVM (fast) — fine; only release needs static.
 
-**Recommendation:** delivery is DONE for the web-developer story. #3 (ship `nls`) is the one the user
+**Recommendation:** delivery is DONE for the web-developer story. #3 (ship `kynalyzer`) is the one the user
 explicitly wants and is small — a cross-compiled pure-Zig binary bundled alongside `kyte`, version-locked to
 the same lang source. Do #2 (un-hardcode) opportunistically; #1 (Windows single-file static) only if it
 matters.
 
-**Decision to lock:** (1) agree delivery is solved (no mirror work). (2) ship `nls` in the SAME archive as
-`kyte` vs a companion artifact? (3) version-lock `nls` to lang via `check-version-sync.sh`?
+**Decision to lock:** (1) agree delivery is solved (no mirror work). (2) ship `kynalyzer` in the SAME archive as
+`kyte` vs a companion artifact? (3) version-lock `kynalyzer` to lang via `check-version-sync.sh`?
 
-**Effort:** #3 (nls) = ~1 day (add an nls build+bundle leg, cross-compiled; extend version-sync). #2 = hours.
+**Effort:** #3 (kynalyzer) = ~1 day (add an kynalyzer build+bundle leg, cross-compiled; extend version-sync). #2 = hours.
 #1 (Windows static) = days, optional.
 
 ---

@@ -85,7 +85,7 @@ Two things are worth knowing:
   no system LLVM on the user's machine.
 - `KYTE_LLVM_PREFIX` points the build at an installed LLVM 21 (from Homebrew or apt) whose static
   component archives are linked in. `KYTE_VERSION` names the archive and defaults to `dev`. Set
-  `KYTE_ARCHIVE_SKIP_NLS=1` to skip building the language server into the bundle.
+  `KYTE_ARCHIVE_SKIP_KYNALYZER=1` to skip building the language server into the bundle.
 
 The step writes two files into `zig-out/`:
 
@@ -143,9 +143,9 @@ supported host builds:
 The one input Zig cannot synthesise is the target architecture's LLVM, so a second-architecture build
 on the same host needs that architecture's LLVM install pointed at by `KYTE_LLVM_PREFIX`. The native
 build needs no target flag and links the host LLVM (the hardcoded dev prefix, or your
-`KYTE_LLVM_PREFIX`). The same matrix applies to the sibling toolchain repos (nls and the
+`KYTE_LLVM_PREFIX`). The same matrix applies to the sibling toolchain repos (kynalyzer and the
 orchestrator): each uses the same `-Dtarget` pass-through, and only the ones that link LLVM (the
-compiler and nls) need the per-architecture `KYTE_LLVM_PREFIX`.
+compiler and kynalyzer) need the per-architecture `KYTE_LLVM_PREFIX`.
 
 What makes this work:
 

@@ -481,7 +481,7 @@ actual code fix that a probe or gate verifies, not a reframing.
       hyphen/or/prerelease + resolve/unify against a JSON index entry), registered in `root.zig` so
       `zig build test` runs them. Corpus unaffected (registry is null for every conformance project).
 
-### LSP (`nls`) ; PARTIAL ; read
+### LSP (`kynalyzer`) ; PARTIAL ; read
 
 - [x] Completion, hover, definition, symbols, semantic tokens.
 - [ ] Rename / references are semantic cross-file (currently text-based for globals).

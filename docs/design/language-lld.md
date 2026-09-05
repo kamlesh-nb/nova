@@ -1178,7 +1178,7 @@ stages in `compiler-lld.md` section 3.
   content-hash cache; `--emit-llvm` writes the `.ll`. **[impl]**
 - **Sanitiser/verifier gates.** `--asan`, `--tsan`, `--arc`, and `KYTE_OSSA=hard`. Verify memory changes with
   `--asan`, not just `--arc`. **[impl]**
-- **Self-contained delivery.** Release builds static-link LLVM; six bundles each carry `kyte` + `nls` + the
+- **Self-contained delivery.** Release builds static-link LLVM; six bundles each carry `kyte` + `kynalyzer` + the
   stdlib + a checksum. **[impl]**
 
 ### 15.3 CLI surface
@@ -1218,7 +1218,7 @@ confirm values render; the formatters must still work with Python absent.
 
 ### 15.5 Language server and editor extension
 
-**What it is.** `nls` (pure Zig, bundled) reuses this repo's frontend, so completion/hover/definition/symbols/
+**What it is.** `kynalyzer` (pure Zig, bundled) reuses this repo's frontend, so completion/hover/definition/symbols/
 semantic-tokens see the same types the compiler does; a VS Code extension adds highlighting and NSX. **[impl]**
 (Inventory Stream 4: LSP, PARTIAL — semantic cross-file rename/references and cross-file diagnostics remain.)
 
@@ -1229,18 +1229,18 @@ editor's type view in agreement with the compiler.
 references, and code-actions over the shared frontend; the extension provides syntax highlighting and `.nsx`
 support.
 
-**Where in code.** `nls` is a separate repo version-locked to lang (`scripts/check-version-sync.sh`); the
+**Where in code.** `kynalyzer` is a separate repo version-locked to lang (`scripts/check-version-sync.sh`); the
 extension is `extension/`.
 
 **Data it produces.** LSP responses (completions, hovers, symbols, tokens) computed from the same types the
 compiler infers.
 
-**Gotchas.** If `nls` drifts from the compiler frontend, the editor's type view disagrees with the compiler.
+**Gotchas.** If `kynalyzer` drifts from the compiler frontend, the editor's type view disagrees with the compiler.
 Cross-file (import-resolved) rename/references and diagnostics are PARTIAL (currently text-based/single-file,
 section 17).
 
-**How to change it safely.** The `nls` repo's own tests plus a manual editor session; keep the version-sync
-check green so `nls` and the compiler frontend stay locked.
+**How to change it safely.** The `kynalyzer` repo's own tests plus a manual editor session; keep the version-sync
+check green so `kynalyzer` and the compiler frontend stay locked.
 
 ### 15.6 The `kyte test` runner
 

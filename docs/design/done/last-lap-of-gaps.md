@@ -117,7 +117,7 @@ value-optional box (weeks), error-union + try (weeks), async coroutines (multi-w
 back gracefully), then the default-on flip (days, gated on coverage). This is the single largest body of work
 and it is months. Verify: emit corpus byte-identical to AST + ASAN, then the default-on corpus staying green.
 
-**Gap 5 - tooling.** PROVEN: the LSP (`nls`, 13 handlers, real type-checker diagnostics) and formatter are
+**Gap 5 - tooling.** PROVEN: the LSP (`kynalyzer`, 13 handlers, real type-checker diagnostics) and formatter are
 genuinely built; the package manager is a 179-line git-clone with no versioning or lockfile; there is no
 debugger and no debug-info emission. PLAN: LSP workspace index for cross-file features (medium); formatter
 idempotency + stress corpus (high confidence, low risk); a real package manager with versions + lockfile

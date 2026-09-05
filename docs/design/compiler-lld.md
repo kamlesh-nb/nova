@@ -674,7 +674,7 @@ reactor, read the reactor sections of `lang/CLAUDE.md` first.
 - **Delivery:** contributor DEV builds use dynamic system LLVM (fast); RELEASE builds static-link LLVM
   (`zig build -Dstatic-llvm`) so end users install nothing. `release.yml` publishes six bundles
   (macOS/Linux arm64+x86_64 static, Windows dynamic with a bundled `LLVM-C.dll`), each containing `kyte` +
-  `nls` + the stdlib + a checksum. A release that ships `kyte` alone is broken for anyone without the stdlib
+  `kynalyzer` + the stdlib + a checksum. A release that ships `kyte` alone is broken for anyone without the stdlib
   on disk.
 - **Windows** has its own trap list (WSAStartup, IOCP timers and association, ConnectEx, MSVC link.exe flag
   translation); it is documented in `lang/CLAUDE.md` and must be read before touching the Windows path.

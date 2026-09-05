@@ -6,10 +6,10 @@ Assessed from the actual code on 2026-08-15. Umbrella root `/Users/kamlesh/kyte-
 
 INSPECTED (all present locally, all read from source, not from README claims):
 
-- LSP server: `nls/src/` (server.zig 2146 lines, analysis.zig 315, main.zig 27, root.zig 12).
+- LSP server: `kynalyzer/src/` (server.zig 2146 lines, analysis.zig 315, main.zig 27, root.zig 12).
 - Formatter: `lang/src/format.zig` (244) + `lang/src/frontend/formatter.zig` (1031).
 - Package manager: `lang/src/packages.zig` (179) + `lang/src/scaffold.zig` (214) + `lang/src/templates.zig` (354).
-- Debugger: searched `lang/`, `nls/`, `extension/` for any DAP/DWARF/debug-info. Confirmed absent (details below).
+- Debugger: searched `lang/`, `kynalyzer/`, `extension/` for any DAP/DWARF/debug-info. Confirmed absent (details below).
 - VS Code extension: `extension/` (extension.ts 102 lines, package.json, grammars, snippets).
 - DB drivers: `packages/kyte-{postgres,mysql,mssql,mongodb,novadb,btreedb,orchestrator}` -- Kyte source, line-counted and structure-sampled.
 - Web framework: `lang/src/lib/std/web/` (24 files, 3747 lines) + DB seam `lang/src/lib/std/data/` (db.ky 677, orm.ky 225, sql/pool.ky 291).
@@ -27,9 +27,9 @@ COULD NOT fully access / NOT VERIFIED:
 
 ## PART A -- TOOLING
 
-### A.1 LSP server (`nls/`) -- GAP: moderate. The best-built tool of the set.
+### A.1 LSP server (`kynalyzer/`) -- GAP: moderate. The best-built tool of the set.
 
-LOCATED: `nls/src/server.zig` + `nls/src/analysis.zig`. Standalone Zig binary, stdio transport, reuses the compiler's parser/type_checker as a `compiler` module (build.zig pulls `../lang/src/root.zig`).
+LOCATED: `kynalyzer/src/server.zig` + `kynalyzer/src/analysis.zig`. Standalone Zig binary, stdio transport, reuses the compiler's parser/type_checker as a `compiler` module (build.zig pulls `../lang/src/root.zig`).
 
 WHAT EXISTS (each handler cited by line in `server.zig`):
 
@@ -43,7 +43,7 @@ WHAT EXISTS (each handler cited by line in `server.zig`):
 Quality reads from the code:
 
 - `definition` (788-829): first tries locals in the enclosing function (accurate), else a whole-open-file scan matching a declaration by NAME via `declSpanFor` (831-851). `declSpanFor` matches on name string only -- so two same-named symbols in different scopes resolve to the first found. Not binding-accurate for globals.
-- `references`/`rename`: per the nls CLAUDE, binding-accurate for function-locals (brace-matched extent), whole-word string/comment-aware fallback for globals/types/fields. That is honest and reasonable but not a real symbol-graph rename.
+- `references`/`rename`: per the kynalyzer CLAUDE, binding-accurate for function-locals (brace-matched extent), whole-word string/comment-aware fallback for globals/types/fields. That is honest and reasonable but not a real symbol-graph rename.
 - `codeAction` (1182): only two actions, keyed on checker message substrings -- the async await/spawn fix and the 128-bit-integer removal. Extensible but tiny.
 - Diagnostics reparse + retypecheck the whole file on every change with a fresh arena; no incremental parse, no caching, no cross-file project model.
 
@@ -55,7 +55,7 @@ WHAT IS MISSING (measured against a beta-grade LSP):
 - Completion has no real type inference, so member completion on anything the light env cannot resolve degrades to globals.
 - No import resolution in diagnostics, so whole classes of real errors (undefined cross-module symbol, wrong import) are invisible in-editor.
 
-ROOT CAUSE: deliberately AST-and-lightweight-env based to avoid running the full sema/mono pipeline (which pulls in codegen/LLVM) inside the editor loop. That keeps nls a pure-Zig, cross-compilable binary but caps semantic precision at "single file, no imports, no inference".
+ROOT CAUSE: deliberately AST-and-lightweight-env based to avoid running the full sema/mono pipeline (which pulls in codegen/LLVM) inside the editor loop. That keeps kynalyzer a pure-Zig, cross-compilable binary but caps semantic precision at "single file, no imports, no inference".
 
 ### A.2 Formatter (`lang/src/format.zig` + `frontend/formatter.zig`) -- GAP: small. Genuinely solid for its scope.
 
@@ -100,7 +100,7 @@ ROOT CAUSE: it is a git-clone convenience wrapper, not a package manager. It was
 
 CONFIRMED absent:
 
-- No DAP implementation anywhere. `grep -ril debugAdapter|DebugSession|vscode-debugadapter|breakpoint` over `lang/`, `nls/`, `extension/` returns only a design doc filename (`bug-async-owned-struct-uaf.md`) -- no code.
+- No DAP implementation anywhere. `grep -ril debugAdapter|DebugSession|vscode-debugadapter|breakpoint` over `lang/`, `kynalyzer/`, `extension/` returns only a design doc filename (`bug-async-owned-struct-uaf.md`) -- no code.
 - No source-level debug info emitted by codegen: `grep -rl DIBuilder|createCompileUnit|LLVMDIBuilder|dwarf` over `lang/src/backend` returns NOTHING. The compiler lowers to LLVM IR and links native binaries but emits no DWARF/line tables, so even attaching `lldb`/`gdb` gives no Kyte-source line mapping -- you would be debugging optimised machine code with no symbols back to `.ky`.
 - The VS Code extension declares no `debuggers` contribution (package.json has languages, grammars, snippets, one command `kyte.runFile`; no debug config).
 
@@ -110,7 +110,7 @@ IMPLICATION: there is no way to set a breakpoint, step, or inspect a Kyte variab
 
 LOCATED. `extension.ts` is 102 lines. Contributes: language registration, a TextMate grammar (syntax highlighting), snippets (`snippets/kyte.json`), and exactly ONE command `kyte.runFile` ("Kyte: Run Current File"). Packaged as `kyte-vscode-0.2.0.vsix`.
 
-It presumably launches `~/.kyte/bin/nls` for LSP features (per nls CLAUDE), so IDE intelligence rides on the LSP above. No debug integration, no build tasks, no test explorer, no `.nsx` rich support beyond grammar. This is a "basic syntax highlighter + LSP client + run button", which matches the CLAUDE.md self-description.
+It presumably launches `~/.kyte/bin/kynalyzer` for LSP features (per kynalyzer CLAUDE), so IDE intelligence rides on the LSP above. No debug integration, no build tasks, no test explorer, no `.nsx` rich support beyond grammar. This is a "basic syntax highlighter + LSP client + run button", which matches the CLAUDE.md self-description.
 
 ---
 
@@ -177,7 +177,7 @@ LSP (confidence: HIGH for the additive features, MEDIUM for precision):
 1. Add the cheap missing capabilities first -- `documentHighlight`, `foldingRange`, `selectionRange`, `semanticTokens/range` -- these are pure AST walks, low risk, high perceived polish.
 2. Build a workspace/project index: on init, scan the project's `.ky` files (respecting `project.json` + resolved imports from `~/.kyte/cache`), parse once, keep a symbol table keyed by module. This unlocks cross-file go-to-def/references/rename and turns diagnostics import-aware. MEDIUM effort; the main unknown is running import resolution without pulling codegen in.
 3. Incremental sync + reparse caching to stop re-typechecking the whole file per keystroke.
-4. Precision: reuse more of `sema/` (infer only, not mono/codegen) inside completion to replace the lightweight env. HIGHEST risk (that is exactly what nls avoided); gate behind a flag.
+4. Precision: reuse more of `sema/` (infer only, not mono/codegen) inside completion to replace the lightweight env. HIGHEST risk (that is exactly what kynalyzer avoided); gate behind a flag.
 
 Formatter (confidence: HIGH): add an explicit idempotency test to the corpus, a stress comment-reinjection corpus, and optional style config (line width). Low risk; the token-stream guard already protects meaning.
 

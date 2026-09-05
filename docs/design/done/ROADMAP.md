@@ -49,13 +49,13 @@ designed, not built), a handful of narrow polish items, and the bigger post-beta
 - **Perf (Gap 5): ACTIVE** — targeted, measure-first allocation reduction. Harness built; win #1 landed
   (JSON parse+bind 114→58 allocs, 49%). Next candidates in `gap5-perf-plan.md`. Not a stop condition that
   we beat Rust/Go.
-- **nls:** ship in the same archive as `kyte` vs a companion artifact? version-lock via `check-version-sync.sh`?
+- **kynalyzer:** ship in the same archive as `kyte` vs a companion artifact? version-lock via `check-version-sync.sh`?
 - **Beta bar (Gap 7):** lock the 6-item release checklist.
 
 ## 5. Roadmap sequence (recommended, not a decree)
 **Near-term (cheap, unblocking):**
 1. Gap 3 corpus-wide verifier gate — hours, immediate soundness value.
-2. `nls` bundled into the release (pure-Zig, cross-compiles from one runner) — ~1 day.
+2. `kynalyzer` bundled into the release (pure-Zig, cross-compiles from one runner) — ~1 day.
 3. Adopt the Gap 7 beta checklist — free; it drives everything else.
 4. Package-manager resolver spike → then implement `pkg-manager.md`.
 

@@ -13,12 +13,12 @@ name: release
 #     kyte.exe. Windows arm64: DYNAMIC LLVM from the LLVM.org clang+llvm aarch64-windows drop (LLVM 22),
 #     built natively on a windows-11-arm runner and bundled the same way. The DLL-free static path
 #     (WIN_STATIC_LLVM_{X64,ARM64}_URL) is a later upgrade; see CLAUDE.md.
-#   * nls (the language server) IS bundled: each runner checks out the sibling `nls` repo and the
-#     archive step builds it from that source, pinned to THIS lang checkout via `-Dkyte-src`. nls is
-#     pure-Zig (no LLVM link), so it builds on every runner without extra toolchain. If the `nls` repo
+#   * kynalyzer (the language server) IS bundled: each runner checks out the sibling `kynalyzer` repo and the
+#     archive step builds it from that source, pinned to THIS lang checkout via `-Dkyte-src`. kynalyzer is
+#     pure-Zig (no LLVM link), so it builds on every runner without extra toolchain. If the `kynalyzer` repo
 #     is private, set the `NLS_TOKEN` secret to a PAT with read access (else the checkout falls back to
-#     the workflow's GITHUB_TOKEN, which only works when nls is in the same repo/owner and permitted).
-#     To ship a kyte-only bundle, set the repo variable `SKIP_NLS=1`.
+#     the workflow's GITHUB_TOKEN, which only works when kynalyzer is in the same repo/owner and permitted).
+#     To ship a kyte-only bundle, set the repo variable `SKIP_KYNALYZER=1`.
 #   * NOTE: the arm64 Linux runner is BILLED on private repos.
 #
 # Trigger: push a tag `v*`, or run manually (Actions -> release -> Run workflow) with a version.
@@ -38,8 +38,8 @@ permissions:
 
 env:
   KYTE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
-  # Bundle nls unless the repo variable SKIP_NLS is set to 1 (archive step reads KYTE_ARCHIVE_SKIP_NLS).
-  KYTE_ARCHIVE_SKIP_NLS: ${{ vars.SKIP_NLS || '0' }}
+  # Bundle kynalyzer unless the repo variable SKIP_KYNALYZER is set to 1 (archive step reads KYTE_ARCHIVE_SKIP_KYNALYZER).
+  KYTE_ARCHIVE_SKIP_KYNALYZER: ${{ vars.SKIP_KYNALYZER || '0' }}
 
 jobs:
   build-macos:
@@ -48,13 +48,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
-      # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
-      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_NLS=1.
+      # kynalyzer (language server): checked out as a SIBLING of lang so the archive step builds it from
+      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_KYNALYZER=1.
       - uses: actions/checkout@v4
-        if: ${{ vars.SKIP_NLS != '1' }}
+        if: ${{ vars.SKIP_KYNALYZER != '1' }}
         with:
-          repository: kamlesh-nb/nls
-          path: nls
+          repository: kamlesh-nb/kynalyzer
+          path: kynalyzer
           token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
@@ -84,13 +84,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
-      # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
-      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_NLS=1.
+      # kynalyzer (language server): checked out as a SIBLING of lang so the archive step builds it from
+      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_KYNALYZER=1.
       - uses: actions/checkout@v4
-        if: ${{ vars.SKIP_NLS != '1' }}
+        if: ${{ vars.SKIP_KYNALYZER != '1' }}
         with:
-          repository: kamlesh-nb/nls
-          path: nls
+          repository: kamlesh-nb/kynalyzer
+          path: kynalyzer
           token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
@@ -125,13 +125,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: lang }
-      # nls (language server): checked out as a SIBLING of lang so the archive step builds it from
-      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_NLS=1.
+      # kynalyzer (language server): checked out as a SIBLING of lang so the archive step builds it from
+      # source, version-pinned to this lang checkout via -Dkyte-src. Skipped only if SKIP_KYNALYZER=1.
       - uses: actions/checkout@v4
-        if: ${{ vars.SKIP_NLS != '1' }}
+        if: ${{ vars.SKIP_KYNALYZER != '1' }}
         with:
-          repository: kamlesh-nb/nls
-          path: nls
+          repository: kamlesh-nb/kynalyzer
+          path: kynalyzer
           token: ${{ secrets.NLS_TOKEN || github.token }}
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }

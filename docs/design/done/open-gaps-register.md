@@ -82,7 +82,7 @@ re-opened by mistake. Reverify a specific one only if it resurfaces.
   publishes 6 bundles (macOS/Linux arm64+x86_64 static via `-Dstatic-llvm`; Windows bundles `LLVM-C.dll`).
   End users never install LLVM. The old static-LLVM mirror was removed on purpose (CI uses OS-package static
   archives). Remaining is polish only: Windows single-file static (optional), un-hardcode the local static
-  default, verify `nls` is in the bundles. See `remaining-gaps-design.md` Gap 2. **[verified]**
+  default, verify `kynalyzer` is in the bundles. See `remaining-gaps-design.md` Gap 2. **[verified]**
 - **WASM** is best-effort (deliberately dropped as the primary target, 2026-07-28). **[register]**
 
 ## E. Ecosystem (Gap 6) — not started; separate repos, weeks+. **[register]**
@@ -115,7 +115,7 @@ The LTO-bitcode blocker is resolved (`convert-drop-to-native.sh`); CI static-lin
 `libLLVM*.a` (no mirror needed — the old fetched `llvm-dist` was removed on purpose). Web developers download
 an archive and never install LLVM. Remaining is **polish only**: (1) Windows single-file static (optional —
 the bundle is still one download), (2) un-hardcode `build.zig`'s local `static_llvm_prefix` (cosmetic; CI
-overrides via `KYTE_LLVM_PREFIX`), (3) verify `nls` is inside the release archives. See
+overrides via `KYTE_LLVM_PREFIX`), (3) verify `kynalyzer` is inside the release archives. See
 `remaining-gaps-design.md` Gap 2. Contributor DEV builds use dynamic system LLVM (fast); only release is static.
 
 ## Appendix 2 — optimiser switches vs `--release`

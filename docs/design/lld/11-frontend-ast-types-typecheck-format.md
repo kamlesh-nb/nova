@@ -285,7 +285,7 @@ Free functions after the struct:
 - The soundness checks (trait-to-concrete narrowing across call/method/constructor/assignment, fixed-array primitive elements, index validity, pointer truncation, narrowing/signedness) are the load-bearing correctness parts. They are narrow on purpose; widening any of them risks false positives on generics.
 - `checkConst` is intentionally empty; do not expect const validation here.
 
-**Cross-references.** Reads `ast.zig` throughout and `sema/builtins.zig` for builtin signatures. `Diagnostic` is consumed by the language server (`nls`). The authoritative typed pass this defers to lives in `src/sema/` (infer/mono/ownership/lower/symbols). The semantic `Type`/`TypeStore` in `types.zig` above is *not* used here; this pass works in syntactic `TypeRef`.
+**Cross-references.** Reads `ast.zig` throughout and `sema/builtins.zig` for builtin signatures. `Diagnostic` is consumed by the language server (`kynalyzer`). The authoritative typed pass this defers to lives in `src/sema/` (infer/mono/ownership/lower/symbols). The semantic `Type`/`TypeStore` in `types.zig` above is *not* used here; this pass works in syntactic `TypeRef`.
 
 ---
 

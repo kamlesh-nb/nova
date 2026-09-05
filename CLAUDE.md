@@ -645,7 +645,7 @@ both are easy to get wrong in a way that still looks plausible).
 ## Status & dependencies
 
 Master roadmap: `docs/design/execution-plan.md` (per-item design + state). Language spec: `docs/specs.md`.
-Depends on **NovaDB** (separate repo); pairs with **nls** (LSP) + the VSCode **extension**.
+Depends on **NovaDB** (separate repo); pairs with **kynalyzer** (LSP) + the VSCode **extension**.
 
 ## Planned / next work
 
