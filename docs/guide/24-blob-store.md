@@ -3,16 +3,16 @@
 Chapter 23 deployed a web app by pointing the manifest at a binary on disk (`workload.binary:
 ./build/release/bin/webapp`). That works when the binary already sits on every node. Once you have more
 than one node, you need a way to get the exact same binary to each of them, and to be sure each node runs
-the binary you built and not something that was altered on the way. The orchestrator ships a small
-artifact origin for this: `artifactd`, a content-addressed blob server, plus the client-side glue that
-each orchd node uses to pull a binary by hash before it spawns a replica.
+the binary you built and not something that was altered on the way. Kynator ships a small artifact origin
+for this: `artifactd`, a content-addressed blob server, plus the client-side glue that each `kynatord`
+node uses to pull a binary by hash before it spawns a replica. `artifactd` is one of the daemons the
+Kynator installer sets up (Chapter 23), so it is already running on a deployed host.
 
-Everything here lives in `packages/nova-orchestrator`, in `src/artifacts/` (the store) and
-`src/orch/artifact.ky` (the client). It is a stopgap that lives inside the orchestrator repository; see
-"Current status and future direction" at the end for exactly what that means.
+The store lives in `src/artifacts/` and the client in `src/orch/artifact.ky`. It is a stopgap that ships
+with Kynator today; see "Current status and future direction" at the end for exactly what that means.
 
 `artifactd` wears a second hat, covered in Chapter 23: alongside the content-addressed blobs it also
-hosts the orchestrator's small key-value **config store** (workload specs, the leader lease, cluster
+hosts Kynator's small key-value **config store** (workload specs, the leader lease, cluster
 membership) on its `/cfg/*` routes. That is why the control plane needs no database of its own. This
 chapter is about the blob half; the config-store half is in Chapter 23.
 
@@ -90,7 +90,7 @@ formality: the store holds a whole blob in memory during a write, so an unbounde
 out-of-memory. Raising it goes hand in hand with adding streaming I/O.
 
 The end-to-end flow the daemon is built for: CI uploads a freshly built native binary keyed by its
-SHA-256 (idempotent and verified), and each orchd node later pulls it by hash into a local cache before
+SHA-256 (idempotent and verified), and each kynatord node later pulls it by hash into a local cache before
 spawning a replica.
 
 ## Bearer auth
@@ -129,7 +129,7 @@ body hashes to the `{sha}` in the URL before publishing, returning 409 on a mism
 
 ## The client side: pulling a binary into a deploy
 
-On the consuming side, `src/orch/artifact.ky` is the glue orchd uses to turn an artifact reference into
+On the consuming side, `src/orch/artifact.ky` is the glue kynatord uses to turn an artifact reference into
 a local file it can execute. It carries a small error type, `ArtifactError`, with `NotCached(sha)` and
 `Corrupt(sha)` cases, and three functions:
 
@@ -150,7 +150,7 @@ cached file are left to the caller's integration step. Keeping the network out o
 lets the verify-and-cache logic be unit-tested without a running server.
 
 The manifest ties into this through `spec.artifact` (in `src/orch/spec.ky`), a `"sha256:<hex>"` string
-on a workload. When it is set, orchd pulls the binary by hash into its blob cache and points the
+on a workload. When it is set, kynatord pulls the binary by hash into its blob cache and points the
 workload's `binaryPath` at the cached file before spawning replicas. When it is empty, the workload runs
 in the legacy local-path mode. So a fully hash-addressed deployment names its binary once, by digest, and
 every node fetches and verifies exactly those bytes.
@@ -165,7 +165,7 @@ The typical sequence for one node:
 ## Current status and future direction
 
 Be clear-eyed about what this is. The blob store is a **stopgap content-addressed store that lives inside
-the orchestrator repository**. It is deliberately simple: it holds a whole blob in memory during a write
+the Kynator repository**. It is deliberately simple: it holds a whole blob in memory during a write
 (hence the 512 MiB cap and the note that raising it needs streaming I/O), and `artifactd` serves plain
 HTTP with a bearer token, so you would put it behind TLS termination in a real deployment. What it does
 give you today is the property that matters most for a deploy path: a binary you fetch is the binary you
@@ -179,7 +179,7 @@ code selects one. Do not reach for it expecting it to exist; the in-repo `BlobSt
 
 ## Where to go next
 
-- Chapter 23 for the orchestrator that consumes these artifacts: the manifest, the reconcile loop, and
+- Chapter 23 for Kynator that consumes these artifacts: the manifest, the reconcile loop, and
   `spec.artifact` wired into a deploy.
 - Chapter 22 for building and cross-compiling the binaries you upload here.
 - The standard library's `sha.sha256`, the digest function the store is built on.

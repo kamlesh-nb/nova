@@ -2,11 +2,11 @@
 
 - Chapter: [24-blob-store.md](../24-blob-store.md)
 - Estimated length: ~10 minutes
-- You will need: Kyte installed and the guide's `packages/nova-orchestrator` handy. Watching Video 23 on the orchestrator first is essential, since this is how its manifests get their binaries.
+- You will need: Kyte installed and Kynator installed. Watching Video 23 on Kynator first is essential, since this is how its manifests get their binaries.
 
 ## Hook (0:00)
 
-**Say:** In the last video the manifest pointed at a binary already sitting on disk. That is fine on one machine. The moment you have several nodes, you need a way to get the exact same binary to each of them, and to be certain each node runs the binary you built and not something altered on the way. The orchestrator ships a small artifact origin for exactly this: artifactd, a content-addressed blob server, plus the client glue each node uses to pull a binary by hash. This is the final piece of the deploy path.
+**Say:** In the last video the manifest pointed at a binary already sitting on disk. That is fine on one machine. The moment you have several nodes, you need a way to get the exact same binary to each of them, and to be certain each node runs the binary you built and not something altered on the way. Kynator ships a small artifact origin for exactly this: artifactd, a content-addressed blob server, plus the client glue each node uses to pull a binary by hash. This is the final piece of the deploy path.
 
 ## What we will cover (0:30)
 
@@ -84,7 +84,7 @@ Path-traversal guard    validSha accepts only 64 hex chars: ../etc/passwd is imp
 
 ## Segment: The client side (8:00)
 
-**Say:** On the consuming side, one small module turns an artifact reference into a local file orchd can execute. resolveBinary looks in the local cache: if the digest is there, it returns the path; if not, it returns a NotCached signal. That is the caller's cue to GET the blob from artifactd and then cacheArtifact the bytes, which verifies the hash and writes atomically, so a tampered download can never become a runnable file.
+**Say:** On the consuming side, one small module turns an artifact reference into a local file kynatord can execute. resolveBinary looks in the local cache: if the digest is there, it returns the path; if not, it returns a NotCached signal. That is the caller's cue to GET the blob from artifactd and then cacheArtifact the bytes, which verifies the hash and writes atomically, so a tampered download can never become a runnable file.
 
 **On screen:**
 ```
@@ -99,7 +99,7 @@ spec.artifact = "sha256:abcd..."     on a workload
 
 ## Segment: Current status, honestly (9:15)
 
-**Say:** Be clear-eyed about what this is. The blob store is a stopgap that lives inside the orchestrator repository. It is deliberately simple: whole blob in memory during a write, plain HTTP with a bearer token that you would put behind TLS termination in production. A natural future direction is to move the bytes to an object store like MinIO or S3 behind the same PUT and GET interface, so the integrity contract stays identical while storage scales. But be honest that this is a direction, not a shipped feature: there is no such backend in the code today. The in-repo store is what runs.
+**Say:** Be clear-eyed about what this is. The blob store is a stopgap that lives inside the Kynator repository. It is deliberately simple: whole blob in memory during a write, plain HTTP with a bearer token that you would put behind TLS termination in production. A natural future direction is to move the bytes to an object store like MinIO or S3 behind the same PUT and GET interface, so the integrity contract stays identical while storage scales. But be honest that this is a direction, not a shipped feature: there is no such backend in the code today. The in-repo store is what runs.
 
 ## Recap and outro (10:00)
 

@@ -12,16 +12,15 @@ state lives in `artifactd`, the same content-addressed blob service that already
 binaries, which hosts a small key-value config store beside the blobs. There is no separate database
 process in the control plane to stand up, secure, or back up.
 
-Kynator lives in `packages/nova-orchestrator`; its `README.md` and `docs/runbooks.md` are the operator
-references. `lang/docs/guide/examples/run-live.sh` runs everything in this chapter against the real
-binaries.
+`lang/docs/guide/examples/run-live.sh` runs everything in this chapter against the real binaries.
 
-## Install from a GitHub release
+## Install
 
-The fastest way onto a real host is the release installer. Kynator publishes a Linux bundle per CPU on
-its GitHub releases, and one command pulls the matching one and sets it up as systemd services. Kynator is
-a Linux production concern (its zero-downtime data plane is POSIX-only), so this path is Linux and systemd
-only:
+**Kynator runs on Linux only.** Its zero-downtime data plane passes sockets between processes with a
+POSIX mechanism that has no portable equivalent, so it is a Linux production concern; treat macOS and
+Windows as development hosts. The fastest way onto a real host is the release installer: Kynator publishes
+a Linux bundle per CPU on its GitHub releases, and one command pulls the matching one and sets it up as
+systemd services (so you also need systemd):
 
 ```sh
 curl -fsSL https://kytelang.org/deploy-kynator.sh | sudo bash -s -- --enable --start
@@ -64,10 +63,10 @@ fails the core stack.
 `artifactd` and the blob store behind it are the subject of the next chapter (Chapter 24, artifact
 delivery); this chapter focuses on running and balancing your replicas.
 
-Build them all with the package's script:
+If you are developing rather than deploying, build them all from a Kynator source checkout with its
+script:
 
 ```sh
-cd packages/nova-orchestrator
 ./build.sh                        # debug build  -> build/debug/bin/
 ./build.sh --release              # optimised    -> build/release/bin/
 ./build.sh --release --target linux-arm64   # cross-compile -> build/release/linux-arm64/bin/
@@ -442,5 +441,5 @@ lang/docs/guide/examples/run-live.sh
   uses (a separate concern from the control-plane config store, which is on artifactd).
 - Chapter 24 for artifact delivery: `artifactd`, the content-addressed blob store it also hosts, and
   pulling a deploy binary by hash.
-- `packages/nova-orchestrator/README.md` and `docs/runbooks.md` for the full operator reference,
-  including leader loss, split-brain, and store-outage runbooks.
+- Kynator's own repository for the full operator reference, including leader loss, split-brain, and
+  store-outage runbooks.
