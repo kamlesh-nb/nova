@@ -44,7 +44,7 @@ src/
       Shared/
         repository.ky             data access for the feature
         database.ky               an in-memory Connection (the default)
-      views/product_card.nsx        an NSX view
+      views/product_card.kyx        an KyX view
   wwwroot/                          static assets
 ```
 
@@ -140,14 +140,14 @@ let ids = ctx.param("id");    // one path parameter, or ""
 Because a hypermedia form POSTs `application/x-www-form-urlencoded`, the SAME
 `ctx.bind<T>()` reads a submitted form with no extra work.
 
-## Views: NSX
+## Views: KyX
 
-View code lives in `.nsx` files. NSX is the same language as `.ky`, just
-filed apart so markup stays separate from logic. An NSX element is a `string`,
+View code lives in `.kyx` files. KyX is the same language as `.ky`, just
+filed apart so markup stays separate from logic. An KyX element is a `string`,
 so views compose directly and expressions embed with `{...}`.
 
 ```kyte
-// Features/Products/views/product_card.nsx
+// Features/Products/views/product_card.kyx
 pub fn productCard(name: string, price: int): Html {
     return <div class="rounded-lg border border-slate-200 p-4 shadow-sm">
         <h3 class="font-semibold text-slate-800">{name}</h3>

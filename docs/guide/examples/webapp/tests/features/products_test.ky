@@ -56,7 +56,7 @@ fn test_get_missing_is_404(): void {
 
 @test
 fn test_product_card_view(): void {
-    // The `.nsx` view renders, and untrusted text is HTML-escaped automatically by `{expr}`.
+    // The `.kyx` view renders, and untrusted text is HTML-escaped automatically by `{expr}`.
     let html = productCard("<b>Gadget</b>", 42);
     assert.isTrue(string.indexOf(html, "&lt;b&gt;Gadget") != -1);
     assert.isTrue(string.indexOf(html, "42") != -1);

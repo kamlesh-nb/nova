@@ -203,7 +203,7 @@ What differs is the source tree:
   right starting point for a command-line tool or a service you drive yourself.
 - **`web`** lays down a full ASP.NET-style vertical-slice tree: `src/main.ky` as
   the composition root, a `src/Features/Products/` slice (routes plus
-  `CreateProduct` and `GetProductById` handlers), a shared repository, an `.nsx`
+  `CreateProduct` and `GetProductById` handlers), a shared repository, an `.kyx`
   view, domain entities and DTOs under `src/Domain/`, a `wwwroot/index.html`,
   and a feature test. It also writes an `app.yaml` at the project root (the
   file-based config the app reads through `app.config`; see Chapter 18), and

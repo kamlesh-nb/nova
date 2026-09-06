@@ -661,13 +661,13 @@ pub fn targetVariantPath(path: []const u8, os_tag: []const u8, arch: []const u8,
     return null;
 }
 
-/// Return `kyte_candidate` if it names an existing source, trying an `.nsx`
+/// Return `kyte_candidate` if it names an existing source, trying a `.kyx`
 /// sibling as a fallback, and freeing the candidate otherwise.
 ///
-/// `.nsx` is the hypermedia-template dialect: a `foo.ky` import also matches a
-/// `foo.nsx` file. Ownership is a subtle contract: this function *consumes*
+/// `.kyx` is the hypermedia-template dialect: a `foo.ky` import also matches a
+/// `foo.kyx` file. Ownership is a subtle contract: this function *consumes*
 /// `kyte_candidate`. It returns the winning path (the original, or a freshly
-/// allocated `.nsx` after freeing the original), and on a total miss it frees
+/// allocated `.kyx` after freeing the original), and on a total miss it frees
 /// `kyte_candidate` and returns null. Callers therefore hand off ownership and
 /// must not free the argument themselves.
 pub fn existingSource(kyte_candidate: []const u8, allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
@@ -675,7 +675,7 @@ pub fn existingSource(kyte_candidate: []const u8, allocator: std.mem.Allocator, 
         return kyte_candidate;
     } else |_| {}
     if (std.mem.endsWith(u8, kyte_candidate, ".ky")) {
-        if (std.fmt.allocPrint(allocator, "{s}.nsx", .{kyte_candidate[0 .. kyte_candidate.len - 3]}) catch null) |nsx| {
+        if (std.fmt.allocPrint(allocator, "{s}.kyx", .{kyte_candidate[0 .. kyte_candidate.len - 3]}) catch null) |nsx| {
             if (Io.Dir.access(.cwd(), io, nsx, .{})) |_| {
                 allocator.free(kyte_candidate);
                 return nsx;
@@ -2042,7 +2042,7 @@ pub fn findKyteFiles(allocator: std.mem.Allocator, io: Io, root_dir: Io.Dir, sub
             try findKyteFiles(allocator, io, root_dir, entry_path, list);
             allocator.free(entry_path);
         } else if (entry.kind == .file) {
-            if ((std.mem.endsWith(u8, entry.name, ".ky") or std.mem.endsWith(u8, entry.name, ".nsx")) and !std.mem.eql(u8, entry.name, "merged.ky")) {
+            if ((std.mem.endsWith(u8, entry.name, ".ky") or std.mem.endsWith(u8, entry.name, ".kyx")) and !std.mem.eql(u8, entry.name, "merged.ky")) {
                 try list.append(allocator, entry_path);
             } else {
                 allocator.free(entry_path);

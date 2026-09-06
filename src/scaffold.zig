@@ -135,7 +135,7 @@ fn indexHtmlFor(framework: []const u8) []const u8 {
 ///
 /// The `web` template is the largest layout: a vertical-slice structure where each use case
 /// (CreateProduct, GetProductById) has its own folder of command/query/response/validator/handler files,
-/// plus a shared repository, an `.nsx` view, a domain entity, static `wwwroot`, tests, and the
+/// plus a shared repository, a `.kyx` view, a domain entity, static `wwwroot`, tests, and the
 /// Tailwind/npm tooling files. Rather than a long sequence of explicit writes, the layout is expressed as
 /// a data table of `{ rel, content }` pairs driven through [`scaffoldFile`], so adding a file to the
 /// template is a one-line table entry. `framework` selects only which `wwwroot/index.html` is written
@@ -164,7 +164,7 @@ fn scaffoldWeb(allocator: std.mem.Allocator, io: std.Io, project: []const u8, fr
 
         .{ .rel = "src/Features/Products/Shared/repository.ky", .content = templates.web_repository_sample },
 
-        .{ .rel = "src/Features/Products/views/product_card.nsx", .content = templates.web_view_sample },
+        .{ .rel = "src/Features/Products/views/product_card.kyx", .content = templates.web_view_sample },
 
         // Clean-arch Domain layer: entities model the persisted rows, DTOs are the
         // request/response shapes bound and returned by the feature slices.

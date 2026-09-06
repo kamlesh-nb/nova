@@ -15,7 +15,7 @@
 - kyte init web: vertical slices, not layers
 - The RouteHandler trait: one serve(ctx) method
 - ctx.bind<T>(): typed input from query, path, and form
-- NSX views: auto-escaped {expr}, response.raw for fragments
+- KyX views: auto-escaped {expr}, response.raw for fragments
 - Wiring: routes.ky per feature + a plain composition root
 - The Connection seam: in-memory now, real PostgreSQL by changing one file
 - Testing offline with app.dispatch
@@ -45,7 +45,7 @@ Features/Products/
   GetProductById/query.ky   read input
   GetProductById/handler.ky
   Shared/repository.ky       data access
-  views/product_card.nsx       an NSX view
+  views/product_card.kyx       an KyX view
 ```
 
 **Say:** One note on the two manifest files. `project.json` is the Kyte manifest, the one the build reads. `package.json` is only for the Tailwind CSS tool; the Kyte build ignores it.
@@ -99,9 +99,9 @@ ctx.param("id")  one path parameter
 
 **Say:** And because a hypermedia form posts url-encoded, the very same `ctx.bind` reads a submitted form with no extra work.
 
-## Segment: NSX views (7:00)
+## Segment: KyX views (7:00)
 
-**Say:** Views live in dot-nsx files. NSX is the same language as Kyte, just filed apart. An element is a string, so views compose, and expressions embed with curly braces.
+**Say:** Views live in dot-nsx files. KyX is the same language as Kyte, just filed apart. An element is a string, so views compose, and expressions embed with curly braces.
 
 **On screen:**
 ```kyte
@@ -208,7 +208,7 @@ registerProducts(app, repo);
 
 ## Recap and outro (15:30)
 
-**Say:** That is a Kyte web application. Vertical slices, one RouteHandler per feature, typed input from ctx.bind, auto-escaped NSX views, a plain composition root, and a Connection seam that lets you go from in-memory to a real database by changing one file. There is more in the box: server-sent events for live updates, sessions and cookies, and middleware for CORS, CSRF, and rate limiting. In the next video we wire this app to a live PostgreSQL, meet the micro-ORM and the drivers, and see the whole data-access story.
+**Say:** That is a Kyte web application. Vertical slices, one RouteHandler per feature, typed input from ctx.bind, auto-escaped KyX views, a plain composition root, and a Connection seam that lets you go from in-memory to a real database by changing one file. There is more in the box: server-sent events for live updates, sessions and cookies, and middleware for CORS, CSRF, and rate limiting. In the next video we wire this app to a live PostgreSQL, meet the micro-ORM and the drivers, and see the whole data-access story.
 
 **On screen:**
 ```

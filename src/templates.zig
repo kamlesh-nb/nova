@@ -5,7 +5,7 @@
 //! literal. They are pure data: [`scaffold`] selects the right set for the
 //! requested project kind (`console` / `web` / `desktop`) and writes each to
 //! disk. The `web_*` set scaffolds a vertical-slice web app (command/query
-//! request types, their handlers, a validator, a repository, an `.nsx` view,
+//! request types, their handlers, a validator, a repository, an `.kyx` view,
 //! and the front-end shell). Editing a template here changes what a freshly
 //! initialised project looks like; it does not affect already-created apps.
 
@@ -292,7 +292,7 @@ pub const web_get_handler_sample =
     \\import Features.Products.views.product_card;
     \\
     \\// Handles GET /api/products/{id:int}. `ctx.bind<GetProductById>()` fills `id` from the route
-    \\// parameter, the injected repository loads the product, and the NSX view renders it as an HTML
+    \\// parameter, the injected repository loads the product, and the KyX view renders it as an HTML
     \\// fragment. One `serve(ctx): Response` shape covers reads and writes alike.
     \\pub struct GetProductByIdHandler impl RouteHandler {
     \\    repo: ProductRepository,
@@ -308,11 +308,11 @@ pub const web_get_handler_sample =
     \\}
 ;
 
-/// The `.nsx` hypermedia view template that renders the feature's response as markup.
+/// The `.kyx` hypermedia view template that renders the feature's response as markup.
 pub const web_view_sample =
-    \\// A per-feature NSX view. View code lives in `.nsx` files (same language as `.ky`, just filed apart
+    \\// A per-feature KyX view. View code lives in `.kyx` files (same language as `.ky`, just filed apart
     \\// so markup stays separate from logic) and returns an HTML string the handler or a page route renders.
-    \\// An NSX element is a `string`, so expressions embed inline with `{...}` and views compose directly.
+    \\// An KyX element is a `string`, so expressions embed inline with `{...}` and views compose directly.
     \\//
     \\// A `{expr}` interpolation is HTML-ESCAPED automatically, so user text like a product name is safe by
     \\// default: you never call an escaper here. To insert an ALREADY-rendered HTML fragment unescaped (one
@@ -382,7 +382,7 @@ pub const web_index_html_htmx =
 ///
 /// Unpoly follows a link/form, fetches the URL, and swaps the element matching `up-target` using the
 /// element of the SAME selector in the response. So the returned product card must carry `id="product"`
-/// (it does -- see the NSX view). Plain HTML fragments, no special content type: a straight fit for the
+/// (it does -- see the KyX view). Plain HTML fragments, no special content type: a straight fit for the
 /// handlers here.
 pub const web_index_html_unpoly =
     \\<!doctype html>
@@ -531,7 +531,7 @@ pub const web_package_json_sample =
 pub const web_tailwind_css_sample =
     \\@import "tailwindcss";
     \\
-    \\/* The content globs (which files Tailwind scans for class names, including the `.nsx` views) live in
+    \\/* The content globs (which files Tailwind scans for class names, including the `.kyx` views) live in
     \\   tailwind.config.js at the project root, loaded here. */
     \\@config "../tailwind.config.js";
 ;
@@ -541,7 +541,7 @@ pub const web_tailwind_config_sample =
     \\/** @type {import('tailwindcss').Config} */
     \\module.exports = {
     \\  content: [
-    \\    "./src/**/*.{nsx,kyte}",
+    \\    "./src/**/*.{kyx,ky}",
     \\    "./wwwroot/*.html",
     \\  ],
     \\};
@@ -598,7 +598,7 @@ pub const web_test_sample =
     \\
     \\@test
     \\fn test_product_card_view(): void {
-    \\    // The `.nsx` view renders, and untrusted text is HTML-escaped via response.escapeHtml.
+    \\    // The `.kyx` view renders, and untrusted text is HTML-escaped via response.escapeHtml.
     \\    let html = productCard("<b>Gadget</b>", 42);
     \\    assert.isTrue(string.indexOf(html, "&lt;b&gt;Gadget") != -1);
     \\    assert.isTrue(string.indexOf(html, "42") != -1);
@@ -607,7 +607,7 @@ pub const web_test_sample =
 
 /// The `main.ky` written by `kyte init desktop`.
 pub const desktop_main_sample =
-    \\// main.ky, a native desktop app: a webview window rendering NSX, with a Kyte
+    \\// main.ky, a native desktop app: a webview window rendering KyX, with a Kyte
     \\// handler bound to a JS call. Build native and run to open the window.
     \\import webview;
     \\

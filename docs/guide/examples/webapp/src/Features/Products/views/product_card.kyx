@@ -1,6 +1,6 @@
-// A per-feature NSX view. View code lives in `.nsx` files (same language as `.ky`, just filed apart
+// A per-feature KyX view. View code lives in `.kyx` files (same language as `.ky`, just filed apart
 // so markup stays separate from logic) and returns an HTML string the handler or a page route renders.
-// An NSX element is a `string`, so expressions embed inline with `{...}` and views compose directly.
+// An KyX element is a `string`, so expressions embed inline with `{...}` and views compose directly.
 //
 // A `{expr}` interpolation is HTML-ESCAPED automatically, so user text like a product name is safe by
 // default: you never call an escaper here. To insert an ALREADY-rendered HTML fragment unescaped (one
