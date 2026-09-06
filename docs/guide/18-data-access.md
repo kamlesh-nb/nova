@@ -210,14 +210,15 @@ for (p in rows) {
 }
 ```
 
-If you want to read into a **different** shape than the table entity, use the projection helpers.
-`listAs<D>()` maps every entity to a DTO `D`, and `oneAs<D>(column, value)` reads a single projected row
-(or `undefined`). A `D` field with no matching `T` field is a compile error, so the mapping is always
-complete, and the DTO's owned strings are independent of the result buffer:
+The projection helpers read into a plain owned type rather than a buffer-backed `Rows<T>`. `listAs<D>()`
+maps every row to `D`, and `oneAs<D>(column, value)` reads a single one (or `undefined`). A `D` field
+with no matching column is a compile error, so the mapping is always complete, and the result's owned
+strings are independent of the wire buffer. The type can differ from the table entity, or be the same
+`Product`:
 
 ```kyte
-let cards = await repo.listAs<ProductCard>();                 // List<ProductCard>
-let card  = await repo.oneAs<ProductCard>("id", db.dbInt(7)); // ProductCard | undefined
+let items = await repo.listAs<Product>();                 // List<Product>, owned copies
+let item  = await repo.oneAs<Product>("id", db.dbInt(7)); // Product | undefined
 ```
 
 ### Writing
