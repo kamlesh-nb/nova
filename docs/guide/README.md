@@ -45,7 +45,6 @@ functions run with `kyte test <file>.ky`.
 | 18 | [Data access & the ORM](18-data-access.md) | the `db` seam, `DbValue`, the micro-ORM, `Repository<T>`, connection strings, backing the web app with PostgreSQL |
 | 19 | [Package management](19-package-management.md) | `project.json`, `kyte get`, the lockfile, `kyte init`, import resolution |
 | 20 | [Database drivers](20-database-drivers.md) | PostgreSQL, MySQL, SQL Server, MongoDB: intro, package deployment, connect, and notes |
-| 21 | [How Kyte works: architecture](21-architecture.md) | the compiler pipeline, ARC memory, the concurrency engine, self-contained delivery |
 | 22 | [Building & distributing](22-building-and-distribution.md) | `kyte build`, cross-compiling programs, packaging toolchain bundles + checksums |
 | 23 | [Deploying with the orchestrator](23-deploying-with-the-orchestrator.md) | `service`/`orchd`/`orchctl`, load-balanced replicas, the config store on artifactd |
 | 24 | [Artifact delivery: the blob store](24-blob-store.md) | content-addressed `artifactd`, sha PUT/GET, Bearer auth, deploy by digest |

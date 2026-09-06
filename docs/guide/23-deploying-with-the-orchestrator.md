@@ -1,20 +1,47 @@
-# 23. Deploying with the orchestrator
+# 23. Deploying with Kynator
 
 You have a PostgreSQL-backed web service (Chapter 18). This chapter runs it in production shape: several
-replicas behind a load balancer, supervised and kept at their desired count. Kyte ships a small
-orchestrator for exactly this. It is a container-free, Kubernetes-style control plane that runs your
-workloads as ordinary native binaries (no images, no container runtime), split into a handful of
-binaries that mirror the Kubernetes control-plane / data-plane split.
+replicas behind a load balancer, supervised and kept at their desired count. Kyte ships **Kynator**, the
+Kyte-native orchestrator, for exactly this. It is a container-free, Kubernetes-style control plane that
+runs your workloads as ordinary native binaries (no images, no container runtime), split into a handful
+of binaries that mirror the Kubernetes control-plane / data-plane split.
 
-The orchestrator's own configuration (workload specs, the leader lease, cluster membership) is a tiny,
-low-churn data set: a few megabytes even across thousands of apps. So it does not run a database of its
-own. That state lives in `artifactd`, the same content-addressed blob service that already distributes
-your deploy binaries, which hosts a small key-value config store beside the blobs. There is no separate
-database process in the control plane to stand up, secure, or back up.
+Kynator's own configuration (workload specs, the leader lease, cluster membership) is a tiny, low-churn
+data set: a few megabytes even across thousands of apps. So it does not run a database of its own. That
+state lives in `artifactd`, the same content-addressed blob service that already distributes your deploy
+binaries, which hosts a small key-value config store beside the blobs. There is no separate database
+process in the control plane to stand up, secure, or back up.
 
-The orchestrator lives in `packages/nova-orchestrator`; its `README.md` and `docs/runbooks.md` are the
-operator references. `lang/docs/guide/examples/run-live.sh` runs everything in this chapter against the
-real binaries.
+Kynator lives in `packages/nova-orchestrator`; its `README.md` and `docs/runbooks.md` are the operator
+references. `lang/docs/guide/examples/run-live.sh` runs everything in this chapter against the real
+binaries.
+
+## Install from a GitHub release
+
+The fastest way onto a real host is the release installer. Kynator publishes a Linux bundle per CPU on
+its GitHub releases, and one command pulls the matching one and sets it up as systemd services. Kynator is
+a Linux production concern (its zero-downtime data plane is POSIX-only), so this path is Linux and systemd
+only:
+
+```sh
+curl -fsSL https://kytelang.org/deploy-kynator.sh | sudo bash -s -- --enable --start
+```
+
+The script detects your CPU (x86_64 or arm64), downloads
+`nova-orchestrator-<version>-linux-<arch>.tar.gz` from the latest release, verifies its checksum, and
+installs the four daemons (`artifactd`, `kynatord`, `kynatorctl`, `service`) into `/opt/nova-orchestrator`,
+with config templates in `/etc/nova-orchestrator` and data in `/var/lib/nova-orchestrator`. It writes the
+three systemd units (`kyte-artifactd`, `kyte-kynatord`, `kyte-service`); `--enable` starts them on boot and
+`--start` starts them now. Pin a specific release with `KYNATOR_VERSION=v0.1.0`. Edit the seeded config,
+then manage the stack with `systemctl` as usual:
+
+```sh
+systemctl status kyte-kynatord
+systemctl restart kyte-service
+```
+
+The rest of this chapter explains the binaries, the manifest, and the config store the installer sets up,
+and how to build them from source when you are developing rather than deploying.
 
 ## The binaries
 
@@ -25,12 +52,12 @@ reference, so the binaries come out naturally separated.
 | Binary      | Plane / role  | Entry file            |
 |-------------|---------------|-----------------------|
 | `service`   | data plane: an L7/L4 reverse proxy and load balancer in front of your app replicas, and the fd-handoff gateway. | `bin/service.ky` |
-| `orchd`     | control plane: reconciles desired vs actual replicas, runs health probes, publishes service discovery, runs the HA leader lease, writes metrics. | `bin/orchd.ky` |
-| `orchctl`   | operations: an offline CLI over a config-store dump. Inspect it, manage cluster membership, print a rolling-upgrade plan. | `bin/orchctl.ky` |
+| `kynatord`     | control plane: reconciles desired vs actual replicas, runs health probes, publishes service discovery, runs the HA leader lease, writes metrics. | `bin/kynatord.ky` |
+| `kynatorctl`   | operations: an offline CLI over a config-store dump. Inspect it, manage cluster membership, print a rolling-upgrade plan. | `bin/kynatorctl.ky` |
 | `artifactd` | the content-addressed artifact origin: a blob server that distributes deploy binaries by hash. | `bin/artifactd.ky` |
 | `orchweb`   | an optional, best-effort control-plane web UI. | `webui/src/main.ky` |
 
-The core set is `service`, `orchd`, `orchctl`, and `artifactd`. `orchweb` is a fifth, optional UI: the
+The core set is `service`, `kynatord`, `kynatorctl`, and `artifactd`. `orchweb` is a fifth, optional UI: the
 build script only attempts it when `webui/src/main.ky` is present, and a build failure there never
 fails the core stack.
 
@@ -59,15 +86,15 @@ mode, `kyte <src> -o <out> --target <triple>`. The supported cross triples are `
                  |      \     /               |
                  |  PostgreSQL (:5432)        |          <- YOUR app's data (the products table)
                  |                            |
-                 +---- artifactd (:8135) -----+          <- deploy blobs + orchestrator config store
+                 +---- artifactd (:8135) -----+          <- deploy blobs + Kynator config store
                            ^
-                         orchd  (reconciles replicas, writes the discovery file service reads)
+                         kynatord  (reconciles replicas, writes the discovery file service reads)
 ```
 
 Two stores with two jobs, and they are separate. Your **application** keeps its data in whatever
-database it chose in Chapter 18 (here PostgreSQL, holding the `products` table). The **orchestrator** keeps
+database it chose in Chapter 18 (here PostgreSQL, holding the `products` table). **Kynator** keeps
 its own control-plane state (cluster membership, workload definitions, the leader lease) in `artifactd`'s
-config store. The orchestrator does not touch your app's database, and your app does not touch the config
+config store. Kynator does not touch your app's database, and your app does not touch the config
 store.
 
 ## service: the data plane
@@ -106,12 +133,12 @@ Your app already supports running many replicas on one host: `main_postgres.ky` 
 > probes share the same pool. To use more cores, run N single-reactor `service` instances behind
 > SO_REUSEPORT.
 
-## orchd: the control plane
+## kynatord: the control plane
 
-Where `service` moves traffic, `orchd` keeps the replicas alive. It reconciles the actual set of running
+Where `service` moves traffic, `kynatord` keeps the replicas alive. It reconciles the actual set of running
 replicas against the desired count on a fixed loop, runs async health probes, and, when configured,
 publishes a service-discovery file that `service` reads instead of a static backend list, plus a
-Prometheus metrics file. It reads its config from `ORCHD_CONFIG` (default `orchd.json`) and has no listen
+Prometheus metrics file. It reads its config from `ORCHD_CONFIG` (default `kynatord.json`) and has no listen
 port of its own.
 
 ```json
@@ -123,11 +150,11 @@ port of its own.
 ```
 
 ```sh
-orchd orchd.json --check       # validate and exit
-orchd orchd.json               # run the reconcile loop
+kynatord kynatord.json --check       # validate and exit
+kynatord kynatord.json               # run the reconcile loop
 ```
 
-The `store.enabled` flag chooses orchd's mode. With the store disabled it runs standalone: it reconciles
+The `store.enabled` flag chooses kynatord's mode. With the store disabled it runs standalone: it reconciles
 from a local manifest directory with no config store and no leader lease. With the store enabled it runs
 the HA path: it points at `artifactd`'s config store (`addr` is artifactd's host:port, `token` is the
 same deploy bearer token artifactd guards its routes with, `tls` selects https), takes the leader lease,
@@ -135,7 +162,7 @@ and reconciles desired state read from the store. Both are covered below.
 
 ## The declarative manifest
 
-The workload you want orchd to run is described declaratively. There are two schemas in the package, and
+The workload you want kynatord to run is described declaratively. There are two schemas in the package, and
 it is worth knowing which is which.
 
 The current schema is a **YAML manifest**, parsed by `src/orch/manifest.ky`. The canonical example is
@@ -192,8 +219,8 @@ supervisor acts on.
 
 ### Where the app's own config lives
 
-The manifest above describes only how the orchestrator *runs* the app; it does not carry the app's own
-configuration. Kyte keeps application config **file-based and outside the orchestrator on purpose**. The
+The manifest above describes only how Kynator *runs* the app; it does not carry the app's own
+configuration. Kyte keeps application config **file-based and outside Kynator on purpose**. The
 app reads it from an `app.yaml` at the project root through the framework loader `web.config`, which the
 framework calls once when `App()` is constructed and exposes as `app.config`:
 
@@ -210,12 +237,12 @@ let port = app.config.port(8080);           // --port argv, else config.port, el
 let db = app.config.bind<DbSettings>("db"); // an @serializable section
 ```
 
-The orchestrator never injects app config as environment variables (co-located apps would collide on the
-same names), and orchd does not parse an app `config:` section even if one is present in the manifest
+Kynator never injects app config as environment variables (co-located apps would collide on the
+same names), and kynatord does not parse an app `config:` section even if one is present in the manifest
 file: `src/orch/manifest.ky` deliberately ignores the `config:` key when binding a `Manifest`, and
-`src/orch/spec.ky` states the same. What the orchestrator does pass to a replica is operational: the
+`src/orch/spec.ky` states the same. What Kynator does pass to a replica is operational: the
 `--config <profile>` argument from `workload.args` (selecting, say, the `prod` profile) and the port. So
-the same binary runs locally with no orchestrator, reading its `app.yaml` directly, and works with zero
+the same binary runs locally with no Kynator running, reading its `app.yaml` directly, and works with zero
 extra wiring.
 
 There is also a **legacy JSON `Spec`** schema in `src/orch/spec.ky`, parsed by `parseSpec(text)`. It
@@ -226,7 +253,7 @@ still parsed for existing deployments.
 
 ## The artifactd-hosted config store
 
-When `store.enabled` is set, orchd reaches its config store over HTTP at `artifactd`. The `store` block
+When `store.enabled` is set, kynatord reaches its config store over HTTP at `artifactd`. The `store` block
 becomes a base URL through the `storeBaseUrl` helper (in `src/cfg/config.ky`): `http://host:port`, or
 `https://host:port` when `tls` is set. There is no database connection string and no database process,
 which is the whole point of the move: the control-plane data set is a few megabytes, and it never needed
@@ -234,7 +261,7 @@ a general database. It needed exactly four things, and a small key-value store g
 named keys, an atomic compare-and-set (the leader-lease split-brain guard), prefix listing, and a
 since-revision watch.
 
-orchd opens the store in its HA path like this:
+kynatord opens the store in its HA path like this:
 
 ```
 let base = config.storeBaseUrl(c.store);
@@ -248,36 +275,36 @@ poll-based watch. Each method is one request to artifactd's `/cfg/*` routes, gua
 token. The keys it persists are worth knowing:
 
 - desired workload state under the `workloads/` prefix,
-- the leader lease under `leases/orchd`,
+- the leader lease under `leases/kynatord`,
 - cluster membership under `members/<id>`.
 
 The store logic itself is the same in-memory core, `ConfigStore` in `src/store/config.ky`, that the
-offline `orchctl` and the backup tooling operate on. artifactd hosts one instance of it behind its
+offline `kynatorctl` and the backup tooling operate on. artifactd hosts one instance of it behind its
 routes (`src/artifacts/cfgstore.ky`), snapshots it to a file after every write so it survives a
 restart with each key's revision intact, and serves one request at a time on its single reactor. That
 last point is what makes the leader election correct: every compare-and-set is a single synchronous call
-into one store, so two racing orchd nodes are serialised and exactly one wins an epoch. It is a simpler,
+into one store, so two racing kynatord nodes are serialised and exactly one wins an epoch. It is a simpler,
 more obviously-correct arbiter than a distributed transaction.
 
 **One honest caveat.** artifactd is a single coordination point, exactly as a shared database would have
-been. Multiple orchd nodes fail over correctly against it, but making the coordinator *itself* highly
+been. Multiple kynatord nodes fail over correctly against it, but making the coordinator *itself* highly
 available (a replicated, standby artifactd) is a separate, larger piece and is not built yet. For a
-single artifactd with several orchd nodes, failover is correct today.
+single artifactd with several kynatord nodes, failover is correct today.
 
 ## Discovery file to load balancing
 
-orchd and service meet through a small discovery file rather than a shared socket.
+kynatord and service meet through a small discovery file rather than a shared socket.
 
-The writer side is orchd's nativelet (`src/orch/nativelet.ky`). Each reconcile tick it renders one
+The writer side is kynatord's nativelet (`src/orch/nativelet.ky`). Each reconcile tick it renders one
 `name=host:port` line per replica and atomically writes the discovery file. With `basePort` set on a
 workload, replica `i` advertises as `host:(basePort + i)`; otherwise replicas share the probe port.
 
 The reader side is `service`. Given a discovery file and a service name, it reads back every
 `name=host:port` line for that name and adds each `host:port` to its proxy pool. So a `service`
-configured with `discoveryService: "web"` load-balances across whatever replicas orchd currently
+configured with `discoveryService: "web"` load-balances across whatever replicas kynatord currently
 advertises, and scaling up or losing a replica reshapes the pool without editing service's config.
 
-The division of labour is deliberate: orchd advertises the desired topology, and the data plane owns
+The division of labour is deliberate: kynatord advertises the desired topology, and the data plane owns
 liveness. service's own active health checks prune any advertised endpoint that stops serving, so a
 replica that has died but not yet been removed from the file still gets taken out of rotation.
 
@@ -285,7 +312,7 @@ replica that has died but not yet been removed from the file still gets taken ou
 
 This is a place where the earlier revision of this chapter drifted, so read it carefully.
 
-`orchd` does **not** serve `/healthz` and `/readyz` as HTTP routes. It has no listen port. Instead,
+`kynatord` does **not** serve `/healthz` and `/readyz` as HTTP routes. It has no listen port. Instead,
 `src/orch/health.ky` computes health as plain data:
 
 - `healthy()` is true when the config store is reachable.
@@ -294,8 +321,8 @@ This is a place where the earlier revision of this chapter drifted, so read it c
 - `healthzText()` renders `"ok"` or `"degraded"`; `readyzText()` renders `"ready"` or `"not ready"`.
 
 These are report strings a process computes, useful for a supervisor or a probe wrapper, not endpoints a
-daemon listens on. What orchd actually emits is the `/metrics` surface, and it emits it as a **file**:
-`renderMetrics` produces Prometheus text that orchd writes to the path in `metricsFile`, for a
+daemon listens on. What kynatord actually emits is the `/metrics` surface, and it emits it as a **file**:
+`renderMetrics` produces Prometheus text that kynatord writes to the path in `metricsFile`, for a
 node_exporter textfile collector to pick up. The metrics include `orch_up`, `orch_ready`,
 `orch_store_reachable`, `orch_leader_epoch`, `orch_workloads_total`, `orch_running_total`,
 `orch_under_provisioned`, `orch_reconcile_latency_ms`, and per-workload
@@ -322,11 +349,11 @@ than bouncing them all at once.
 **Node-level rolling upgrade** happens across nodes, driven by the leader lease. `src/orch/rollout.ky`
 walks the nodes one at a time: if a node is the live leader, it releases the lease and promotes a peer
 *before* the upgrade so leadership is never lost; it upgrades the node; the node rejoins as a standby; and
-a failed upgrade rolls back and stops the roll. `orchctl upgrade-plan <file>` prints this node order so
+a failed upgrade rolls back and stops the roll. `kynatorctl upgrade-plan <file>` prints this node order so
 you can review it before it touches a live cluster.
 
 **The HA leader lease** underneath all this is in `src/orch/asynclease.ky` (`AsyncLeaderLease`; there is
-a synchronous sibling in `lease.ky`). orchd builds it in its HA path against the `leases/orchd` key with
+a synchronous sibling in `lease.ky`). kynatord builds it in its HA path against the `leases/kynatord` key with
 a TTL of `max(reconcileMs * 5, 15000)` ms. The lease value encodes `holder|epoch|deadlineMs`. Acquisition
 is a compare-and-swap on the lease key, and the epoch is bumped on every takeover. Safety rests on that
 **fencing epoch**, not on wall-clock time: the CAS guarantees exactly one winner per epoch, and a new
@@ -361,28 +388,28 @@ Two details that look like bugs if you get them wrong:
 On Windows the `socket.sendFd`/`socket.recvFd` stubs return -1: the handoff compiles but does not run
 there. The mechanism has no direct Windows equivalent (`SCM_RIGHTS` hands a descriptor to whoever holds
 the other end, whereas `WSADuplicateSocket` prepares a duplicate for a process named by PID), so a
-Windows port is explicitly not planned. Treat the orchestrator as a Linux and macOS production concern,
+Windows port is explicitly not planned. Treat Kynator as a Linux and macOS production concern,
 with Windows as a development host.
 
-## orchctl: operating the config store offline
+## kynatorctl: operating the config store offline
 
-`orchctl` is deliberately offline. It works on a backup dump of the config store, a `key<TAB>value` file,
+`kynatorctl` is deliberately offline. It works on a backup dump of the config store, a `key<TAB>value` file,
 so you can inspect and repair cluster state without a running control plane. Its real subcommands are:
 
 ```sh
-orchctl inspect store.dump                 # count + list keys
-orchctl members store.dump                 # list cluster members
-orchctl member add store.dump node-4 10.0.0.4:7004
-orchctl member remove store.dump node-2
-orchctl upgrade-plan store.dump            # print the safe rolling-upgrade node order
+kynatorctl inspect store.dump                 # count + list keys
+kynatorctl members store.dump                 # list cluster members
+kynatorctl member add store.dump node-4 10.0.0.4:7004
+kynatorctl member remove store.dump node-2
+kynatorctl upgrade-plan store.dump            # print the safe rolling-upgrade node order
 ```
 
 `upgrade-plan` prints the per-node order described above: it drains a node if it is the leader, upgrades
 it, then lets it rejoin, so a rolling upgrade never takes down the quorum.
 
-Backup and restore are a supported operation, though they are not a distinct `orchctl` subcommand.
+Backup and restore are a supported operation, though they are not a distinct `kynatorctl` subcommand.
 `src/orch/backup.ky` provides `dump(store, prefix)` (line-oriented, escaped `key<TAB>value`) and
-`restore(store, data)` (re-applies each entry, last write wins). `orchctl` is the operator surface over
+`restore(store, data)` (re-applies each entry, last write wins). `kynatorctl` is the operator surface over
 such a dump: loading a file is a restore into an in-memory store, saving it is a dump. The live config
 store itself is durable without any of this: artifactd snapshots it to `<root>/config.snap` after every
 write and reloads it on start, so a restart keeps every key at its original revision.
@@ -396,11 +423,11 @@ write and reloads it on start, so a restart keeps every key at its original revi
    via `KYTE_PORT`,
 3. exercises the app directly: a `POST /api/products` write through to PostgreSQL and a
    `GET /api/products/1` read back,
-4. builds the orchestrator with `./build.sh`, writes a `service.json` for the two replicas, validates it
+4. builds Kynator with `./build.sh`, writes a `service.json` for the two replicas, validates it
    with `service --check`, starts `service` on 8090, and curls `GET /api/products/1` through the proxy
    three times so you can watch the round-robin,
-5. seeds a config-store dump (members plus a workload) and runs `orchctl inspect`, `orchctl members`, and
-   `orchctl upgrade-plan` over it.
+5. seeds a config-store dump (members plus a workload) and runs `kynatorctl inspect`, `kynatorctl members`, and
+   `kynatorctl upgrade-plan` over it.
 
 Run it from anywhere; it builds what it needs and cleans up every process on exit:
 

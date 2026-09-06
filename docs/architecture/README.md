@@ -20,7 +20,7 @@ Kyte is composed of three cooperating codebases.
 | **Standard library** | Kyte | `src/std/` | Collections, string, serde (JSON, YAML, BSON), decimal128, regex, crypto, the HTTP and web framework, and the database seam. It is compiled from source on every build. |
 
 Two sibling projects reside outside this repository, namely **NovaDB** (the Zig storage engine,
-`../../btree/`) and **nova-orchestrator** along with the database drivers (which are published Kyte
+`../../btree/`) and **Kynator** (the orchestrator, `../../packages/nova-orchestrator/`) along with the database drivers (which are published Kyte
 packages). These are consumers of the language and are not a part of it.
 
 ## The Compilation Pipeline at a Glance

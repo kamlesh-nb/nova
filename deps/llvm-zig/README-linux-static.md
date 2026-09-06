@@ -24,6 +24,6 @@ Under `llvm-21-<triple>/lib/`:
   archive-cycle limit (macOS ld auto-resolves cycles; ld.lld needs --start-group, unavailable in
   zig-build). Dynamic libstdc++/libgcc_s are order-independent and universal on Linux.
 - Build with `-Dstatic-llvm -Dtarget=aarch64-linux-gnu.2.39` (glibc pin → __isoc23_*/mallinfo2/
-  arc4random resolve) and `NOVA_LLVM_PREFIX=<extracted prefix>`.
+  arc4random resolve) and `KYTE_LLVM_PREFIX=<extracted prefix>`.
 
 Produce the tarball in a container: see the produce steps in the deps-generalization notes.

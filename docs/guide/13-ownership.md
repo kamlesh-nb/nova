@@ -117,7 +117,6 @@ either.
 One honest limit to know: reference counting does not reclaim a **cycle** of strong references (A owns B
 and B owns A), and Kyte has no `weak` reference to break one for you, so such a cycle leaks. Keep
 ownership a one-way tree and, where a child must refer back to its parent, hold it by an id or index
-rather than a second strong reference. The mechanism, and why this is the one case ARC cannot handle, is
-in [Chapter 21](21-architecture.md#reference-cycles).
+rather than a second strong reference. This is the one case reference counting cannot reclaim on its own.
 
 Next: [Modules & visibility](14-modules.md)

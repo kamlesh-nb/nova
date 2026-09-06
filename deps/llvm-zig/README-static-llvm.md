@@ -23,7 +23,7 @@ Default stays dynamic because static-linking all of LLVM bloats the binary and s
 self-containment only matters at release. The delivery invariant ("users deploy only `nova`") is satisfied
 by the static binary — the *build machine* still uses an LLVM install, which is fine.
 
-Default prefixes (override either with `NOVA_LLVM_PREFIX`):
+Default prefixes (override either with `KYTE_LLVM_PREFIX`):
 - **dynamic** → `/opt/homebrew/opt/llvm` (Homebrew LLVM 21 — has `libLLVM.dylib`).
 - **static** → `/Users/kamlesh/LLVM-22.1.0-macOS-ARM64-native` (**native LLVM 22**, see below).
 

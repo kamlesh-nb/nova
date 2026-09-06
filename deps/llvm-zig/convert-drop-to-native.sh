@@ -6,7 +6,7 @@
 # not native objects, so Zig's linker rejects them ("unknown cpu architecture: 0").
 # This runs each member through the drop's own `llc` (per-file → memory-safe),
 # re-archives with `llvm-ar`, and writes a NATIVE prefix `nova` can link against
-# via NOVA_LLVM_PREFIX / static_llvm_prefix in build.zig.
+# via KYTE_LLVM_PREFIX / static_llvm_prefix in build.zig.
 #
 # Usage:  convert-drop-to-native.sh [DROP_PREFIX] [OUT_PREFIX]
 #   DROP_PREFIX  default: /Users/kamlesh/LLVM-22.1.0-macOS-ARM64
