@@ -42,7 +42,7 @@ functions run with `kyte test <file>.ky`.
 | 15 | [Concurrency](15-concurrency.md) | `async`/`await`/`spawn`, futures, channels |
 | 16 | [Serialization](16-serialization.md) | `@serializable`, JSON/BSON |
 | 17 | [Web applications](17-web.md) | vertical slices, `RouteHandler`, `ctx.bind`, NSX views, the composition root |
-| 18 | [Data access & the ORM](18-data-access.md) | the `db` seam, `DbValue`, the micro-ORM, `Repository<T>`, connection strings, backing the web app with PostgreSQL |
+| 18 | [Data access & the repository](18-data-access.md) | the `db` seam, `DbValue`, binding rows to structs, `Repository<T>`, connection strings, backing the web app with PostgreSQL |
 | 19 | [Package management](19-package-management.md) | `project.json`, `kyte get`, the lockfile, `kyte init`, import resolution |
 | 20 | [Database drivers](20-database-drivers.md) | PostgreSQL, MySQL, SQL Server, MongoDB: intro, package deployment, connect, and notes |
 | 22 | [Building & distributing](22-building-and-distribution.md) | `kyte build`, cross-compiling programs, packaging toolchain bundles + checksums |

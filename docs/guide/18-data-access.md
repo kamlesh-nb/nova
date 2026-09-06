@@ -2,11 +2,13 @@
 
 The web service in the previous chapter stored its products in memory. Real services keep their data in
 a database. This chapter shows how Kyte talks to one: the `db` seam that every driver implements, the
-drivers themselves (PostgreSQL, MySQL, SQL Server, MongoDB), the micro-ORM that turns rows into your
-typed structs, and the repository pattern that keeps all of this out of your handlers. At the end we take
-the exact web app from Chapter 17 and point it at a live PostgreSQL, changing one file.
+drivers themselves (PostgreSQL, MySQL, SQL Server, MongoDB), the row binder that turns rows into your
+typed structs, and the generic `Repository<T>` that keeps all of this out of your handlers. Kyte does not
+ship a full object-relational mapper, and deliberately so: it gives you a thin, predictable seam (typed
+parameters, row binding, and a table-scoped repository) and leaves the SQL to you. At the end we take the
+exact web app from Chapter 17 and point it at a live PostgreSQL, changing one file.
 
-The running code for this chapter is `examples/28_db_drivers.ky` (the seam and the ORM, verifiable
+The running code for this chapter is `examples/28_db_drivers.ky` (the seam and row binding, verifiable
 offline) and `examples/webapp/main_postgres.ky` (the same web app, backed by PostgreSQL).
 
 ## One seam, many drivers
@@ -85,9 +87,9 @@ let name = r.getText(1);
 `connect`, `query`, `exec`, `prepare`, and the transaction methods (`begin`/`commit`/`rollback`) are all
 `async`; `close` and `setTimeout` are synchronous. Inside an `async` function you `await` the async ones.
 
-## The micro-ORM: rows into structs
+## Binding rows to structs
 
-Reading cells by index gets tedious and fragile. The micro-ORM in `data.orm` binds a whole result set
+Reading cells by index gets tedious and fragile. The row binder in `data.orm` binds a whole result set
 into typed structs, mapping columns to fields by name. Mark the target struct `@serializable` so the
 compiler generates the binder:
 
@@ -125,7 +127,7 @@ pub struct ProductRepository {
     pub async fn findById(self: ProductRepository, id: int): ProductDto | undefined {
         let params = List<DbValue>();
         params.push(db.dbInt(id));
-        // Await the I/O, then bind the rows with the synchronous ORM binder.
+        // Await the I/O, then bind the rows with the synchronous row binder.
         let rs = await self.conn.query("SELECT id, name, price FROM products WHERE id = $1", params);
         return orm.bindOne<ProductDto>(rs);
     }
@@ -145,33 +147,116 @@ database backs it.
 
 ## The generic `Repository<T>`
 
-When a repository is a thin wrapper over one table, the stdlib gives you a ready one:
-`data.repository.Repository<T>`. Bind it to an entity type and a table, and it maps rows to `T` by name
-for you, so a slice never writes bind code:
+Writing a `ProductRepository` by hand, as above, is fine, but most repositories are a thin wrapper over a
+single table doing the same five things: read all, read by key, run a query, insert, update, delete. The
+standard library gives you those out of the box with `data.repository.Repository<T>`, a table-scoped
+repository that binds an entity type `T` to one table and maps rows to `T` for you. You never write bind
+code, and you never repeat the type at each call.
+
+It is not an object-relational mapper. There is no change tracking, no lazy loading, no relationship
+graph, and no query builder. It is a small, honest convenience over the same seam and row binder you saw
+above: it holds the connection and the table name once, generates the obvious SQL for the common cases,
+and forwards everything else to your own SQL. That narrow scope is the point, because it keeps what runs
+against your database predictable.
+
+### Setting one up
+
+Construct it with a connection and a table name. The entity `T` must be a `@serializable` struct whose
+field names match the table's columns (case-insensitively), because that is how rows bind to it:
 
 ```kyte
 import data.db;
 import data.repository;
 
+@serializable pub struct Product {
+    pub id: int,
+    pub name: string,
+    pub price: int,
+}
+
 let repo = Repository<Product>(conn, "products");
-let all  = await repo.all();                                  // Rows<Product>: SELECT * FROM products
-let one  = await repo.findBy("id", db.dbInt(7));              // Rows<Product> filtered by a column
-let rows = await repo.query(                                   // your own SQL, still bound to Product
-    "SELECT id, name, price FROM products WHERE price > $1", params);
-let _r   = await repo.add(product);                           // INSERT every field of the entity
 ```
 
-`Repository<T>` also offers `update`, `remove`, and the projection helpers `listAs<D>`/`oneAs<D>` for
-reading into a DTO that differs from the table entity. The reads return a buffer-owning `Rows<T>`, which
-is the sound path. There is also a lower-level `orm.queryAs<T>` that binds without owning the buffer, so
-its `str.Str` fields dangle once the buffer is freed; prefer `queryRows<T>` or `Repository<T>` unless you
-know the buffer outlives the rows.
+The connection is **borrowed, never owned**: the repository does not open or close it. In a web app you
+take a connection from the pool for the unit of work, hand it to the repository, and release it
+afterwards; the repository just runs on whatever connection you gave it.
 
-One nicety worth knowing: a **literal** `SELECT` in `db.query<T>`, `orm.queryRows<T>`, `Repository.query`,
-or a `querySql` tagged template is checked at COMPILE TIME. If the selected columns do not cover every
-plain field of `T`, or the `$N` placeholders are not contiguous from `$1`, the build fails. A typo like
-`naem` is a compile error, not a runtime surprise. The check skips `SELECT *` and computed expressions,
-where it cannot know the shape.
+### Reading
+
+Four read methods cover the usual cases. All are `async`, so you `await` them:
+
+```kyte
+let all = await repo.all();                        // SELECT * FROM products
+let hit = await repo.findBy("id", db.dbInt(7));    // SELECT * FROM products WHERE id = $1
+let dear = await repo.query(                        // your own SQL, still bound to Product
+    "SELECT id, name, price FROM products WHERE price > $1 ORDER BY price DESC", params);
+```
+
+- `all()` returns every row as `Rows<Product>`.
+- `findBy(column, value)` filters by one column; the column name is trusted identifier text and the value
+  is bound as a parameter, so it is injection-safe.
+- `query(sql, params)` is the escape hatch: pass any SQL (joins, aliases, ordering, `WHERE` clauses the
+  generated helpers cannot express) and it still binds each row to `Product`. Reach for this the moment
+  the table's columns do not line up one-to-one with the entity's fields.
+
+The reads return a `Rows<T>`, which **owns the wire result buffer**. That matters because text columns can
+bind as zero-copy `str.Str` views into that buffer, and holding the `Rows` keeps them valid. Iterate it
+directly:
+
+```kyte
+let rows = await repo.all();
+for (p in rows) {
+    console.log(`${p.name} = ${p.price}`);
+}
+```
+
+If you want to read into a **different** shape than the table entity, use the projection helpers.
+`listAs<D>()` maps every entity to a DTO `D`, and `oneAs<D>(column, value)` reads a single projected row
+(or `undefined`). A `D` field with no matching `T` field is a compile error, so the mapping is always
+complete, and the DTO's owned strings are independent of the result buffer:
+
+```kyte
+let cards = await repo.listAs<ProductCard>();                 // List<ProductCard>
+let card  = await repo.oneAs<ProductCard>("id", db.dbInt(7)); // ProductCard | undefined
+```
+
+### Writing
+
+Three write methods cover insert, update, and delete. Each returns an `ExecResult` you can check with
+`.ok()` and `.rows_affected`:
+
+```kyte
+let ins = await repo.add(Product { id: 0, name: "Cola", price: 120 });  // INSERT every field
+let upd = await repo.update(product, "id");                             // UPDATE ... WHERE id = ...
+let del = await repo.remove("id", db.dbInt(7));                         // DELETE ... WHERE id = $1
+```
+
+- `add(entity)` inserts **every field** of the entity. This is exactly what you want for a plain table,
+  but a table with `DEFAULT` or generated columns (a `uuid` primary key, a computed total) does not want
+  every field supplied, so write that `INSERT` yourself and run it through the connection's `exec`.
+- `update(entity, keyColumn)` writes the entity back, keyed on `keyColumn`.
+- `remove(keyColumn, value)` deletes the matching rows.
+
+### The one caveat, and the compile-time check that guards it
+
+`all()` and `findBy()` emit `SELECT *`, which binds correctly only when the table's column names match the
+entity's field names. A table with aliased or joined columns (say `image_url AS imageUrl`) needs explicit
+SQL through `query()`. When you do write that SQL, the compiler helps: a **literal** `SELECT` in
+`repo.query(...)`, `db.query<T>`, `orm.queryRows<T>`, or a `querySql` tagged template is checked at
+**compile time**. If the selected columns do not cover every plain field of `T`, or the `$N` placeholders
+are not contiguous from `$1`, the build fails. A typo like `naem` is a compile error, not a runtime
+surprise. The check skips `SELECT *` and computed expressions, where it cannot know the shape.
+
+One lower-level note: there is an `orm.queryAs<T>` that binds without owning the buffer, so its `str.Str`
+fields dangle once the buffer is freed. Prefer `Repository<T>` (or `orm.queryRows<T>`) unless you know the
+buffer outlives the rows.
+
+### When to use which
+
+Use `Repository<T>` when a table maps cleanly onto a struct and you want CRUD without boilerplate. Drop to
+a hand-written repository like `ProductRepository` above when you need bespoke SQL, multiple tables, or
+logic around the queries; both hold the same `Connection` trait, so you can mix them freely and swap the
+driver underneath either one without changing a line.
 
 ## Swapping the web app onto PostgreSQL
 
@@ -283,7 +368,7 @@ behind the orchestrator, which is the subject of Chapter 23.
 
 MongoDB is not relational, so it does not fit the `query`/`exec` seam the SQL drivers share. Instead the
 `mongodb` package gives you a native document API: typed documents, a fluent filter and update builder,
-lazy cursors, sessions and transactions, and a typed ORM that reads and writes your `@serializable`
+lazy cursors, sessions and transactions, and typed struct serialisation that reads and writes your `@serializable`
 structs directly. `MongoConnection` still implements the `Connection` trait, so it can sit behind the
 same pool, but the document methods are what you use day to day.
 
@@ -406,7 +491,7 @@ Single-document writes are **retryable**: on a transient failure the driver retr
 Multi-document writes stream their documents in an OP_MSG document sequence (the wire-efficient bulk
 form) rather than nesting a large array in the command.
 
-### Typed structs: the ORM both ways
+### Typed structs both ways
 
 Hand-building a `Doc` per field is tedious. Mark a struct `@serializable` and let the driver serialise it:
 
@@ -430,7 +515,7 @@ let first    = mongodb.bindOne<Product>(await coll.findOne(mongodb.all()));   //
 
 `docOf`, `bindAll`, and `bindOne` are **synchronous** on purpose: the compiler resolves the concrete type
 only outside an `async` frame, so you fetch first (the `await`) and then convert. It is the same fetch
-then bind split the SQL micro-ORM uses.
+then bind split the SQL row binder uses.
 
 ### Typed values and decimals
 
@@ -567,4 +652,4 @@ MongoDB driver, and vice versa.
 - Chapter 19 for package management: how you add a driver dependency with `kyte get`.
 - Chapter 20 for the database drivers, each with its intro, package deployment, and connection string.
 - Chapter 23 for deploying this PostgreSQL-backed app under the orchestrator (service, orchd, orchctl).
-- Chapter 16 for `@serializable`, which powers both JSON responses and the ORM binder.
+- Chapter 16 for `@serializable`, which powers both JSON responses and the row binder.
