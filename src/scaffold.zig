@@ -293,14 +293,28 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     try writeVscodeConfig(allocator, init.io, project_name.?);
 
+    // A web app scaffolded with `--framework datastar` drives the browser over an SSE event stream, which
+    // needs the `nova-datastar` server SDK. Wire that dependency into project.json automatically so the
+    // user never hand-edits it: `kyte build` resolves it (locally from a sibling `packages/` root, or by
+    // fetching the git URL). Every other framework (htmx/unpoly/htmz/alpine) consumes plain HTML fragments
+    // the handlers already return, so it needs no package and dependencies stay empty. Matches the
+    // `https://github.com/kamlesh-nb/nova-<name>` convention the DB-driver packages use.
+    const is_datastar_web = std.mem.eql(u8, template_type, "web") and std.mem.eql(u8, framework, "datastar");
+    const deps_literal: []const u8 = if (is_datastar_web)
+        \\[
+        \\    "https://github.com/kamlesh-nb/nova-datastar"
+        \\  ]
+    else
+        "[]";
+
     const project_json_content = try std.fmt.allocPrint(allocator,
         \\{{
         \\  "name": "{s}",
         \\  "version": "0.1.0",
         \\  "type": "{s}",
-        \\  "dependencies": []
+        \\  "dependencies": {s}
         \\}}
-        , .{ project_name.?, template_type });
+        , .{ project_name.?, template_type, deps_literal });
     defer allocator.free(project_json_content);
 
     const project_json_path = try std.fmt.allocPrint(allocator, "{s}/project.json", .{project_name.?});
@@ -313,6 +327,9 @@ pub fn cmdInit(allocator: std.mem.Allocator, init: std.process.Init, args: []con
 
     if (std.mem.eql(u8, template_type, "web")) {
         std.debug.print("Project '{s}' initialized successfully (hypermedia framework: {s}).\n", .{ project_name.?, framework });
+        if (is_datastar_web) {
+            std.debug.print("  wired the nova-datastar server SDK into project.json; `kyte build` will resolve it.\n", .{});
+        }
     } else {
         std.debug.print("Project '{s}' initialized successfully.\n", .{project_name.?});
     }

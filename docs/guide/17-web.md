@@ -386,6 +386,8 @@ The framework in `web.*` covers the rest of a real application:
   backing this app with PostgreSQL.
 - **Chapter 19, Package management**, explains `project.json` and how the
   compiler resolves a driver dependency.
+- **Chapter 21, Datastar: server-driven hypermedia**, drives the browser over a
+  live SSE connection: patch elements and reactive signals from the server.
 - **Chapter 20, Database drivers**, introduces each driver (PostgreSQL, MySQL,
   SQL Server, MongoDB) and how to add it to a project.
 - **Chapter 23, Deploying with the orchestrator**, runs replicas of this app
